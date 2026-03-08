@@ -1,0 +1,43 @@
+# Embedding Service (BGE-M3 via vLLM) — GPU 0
+# Usage:
+#   docker compose up -d
+#   docker compose down
+
+services:
+  embedding:
+    image: vllm/vllm-openai:latest
+    container_name: lai_embedding
+    restart: unless-stopped
+    ipc: host
+    command: >
+      --model ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      --task embed
+      --dtype auto
+      --trust-remote-code
+      --max-model-len 8192
+      --gpu-memory-utilization 0.05
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./model-cache:/root/.cache/huggingface
+    ports:
+      - "${EMBEDDING_PORT:-8003}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    networks:
+      - lai_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+networks:
+  lai_network:
+    external: true

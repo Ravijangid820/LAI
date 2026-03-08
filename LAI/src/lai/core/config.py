@@ -1,0 +1,324 @@
+"""LAI configuration management.
+
+Nested Pydantic settings loaded from environment variables / .env file.
+Merges the best of V3 (validation, SecretStr, field descriptions) and
+V4 (cleaner grouping, improved defaults from LAIV5 improvements doc).
+"""
+
+from functools import lru_cache
+
+from pydantic import Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# ---------------------------------------------------------------------------
+# Base config shared by all settings groups
+# ---------------------------------------------------------------------------
+
+_COMMON_CONFIG = SettingsConfigDict(
+    env_file=".env",
+    env_file_encoding="utf-8",
+    extra="ignore",
+)
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure
+# ---------------------------------------------------------------------------
+
+class DatabaseSettings(BaseSettings):
+    """PostgreSQL + pgvector configuration."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "PG"})
+
+    host: str = Field(default="localhost", alias="PGHOST")
+    port: int = Field(default=5433, ge=1, le=65535, alias="PGPORT")
+    database: str = Field(default="lai_db", alias="PGDATABASE")
+    user: str = Field(default="lai_user", alias="PGUSER")
+    password: SecretStr = Field(default=SecretStr("lai_dev_password"), alias="PGPASSWORD")
+    pool_min_size: int = Field(default=2, ge=1, le=100)
+    pool_max_size: int = Field(default=10, ge=1, le=200)
+
+    @property
+    def dsn(self) -> str:
+        return (
+            f"postgresql://{self.user}:{self.password.get_secret_value()}"
+            f"@{self.host}:{self.port}/{self.database}"
+        )
+
+    @property
+    def async_dsn(self) -> str:
+        return (
+            f"postgresql+asyncpg://{self.user}:{self.password.get_secret_value()}"
+            f"@{self.host}:{self.port}/{self.database}"
+        )
+
+
+class RedisSettings(BaseSettings):
+    """Redis configuration for caching and task queue."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "REDIS_"})
+
+    host: str = "localhost"
+    port: int = Field(default=6380, ge=1, le=65535)
+    password: SecretStr | None = None
+    db: int = Field(default=0, ge=0, le=15)
+    ssl: bool = False
+    cache_ttl: int = Field(default=3600, description="Embedding cache TTL in seconds.")
+
+    @property
+    def url(self) -> str:
+        scheme = "rediss" if self.ssl else "redis"
+        if self.password:
+            return f"{scheme}://:{self.password.get_secret_value()}@{self.host}:{self.port}/{self.db}"
+        return f"{scheme}://{self.host}:{self.port}/{self.db}"
+
+
+class MinIOSettings(BaseSettings):
+    """MinIO object storage configuration."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "MINIO_"})
+
+    endpoint: str = Field(default="localhost:9002")
+    access_key: str = "laiadmin"
+    secret_key: SecretStr = Field(default=SecretStr("superStrongPassword123!"))
+    use_ssl: bool = False
+    documents_bucket: str = "documents"
+    datasets_bucket: str = "datasets"
+    user_documents_bucket: str = "user-documents"
+
+
+# ---------------------------------------------------------------------------
+# ML Services
+# ---------------------------------------------------------------------------
+
+class EmbeddingSettings(BaseSettings):
+    """Embedding service configuration (BGE-M3 via vLLM/TEI)."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "EMBEDDING_"})
+
+    url: str = "http://localhost:8003"
+    model: str = "BAAI/bge-m3"
+    dimension: int = Field(default=1024, ge=1)
+    batch_size: int = Field(default=32, ge=1, le=256)
+    timeout: float = Field(default=30.0, ge=1, le=300)
+    max_retries: int = Field(default=3, ge=0, le=10)
+
+
+class RerankerSettings(BaseSettings):
+    """Reranker configuration (cross-encoder via vLLM/TEI)."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "RERANKER_"})
+
+    url: str = "http://localhost:8004/v1"
+    model: str = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+    timeout: float = Field(default=30.0, ge=1, le=120)
+    max_text_length: int = Field(default=400, description="Max chars per doc sent to reranker.")
+    batch_size: int = Field(default=16, ge=1, le=128)
+
+
+class LLMSettings(BaseSettings):
+    """LLM configuration (Qwen2.5-7B via vLLM)."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "LLM_"})
+
+    url: str = "http://localhost:8001/v1"
+    model: str = "Qwen/Qwen2.5-7B-Instruct"
+    temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=4096, ge=1, le=8192)  # Increased from 2048 -> 4096
+    timeout: float = Field(default=120.0, ge=1, le=600)
+    top_p: float = Field(default=0.95, ge=0.0, le=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+class RetrievalSettings(BaseSettings):
+    """Retrieval pipeline configuration."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "RETRIEVAL_"})
+
+    # Hybrid search weights
+    dense_weight: float = Field(default=0.6, ge=0.0, le=1.0)
+    sparse_weight: float = Field(default=0.4, ge=0.0, le=1.0)
+    rrf_k: int = Field(default=60, ge=1, le=1000)
+
+    # Retrieval counts
+    initial_k: int = Field(default=100, ge=1, le=1000)
+    final_k: int = Field(default=7, ge=1, le=50)       # Increased from 5 -> 7
+    max_final_k: int = Field(default=10, ge=1, le=50)   # Increased from 7 -> 10
+    min_final_k: int = Field(default=2, ge=1, le=50)
+
+    # Quality thresholds
+    min_similarity_threshold: float = Field(default=0.5, ge=0.0, le=1.0)  # Raised from 0.3 -> 0.5
+    min_chunks_required: int = Field(default=2, ge=1, le=10)
+
+    # HNSW parameters
+    hnsw_ef_search: int = Field(default=100, ge=1, le=1000)
+
+    @field_validator("sparse_weight")
+    @classmethod
+    def validate_weights(cls, v: float) -> float:
+        return v
+
+
+class CRAGSettings(BaseSettings):
+    """Corrective RAG settings."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "CRAG_"})
+
+    enabled: bool = Field(default=True, description="Enable CRAG loop for LEGAL_COMPLEX queries.")
+    max_loops: int = Field(default=2, ge=1, le=5)
+    min_relevant_chunks: int = Field(default=2, ge=1, le=10)
+    grading_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
+    grading_max_tokens: int = Field(default=16, ge=1, le=100)
+
+
+class ChunkingSettings(BaseSettings):
+    """Document chunking configuration."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "CHUNK_"})
+
+    max_tokens: int = Field(default=512, ge=100, le=4096)
+    min_chars: int = Field(default=400, ge=50, le=2000)
+    overlap_tokens: int = Field(default=100, ge=0, le=500)  # Increased from 50 -> 100
+    max_file_size_mb: int = Field(default=50, ge=1, le=500)
+    allowed_extensions: list[str] = [".pdf", ".docx"]
+
+
+class BatchProcessingSettings(BaseSettings):
+    """Batch processing for large-scale corpus ingestion."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "BATCH_"})
+
+    size: int = Field(default=10000, ge=100, le=100000)
+    checkpoint_interval: int = Field(default=5, ge=1, le=100)
+    max_concurrent: int = Field(default=3, ge=1, le=10)
+    dedup_minhash_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    dedup_minhash_permutations: int = Field(default=128, ge=16, le=512)
+
+
+# ---------------------------------------------------------------------------
+# External Services
+# ---------------------------------------------------------------------------
+
+class BraveSearchSettings(BaseSettings):
+    """Brave Search API for web search fallback."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "BRAVE_"})
+
+    api_key: str = ""
+    base_url: str = "https://api.search.brave.com/res/v1/web/search"
+    max_results: int = Field(default=5, ge=1, le=20)
+    timeout: float = Field(default=15.0, ge=1, le=60)
+    enabled: bool = Field(default=False, description="Enable web search fallback.")
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+class JWTSettings(BaseSettings):
+    """JWT authentication configuration."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "JWT_"})
+
+    secret_key: SecretStr = Field(default=SecretStr("CHANGE-ME-IN-PRODUCTION"))
+    algorithm: str = "HS256"
+    access_token_expire_minutes: int = Field(default=30, ge=1, le=1440)
+    refresh_token_expire_days: int = Field(default=7, ge=1, le=90)
+
+
+class MonitoringSettings(BaseSettings):
+    """Monitoring SLOs and alert thresholds."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "MONITOR_"})
+
+    target_refusal_rate_min: float = Field(default=0.15, ge=0.0, le=1.0)
+    target_refusal_rate_max: float = Field(default=0.25, ge=0.0, le=1.0)
+    alert_refusal_rate_max: float = Field(default=0.40, ge=0.0, le=1.0)
+    alert_refusal_rate_min: float = Field(default=0.05, ge=0.0, le=1.0)
+    target_citation_verification_rate: float = Field(default=0.98, ge=0.0, le=1.0)
+    alert_citation_verification_rate: float = Field(default=0.95, ge=0.0, le=1.0)
+    target_p95_latency_ms: int = Field(default=3000, ge=100, le=30000)
+    alert_p95_latency_ms: int = Field(default=5000, ge=100, le=60000)
+
+
+class APISettings(BaseSettings):
+    """API server configuration."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "API_"})
+
+    host: str = "0.0.0.0"
+    port: int = Field(default=8000, ge=1, le=65535)
+    debug: bool = False
+    cors_origins: list[str] = ["*"]
+    rate_limit_per_minute: int = Field(default=60, ge=1, le=10000)
+    request_timeout_seconds: int = Field(default=60, ge=1, le=300)
+    max_query_length: int = Field(default=2000, description="Max chars for user query input.")
+
+
+class SessionSettings(BaseSettings):
+    """Conversation session configuration."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "SESSION_"})
+
+    max_turns: int = Field(default=10, ge=1, le=100)
+    expiry_days: int = Field(default=7, ge=1, le=90)  # Increased from 1 -> 7
+
+
+# ---------------------------------------------------------------------------
+# Aggregate settings
+# ---------------------------------------------------------------------------
+
+class Settings(BaseSettings):
+    """Main settings container - aggregates all settings groups.
+
+    Usage:
+        from lai.core.config import get_settings
+        settings = get_settings()
+        print(settings.db.host)
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Infrastructure
+    db: DatabaseSettings = Field(default_factory=DatabaseSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
+    minio: MinIOSettings = Field(default_factory=MinIOSettings)
+
+    # ML Services
+    embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
+    reranker: RerankerSettings = Field(default_factory=RerankerSettings)
+    llm: LLMSettings = Field(default_factory=LLMSettings)
+
+    # Pipeline
+    retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
+    crag: CRAGSettings = Field(default_factory=CRAGSettings)
+    chunking: ChunkingSettings = Field(default_factory=ChunkingSettings)
+    batch: BatchProcessingSettings = Field(default_factory=BatchProcessingSettings)
+
+    # External services
+    brave_search: BraveSearchSettings = Field(default_factory=BraveSearchSettings)
+
+    # Application
+    jwt: JWTSettings = Field(default_factory=JWTSettings)
+    monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
+    api: APISettings = Field(default_factory=APISettings)
+    session: SessionSettings = Field(default_factory=SessionSettings)
+
+    # Metadata
+    app_name: str = "LAI"
+    app_version: str = "5.0.0"
+    environment: str = Field(default="development", description="development | staging | production")
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Get cached settings instance. Call get_settings.cache_clear() to reload."""
+    return Settings()

@@ -1,0 +1,18 @@
+# Persistent data directories (local only, not committed)
+database/pgvector/data/*
+!database/pgvector/data/.gitkeep
+database/redis/data/*
+!database/redis/data/.gitkeep
+database/minio/data/
+embedding/model-cache/*
+!embedding/model-cache/.gitkeep
+reranker/model-cache/*
+!reranker/model-cache/.gitkeep
+llm/model-cache/*
+!llm/model-cache/.gitkeep
+monitoring/prometheus-data/
+monitoring/grafana-data/
+
+# Environment files with secrets
+.env
+**/.env

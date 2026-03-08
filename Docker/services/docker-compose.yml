@@ -1,0 +1,285 @@
+# =============================================================================
+# LAIV4 Multi-Agent Legal AI Platform — Full Stack
+# =============================================================================
+#
+# Usage:
+#   docker compose up -d                      # Start everything (infra + ML)
+#   docker compose --profile monitoring up -d # Also include Prometheus + Grafana
+#   docker compose down                       # Stop everything
+#   docker compose down -v                    # Stop + delete all volumes
+#
+# Then start the application:
+#   cd /data/projects/lai/LAIV4
+#   uv run main.py serve
+#
+# Port Map:
+#   5433  → PostgreSQL (pgvector)
+#   6380  → Redis
+#   9002  → MinIO API
+#   9003  → MinIO Console
+#   8003  → vLLM Embedding (BGE-M3)
+#   8004  → vLLM Reranker (cross-encoder)
+#   8001  → vLLM LLM (Qwen2.5-7B-Instruct)
+#   8000  → LAIV4 FastAPI (host, not containerized)
+#   9090  → Prometheus (monitoring profile)
+#   3001  → Grafana (monitoring profile)
+# =============================================================================
+
+x-common-env: &common-env
+  # PostgreSQL
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGDATABASE: ${PGDATABASE:-lai_db}
+  PGUSER: ${PGUSER:-lai_user}
+  PGPASSWORD: ${PGPASSWORD:-lai_test_password_2024}
+  # Redis
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+  # MinIO
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-laiadmin}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-superStrongPassword123!}
+  MINIO_USE_SSL: "false"
+  # ML Services (internal Docker network names)
+  EMBEDDING_URL: http://embedding:8000/v1
+  LLM_URL: http://llm:8000/v1
+  RERANKER_CROSS_ENCODER_URL: http://reranker:8000/v1
+  # Application
+  ENVIRONMENT: production
+
+services:
+
+  # ===========================================================================
+  # Core Infrastructure (starts by default)
+  # ===========================================================================
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: laiv4_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-lai_db}
+      POSTGRES_USER: ${PGUSER:-lai_user}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-lai_test_password_2024}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    ports:
+      - "${PGPORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lai_user -d lai_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - laiv4_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: laiv4_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - laiv4_network
+
+  minio:
+    image: minio/minio:latest
+    container_name: laiv4_minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-laiadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-superStrongPassword123!}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_PORT:-9002}:9000"
+      - "${MINIO_CONSOLE_PORT:-9003}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - laiv4_network
+
+  # ===========================================================================
+  # ML Inference Services
+  # ===========================================================================
+
+  # Embedding Service (BGE-M3 via vLLM) — GPU 0
+  embedding:
+    image: vllm/vllm-openai:latest
+    container_name: laiv4_embedding
+    restart: unless-stopped
+    ipc: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      --model ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      --task embed
+      --dtype auto
+      --trust-remote-code
+      --max-model-len 8192
+      --gpu-memory-utilization 0.05
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - embedding_cache:/root/.cache/huggingface
+    ports:
+      - "${EMBEDDING_PORT:-8003}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    networks:
+      - laiv4_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+  # Reranker Service (Cross-encoder via vLLM) — GPU 0
+  reranker:
+    image: vllm/vllm-openai:latest
+    container_name: laiv4_reranker
+    restart: unless-stopped
+    ipc: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      --model cross-encoder/ms-marco-MiniLM-L-12-v2
+      --task score
+      --dtype auto
+      --trust-remote-code
+      --max-model-len 512
+      --gpu-memory-utilization 0.02
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - reranker_cache:/root/.cache/huggingface
+    ports:
+      - "${RERANKER_PORT:-8004}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    networks:
+      - laiv4_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+  # LLM Service (Qwen via vLLM) — GPU 1
+  llm:
+    image: vllm/vllm-openai:latest
+    container_name: laiv4_llm
+    restart: unless-stopped
+    ipc: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      --model ${LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      --max-model-len ${LLM_MAX_MODEL_LEN:-8192}
+      --dtype auto
+      --trust-remote-code
+      --gpu-memory-utilization 0.7
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - llm_cache:/root/.cache/huggingface
+    ports:
+      - "${LLM_PORT:-8001}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+      start_period: 300s
+    networks:
+      - laiv4_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${CUDA_DEVICE:-1}']
+              capabilities: [gpu]
+
+  # ===========================================================================
+  # Monitoring (optional — use with: docker compose --profile monitoring up -d)
+  # ===========================================================================
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: laiv4_prometheus
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - laiv4_network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: laiv4_grafana
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - laiv4_network
+
+networks:
+  laiv4_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  embedding_cache:
+  reranker_cache:
+  llm_cache:
+  prometheus_data:
+  grafana_data:

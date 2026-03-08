@@ -1,0 +1,43 @@
+# Reranker Service (Cross-encoder via vLLM) — GPU 0
+# Usage:
+#   docker compose up -d
+#   docker compose down
+
+services:
+  reranker:
+    image: vllm/vllm-openai:latest
+    container_name: lai_reranker
+    restart: unless-stopped
+    ipc: host
+    command: >
+      --model cross-encoder/ms-marco-MiniLM-L-12-v2
+      --task score
+      --dtype auto
+      --trust-remote-code
+      --max-model-len 512
+      --gpu-memory-utilization 0.02
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./model-cache:/root/.cache/huggingface
+    ports:
+      - "${RERANKER_PORT:-8004}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    networks:
+      - lai_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+networks:
+  lai_network:
+    external: true

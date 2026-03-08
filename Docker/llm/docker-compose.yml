@@ -1,0 +1,42 @@
+# LLM Service (Qwen via vLLM) — GPU 1
+# Usage:
+#   docker compose up -d
+#   docker compose down
+
+services:
+  llm:
+    image: vllm/vllm-openai:latest
+    container_name: lai_llm
+    restart: unless-stopped
+    ipc: host
+    command: >
+      --model ${LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      --max-model-len ${LLM_MAX_MODEL_LEN:-8192}
+      --dtype auto
+      --trust-remote-code
+      --gpu-memory-utilization 0.7
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./model-cache:/root/.cache/huggingface
+    ports:
+      - "${LLM_PORT:-8001}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+      start_period: 300s
+    networks:
+      - lai_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${CUDA_DEVICE:-1}']
+              capabilities: [gpu]
+
+networks:
+  lai_network:
+    external: true

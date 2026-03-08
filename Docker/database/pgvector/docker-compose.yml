@@ -1,0 +1,31 @@
+# PostgreSQL + pgvector
+# Usage:
+#   docker compose up -d
+#   docker compose down
+#   docker compose down -v   # also delete data volume
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: lai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-lai_db}
+      POSTGRES_USER: ${PGUSER:-lai_user}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-lai_test_password_2024}
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${PGPORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lai_user -d lai_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lai_network
+
+networks:
+  lai_network:
+    external: true

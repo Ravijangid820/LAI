@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large data / models / Docker volumes
+models/
+older_versions/
+VDRs/
+data/
+Data/
+data_processing/
+Docker/database/pgvector/data/
+Docker/database/minio/data/
+Docker/database/redis/data/
+Docker/embedding_server/
+Docker/inference_engine/
+Docker/mlflow/data/
+Docker/monitoring/data/
+Libary/
+qdrant/
+logs/
+LAIV1/
+
+# Office docs (not code)
+*.docx
+*.xlsx
+*.csv
+
+# Misc
+*.txt
+backend/
+testing/
+_ul/
+_ul
+KS/
+MD/
+DD Reports/
+Flow Diagram/
+.claude/
+
+# Processed training data
+LAI/processed/

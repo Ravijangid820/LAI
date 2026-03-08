@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "lai-api"
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+    metrics_path: /metrics
+
+  - job_name: "vllm-embedding"
+    static_configs:
+      - targets: ["lai_embedding:8000"]
+
+  - job_name: "vllm-reranker"
+    static_configs:
+      - targets: ["lai_reranker:8000"]
+
+  - job_name: "vllm-llm"
+    static_configs:
+      - targets: ["lai_llm:8000"]
