@@ -27,6 +27,7 @@ Thumbs.db
 # Large data / models / Docker volumes
 models/
 older_versions/
+older_version/
 VDRs/
 data/
 Data/
