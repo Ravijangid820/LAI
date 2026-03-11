@@ -36,6 +36,7 @@ Docker/database/pgvector/data/
 Docker/database/minio/data/
 Docker/database/redis/data/
 Docker/embedding_server/
+LAI/embedding_server/
 Docker/inference_engine/
 Docker/mlflow/data/
 Docker/monitoring/data/
@@ -48,6 +49,9 @@ LAIV1/
 *.docx
 *.xlsx
 *.csv
+
+# Reference documents (not code)
+Documents/
 
 # Misc
 *.txt

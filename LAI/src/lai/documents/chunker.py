@@ -54,10 +54,15 @@ class Chunker:
 
     def __init__(self) -> None:
         settings = get_settings().chunking
-        self._max_chars = settings.max_tokens * 4  # ~4 chars per token for German
-        self._min_chars = settings.min_chars
-        self._overlap_chars = settings.overlap_tokens * 4
-        logger.info("Chunker initialized: max_chars=%d, min_chars=%d, overlap=%d", self._max_chars, self._min_chars, self._overlap_chars)
+        # Child chunk params (for RAG retrieval)
+        self._max_chars = settings.child_max_chars
+        self._min_chars = settings.child_min_chars
+        self._overlap_chars = settings.child_overlap_chars
+        # Parent chunk params (for fine-tuning context)
+        self._parent_max = settings.parent_max_chars
+        self._parent_target = settings.parent_target_chars
+        self._parent_min = settings.parent_min_chars
+        logger.info("Chunker initialized: child_max=%d, child_min=%d, overlap=%d", self._max_chars, self._min_chars, self._overlap_chars)
 
     def chunk_text(self, text: str, doc_section: str = "") -> list[Chunk]:
         """Split text into chunks respecting legal section boundaries."""

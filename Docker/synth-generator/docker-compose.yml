@@ -1,0 +1,61 @@
+# Synthetic Data Generator (Qwen2.5-72B-Instruct via vLLM) — GPU 0+1
+# Temporary service for generating fine-tuning data.
+# Stop embedding, reranker, and LLM services before starting.
+#
+# Usage:
+#   # Stop regular services first
+#   cd ../embedding && docker compose down
+#   cd ../reranker && docker compose down
+#   cd ../llm && docker compose down
+#
+#   # Start generator (uses both GPUs)
+#   cd ../synth-generator && docker compose up -d
+#
+#   # When done generating, stop and restart regular services
+#   docker compose down
+#   cd ../embedding && docker compose up -d
+#   cd ../reranker && docker compose up -d
+#   cd ../llm && docker compose up -d
+
+services:
+  synth-generator:
+    image: vllm/vllm-openai:latest
+    container_name: lai_synth_generator
+    restart: unless-stopped
+    ipc: host
+    command: >
+      --model ${SYNTH_MODEL:-Qwen/Qwen2.5-72B-Instruct}
+      --max-model-len ${SYNTH_MAX_MODEL_LEN:-8192}
+      --dtype auto
+      --quantization ${SYNTH_QUANTIZATION:-awq}
+      --trust-remote-code
+      --gpu-memory-utilization 0.90
+      --tensor-parallel-size 2
+      --max-num-seqs 8
+      --enable-prefix-caching
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      CUDA_VISIBLE_DEVICES: "0,1"
+    volumes:
+      - ./model-cache:/root/.cache/huggingface
+    ports:
+      - "${SYNTH_PORT:-8005}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 600s
+    networks:
+      - lai_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 2
+              capabilities: [gpu]
+
+networks:
+  lai_network:
+    external: true

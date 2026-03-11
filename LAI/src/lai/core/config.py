@@ -93,15 +93,15 @@ class MinIOSettings(BaseSettings):
 # ---------------------------------------------------------------------------
 
 class EmbeddingSettings(BaseSettings):
-    """Embedding service configuration (BGE-M3 via vLLM/TEI)."""
+    """Embedding service configuration (Qwen3-Embedding-8B via vLLM)."""
 
     model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "EMBEDDING_"})
 
     url: str = "http://localhost:8003"
-    model: str = "BAAI/bge-m3"
+    model: str = "Qwen/Qwen3-Embedding-8B"
     dimension: int = Field(default=1024, ge=1)
     batch_size: int = Field(default=32, ge=1, le=256)
-    timeout: float = Field(default=30.0, ge=1, le=300)
+    timeout: float = Field(default=60.0, ge=1, le=300)
     max_retries: int = Field(default=3, ge=0, le=10)
 
 
@@ -176,15 +176,28 @@ class CRAGSettings(BaseSettings):
 
 
 class ChunkingSettings(BaseSettings):
-    """Document chunking configuration."""
+    """Parent-child chunking configuration for German legal text.
+
+    German tokenization: ~3 chars per token (compound words).
+    Parent chunks: used as context for fine-tuning data generation.
+    Child chunks: embedded for RAG retrieval.
+    """
 
     model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "CHUNK_"})
 
-    max_tokens: int = Field(default=512, ge=100, le=4096)
-    min_chars: int = Field(default=400, ge=50, le=2000)
-    overlap_tokens: int = Field(default=100, ge=0, le=500)  # Increased from 50 -> 100
+    # Parent chunks: 1024-2048 tokens × 3 chars/token
+    parent_target_chars: int = Field(default=3072, ge=500, le=10000)
+    parent_max_chars: int = Field(default=6144, ge=1000, le=20000)
+    parent_min_chars: int = Field(default=400, ge=50, le=2000)
+
+    # Child chunks: ~512 tokens × 3 chars/token
+    child_target_chars: int = Field(default=1536, ge=200, le=5000)
+    child_max_chars: int = Field(default=1800, ge=300, le=6000)
+    child_min_chars: int = Field(default=200, ge=50, le=1000)
+    child_overlap_chars: int = Field(default=384, ge=0, le=2000)
+
     max_file_size_mb: int = Field(default=50, ge=1, le=500)
-    allowed_extensions: list[str] = [".pdf", ".docx"]
+    allowed_extensions: list[str] = [".pdf", ".docx", ".json", ".jsonl", ".txt", ".md", ".html"]
 
 
 class BatchProcessingSettings(BaseSettings):
@@ -197,6 +210,30 @@ class BatchProcessingSettings(BaseSettings):
     max_concurrent: int = Field(default=3, ge=1, le=10)
     dedup_minhash_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
     dedup_minhash_permutations: int = Field(default=128, ge=16, le=512)
+
+
+class PipelineSettings(BaseSettings):
+    """Data processing pipeline configuration (Steps 1-6)."""
+
+    model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "PIPELINE_"})
+
+    # MinIO buckets for pipeline stages
+    bucket_raw: str = Field(default="lai-raw", description="Source bucket with raw documents.")
+    bucket_segments: str = Field(default="lai-segments", description="Step 1 output: normalized segments.")
+
+    # Processing
+    max_workers: int = Field(default=0, ge=0, le=64, description="0 = auto-detect from GPU/CPU.")
+    vram_per_worker_gb: float = Field(default=4.0, ge=1.0, le=48.0)
+
+    # LLM for classification, enrichment, fine-tuning generation (Qwen2.5-72B)
+    synth_llm_url: str = "http://localhost:8005/v1/chat/completions"
+    synth_llm_model: str = "Qwen/Qwen2.5-72B-Instruct-AWQ"
+    synth_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    synth_max_tokens: int = Field(default=2048, ge=256, le=8192)
+
+    # Fine-tuning target
+    target_training_samples: int = Field(default=200000, ge=1000)
+    refusal_ratio: float = Field(default=0.10, ge=0.0, le=0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +339,7 @@ class Settings(BaseSettings):
     crag: CRAGSettings = Field(default_factory=CRAGSettings)
     chunking: ChunkingSettings = Field(default_factory=ChunkingSettings)
     batch: BatchProcessingSettings = Field(default_factory=BatchProcessingSettings)
+    pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
 
     # External services
     brave_search: BraveSearchSettings = Field(default_factory=BraveSearchSettings)

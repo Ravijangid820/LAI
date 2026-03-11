@@ -1,6 +1,6 @@
 # LAI Project Status
 
-> Last updated: 2026-03-07
+> Last updated: 2026-03-10
 
 This document explains the current state of the LAI project for developers joining the team.
 
@@ -29,13 +29,14 @@ LAI (Legal AI) is a **German legal AI platform for wind energy due diligence**. 
 | Database | PostgreSQL 16 + pgvector (HNSW indexes) |
 | Cache | Redis 7 |
 | Object storage | MinIO |
-| LLM | Qwen/Qwen2.5-7B-Instruct via vLLM |
-| Embedding | BAAI/bge-m3 (1024 dims) via vLLM |
+| LLM (inference) | Qwen/Qwen2.5-7B-Instruct via vLLM |
+| LLM (pipeline) | Qwen/Qwen2.5-72B-Instruct-AWQ via vLLM (tensor-parallel, 2 GPUs) |
+| Embedding | Qwen/Qwen3-Embedding-8B (1024 dims) via vLLM |
 | Reranker | ms-marco-MiniLM-L-12-v2 via vLLM |
 | Experiment tracking | MLflow |
 | Monitoring | Prometheus + Grafana |
 
-All ML models are self-hosted — no external API calls. GPU requirement: 2x GPUs (embedding + reranker share GPU 0, LLM on GPU 1).
+All ML models are self-hosted — no external API calls. Hardware: 2x RTX Pro 6000 GPUs (96GB VRAM each).
 
 ---
 
@@ -48,7 +49,7 @@ User Query
 1. Query Analysis -----> Rule-based: extract § refs, Art. refs, law codes, dates, intent
     |
     v
-2. Embed Query --------> BGE-M3 via vLLM (cached in Redis)
+2. Embed Query --------> Qwen3-Embedding-8B via vLLM (cached in Redis)
     |
     v
 3. Hybrid Search ------> Dense (pgvector, weight 0.6) + BM25 (tsvector, weight 0.4)
@@ -84,7 +85,8 @@ User Query
 │   │   ├── documents/                # Upload, parse, chunk, embed, store
 │   │   ├── search/                   # Query analysis, hybrid search, reranking
 │   │   ├── generation/               # LLM client, prompts, CRAG, citation verification
-│   │   └── infra/                    # Database pool, Redis cache, MinIO client
+│   │   ├── infra/                    # Database pool, Redis cache, MinIO client
+│   │   └── pipeline/                 # Data processing pipeline (Steps 1-6)
 │   ├── training/                     # Model fine-tuning (separate lifecycle)
 │   ├── tests/                        # Unit, integration, E2E
 │   ├── docs/                         # Documentation
@@ -92,10 +94,10 @@ User Query
 │
 └── Docker/                           # Containerized services (one dir per service)
     ├── database/
-    │   ├── pgvector/                 # PostgreSQL + pgvector (port 5433)
+    │   ├── pgvector/                 # PostgreSQL + pgvector (port 5434)
     │   ├── minio/                    # Object storage (port 9000)
     │   └── redis/                    # Cache (port 6380)
-    ├── embedding/                    # BGE-M3 via vLLM (port 8003, GPU 0)
+    ├── embedding/                    # Qwen3-Embedding-8B via vLLM (port 8003, GPU 0)
     ├── reranker/                     # MiniLM via vLLM (port 8004, GPU 0)
     ├── llm/                          # Qwen2.5-7B via vLLM (port 8001, GPU 1)
     ├── mlflow/                       # Experiment tracking (port 5000)
@@ -202,8 +204,10 @@ All settings are in `src/lai/core/config.py`, loaded from environment variables.
 | `initial_k` | 100 | Chunks retrieved before reranking |
 | `final_k` | 7 | Chunks after reranking (sent to LLM) |
 | `llm_max_tokens` | 4096 | Max generation length |
-| `chunk_size` | 512 tokens | Target chunk size |
-| `chunk_overlap` | 100 tokens | Overlap between consecutive chunks |
+| `chunking.parent_target_chars` | 3072 | Parent chunk target (fine-tuning context) |
+| `chunking.parent_max_chars` | 6144 | Parent chunk max |
+| `chunking.child_target_chars` | 1536 | Child chunk target (RAG retrieval) |
+| `chunking.child_overlap_chars` | 384 | Overlap between child chunks |
 | `crag.max_loops` | 2 | Max query-rewrite cycles |
 | `crag.enabled` | true | Toggle CRAG grading on/off |
 
@@ -237,6 +241,48 @@ cd /data/projects/lai/Docker/mlflow && docker compose up -d
 
 ---
 
+## Data Processing Pipeline (v2)
+
+The `lai.pipeline` package processes the 672GB raw corpus into both RAG-ready embeddings and fine-tuning data.
+
+### Data Sources (MinIO `lai-raw`, 672GB)
+
+| Source | Size | Files | Value |
+|--------|------|-------|-------|
+| multilegalpile | 643GB | 132K | ~96% non-German, filtered to `de` only |
+| hf_cases | 14GB | 14K | German court decisions |
+| openlegaldata | 1.5GB | 4K | Overlaps ~30-50% with hf_cases |
+| VDRs | 6GB | 4.3K | **HIGH** — wind park data rooms |
+| Library | 5.4GB | 2.1K | PDFs |
+| de/gesetzes | 750MB | 764 | German statutes |
+| DD Reports | 19MB | 18 | **HIGH** — due diligence reports |
+
+### Pipeline Steps
+
+```bash
+# All steps via: python -m lai.pipeline.cli stepN [--dry-run] [--batch-size N]
+```
+
+| Step | Module | Input | Output | Engine |
+|------|--------|-------|--------|--------|
+| 1 | `convert.py` | Raw files (MinIO) | Normalized segments (MinIO) | Docling, custom parsers |
+| 2 | `chunk.py` | Segments | Parent + child chunks (PostgreSQL) | German-aware splitting |
+| 3 | `classify.py` | Parent chunks | Domain labels (12 domains) | Qwen2.5-72B |
+| 4 | `enrich.py` | Child chunks | Context prefix per chunk | Qwen2.5-72B |
+| 5 | `generate.py` | Parent chunks | ~200K ChatML training samples | Qwen2.5-72B |
+| 6 | `embed.py` | Child chunks | 1024-dim vectors + tsvector | Qwen3-Embedding-8B |
+
+### Chunking Strategy (German legal text, ~3 chars/token)
+
+- **Parent chunks:** 3072 target, 6144 max chars (1024-2048 tokens) — for fine-tuning context + domain classification
+- **Child chunks:** 1536 target, 1800 max, 384 overlap chars (~512 tokens) — for RAG retrieval with embeddings
+
+### Legal Domains (12)
+
+immissionsschutzrecht, energierecht, baurecht, umweltrecht, vertragsrecht, gesellschaftsrecht, grundstuecksrecht, arbeitsrecht, steuerrecht, verwaltungsrecht, prozessrecht, allgemein
+
+---
+
 ## What's Done (v5.0.0)
 
 - [x] Domain-driven package architecture
@@ -255,18 +301,25 @@ cd /data/projects/lai/Docker/mlflow && docker compose up -d
 - [x] MLflow experiment tracking
 - [x] Prometheus + Grafana monitoring
 - [x] Infrastructure documentation
+- [x] Data processing pipeline v2 (6-step, `lai.pipeline`)
+- [x] Parent-child chunking (German-aware, dual-purpose for RAG + fine-tuning)
+- [x] Domain classification module (12 wind-energy legal domains)
+- [x] Contextual enrichment (Anthropic's approach for child chunks)
+- [x] Synthetic fine-tuning data generation (~200K target, 7 task types)
+- [x] Embedding pipeline (Qwen3-Embedding-8B, 1024 dims)
+- [x] Upgraded embedding model: BGE-M3 → Qwen3-Embedding-8B
 
 ## What's Next
 
-See [LAIV5_IMPROVEMENTS.md](analysis/LAIV5_IMPROVEMENTS.md) for the full roadmap. Priority items:
+Priority items:
 
-1. **Embedding backfill** — only ~1% of 19.2M chunks have embeddings
-2. **BM25 population** — tsvector column is empty, sparse search doesn't work yet
-3. **Integration tests** — no test coverage yet
-4. **CI/CD pipeline** — no automated testing/deployment
-5. **Database migrations** — no Alembic setup yet
-6. **Re-chunking** — 66.9% of chunks are too large, need 800-1200 char target
-7. **German reranker** — current MiniLM is English-only
+1. **Run pipeline on DD Reports** — small high-value dataset, test all 6 steps end-to-end
+2. **Run pipeline on full corpus** — process remaining data sources
+3. **Fine-tune Qwen2.5-7B** — using generated ~200K training samples
+4. **Integration tests** — test pipeline steps, RAG pipeline
+5. **CI/CD pipeline** — automated testing/deployment
+6. **German reranker** — current MiniLM is English-only
+7. **Database migrations** — no Alembic setup yet
 
 ---
 
@@ -274,13 +327,11 @@ See [LAIV5_IMPROVEMENTS.md](analysis/LAIV5_IMPROVEMENTS.md) for the full roadmap
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| Only ~1% chunks have embeddings | Search barely works | Needs backfill script |
-| BM25 search_vector column empty | Hybrid search is dense-only | Needs SQL batch update |
-| 66.9% chunks exceed size target | Retrieval quality degraded | Needs re-chunking |
+| Pipeline not yet run on full corpus | No production embeddings/training data | Run steps 1-6 |
 | Reranker is English-only (MiniLM) | Suboptimal for German text | Evaluate German alternatives |
-| Best model is checkpoint-400, not final | Using suboptimal weights | Redeploy correct checkpoint |
-| contract + land domains have 0 training data | LLM weak on these topics | Generate training data |
+| No fine-tuned model yet | Using base Qwen2.5-7B | Generate training data first (Step 5) |
 | No CI/CD | Manual testing only | Set up GitHub Actions |
+| `LAI/embedding_server/` (2.2GB) | Old BGE-M3 cache, not used by any docker-compose | Safe to delete |
 
 ---
 
@@ -289,6 +340,8 @@ See [LAIV5_IMPROVEMENTS.md](analysis/LAIV5_IMPROVEMENTS.md) for the full roadmap
 | What | Where |
 |------|-------|
 | App config | [src/lai/core/config.py](../src/lai/core/config.py) |
+| Data pipeline | [src/lai/pipeline/](../src/lai/pipeline/) — Steps 1-6 |
+| Pipeline CLI | `python -m lai.pipeline.cli step1 --help` |
 | RAG pipeline | [src/lai/api/pipeline.py](../src/lai/api/pipeline.py) |
 | Hybrid search SQL | [src/lai/search/hybrid_search.py](../src/lai/search/hybrid_search.py) |
 | Prompt templates | [src/lai/generation/prompt_builder.py](../src/lai/generation/prompt_builder.py) |

@@ -7,17 +7,18 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: lai_postgres
+    container_name: lai_postgres_main
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${PGDATABASE:-lai_db}
       POSTGRES_USER: ${PGUSER:-lai_user}
       POSTGRES_PASSWORD: ${PGPASSWORD:-lai_test_password_2024}
+      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - ./data:/var/lib/postgresql/data
       - ./init:/docker-entrypoint-initdb.d:ro
     ports:
-      - "${PGPORT:-5433}:5432"
+      - "${PGPORT:-5434}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lai_user -d lai_db"]
       interval: 10s

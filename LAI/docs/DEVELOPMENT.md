@@ -11,7 +11,8 @@ LAI/
 │   ├── documents/                # Chunking, embedding, parsing, document CRUD, routes
 │   ├── search/                   # Query analysis, hybrid search, reranking, routes
 │   ├── generation/               # LLM client, prompts, CRAG grading, citation verification
-│   └── infra/                    # Database pool, Redis cache, MinIO client
+│   ├── infra/                    # Database pool, Redis cache, MinIO client
+│   └── pipeline/                 # Data processing pipeline (6 steps, CLI)
 │
 ├── training/                     # Model training (separate lifecycle)
 ├── tests/                        # Test suites (unit, integration, e2e)
@@ -86,6 +87,31 @@ async with trace_operation("retrieve", request_id) as ctx:
     ctx.record_tokens(token_usage)
 # ctx.metrics now has duration_ms, token_usage, success
 ```
+
+## Data Processing Pipeline
+
+The `lai.pipeline` package processes the raw legal corpus (MinIO) into RAG-ready embeddings and fine-tuning data. Run via CLI:
+
+```bash
+# Each step is idempotent and supports --dry-run
+python -m lai.pipeline.cli step1 --source "DD Reports/" --dry-run  # Raw → segments
+python -m lai.pipeline.cli step2                                    # Segments → parent-child chunks
+python -m lai.pipeline.cli step3 --batch-size 100                   # Domain classification (LLM)
+python -m lai.pipeline.cli step4 --batch-size 50                    # Contextual enrichment (LLM)
+python -m lai.pipeline.cli step5 --max-samples 200000               # Fine-tuning data (LLM)
+python -m lai.pipeline.cli step6 --create-indexes                   # Embeddings → pgvector
+```
+
+Pipeline modules are in `src/lai/pipeline/`:
+- `convert.py` — Docling for PDF/DOCX, custom parsers for JSON/JSONL datasets
+- `chunk.py` — Parent-child chunking with German legal sentence splitting
+- `classify.py` — 12 wind-energy legal domains via Qwen2.5-72B
+- `enrich.py` — Contextual retrieval prefix (Anthropic's approach)
+- `generate.py` — Synthetic Q&A in ChatML format (7 task types)
+- `embed.py` — Qwen3-Embedding-8B vectors + German tsvector for BM25
+- `cli.py` — CLI orchestrator with progress logging and timing
+
+All steps log extensively to aid debugging. Logs include step timing, batch progress, API errors, and per-document statistics.
 
 ## Adding a New Feature
 
