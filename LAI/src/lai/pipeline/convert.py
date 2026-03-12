@@ -131,17 +131,26 @@ def _get_docling_converter():
         logger.info("Initializing Docling DocumentConverter (first call in this process)")
         from docling.document_converter import DocumentConverter, PdfFormatOption
         from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+        from docling.datamodel.pipeline_options import (
+            PdfPipelineOptions,
+            TableFormerMode,
+            TesseractCliOcrOptions,
+        )
 
         pdf_opts = PdfPipelineOptions()
         pdf_opts.do_ocr = True
         pdf_opts.do_table_structure = True
         pdf_opts.table_structure_options.mode = TableFormerMode.ACCURATE
 
+        # Use Tesseract with German language pack for accurate OCR on legal text.
+        # Default RapidOCR uses Chinese PP-OCR models — unsuitable for German.
+        pdf_opts.ocr_options = TesseractCliOcrOptions(lang=["deu", "eng"])
+        logger.info("OCR engine: Tesseract CLI (languages: deu, eng)")
+
         _CONVERTER = DocumentConverter(
             format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
         )
-        logger.info("Docling DocumentConverter ready")
+        logger.info("Docling DocumentConverter ready (Tesseract OCR)")
     return _CONVERTER
 
 

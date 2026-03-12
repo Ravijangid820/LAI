@@ -5,10 +5,13 @@ request tracing, and per-operation timing via the trace_operation context manage
 """
 
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -42,12 +45,20 @@ def setup_logging(
     level: int = logging.INFO,
     *,
     json_output: bool = False,
-) -> None:
+    log_name: str | None = None,
+    log_dir: str | None = None,
+) -> str | None:
     """Configure logging for the LAI platform.
 
     Args:
         level: Log level (default INFO).
         json_output: If True, use JSON-structured output (for production).
+        log_name: Name for the log file (e.g., "step1_dd_reports").
+                  If provided, logs are saved to a file automatically.
+        log_dir: Directory for log files. Defaults to LAI/logs/pipeline/.
+
+    Returns:
+        Path to the log file if file logging is enabled, None otherwise.
     """
     root = logging.getLogger()
     root.setLevel(level)
@@ -56,20 +67,35 @@ def setup_logging(
     for handler in root.handlers[:]:
         root.removeHandler(handler)
 
-    handler = logging.StreamHandler()
-    handler.setLevel(level)
-
+    formatter = StructuredFormatter(datefmt="%Y-%m-%d %H:%M:%S")
     if json_output:
-        # Production: structured for log aggregation
-        handler.setFormatter(logging.Formatter(
+        formatter = logging.Formatter(
             '{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}',
             datefmt="%Y-%m-%dT%H:%M:%S",
-        ))
-    else:
-        # Development: human-readable
-        handler.setFormatter(StructuredFormatter(datefmt="%Y-%m-%d %H:%M:%S"))
+        )
 
-    root.addHandler(handler)
+    # Console handler
+    console = logging.StreamHandler()
+    console.setLevel(level)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    # File handler (if log_name provided)
+    log_file_path = None
+    if log_name:
+        if log_dir is None:
+            # Default: LAI/logs/pipeline/ relative to project root
+            project_root = Path(__file__).resolve().parents[3]  # src/lai/core/ -> LAI/
+            log_dir = str(project_root / "logs" / "pipeline")
+
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        log_file_path = os.path.join(log_dir, f"{log_name}_{timestamp}.log")
+
+        file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(StructuredFormatter(datefmt="%Y-%m-%d %H:%M:%S"))
+        root.addHandler(file_handler)
 
     # Reduce noise from third-party libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -77,6 +103,8 @@ def setup_logging(
     logging.getLogger("asyncpg").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+    return log_file_path
 
 
 def get_logger(name: str) -> logging.Logger:

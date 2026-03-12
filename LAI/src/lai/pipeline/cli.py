@@ -726,10 +726,23 @@ def run_step6(args):
 # Main CLI
 # ============================================================
 
+def _build_log_name(step: str, args) -> str:
+    """Build a descriptive log file name from step and args."""
+    parts = [step]
+    source = getattr(args, "source", None)
+    if source:
+        # "DD Reports/" -> "dd_reports"
+        clean = source.strip("/").replace(" ", "_").replace("/", "_").lower()
+        parts.append(clean)
+    if getattr(args, "dry_run", False):
+        parts.append("dryrun")
+    return "_".join(parts)
+
+
 def main():
     from lai.core.logging import setup_logging
-    setup_logging()
 
+    # Parse args first (before logging setup) to get step name
     parser = argparse.ArgumentParser(description="LAI Data Processing Pipeline")
     sub = parser.add_subparsers(dest="step", required=True)
 
@@ -769,6 +782,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Setup logging with auto file output
+    log_name = _build_log_name(args.step, args)
+    log_file = setup_logging(log_name=log_name)
+
     step_fn = {
         "step1": lambda: (multiprocessing.set_start_method("spawn", force=True), run_step1(args)),
         "step2": lambda: run_step2(args),
@@ -781,6 +798,8 @@ def main():
     fn = step_fn.get(args.step)
     if fn:
         t0 = time.perf_counter()
+        if log_file:
+            logger.info(f"Logging to: {log_file}")
         logger.info(f"Starting {args.step}...")
         try:
             fn()
