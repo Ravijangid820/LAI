@@ -1,4 +1,4 @@
-# Embedding Service (BGE-M3 via vLLM) — GPU 0
+# Embedding Service (Qwen3-Embedding-8B via vLLM) — GPU 0
 # Usage:
 #   docker compose up -d
 #   docker compose down
@@ -10,12 +10,12 @@ services:
     restart: unless-stopped
     ipc: host
     command: >
-      --model ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      --model ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-8B}
       --task embed
       --dtype auto
       --trust-remote-code
       --max-model-len 8192
-      --gpu-memory-utilization 0.05
+      --gpu-memory-utilization 0.15
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
     volumes:

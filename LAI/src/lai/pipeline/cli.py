@@ -727,6 +727,9 @@ def run_step6(args):
 # ============================================================
 
 def main():
+    from lai.core.logging import setup_logging
+    setup_logging()
+
     parser = argparse.ArgumentParser(description="LAI Data Processing Pipeline")
     sub = parser.add_subparsers(dest="step", required=True)
 

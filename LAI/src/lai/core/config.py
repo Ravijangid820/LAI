@@ -79,7 +79,7 @@ class MinIOSettings(BaseSettings):
 
     model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "MINIO_"})
 
-    endpoint: str = Field(default="localhost:9002")
+    endpoint: str = Field(default="localhost:9000")
     access_key: str = "laiadmin"
     secret_key: SecretStr = Field(default=SecretStr("superStrongPassword123!"))
     use_ssl: bool = False
