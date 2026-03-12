@@ -187,7 +187,7 @@ def _process_single_file(task: Dict[str, Any]) -> Dict[str, Any]:
         base = os.path.splitext(file_path)[0]
         target_key = f"{base}.segments.jsonl"
 
-        if _object_exists(bucket_segments, target_key):
+        if not task.get("force") and _object_exists(bucket_segments, target_key):
             return {**result, "status": "SKIPPED"}
 
         file_bytes = _download(bucket_raw, file_path)
@@ -228,6 +228,7 @@ def run_step1(args):
     logger.info(f"  Raw bucket:      {bucket_raw}")
     logger.info(f"  Segments bucket:  {bucket_segments}")
     logger.info(f"  Source filter:    {args.source or '(all)'}")
+    logger.info(f"  Force re-process: {getattr(args, 'force', False)}")
     logger.info("=" * 60)
 
     _ensure_bucket(bucket_segments)
@@ -260,7 +261,8 @@ def run_step1(args):
                 break
 
             batch = raw_files[i:i + batch_size]
-            tasks = [{"file_path": f["name"], "bucket_raw": bucket_raw, "bucket_segments": bucket_segments} for f in batch]
+            force = getattr(args, "force", False)
+            tasks = [{"file_path": f["name"], "bucket_raw": bucket_raw, "bucket_segments": bucket_segments, "force": force} for f in batch]
 
             futures = {executor.submit(_process_single_file, t): t for t in tasks}
             for future in as_completed(futures):
@@ -751,6 +753,7 @@ def main():
     p1.add_argument("--source", type=str, default=None, help="MinIO prefix filter (e.g., 'DD Reports/')")
     p1.add_argument("--workers", type=int, default=0, help="Max workers (0=auto)")
     p1.add_argument("--dry-run", action="store_true")
+    p1.add_argument("--force", action="store_true", help="Re-process files even if segments already exist")
 
     # Step 2
     p2 = sub.add_parser("step2", help="Segments → Parent-Child Chunks")
