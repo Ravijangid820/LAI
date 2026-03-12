@@ -18,6 +18,7 @@ import sys
 import time
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import Dict, Any, Optional
 
 from lai.core.config import get_settings
@@ -160,6 +161,29 @@ def _db_insert_returning(query: str, params=None):
             row = cur.fetchone()
         conn.commit()
         return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
+
+
+@contextmanager
+def _db_transaction():
+    """Get a connection for multi-statement transactions.
+
+    Usage:
+        with _db_transaction() as (conn, cur):
+            cur.execute(...)
+            cur.execute(...)
+        # auto-commits on exit, rolls back on exception
+    """
+    pool = _get_db()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            yield conn, cur
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
@@ -344,37 +368,40 @@ def run_step2(args):
                 doc_type = doc["doc_type"]
                 metadata = json.dumps(doc.get("metadata", {}), ensure_ascii=False)
 
-                for p_idx, parent in enumerate(parents):
-                    safe_section = re.sub(r"[^a-zA-Z0-9_]", "_", parent.get("section", "general"))[:50]
-                    parent_chunk_id = f"{doc_id}_{safe_section}_{p_idx:04d}"
+                # Atomic: insert all parents + children for this document in one transaction
+                with _db_transaction() as (conn, cur):
+                    for p_idx, parent in enumerate(parents):
+                        safe_section = re.sub(r"[^a-zA-Z0-9_]", "_", parent.get("section", "general"))[:50]
+                        parent_chunk_id = f"{doc_id}_{safe_section}_{p_idx:04d}"
 
-                    row = _db_insert_returning("""
-                        INSERT INTO parent_chunks
-                            (doc_id, chunk_id, section, content, char_count, language,
-                             doc_type, source_file, page_start, page_end, metadata)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (chunk_id) DO NOTHING
-                        RETURNING id
-                    """, (
-                        doc_id, parent_chunk_id, parent.get("section"),
-                        parent["text"], parent["char_count"],
-                        language, doc_type, source_file,
-                        parent.get("page_start"), parent.get("page_end"), metadata,
-                    ))
-
-                    if row is None:
-                        continue
-                    parent_db_id = row[0]
-                    total_parents += 1
-
-                    for c_idx, child in enumerate(children_per_parent[p_idx]):
-                        child_chunk_id = f"{parent_chunk_id}_c{c_idx:03d}"
-                        _db_execute("""
-                            INSERT INTO child_chunks (parent_id, chunk_id, content, char_count)
-                            VALUES (%s,%s,%s,%s)
+                        cur.execute("""
+                            INSERT INTO parent_chunks
+                                (doc_id, chunk_id, section, content, char_count, language,
+                                 doc_type, source_file, page_start, page_end, metadata)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                             ON CONFLICT (chunk_id) DO NOTHING
-                        """, (parent_db_id, child_chunk_id, child["text"], child["char_count"]))
-                        total_children += 1
+                            RETURNING id
+                        """, (
+                            doc_id, parent_chunk_id, parent.get("section"),
+                            parent["text"], parent["char_count"],
+                            language, doc_type, source_file,
+                            parent.get("page_start"), parent.get("page_end"), metadata,
+                        ))
+
+                        row = cur.fetchone()
+                        if row is None:
+                            continue
+                        parent_db_id = row[0]
+                        total_parents += 1
+
+                        for c_idx, child in enumerate(children_per_parent[p_idx]):
+                            child_chunk_id = f"{parent_chunk_id}_c{c_idx:03d}"
+                            cur.execute("""
+                                INSERT INTO child_chunks (parent_id, chunk_id, content, char_count)
+                                VALUES (%s,%s,%s,%s)
+                                ON CONFLICT (chunk_id) DO NOTHING
+                            """, (parent_db_id, child_chunk_id, child["text"], child["char_count"]))
+                            total_children += 1
 
             files_done += 1
             if files_done % 100 == 0:
