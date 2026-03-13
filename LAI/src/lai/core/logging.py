@@ -84,9 +84,11 @@ def setup_logging(
     log_file_path = None
     if log_name:
         if log_dir is None:
-            # Default: LAI/logs/pipeline/ relative to project root
+            # Default: LAI/logs/pipeline/<step>/ relative to project root
             project_root = Path(__file__).resolve().parents[3]  # src/lai/core/ -> LAI/
-            log_dir = str(project_root / "logs" / "pipeline")
+            # Extract step name (first part before _) for subdirectory
+            step_dir = log_name.split("_")[0] if "_" in log_name else log_name
+            log_dir = str(project_root / "logs" / "pipeline" / step_dir)
 
         os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")

@@ -89,6 +89,10 @@ User Query
 │   │   └── pipeline/                 # Data processing pipeline (Steps 1-6)
 │   ├── training/                     # Model fine-tuning (separate lifecycle)
 │   ├── tests/                        # Unit, integration, E2E
+│   ├── logs/pipeline/                # Auto-generated logs per step
+│   │   ├── step1/                   #   step1_<source>_<timestamp>.log
+│   │   ├── step2/                   #   step2_<timestamp>.log
+│   │   └── ...
 │   ├── docs/                         # Documentation
 │   └── pyproject.toml
 │
@@ -310,9 +314,10 @@ immissionsschutzrecht, energierecht, baurecht, umweltrecht, vertragsrecht, gesel
 - [x] Upgraded embedding model: BGE-M3 → Qwen3-Embedding-8B
 - [x] Switched OCR from RapidOCR (Chinese PP-OCR) to Tesseract with German language pack
 - [x] German legal OCR post-processing ($ → §, hyphenation fixes)
-- [x] Automatic file logging for all pipeline steps (`LAI/logs/pipeline/`)
+- [x] Automatic file logging for all pipeline steps (`LAI/logs/pipeline/<step>/`)
 - [x] Graceful shutdown with signal handling (first Ctrl+C finishes work, second force-exits)
-- [x] Step 2 parallelized (ThreadPoolExecutor for download+chunk, sequential atomic DB writes)
+- [x] Step 2 parallelized (ThreadPoolExecutor + batch `execute_values` inserts, atomic DB writes)
+- [x] DB config fix: default port 5433 → 5434 (main PostgreSQL container)
 
 ---
 

@@ -319,7 +319,10 @@ def run_step1(args):
 # ============================================================
 
 def _download_and_chunk(file_name: str, bucket: str):
-    """Download a segment file from MinIO and chunk it. Returns list of prepared docs."""
+    """Download a segment file from MinIO and chunk it.
+
+    Returns pre-flattened parent_rows and child_rows ready for batch insert.
+    """
     import re
     from lai.pipeline.chunk import process_document
 
@@ -327,10 +330,11 @@ def _download_and_chunk(file_name: str, bucket: str):
     raw = data.getvalue()
     start = raw.find(b"{")
     if start < 0:
-        return []
+        return [], []
 
     text = raw[start:].decode("utf-8", errors="replace")
-    results = []
+    parent_rows = []  # flat list of tuples
+    child_map = {}    # parent_chunk_id -> list of (chunk_id, text, char_count)
 
     for line in text.split("\n"):
         line = line.strip()
@@ -345,28 +349,42 @@ def _download_and_chunk(file_name: str, bucket: str):
         if not parents:
             continue
 
-        results.append({
-            "doc_id": doc["doc_id"],
-            "source_file": doc["source_file"],
-            "language": doc["language"],
-            "doc_type": doc["doc_type"],
-            "metadata": json.dumps(doc.get("metadata", {}), ensure_ascii=False),
-            "parents": parents,
-            "children_per_parent": children_per_parent,
-        })
+        doc_id = doc["doc_id"]
+        source_file = doc["source_file"]
+        language = doc["language"]
+        doc_type = doc["doc_type"]
+        metadata = json.dumps(doc.get("metadata", {}), ensure_ascii=False)
 
-    return results
+        for p_idx, parent in enumerate(parents):
+            safe_section = re.sub(r"[^a-zA-Z0-9_]", "_", parent.get("section", "general"))[:50]
+            parent_chunk_id = f"{doc_id}_{safe_section}_{p_idx:04d}"
+
+            parent_rows.append((
+                doc_id, parent_chunk_id, parent.get("section"),
+                parent["text"], parent["char_count"],
+                language, doc_type, source_file,
+                parent.get("page_start"), parent.get("page_end"), metadata,
+            ))
+
+            children = []
+            for c_idx, child in enumerate(children_per_parent[p_idx]):
+                child_chunk_id = f"{parent_chunk_id}_c{c_idx:03d}"
+                children.append((child_chunk_id, child["text"], child["char_count"]))
+            child_map[parent_chunk_id] = children
+
+    return parent_rows, child_map
 
 
 def run_step2(args):
     """Step 2: Chunk segments into parent-child chunks in PostgreSQL.
 
-    Uses ThreadPoolExecutor to parallelize MinIO downloads + chunking,
-    then writes to DB sequentially to maintain atomicity.
+    Optimized pipeline:
+    - ThreadPoolExecutor downloads + chunks files in parallel
+    - Batch DB inserts using execute_values (10-100x faster)
+    - Multiple files per transaction to reduce commit overhead
     """
-    import re
-    import queue
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from psycopg2.extras import execute_values
 
     settings = get_settings()
     bucket_segments = settings.pipeline.bucket_segments
@@ -374,30 +392,92 @@ def run_step2(args):
 
     workers = getattr(args, "workers", None) or min(16, max(1, os.cpu_count() // 4))
 
+    # Fail fast if DB is unreachable
+    try:
+        _db_fetch("SELECT 1")
+        logger.info("DB connection OK")
+    except Exception as e:
+        logger.error(f"Cannot connect to PostgreSQL: {e}")
+        logger.error("Start the database first: cd Docker/database/pgvector && docker compose up -d")
+        return
+    db_batch = 50  # files to accumulate before flushing to DB
+
     logger.info("=" * 60)
     logger.info("Step 2: Segments → Parent-Child Chunks")
     logger.info(f"  Parent: {chunk_cfg.parent_target_chars}-{chunk_cfg.parent_max_chars} chars")
     logger.info(f"  Child:  {chunk_cfg.child_target_chars} target, {chunk_cfg.child_overlap_chars} overlap")
-    logger.info(f"  Workers: {workers}")
+    logger.info(f"  Workers: {workers}, DB batch: {db_batch} files")
     logger.info("=" * 60)
 
     prefix = args.source or ""
-    seg_files = [f for f in _list_objects(bucket_segments, prefix=prefix) if f["name"].endswith(".segments.jsonl")]
+    seg_files = list(_list_objects(bucket_segments, prefix=prefix))
+    seg_files = [f for f in seg_files if f["name"].endswith(".segments.jsonl")]
     logger.info(f"Found {len(seg_files)} segment files")
 
-    if args.dry_run:
+    if args.dry_run or not seg_files:
         return
 
     total_parents = total_children = files_done = files_failed = 0
-    batch_size = 200  # submit this many files at a time to the thread pool
 
-    for batch_start in range(0, len(seg_files), batch_size):
+    # Accumulate rows across files, flush in batches
+    pending_parents = []
+    pending_child_map = {}
+    pending_count = 0
+
+    def _flush_to_db():
+        """Batch-insert accumulated parents + children in one transaction."""
+        nonlocal total_parents, total_children, pending_parents, pending_child_map, pending_count
+        if not pending_parents:
+            pending_count = 0
+            return
+
+        with _db_transaction() as (conn, cur):
+            # Batch insert parents, get back (id, chunk_id) for those that were inserted
+            inserted = execute_values(
+                cur,
+                """INSERT INTO parent_chunks
+                       (doc_id, chunk_id, section, content, char_count, language,
+                        doc_type, source_file, page_start, page_end, metadata)
+                   VALUES %s
+                   ON CONFLICT (chunk_id) DO NOTHING
+                   RETURNING id, chunk_id""",
+                pending_parents,
+                template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                fetch=True,
+            )
+
+            total_parents += len(inserted)
+
+            # Build child rows using returned parent IDs
+            child_rows = []
+            for parent_db_id, parent_chunk_id in inserted:
+                for child_chunk_id, text, char_count in pending_child_map.get(parent_chunk_id, []):
+                    child_rows.append((parent_db_id, child_chunk_id, text, char_count))
+
+            if child_rows:
+                execute_values(
+                    cur,
+                    """INSERT INTO child_chunks (parent_id, chunk_id, content, char_count)
+                       VALUES %s
+                       ON CONFLICT (chunk_id) DO NOTHING""",
+                    child_rows,
+                    template="(%s,%s,%s,%s)",
+                )
+                total_children += len(child_rows)
+
+        pending_parents = []
+        pending_child_map = {}
+        pending_count = 0
+
+    # Process files in thread-pool batches
+    pool_batch_size = workers * 4  # keep thread pool fed
+
+    for batch_start in range(0, len(seg_files), pool_batch_size):
         if _shutdown:
             break
 
-        batch = seg_files[batch_start:batch_start + batch_size]
+        batch = seg_files[batch_start:batch_start + pool_batch_size]
 
-        # Phase 1: Download + chunk in parallel (threads)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_name = {
                 executor.submit(_download_and_chunk, f["name"], bucket_segments): f["name"]
@@ -410,62 +490,50 @@ def run_step2(args):
 
                 file_name = future_to_name[future]
                 try:
-                    docs = future.result()
+                    parent_rows, child_map = future.result()
                 except Exception as e:
-                    logger.error(f"Failed: {file_name}: {e}")
+                    logger.error(f"Failed download/chunk: {file_name}: {e}")
                     files_failed += 1
                     continue
 
-                if not docs:
-                    files_done += 1
-                    continue
+                files_done += 1
 
-                # Phase 2: DB write — sequential, one atomic transaction per document
-                try:
-                    for doc_data in docs:
-                        with _db_transaction() as (conn, cur):
-                            for p_idx, parent in enumerate(doc_data["parents"]):
-                                safe_section = re.sub(r"[^a-zA-Z0-9_]", "_", parent.get("section", "general"))[:50]
-                                parent_chunk_id = f"{doc_data['doc_id']}_{safe_section}_{p_idx:04d}"
+                if parent_rows:
+                    pending_parents.extend(parent_rows)
+                    pending_child_map.update(child_map)
+                    pending_count += 1
 
-                                cur.execute("""
-                                    INSERT INTO parent_chunks
-                                        (doc_id, chunk_id, section, content, char_count, language,
-                                         doc_type, source_file, page_start, page_end, metadata)
-                                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                                    ON CONFLICT (chunk_id) DO NOTHING
-                                    RETURNING id
-                                """, (
-                                    doc_data["doc_id"], parent_chunk_id, parent.get("section"),
-                                    parent["text"], parent["char_count"],
-                                    doc_data["language"], doc_data["doc_type"], doc_data["source_file"],
-                                    parent.get("page_start"), parent.get("page_end"), doc_data["metadata"],
-                                ))
+                # Flush when enough files accumulated
+                if pending_count >= db_batch:
+                    try:
+                        _flush_to_db()
+                    except Exception as e:
+                        logger.error(f"DB batch insert failed: {e}")
+                        files_failed += pending_count
+                        pending_parents = []
+                        pending_child_map = {}
+                        pending_count = 0
 
-                                row = cur.fetchone()
-                                if row is None:
-                                    continue
-                                parent_db_id = row[0]
-                                total_parents += 1
+                if files_done % 500 == 0:
+                    logger.info(
+                        f"Progress: {files_done}/{len(seg_files)} files "
+                        f"({files_done*100//len(seg_files)}%), "
+                        f"{total_parents} parents, {total_children} children"
+                    )
 
-                                for c_idx, child in enumerate(doc_data["children_per_parent"][p_idx]):
-                                    child_chunk_id = f"{parent_chunk_id}_c{c_idx:03d}"
-                                    cur.execute("""
-                                        INSERT INTO child_chunks (parent_id, chunk_id, content, char_count)
-                                        VALUES (%s,%s,%s,%s)
-                                        ON CONFLICT (chunk_id) DO NOTHING
-                                    """, (parent_db_id, child_chunk_id, child["text"], child["char_count"]))
-                                    total_children += 1
+    # Flush remaining
+    if pending_parents:
+        try:
+            _flush_to_db()
+        except Exception as e:
+            logger.error(f"Final DB batch insert failed: {e}")
+            files_failed += pending_count
 
-                    files_done += 1
-                except Exception as e:
-                    logger.error(f"Failed DB write: {file_name}: {e}")
-                    files_failed += 1
-
-                if files_done % 100 == 0 and files_done > 0:
-                    logger.info(f"Progress: {files_done}/{len(seg_files)} files, {total_parents} parents, {total_children} children")
-
-    logger.info(f"Step 2 complete: {files_done} files, {total_parents} parents, {total_children} children, {files_failed} failed")
+    logger.info(
+        f"Step 2 complete: {files_done} files, "
+        f"{total_parents} parents, {total_children} children, "
+        f"{files_failed} failed"
+    )
 
 
 # ============================================================
