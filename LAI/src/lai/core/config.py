@@ -32,10 +32,10 @@ class DatabaseSettings(BaseSettings):
     model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "PG"})
 
     host: str = Field(default="localhost", alias="PGHOST")
-    port: int = Field(default=5433, ge=1, le=65535, alias="PGPORT")
+    port: int = Field(default=5434, ge=1, le=65535, alias="PGPORT")
     database: str = Field(default="lai_db", alias="PGDATABASE")
     user: str = Field(default="lai_user", alias="PGUSER")
-    password: SecretStr = Field(default=SecretStr("lai_dev_password"), alias="PGPASSWORD")
+    password: SecretStr = Field(default=SecretStr("lai_test_password_2024"), alias="PGPASSWORD")
     pool_min_size: int = Field(default=2, ge=1, le=100)
     pool_max_size: int = Field(default=10, ge=1, le=200)
 

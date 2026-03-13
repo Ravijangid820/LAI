@@ -27,12 +27,19 @@ from lai.core.logging import get_logger
 logger = get_logger("lai.pipeline.cli")
 
 _shutdown = False
+_shutdown_count = 0
 
 
 def _signal_handler(signum, frame):
-    global _shutdown
-    logger.warning(f"Received signal {signum}, shutting down...")
-    _shutdown = True
+    global _shutdown, _shutdown_count
+    _shutdown_count += 1
+    if _shutdown_count == 1:
+        logger.warning(f"Received signal {signum}, finishing current work and shutting down...")
+        _shutdown = True
+    elif _shutdown_count >= 2:
+        logger.warning("Forced exit.")
+        import sys
+        sys.exit(1)
 
 
 signal.signal(signal.SIGINT, _signal_handler)
@@ -311,19 +318,67 @@ def run_step1(args):
 # Step 2: Segments → Parent-Child Chunks
 # ============================================================
 
-def run_step2(args):
-    """Step 2: Chunk segments into parent-child chunks in PostgreSQL."""
+def _download_and_chunk(file_name: str, bucket: str):
+    """Download a segment file from MinIO and chunk it. Returns list of prepared docs."""
     import re
     from lai.pipeline.chunk import process_document
+
+    data = _download(bucket, file_name)
+    raw = data.getvalue()
+    start = raw.find(b"{")
+    if start < 0:
+        return []
+
+    text = raw[start:].decode("utf-8", errors="replace")
+    results = []
+
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            doc = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        parents, children_per_parent = process_document(doc)
+        if not parents:
+            continue
+
+        results.append({
+            "doc_id": doc["doc_id"],
+            "source_file": doc["source_file"],
+            "language": doc["language"],
+            "doc_type": doc["doc_type"],
+            "metadata": json.dumps(doc.get("metadata", {}), ensure_ascii=False),
+            "parents": parents,
+            "children_per_parent": children_per_parent,
+        })
+
+    return results
+
+
+def run_step2(args):
+    """Step 2: Chunk segments into parent-child chunks in PostgreSQL.
+
+    Uses ThreadPoolExecutor to parallelize MinIO downloads + chunking,
+    then writes to DB sequentially to maintain atomicity.
+    """
+    import re
+    import queue
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     settings = get_settings()
     bucket_segments = settings.pipeline.bucket_segments
     chunk_cfg = settings.chunking
 
+    workers = getattr(args, "workers", None) or min(16, max(1, os.cpu_count() // 4))
+
     logger.info("=" * 60)
     logger.info("Step 2: Segments → Parent-Child Chunks")
     logger.info(f"  Parent: {chunk_cfg.parent_target_chars}-{chunk_cfg.parent_max_chars} chars")
     logger.info(f"  Child:  {chunk_cfg.child_target_chars} target, {chunk_cfg.child_overlap_chars} overlap")
+    logger.info(f"  Workers: {workers}")
     logger.info("=" * 60)
 
     prefix = args.source or ""
@@ -334,82 +389,81 @@ def run_step2(args):
         return
 
     total_parents = total_children = files_done = files_failed = 0
+    batch_size = 200  # submit this many files at a time to the thread pool
 
-    for file_info in seg_files:
+    for batch_start in range(0, len(seg_files), batch_size):
         if _shutdown:
             break
 
-        file_name = file_info["name"]
-        try:
-            data = _download(bucket_segments, file_name)
-            raw = data.getvalue()
-            start = raw.find(b"{")
-            if start < 0:
-                continue
+        batch = seg_files[batch_start:batch_start + batch_size]
 
-            text = raw[start:].decode("utf-8", errors="replace")
+        # Phase 1: Download + chunk in parallel (threads)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_name = {
+                executor.submit(_download_and_chunk, f["name"], bucket_segments): f["name"]
+                for f in batch
+            }
 
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line.startswith("{"):
-                    continue
+            for future in as_completed(future_to_name):
+                if _shutdown:
+                    break
+
+                file_name = future_to_name[future]
                 try:
-                    doc = json.loads(line)
-                except json.JSONDecodeError:
+                    docs = future.result()
+                except Exception as e:
+                    logger.error(f"Failed: {file_name}: {e}")
+                    files_failed += 1
                     continue
 
-                parents, children_per_parent = process_document(doc)
-                if not parents:
+                if not docs:
+                    files_done += 1
                     continue
 
-                doc_id = doc["doc_id"]
-                source_file = doc["source_file"]
-                language = doc["language"]
-                doc_type = doc["doc_type"]
-                metadata = json.dumps(doc.get("metadata", {}), ensure_ascii=False)
+                # Phase 2: DB write — sequential, one atomic transaction per document
+                try:
+                    for doc_data in docs:
+                        with _db_transaction() as (conn, cur):
+                            for p_idx, parent in enumerate(doc_data["parents"]):
+                                safe_section = re.sub(r"[^a-zA-Z0-9_]", "_", parent.get("section", "general"))[:50]
+                                parent_chunk_id = f"{doc_data['doc_id']}_{safe_section}_{p_idx:04d}"
 
-                # Atomic: insert all parents + children for this document in one transaction
-                with _db_transaction() as (conn, cur):
-                    for p_idx, parent in enumerate(parents):
-                        safe_section = re.sub(r"[^a-zA-Z0-9_]", "_", parent.get("section", "general"))[:50]
-                        parent_chunk_id = f"{doc_id}_{safe_section}_{p_idx:04d}"
+                                cur.execute("""
+                                    INSERT INTO parent_chunks
+                                        (doc_id, chunk_id, section, content, char_count, language,
+                                         doc_type, source_file, page_start, page_end, metadata)
+                                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                    ON CONFLICT (chunk_id) DO NOTHING
+                                    RETURNING id
+                                """, (
+                                    doc_data["doc_id"], parent_chunk_id, parent.get("section"),
+                                    parent["text"], parent["char_count"],
+                                    doc_data["language"], doc_data["doc_type"], doc_data["source_file"],
+                                    parent.get("page_start"), parent.get("page_end"), doc_data["metadata"],
+                                ))
 
-                        cur.execute("""
-                            INSERT INTO parent_chunks
-                                (doc_id, chunk_id, section, content, char_count, language,
-                                 doc_type, source_file, page_start, page_end, metadata)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (chunk_id) DO NOTHING
-                            RETURNING id
-                        """, (
-                            doc_id, parent_chunk_id, parent.get("section"),
-                            parent["text"], parent["char_count"],
-                            language, doc_type, source_file,
-                            parent.get("page_start"), parent.get("page_end"), metadata,
-                        ))
+                                row = cur.fetchone()
+                                if row is None:
+                                    continue
+                                parent_db_id = row[0]
+                                total_parents += 1
 
-                        row = cur.fetchone()
-                        if row is None:
-                            continue
-                        parent_db_id = row[0]
-                        total_parents += 1
+                                for c_idx, child in enumerate(doc_data["children_per_parent"][p_idx]):
+                                    child_chunk_id = f"{parent_chunk_id}_c{c_idx:03d}"
+                                    cur.execute("""
+                                        INSERT INTO child_chunks (parent_id, chunk_id, content, char_count)
+                                        VALUES (%s,%s,%s,%s)
+                                        ON CONFLICT (chunk_id) DO NOTHING
+                                    """, (parent_db_id, child_chunk_id, child["text"], child["char_count"]))
+                                    total_children += 1
 
-                        for c_idx, child in enumerate(children_per_parent[p_idx]):
-                            child_chunk_id = f"{parent_chunk_id}_c{c_idx:03d}"
-                            cur.execute("""
-                                INSERT INTO child_chunks (parent_id, chunk_id, content, char_count)
-                                VALUES (%s,%s,%s,%s)
-                                ON CONFLICT (chunk_id) DO NOTHING
-                            """, (parent_db_id, child_chunk_id, child["text"], child["char_count"]))
-                            total_children += 1
+                    files_done += 1
+                except Exception as e:
+                    logger.error(f"Failed DB write: {file_name}: {e}")
+                    files_failed += 1
 
-            files_done += 1
-            if files_done % 100 == 0:
-                logger.info(f"Progress: {files_done} files, {total_parents} parents, {total_children} children")
-
-        except Exception as e:
-            logger.error(f"Failed: {file_name}: {e}")
-            files_failed += 1
+                if files_done % 100 == 0 and files_done > 0:
+                    logger.info(f"Progress: {files_done}/{len(seg_files)} files, {total_parents} parents, {total_children} children")
 
     logger.info(f"Step 2 complete: {files_done} files, {total_parents} parents, {total_children} children, {files_failed} failed")
 
@@ -785,6 +839,7 @@ def main():
     # Step 2
     p2 = sub.add_parser("step2", help="Segments → Parent-Child Chunks")
     p2.add_argument("--source", type=str, default=None, help="Segment prefix filter")
+    p2.add_argument("--workers", type=int, default=None, help="Number of download/chunk threads")
     p2.add_argument("--dry-run", action="store_true")
 
     # Step 3

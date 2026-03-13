@@ -308,18 +308,54 @@ immissionsschutzrecht, energierecht, baurecht, umweltrecht, vertragsrecht, gesel
 - [x] Synthetic fine-tuning data generation (~200K target, 7 task types)
 - [x] Embedding pipeline (Qwen3-Embedding-8B, 1024 dims)
 - [x] Upgraded embedding model: BGE-M3 → Qwen3-Embedding-8B
+- [x] Switched OCR from RapidOCR (Chinese PP-OCR) to Tesseract with German language pack
+- [x] German legal OCR post-processing ($ → §, hyphenation fixes)
+- [x] Automatic file logging for all pipeline steps (`LAI/logs/pipeline/`)
+- [x] Graceful shutdown with signal handling (first Ctrl+C finishes work, second force-exits)
+- [x] Step 2 parallelized (ThreadPoolExecutor for download+chunk, sequential atomic DB writes)
+
+---
+
+## Pipeline Execution Progress (Phase 1)
+
+Processing is done in phases due to storage constraints (~613GB free).
+
+### Phase 1 — High-value sources (~20GB)
+
+| Source | Step 1 (Convert) | Step 2 (Chunk) | Step 3 (Classify) | Step 4 (Enrich) | Step 5 (Generate) | Step 6 (Embed) |
+|--------|:-:|:-:|:-:|:-:|:-:|:-:|
+| DD Reports (19MB, 18 files) | Done (16 ok, 1 .DOC fail, 2 corrupt) | In progress | - | - | - | - |
+| VDRs (6GB, 4.3K files) | Done (5,469 ok, 103 failed) | In progress | - | - | - | - |
+| de/gesetzes (750MB, 764 files) | Done | In progress | - | - | - | - |
+
+### Phase 2 — Medium sources (~20GB)
+
+| Source | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 | Step 6 |
+|--------|:-:|:-:|:-:|:-:|:-:|:-:|
+| hf_cases (14GB, 14K files) | - | - | - | - | - | - |
+| openlegaldata (1.5GB, 4K files) | - | - | - | - | - | - |
+| Library (5.4GB, 2.1K PDFs) | - | - | - | - | - | - |
+
+### Phase 3 — Large source (~30-50GB German subset)
+
+| Source | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 | Step 6 |
+|--------|:-:|:-:|:-:|:-:|:-:|:-:|
+| multilegalpile (643GB, filter to `de`) | - | - | - | - | - | - |
+
+---
 
 ## What's Next
 
 Priority items:
 
-1. **Run pipeline on DD Reports** — small high-value dataset, test all 6 steps end-to-end
-2. **Run pipeline on full corpus** — process remaining data sources
-3. **Fine-tune Qwen2.5-7B** — using generated ~200K training samples
-4. **Integration tests** — test pipeline steps, RAG pipeline
-5. **CI/CD pipeline** — automated testing/deployment
-6. **German reranker** — current MiniLM is English-only
-7. **Database migrations** — no Alembic setup yet
+1. **Complete Phase 1 Steps 2-6** — finish chunking, classify, enrich, generate, embed on DD Reports + VDRs + de/gesetzes
+2. **Run Phase 2** — hf_cases, openlegaldata, Library
+3. **Run Phase 3** — multilegalpile (German subset only)
+4. **Fine-tune Qwen2.5-7B** — using generated ~200K training samples
+5. **Integration tests** — test pipeline steps, RAG pipeline
+6. **CI/CD pipeline** — automated testing/deployment
+7. **German reranker** — current MiniLM is English-only
+8. **Database migrations** — no Alembic setup yet
 
 ---
 
@@ -327,7 +363,10 @@ Priority items:
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| Pipeline not yet run on full corpus | No production embeddings/training data | Run steps 1-6 |
+| Phase 1 Step 2-6 in progress | Chunking/classification/embedding not yet done | Running Step 2 now |
+| Phase 2-3 data not yet processed | ~650GB remaining corpus | After Phase 1 completes |
+| 103 VDR files failed Step 1 | Mostly legacy .xls/.doc formats | Install LibreOffice for conversion |
+| OCR § vs $ confusion (some docs) | 20 instances in one Jahresabschluss | Post-processing fix in text cleaner |
 | Reranker is English-only (MiniLM) | Suboptimal for German text | Evaluate German alternatives |
 | No fine-tuned model yet | Using base Qwen2.5-7B | Generate training data first (Step 5) |
 | No CI/CD | Manual testing only | Set up GitHub Actions |
