@@ -173,8 +173,14 @@ def build_child_chunks(
                     overlap_start = j
                     break
 
+            prev_len = current_len
             current = current[overlap_start:]
             current_len = sum(len(s) + 1 for s in current) - 1 if current else 0
+
+            # Guard: if overlap didn't reduce length, clear it to prevent infinite loop
+            if current_len >= prev_len or (current_len + addition > target_chars and current_len >= min_chars):
+                current = []
+                current_len = 0
             continue
 
         current.append(sent)

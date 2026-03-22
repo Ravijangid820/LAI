@@ -42,8 +42,10 @@ def _signal_handler(signum, frame):
         sys.exit(1)
 
 
-signal.signal(signal.SIGINT, _signal_handler)
-signal.signal(signal.SIGTERM, _signal_handler)
+# Signal handlers are registered in main() — NOT at import time.
+# Registering at import time causes _shutdown to be set by unrelated
+# SIGTERM signals (e.g., timeout commands, process managers), breaking
+# the processing loop before the final DB flush happens.
 
 
 # ============================================================
@@ -378,19 +380,15 @@ def _download_and_chunk(file_name: str, bucket: str):
 def run_step2(args):
     """Step 2: Chunk segments into parent-child chunks in PostgreSQL.
 
-    Optimized pipeline:
-    - ThreadPoolExecutor downloads + chunks files in parallel
-    - Batch DB inserts using execute_values (10-100x faster)
-    - Multiple files per transaction to reduce commit overhead
+    Downloads + chunks files, then batch-inserts into DB using execute_values.
+    Files are processed sequentially; DB writes are batched for throughput.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     from psycopg2.extras import execute_values
+    import time as _time
 
     settings = get_settings()
     bucket_segments = settings.pipeline.bucket_segments
     chunk_cfg = settings.chunking
-
-    workers = getattr(args, "workers", None) or min(16, max(1, os.cpu_count() // 4))
 
     # Fail fast if DB is unreachable
     try:
@@ -400,13 +398,14 @@ def run_step2(args):
         logger.error(f"Cannot connect to PostgreSQL: {e}")
         logger.error("Start the database first: cd Docker/database/pgvector && docker compose up -d")
         return
-    db_batch = 50  # files to accumulate before flushing to DB
+
+    db_batch = 20  # files to accumulate before flushing to DB
 
     logger.info("=" * 60)
     logger.info("Step 2: Segments → Parent-Child Chunks")
     logger.info(f"  Parent: {chunk_cfg.parent_target_chars}-{chunk_cfg.parent_max_chars} chars")
     logger.info(f"  Child:  {chunk_cfg.child_target_chars} target, {chunk_cfg.child_overlap_chars} overlap")
-    logger.info(f"  Workers: {workers}, DB batch: {db_batch} files")
+    logger.info(f"  DB batch: {db_batch} files per transaction")
     logger.info("=" * 60)
 
     prefix = args.source or ""
@@ -418,6 +417,7 @@ def run_step2(args):
         return
 
     total_parents = total_children = files_done = files_failed = 0
+    t0 = _time.time()
 
     # Accumulate rows across files, flush in batches
     pending_parents = []
@@ -432,7 +432,6 @@ def run_step2(args):
             return
 
         with _db_transaction() as (conn, cur):
-            # Batch insert parents, get back (id, chunk_id) for those that were inserted
             inserted = execute_values(
                 cur,
                 """INSERT INTO parent_chunks
@@ -448,7 +447,6 @@ def run_step2(args):
 
             total_parents += len(inserted)
 
-            # Build child rows using returned parent IDs
             child_rows = []
             for parent_db_id, parent_chunk_id in inserted:
                 for child_chunk_id, text, char_count in pending_child_map.get(parent_chunk_id, []):
@@ -465,61 +463,52 @@ def run_step2(args):
                 )
                 total_children += len(child_rows)
 
+        logger.info(
+            f"Flushed {pending_count} files — "
+            f"{files_done}/{len(seg_files)} ({files_done*100//len(seg_files)}%), "
+            f"{total_parents} parents, {total_children} children"
+        )
         pending_parents = []
         pending_child_map = {}
         pending_count = 0
 
-    # Process files in thread-pool batches
-    pool_batch_size = workers * 4  # keep thread pool fed
-
-    for batch_start in range(0, len(seg_files), pool_batch_size):
+    # Process files one by one — simple, reliable, and fast enough
+    logger.info(f"Starting processing loop over {len(seg_files)} files...")
+    for i, seg_file in enumerate(seg_files):
         if _shutdown:
+            logger.info("Shutdown flag detected, breaking loop")
             break
 
-        batch = seg_files[batch_start:batch_start + pool_batch_size]
+        file_name = seg_file["name"]
+        logger.info(f"[{i+1}/{len(seg_files)}] {file_name}")
+        try:
+            parent_rows, child_map = _download_and_chunk(file_name, bucket_segments)
+            logger.info(f"  -> {len(parent_rows)} parents, {len(child_map)} child groups")
+            files_done += 1
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_name = {
-                executor.submit(_download_and_chunk, f["name"], bucket_segments): f["name"]
-                for f in batch
-            }
+            if parent_rows:
+                pending_parents.extend(parent_rows)
+                pending_child_map.update(child_map)
+                pending_count += 1
 
-            for future in as_completed(future_to_name):
-                if _shutdown:
-                    break
+            # Flush when enough files accumulated
+            if pending_count >= db_batch:
+                _flush_to_db()
 
-                file_name = future_to_name[future]
-                try:
-                    parent_rows, child_map = future.result()
-                except Exception as e:
-                    logger.error(f"Failed download/chunk: {file_name}: {e}")
-                    files_failed += 1
-                    continue
+        except Exception as e:
+            logger.error(f"Failed: {file_name}: {e}")
+            files_failed += 1
 
-                files_done += 1
-
-                if parent_rows:
-                    pending_parents.extend(parent_rows)
-                    pending_child_map.update(child_map)
-                    pending_count += 1
-
-                # Flush when enough files accumulated
-                if pending_count >= db_batch:
-                    try:
-                        _flush_to_db()
-                    except Exception as e:
-                        logger.error(f"DB batch insert failed: {e}")
-                        files_failed += pending_count
-                        pending_parents = []
-                        pending_child_map = {}
-                        pending_count = 0
-
-                if files_done % 500 == 0:
-                    logger.info(
-                        f"Progress: {files_done}/{len(seg_files)} files "
-                        f"({files_done*100//len(seg_files)}%), "
-                        f"{total_parents} parents, {total_children} children"
-                    )
+        # Progress every 500 files
+        if (i + 1) % 500 == 0:
+            elapsed = _time.time() - t0
+            rate = files_done / elapsed if elapsed > 0 else 0
+            eta = (len(seg_files) - files_done) / rate if rate > 0 else 0
+            logger.info(
+                f"Progress: {files_done}/{len(seg_files)} "
+                f"({files_done*100//len(seg_files)}%), "
+                f"{rate:.1f} files/s, ETA {eta/60:.0f}m"
+            )
 
     # Flush remaining
     if pending_parents:
@@ -529,10 +518,11 @@ def run_step2(args):
             logger.error(f"Final DB batch insert failed: {e}")
             files_failed += pending_count
 
+    elapsed = _time.time() - t0
     logger.info(
         f"Step 2 complete: {files_done} files, "
         f"{total_parents} parents, {total_children} children, "
-        f"{files_failed} failed"
+        f"{files_failed} failed, {elapsed/60:.1f}m elapsed"
     )
 
 
@@ -893,6 +883,10 @@ def _build_log_name(step: str, args) -> str:
 def main():
     from lai.core.logging import setup_logging
 
+    # Register signal handlers HERE, not at import time
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     # Parse args first (before logging setup) to get step name
     parser = argparse.ArgumentParser(description="LAI Data Processing Pipeline")
     sub = parser.add_subparsers(dest="step", required=True)
@@ -907,7 +901,6 @@ def main():
     # Step 2
     p2 = sub.add_parser("step2", help="Segments → Parent-Child Chunks")
     p2.add_argument("--source", type=str, default=None, help="Segment prefix filter")
-    p2.add_argument("--workers", type=int, default=None, help="Number of download/chunk threads")
     p2.add_argument("--dry-run", action="store_true")
 
     # Step 3
