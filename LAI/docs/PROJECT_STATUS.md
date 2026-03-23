@@ -1,6 +1,6 @@
 # LAI Project Status
 
-> Last updated: 2026-03-10
+> Last updated: 2026-03-23
 
 This document explains the current state of the LAI project for developers joining the team.
 
@@ -318,6 +318,10 @@ immissionsschutzrecht, energierecht, baurecht, umweltrecht, vertragsrecht, gesel
 - [x] Graceful shutdown with signal handling (first Ctrl+C finishes work, second force-exits)
 - [x] Step 2 parallelized (ThreadPoolExecutor + batch `execute_values` inserts, atomic DB writes)
 - [x] DB config fix: default port 5433 → 5434 (main PostgreSQL container)
+- [x] Fixed infinite loop in child chunk overlap calculation
+- [x] Versioned classification history table (`chunk_classifications`) with audit trail
+- [x] Fixed synth-generator docker-compose for Blackwell GPU compatibility (CUDA 13.0)
+- [x] `--reclassify` and `--model-version` flags for Step 3
 
 ---
 
@@ -329,9 +333,12 @@ Processing is done in phases due to storage constraints (~613GB free).
 
 | Source | Step 1 (Convert) | Step 2 (Chunk) | Step 3 (Classify) | Step 4 (Enrich) | Step 5 (Generate) | Step 6 (Embed) |
 |--------|:-:|:-:|:-:|:-:|:-:|:-:|
-| DD Reports (19MB, 18 files) | Done (16 ok, 1 .DOC fail, 2 corrupt) | In progress | - | - | - | - |
-| VDRs (6GB, 4.3K files) | Done (5,469 ok, 103 failed) | In progress | - | - | - | - |
-| de/gesetzes (750MB, 764 files) | Done | In progress | - | - | - | - |
+| DD Reports (19MB, 18 files) | Done (18 ok, 1 .DOC fail) | Done | In progress | - | - | - |
+| VDRs (6GB, 4.3K files) | Done (5,469 ok, 103 failed) | Done | In progress | - | - | - |
+| de/gesetzes (750MB, 764 files) | Done (6,820 ok, 0 failed) | Done | In progress | - | - | - |
+
+**Step 2 totals:** 12,307 files → 134,474 parent chunks, 217,165 child chunks (2m 35s)
+**Step 3:** Re-classifying with improved JSON parser + versioned history table (running)
 
 ### Phase 2 — Medium sources (~20GB)
 
@@ -353,14 +360,17 @@ Processing is done in phases due to storage constraints (~613GB free).
 
 Priority items:
 
-1. **Complete Phase 1 Steps 2-6** — finish chunking, classify, enrich, generate, embed on DD Reports + VDRs + de/gesetzes
-2. **Run Phase 2** — hf_cases, openlegaldata, Library
-3. **Run Phase 3** — multilegalpile (German subset only)
-4. **Fine-tune Qwen2.5-7B** — using generated ~200K training samples
-5. **Integration tests** — test pipeline steps, RAG pipeline
-6. **CI/CD pipeline** — automated testing/deployment
-7. **German reranker** — current MiniLM is English-only
-8. **Database migrations** — no Alembic setup yet
+1. **Complete Step 3 reclassification** — running now (~55 min total)
+2. **Run Step 4** (contextual enrichment) — ~3-4 hours, needs LLM container
+3. **Run Step 5** (training data generation) — ~10-15 hours, needs LLM container
+4. **Run Step 6** (embeddings) — ~1-2 hours, needs embedding container
+5. **Run Phase 2** — hf_cases, openlegaldata, Library (Steps 1-6)
+6. **Run Phase 3** — multilegalpile (German subset only)
+7. **Fine-tune Qwen2.5-7B** — using generated ~200K training samples
+8. **Integration tests** — test full RAG pipeline end-to-end
+9. **German reranker** — current MiniLM is English-only
+10. **CI/CD pipeline** — automated testing/deployment
+11. **Database migrations** — Alembic setup
 
 ---
 
@@ -368,10 +378,10 @@ Priority items:
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| Phase 1 Step 2-6 in progress | Chunking/classification/embedding not yet done | Running Step 2 now |
+| Step 3 reclassification running | Previous run had JSON parse errors, re-running with fix | In progress |
+| Steps 4-6 not yet started | Enrichment, training data, embeddings pending | Awaiting Step 3 |
 | Phase 2-3 data not yet processed | ~650GB remaining corpus | After Phase 1 completes |
 | 103 VDR files failed Step 1 | Mostly legacy .xls/.doc formats | Install LibreOffice for conversion |
-| OCR § vs $ confusion (some docs) | 20 instances in one Jahresabschluss | Post-processing fix in text cleaner |
 | Reranker is English-only (MiniLM) | Suboptimal for German text | Evaluate German alternatives |
 | No fine-tuned model yet | Using base Qwen2.5-7B | Generate training data first (Step 5) |
 | No CI/CD | Manual testing only | Set up GitHub Actions |
@@ -385,6 +395,7 @@ Priority items:
 |------|-------|
 | App config | [src/lai/core/config.py](../src/lai/core/config.py) |
 | Data pipeline | [src/lai/pipeline/](../src/lai/pipeline/) — Steps 1-6 |
+| Pipeline progress report | [PIPELINE_PROGRESS_REPORT.md](PIPELINE_PROGRESS_REPORT.md) |
 | Pipeline CLI | `python -m lai.pipeline.cli step1 --help` |
 | RAG pipeline | [src/lai/api/pipeline.py](../src/lai/api/pipeline.py) |
 | Hybrid search SQL | [src/lai/search/hybrid_search.py](../src/lai/search/hybrid_search.py) |
