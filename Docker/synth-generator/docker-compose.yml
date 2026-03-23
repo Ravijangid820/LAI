@@ -1,53 +1,33 @@
-# Synthetic Data Generator (Qwen2.5-72B-Instruct via vLLM) — GPU 0+1
-# Temporary service for generating fine-tuning data.
-# Stop embedding, reranker, and LLM services before starting.
+# Synthetic Data Generator (Qwen2.5-72B-Instruct-AWQ via vLLM) — GPU 0+1
+# Uses both GPUs with tensor parallelism for maximum throughput.
 #
 # Usage:
-#   # Stop regular services first
-#   cd ../embedding && docker compose down
-#   cd ../reranker && docker compose down
-#   cd ../llm && docker compose down
-#
-#   # Start generator (uses both GPUs)
-#   cd ../synth-generator && docker compose up -d
-#
-#   # When done generating, stop and restart regular services
+#   cd /data/projects/lai/Docker/synth-generator && docker compose up -d
+#   curl http://localhost:8005/v1/models
 #   docker compose down
-#   cd ../embedding && docker compose up -d
-#   cd ../reranker && docker compose up -d
-#   cd ../llm && docker compose up -d
 
 services:
   synth-generator:
-    image: vllm/vllm-openai:latest
+    image: vllm-eval-local:working        # only image with sm_120 (Blackwell) kernels
     container_name: lai_synth_generator
     restart: unless-stopped
-    ipc: host
-    command: >
-      --model ${SYNTH_MODEL:-Qwen/Qwen2.5-72B-Instruct}
-      --max-model-len ${SYNTH_MAX_MODEL_LEN:-8192}
-      --dtype auto
-      --quantization ${SYNTH_QUANTIZATION:-awq}
-      --trust-remote-code
-      --gpu-memory-utilization 0.90
+    stop_grace_period: 120s
+    command: >-
+      Qwen/Qwen2.5-72B-Instruct-AWQ
+      --served-model-name Qwen/Qwen2.5-72B-Instruct-AWQ
+      --quantization awq_marlin
+      --host 0.0.0.0
+      --port 8000
       --tensor-parallel-size 2
-      --max-num-seqs 8
+      --max-model-len 8192
+      --gpu-memory-utilization 0.90
+      --dtype float16
+      --max-num-seqs 16
+      --enable-chunked-prefill
       --enable-prefix-caching
     environment:
-      HF_TOKEN: ${HF_TOKEN:-}
-      CUDA_VISIBLE_DEVICES: "0,1"
-    volumes:
-      - ./model-cache:/root/.cache/huggingface
-    ports:
-      - "${SYNTH_PORT:-8005}:8000"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 20
-      start_period: 600s
-    networks:
-      - lai_network
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
     deploy:
       resources:
         reservations:
@@ -55,6 +35,19 @@ services:
             - driver: nvidia
               count: 2
               capabilities: [gpu]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ~/.cache/vllm:/root/.cache/vllm
+    ports:
+      - "8005:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+    networks:
+      - lai_network
 
 networks:
   lai_network:

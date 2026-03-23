@@ -112,11 +112,14 @@ def enrich_children_for_parent(
     *,
     llm_url: str,
     llm_model: str,
+    max_concurrent: int = 16,
 ) -> Dict[int, str]:
     """
-    Generate context prefixes for all children of a parent chunk.
+    Generate context prefixes for all children of a parent chunk concurrently.
     Returns {child_id: prefix}.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     results: Dict[int, str] = {}
     logger.info(f"Enriching {len(children)} children for parent {parent['id']}")
     parent_text = parent["content"]
@@ -124,14 +127,12 @@ def enrich_children_for_parent(
     section = parent.get("section", "")
     domains = parent.get("domain", [])
 
-    for child in children:
+    def _enrich_one(child):
         child_id = child["id"]
         child_text = child["content"]
 
-        # Skip very short children
         if len(child_text) < 50:
-            results[child_id] = ""
-            continue
+            return child_id, ""
 
         prefix = generate_context_prefix(
             parent_text,
@@ -142,6 +143,17 @@ def enrich_children_for_parent(
             llm_url=llm_url,
             llm_model=llm_model,
         )
-        results[child_id] = prefix
+        return child_id, prefix
+
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        futures = {executor.submit(_enrich_one, c): c["id"] for c in children}
+        for future in as_completed(futures):
+            try:
+                child_id, prefix = future.result()
+                results[child_id] = prefix
+            except Exception as e:
+                child_id = futures[future]
+                logger.warning(f"Child {child_id} enrichment failed: {e}")
+                results[child_id] = ""
 
     return results
