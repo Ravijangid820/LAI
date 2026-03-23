@@ -531,18 +531,32 @@ def run_step2(args):
 # ============================================================
 
 def run_step3(args):
-    """Step 3: Classify parent chunks into legal domains."""
-    from lai.pipeline.classify import classify_batch
+    """Step 3: Classify parent chunks into legal domains.
+
+    Writes to both parent_chunks.domain (latest) and chunk_classifications (history).
+    Re-running with a new prompt/model version adds new history rows without
+    deleting old ones. Use the latest_classifications view to query.
+    """
+    from lai.pipeline.classify import classify_batch, PROMPT_VERSION
+    from psycopg2.extras import execute_values
 
     settings = get_settings()
     pipe = settings.pipeline
     batch_size = args.batch_size
+    model_version = getattr(args, "model_version", "1") or "1"
 
     logger.info("=" * 60)
     logger.info("Step 3: Domain Classification (parent chunks)")
     logger.info(f"  LLM: {pipe.synth_llm_model}")
+    logger.info(f"  Model version: {model_version}, Prompt version: {PROMPT_VERSION}")
     logger.info(f"  Batch size: {batch_size}")
     logger.info("=" * 60)
+
+    # Reclassify: reset all domains (history is preserved in chunk_classifications)
+    if getattr(args, "reclassify", False):
+        count = _db_fetch("SELECT COUNT(*) FROM parent_chunks WHERE domain IS NOT NULL")[0][0]
+        logger.info(f"Reclassify mode: resetting {count} existing classifications (history preserved)")
+        _db_execute("UPDATE parent_chunks SET domain = NULL")
 
     # Count unclassified parents (domain IS NULL or empty)
     rows = _db_fetch("SELECT COUNT(*) FROM parent_chunks WHERE domain IS NULL OR domain = '{}'")
@@ -553,7 +567,6 @@ def run_step3(args):
         return
 
     classified = 0
-    offset = 0
 
     while not _shutdown:
         rows = _db_fetch("""
@@ -575,13 +588,33 @@ def run_step3(args):
             llm_model=pipe.synth_llm_model,
         )
 
-        for parent_id, domains in results.items():
-            _db_execute(
-                "UPDATE parent_chunks SET domain = %s WHERE id = %s",
-                (domains, parent_id),
-            )
-            classified += 1
+        # Write to both tables in one transaction per batch
+        with _db_transaction() as (conn, cur):
+            history_rows = []
+            for parent_id, (domains, raw_response) in results.items():
+                # Update parent_chunks.domain (latest value)
+                cur.execute(
+                    "UPDATE parent_chunks SET domain = %s WHERE id = %s",
+                    (domains, parent_id),
+                )
+                # Prepare history row
+                history_rows.append((
+                    parent_id, domains, pipe.synth_llm_model,
+                    model_version, PROMPT_VERSION, raw_response,
+                ))
 
+            # Batch insert into classification history
+            if history_rows:
+                execute_values(
+                    cur,
+                    """INSERT INTO chunk_classifications
+                           (parent_id, domain, model_name, model_version, prompt_version, raw_response)
+                       VALUES %s""",
+                    history_rows,
+                    template="(%s,%s,%s,%s,%s,%s)",
+                )
+
+        classified += len(results)
         logger.info(f"Progress: {classified}/{total_unclassified} classified")
 
     logger.info(f"Step 3 complete: {classified} parent chunks classified")
@@ -906,6 +939,8 @@ def main():
     # Step 3
     p3 = sub.add_parser("step3", help="Domain Classification (parent chunks)")
     p3.add_argument("--batch-size", type=int, default=100, help="DB fetch batch size")
+    p3.add_argument("--model-version", type=str, default="1", help="Version tag for classification history")
+    p3.add_argument("--reclassify", action="store_true", help="Reset all domains and re-classify from scratch")
     p3.add_argument("--dry-run", action="store_true")
 
     # Step 4

@@ -2,7 +2,10 @@
 Step 3: Domain Classification
 
 Classifies parent chunks into legal domains using Qwen2.5-72B via vLLM.
-Domains are stored as TEXT[] on parent_chunks.domain column.
+
+Classifications are stored in two places:
+- parent_chunks.domain (TEXT[]) — latest classification for fast queries
+- chunk_classifications table — full history with model/prompt versioning
 
 Wind-energy due-diligence domains:
     - immissionsschutzrecht (BImSchG, TA Lärm, TA Luft)
@@ -55,6 +58,10 @@ Wähle 1-3 Domains, die am besten passen. Bei unklarem Text: ["allgemein"]
 Keine Erklärung, nur das JSON-Array."""
 
 
+# Current classification version — bump when changing prompt or model
+PROMPT_VERSION = "1"
+
+
 def classify_chunk(
     text: str,
     *,
@@ -62,8 +69,13 @@ def classify_chunk(
     llm_model: str,
     timeout: float = 60.0,
     max_input_chars: int = 4000,
-) -> List[str]:
-    """Classify a single parent chunk text into domains."""
+) -> tuple[List[str], str | None]:
+    """Classify a single parent chunk text into domains.
+
+    Returns (domains, raw_response) — raw_response is kept for audit trail.
+    """
+    import re
+
     # Truncate to save tokens — first + last portions give best signal
     if len(text) > max_input_chars:
         half = max_input_chars // 2
@@ -79,11 +91,12 @@ def classify_chunk(
         "max_tokens": 64,
     }
 
+    raw_content = None
     try:
-        import re
         resp = httpx.post(llm_url, json=payload, timeout=timeout)
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip()
+        raw_content = resp.json()["choices"][0]["message"]["content"].strip()
+        content = raw_content
 
         # Parse JSON array from response
         # Handle cases where LLM wraps in markdown code blocks
@@ -99,16 +112,17 @@ def classify_chunk(
 
         domains = json.loads(content)
         if isinstance(domains, list):
-            return [d for d in domains if d in DOMAINS] or ["allgemein"]
+            valid = [d for d in domains if d in DOMAINS] or ["allgemein"]
+            return valid, raw_content
 
     except httpx.HTTPError as e:
         logger.warning(f"Classification HTTP error: {e}")
     except json.JSONDecodeError as e:
-        logger.warning(f"Classification JSON parse error: {e} — raw: {content[:200] if 'content' in dir() else 'N/A'}")
+        logger.warning(f"Classification JSON parse error: {e} — raw: {raw_content[:200] if raw_content else 'N/A'}")
     except (KeyError, IndexError) as e:
         logger.warning(f"Classification response structure error: {e}")
 
-    return ["allgemein"]
+    return ["allgemein"], raw_content
 
 
 def classify_batch(
@@ -117,16 +131,16 @@ def classify_batch(
     llm_url: str,
     llm_model: str,
     max_concurrent: int = 16,
-) -> Dict[int, List[str]]:
+) -> Dict[int, tuple[List[str], str | None]]:
     """
-    Classify a batch of parent chunks concurrently. Returns {parent_id: [domains]}.
+    Classify a batch of parent chunks concurrently.
 
-    Sends up to max_concurrent requests in parallel to saturate vLLM's
-    continuous batching (--max-num-seqs). This is 10-16x faster than sequential.
+    Returns {parent_id: (domains, raw_response)}.
+    raw_response is stored in chunk_classifications for audit trail.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    results: Dict[int, List[str]] = {}
+    results: Dict[int, tuple[List[str], str | None]] = {}
     logger.info(f"Classifying batch of {len(chunks)} parent chunks ({max_concurrent} concurrent)")
 
     def _classify_one(chunk):
@@ -135,27 +149,27 @@ def classify_batch(
         doc_type = chunk.get("doc_type", "")
 
         if len(text) < 50:
-            return parent_id, ["allgemein"]
+            return parent_id, (["allgemein"], None)
 
         hint = f"\n[Dokumenttyp: {doc_type}]" if doc_type else ""
-        domains = classify_chunk(
+        domains, raw = classify_chunk(
             text + hint,
             llm_url=llm_url,
             llm_model=llm_model,
         )
-        return parent_id, domains
+        return parent_id, (domains, raw)
 
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
         futures = {executor.submit(_classify_one, c): c["id"] for c in chunks}
         for future in as_completed(futures):
             try:
-                parent_id, domains = future.result()
-                results[parent_id] = domains
-                logger.debug(f"Parent {parent_id} classified as {domains}")
+                parent_id, result = future.result()
+                results[parent_id] = result
+                logger.debug(f"Parent {parent_id} classified as {result[0]}")
             except Exception as e:
                 parent_id = futures[future]
                 logger.warning(f"Parent {parent_id} classification failed: {e}")
-                results[parent_id] = ["allgemein"]
+                results[parent_id] = (["allgemein"], None)
 
     logger.info(f"Batch classification complete: {len(results)} chunks classified")
     return results
