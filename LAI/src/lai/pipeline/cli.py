@@ -625,16 +625,24 @@ def run_step3(args):
 # ============================================================
 
 def run_step4(args):
-    """Step 4: Generate context prefixes for child chunks."""
-    from lai.pipeline.enrich import enrich_children_for_parent
+    """Step 4: Generate context prefixes for child chunks.
+
+    Processes children in large concurrent batches — sends 16 LLM requests
+    in parallel across multiple parents for maximum throughput.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from lai.pipeline.enrich import generate_context_prefix
+    import time as _time
 
     settings = get_settings()
     pipe = settings.pipeline
     batch_size = args.batch_size
+    max_concurrent = 16
 
     logger.info("=" * 60)
     logger.info("Step 4: Contextual Enrichment (child chunks)")
     logger.info(f"  LLM: {pipe.synth_llm_model}")
+    logger.info(f"  Concurrent requests: {max_concurrent}")
     logger.info("=" * 60)
 
     # Count children without context_prefix
@@ -646,56 +654,75 @@ def run_step4(args):
         return
 
     enriched = 0
+    failed = 0
+    t0 = _time.time()
 
-    # Process parent by parent — fetch parents that have unenriched children
     while not _shutdown:
-        parent_rows = _db_fetch("""
-            SELECT DISTINCT p.id, p.content, p.doc_type, p.section, p.domain
-            FROM parent_chunks p
-            JOIN child_chunks c ON c.parent_id = p.id
+        # Fetch a batch of unenriched children with their parent info
+        rows = _db_fetch("""
+            SELECT c.id, c.content, p.content, p.doc_type, p.section, p.domain
+            FROM child_chunks c
+            JOIN parent_chunks p ON p.id = c.parent_id
             WHERE c.context_prefix IS NULL
-            ORDER BY p.id
+            ORDER BY c.id
             LIMIT %s
         """, (batch_size,))
 
-        if not parent_rows:
+        if not rows:
             break
 
-        for p_row in parent_rows:
-            if _shutdown:
-                break
+        # Build work items
+        work = []
+        for r in rows:
+            work.append({
+                "child_id": r[0], "child_text": r[1],
+                "parent_text": r[2], "doc_type": r[3] or "",
+                "section": r[4] or "", "domains": r[5] or [],
+            })
 
-            parent = {
-                "id": p_row[0], "content": p_row[1],
-                "doc_type": p_row[2], "section": p_row[3],
-                "domain": p_row[4] or [],
-            }
-
-            child_rows = _db_fetch("""
-                SELECT id, content FROM child_chunks
-                WHERE parent_id = %s AND context_prefix IS NULL
-            """, (parent["id"],))
-
-            children = [{"id": r[0], "content": r[1]} for r in child_rows]
-            if not children:
-                continue
-
-            results = enrich_children_for_parent(
-                parent, children,
-                llm_url=pipe.synth_llm_url,
-                llm_model=pipe.synth_llm_model,
+        def _enrich_one(item):
+            if len(item["child_text"]) < 50:
+                return item["child_id"], ""
+            prefix = generate_context_prefix(
+                item["parent_text"], item["child_text"],
+                doc_type=item["doc_type"], section=item["section"],
+                domains=item["domains"],
+                llm_url=pipe.synth_llm_url, llm_model=pipe.synth_llm_model,
             )
+            return item["child_id"], prefix
 
-            for child_id, prefix in results.items():
-                _db_execute(
-                    "UPDATE child_chunks SET context_prefix = %s WHERE id = %s",
-                    (prefix, child_id),
-                )
-                enriched += 1
+        # Process batch concurrently
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            futures = {executor.submit(_enrich_one, w): w["child_id"] for w in work}
+            for future in as_completed(futures):
+                if _shutdown:
+                    break
+                try:
+                    child_id, prefix = future.result(timeout=120)
+                    _db_execute(
+                        "UPDATE child_chunks SET context_prefix = %s WHERE id = %s",
+                        (prefix, child_id),
+                    )
+                    enriched += 1
+                except Exception as e:
+                    child_id = futures[future]
+                    logger.warning(f"Child {child_id} enrichment failed: {e}")
+                    failed += 1
 
-        logger.info(f"Progress: {enriched}/{total_unenriched} enriched")
+        elapsed = _time.time() - t0
+        rate = enriched / elapsed if elapsed > 0 else 0
+        eta = (total_unenriched - enriched) / rate if rate > 0 else 0
+        logger.info(
+            f"Progress: {enriched}/{total_unenriched} enriched "
+            f"({enriched*100//max(total_unenriched,1)}%), "
+            f"{rate:.1f} chunks/s, ETA {eta/60:.0f}m"
+        )
 
-    logger.info(f"Step 4 complete: {enriched} child chunks enriched")
+    elapsed = _time.time() - t0
+    logger.info(
+        f"Step 4 complete: {enriched} enriched, {failed} failed, "
+        f"{elapsed/60:.1f}m elapsed"
+    )
 
 
 # ============================================================
