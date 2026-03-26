@@ -776,9 +776,9 @@ def run_step5(args):
     t0 = _time.time()
 
     # Process multiple parents concurrently
-    # Each parent fires 3-5 concurrent LLM calls internally,
-    # so 2 parents * ~4 tasks = ~8 concurrent requests (matches vLLM max_num_seqs)
-    concurrent_parents = 2
+    # vLLM has max_num_seqs=16, KV cache <2% used → plenty of headroom
+    # 8 parents * ~4 tasks staggered = ~16 requests in flight at once
+    concurrent_parents = getattr(args, "workers", None) or 8
 
     while not _shutdown and total_count < target:
         # Fetch parents not yet used, or with few samples
@@ -1018,6 +1018,7 @@ def main():
     p5 = sub.add_parser("step5", help="Synthetic Fine-Tuning Data Generation")
     p5.add_argument("--batch-size", type=int, default=50, help="DB fetch batch size")
     p5.add_argument("--max-samples", type=int, default=0, help="Stop after N samples (0=use config target)")
+    p5.add_argument("--workers", type=int, default=0, help="Concurrent parents (0=auto, default 8)")
     p5.add_argument("--dry-run", action="store_true")
 
     # Step 6
