@@ -218,21 +218,27 @@ def generate_samples_for_parent(
 
     logger.debug(f"Parent {parent['id']}: generating {len(tasks)} samples with tasks {tasks}")
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     samples = []
-    for task_type in tasks:
-        sample = _generate_sample(
-            text,
-            task_type,
-            domains=domains,
-            llm_url=llm_url,
-            llm_model=llm_model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        if sample:
-            sample["parent_id"] = parent["id"]
-            sample["domain"] = domains[0] if domains else "allgemein"
-            samples.append(sample)
+    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+        futures = {
+            executor.submit(
+                _generate_sample, text, task_type,
+                domains=domains, llm_url=llm_url, llm_model=llm_model,
+                temperature=temperature, max_tokens=max_tokens,
+            ): task_type
+            for task_type in tasks
+        }
+        for future in as_completed(futures):
+            try:
+                sample = future.result(timeout=120)
+                if sample:
+                    sample["parent_id"] = parent["id"]
+                    sample["domain"] = domains[0] if domains else "allgemein"
+                    samples.append(sample)
+            except Exception as e:
+                logger.warning(f"Parent {parent['id']} task {futures[future]} failed: {e}")
 
     logger.info(f"Parent {parent['id']}: generated {len(samples)}/{len(tasks)} samples successfully")
     return samples

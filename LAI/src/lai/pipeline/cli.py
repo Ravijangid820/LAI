@@ -770,6 +770,15 @@ def run_step5(args):
 
     generated = 0
     total_count = existing_count
+    parents_processed = 0
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    t0 = _time.time()
+
+    # Process multiple parents concurrently
+    # Each parent fires 3-5 concurrent LLM calls internally,
+    # so 2 parents * ~4 tasks = ~8 concurrent requests (matches vLLM max_num_seqs)
+    concurrent_parents = 2
 
     while not _shutdown and total_count < target:
         # Fetch parents not yet used, or with few samples
@@ -788,42 +797,72 @@ def run_step5(args):
         if not parent_rows:
             break
 
+        # Build parent dicts
+        parents = []
         for p_row in parent_rows:
-            if _shutdown or total_count >= target:
-                break
-
-            parent = {
+            parents.append({
                 "id": p_row[0], "content": p_row[1],
                 "doc_type": p_row[2], "section": p_row[3],
                 "domain": p_row[4] or [],
-            }
+            })
 
-            samples = generate_samples_for_parent(
-                parent,
-                llm_url=pipe.synth_llm_url,
-                llm_model=pipe.synth_llm_model,
-                temperature=pipe.synth_temperature,
-                max_tokens=pipe.synth_max_tokens,
-                refusal_ratio=pipe.refusal_ratio,
-            )
+        # Process parents in concurrent batches
+        for batch_start in range(0, len(parents), concurrent_parents):
+            if _shutdown or total_count >= target:
+                break
 
-            for sample in samples:
-                _db_execute("""
-                    INSERT INTO training_samples (parent_id, domain, task_type, messages, quality_score)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, (
-                    sample["parent_id"],
-                    sample["domain"],
-                    sample["task_type"],
-                    json.dumps(sample["messages"], ensure_ascii=False),
-                    sample.get("quality_score"),
-                ))
-                generated += 1
-                total_count += 1
+            batch = parents[batch_start:batch_start + concurrent_parents]
 
-        logger.info(f"Progress: {total_count}/{target} samples ({generated} new)")
+            with ThreadPoolExecutor(max_workers=concurrent_parents) as executor:
+                future_to_parent = {
+                    executor.submit(
+                        generate_samples_for_parent, parent,
+                        llm_url=pipe.synth_llm_url,
+                        llm_model=pipe.synth_llm_model,
+                        temperature=pipe.synth_temperature,
+                        max_tokens=pipe.synth_max_tokens,
+                        refusal_ratio=pipe.refusal_ratio,
+                    ): parent
+                    for parent in batch
+                }
 
-    logger.info(f"Step 5 complete: {generated} new samples, {total_count} total")
+                for future in as_completed(future_to_parent):
+                    parent = future_to_parent[future]
+                    try:
+                        samples = future.result(timeout=300)
+                    except Exception as e:
+                        logger.error(f"Parent {parent['id']} generation failed: {e}")
+                        continue
+
+                    for sample in samples:
+                        _db_execute("""
+                            INSERT INTO training_samples (parent_id, domain, task_type, messages, quality_score)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (
+                            sample["parent_id"],
+                            sample["domain"],
+                            sample["task_type"],
+                            json.dumps(sample["messages"], ensure_ascii=False),
+                            sample.get("quality_score"),
+                        ))
+                        generated += 1
+                        total_count += 1
+                    parents_processed += 1
+
+                    # Progress every 10 parents
+                    if parents_processed % 10 == 0:
+                        elapsed = _time.time() - t0
+                        rate = generated / elapsed if elapsed > 0 else 0
+                        eta = (target - total_count) / rate / 60 if rate > 0 else 0
+                        logger.info(
+                            f"Progress: {total_count}/{target} samples "
+                            f"({total_count*100//target}%), "
+                            f"{parents_processed} parents done, "
+                            f"{rate:.1f} samples/s, ETA {eta:.0f}m"
+                        )
+
+    elapsed = _time.time() - t0
+    logger.info(f"Step 5 complete: {generated} new samples, {total_count} total, {elapsed/60:.1f}m elapsed")
 
 
 # ============================================================
