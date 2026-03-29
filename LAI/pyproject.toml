@@ -11,41 +11,31 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "sse-starlette>=2.0",
     "python-multipart>=0.0.18",
-
     # Database
     "asyncpg>=0.30.0",
     "pgvector>=0.3.0",
     "psycopg2-binary>=2.9.11",
-
     # Cache & queue
     "redis>=5.2.0",
     "celery[redis]>=5.4.0",
-
     # Configuration
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
-
     # HTTP client
     "httpx>=0.28.0",
-
     # Document processing
     "docling>=2.0.0",
     "python-docx>=1.1.0",
-
     # Object storage
     "miniopy-async>=1.21.0",
     "minio>=7.2.0",
-
     # Auth
     "python-jose[cryptography]>=3.3.0",
     "passlib[bcrypt]>=1.7.4",
-
     # Monitoring
     "prometheus-client>=0.21.0",
-
     # Retry logic
     "tenacity>=9.0.0",
-
     # Utilities
     "numpy>=1.26.0",
 ]

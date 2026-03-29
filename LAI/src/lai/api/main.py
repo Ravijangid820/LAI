@@ -105,11 +105,13 @@ def create_app() -> FastAPI:
     # Register domain routers
     from lai.auth.routes import router as auth_router
     from lai.documents.routes import router as documents_router
+    from lai.extraction.routes import router as extraction_router
     from lai.search.routes import router as search_router
 
     app.include_router(search_router)
     app.include_router(documents_router)
     app.include_router(auth_router)
+    app.include_router(extraction_router)
 
     return app
 

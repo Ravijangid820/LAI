@@ -1,6 +1,6 @@
 # LAI Project Status
 
-> Last updated: 2026-03-23
+> Last updated: 2026-03-29
 
 This document explains the current state of the LAI project for developers joining the team.
 
@@ -83,6 +83,7 @@ User Query
 │   │   ├── api/                      # FastAPI app, middleware, RAG pipeline orchestrator
 │   │   ├── auth/                     # JWT auth, user CRUD, routes
 │   │   ├── documents/                # Upload, parse, chunk, embed, store
+│   │   ├── extraction/               # Location/geo extraction from legal docs (LLM-based)
 │   │   ├── search/                   # Query analysis, hybrid search, reranking
 │   │   ├── generation/               # LLM client, prompts, CRAG, citation verification
 │   │   ├── infra/                    # Database pool, Redis cache, MinIO client
@@ -181,6 +182,10 @@ uv run pytest -m "not slow"      # Skip slow tests
 | `POST` | `/documents/upload` | Upload PDF/DOCX (parse → chunk → embed → store) |
 | `GET` | `/documents` | List user's uploaded documents |
 | `DELETE` | `/documents/{id}` | Delete a document and its chunks |
+| `POST` | `/extraction/locations/{segment_id}` | Extract geo locations from a segment |
+| `POST` | `/extraction/locations/batch` | Batch extract locations by source |
+| `GET` | `/extraction/locations/{segment_id}` | Get extracted locations for a segment |
+| `GET` | `/extraction/locations/summary` | Location extraction statistics |
 | `POST` | `/auth/register` | Create account |
 | `POST` | `/auth/login` | Get JWT tokens |
 | `GET` | `/auth/me` | Current user info |
@@ -322,6 +327,12 @@ immissionsschutzrecht, energierecht, baurecht, umweltrecht, vertragsrecht, gesel
 - [x] Versioned classification history table (`chunk_classifications`) with audit trail
 - [x] Fixed synth-generator docker-compose for Blackwell GPU compatibility (CUDA 13.0)
 - [x] `--reclassify` and `--model-version` flags for Step 3
+- [x] Step 3 domain classification completed (Phase 1)
+- [x] Step 4 contextual enrichment completed (Phase 1, 217K chunks, 4h 51m)
+- [x] Step 5 fine-tuning data generation in progress (8 concurrent, ~46h ETA)
+- [x] Location/geo extraction module (`lai.extraction`) — LLM-based extraction of geocodable addresses, Flurstücke, coordinates from legal documents
+- [x] Extraction API endpoints (single, batch, summary)
+- [x] Test script for extraction (`scripts/test_extraction.py`)
 
 ---
 
@@ -333,12 +344,14 @@ Processing is done in phases due to storage constraints (~613GB free).
 
 | Source | Step 1 (Convert) | Step 2 (Chunk) | Step 3 (Classify) | Step 4 (Enrich) | Step 5 (Generate) | Step 6 (Embed) |
 |--------|:-:|:-:|:-:|:-:|:-:|:-:|
-| DD Reports (19MB, 18 files) | Done (18 ok, 1 .DOC fail) | Done | In progress | - | - | - |
-| VDRs (6GB, 4.3K files) | Done (5,469 ok, 103 failed) | Done | In progress | - | - | - |
-| de/gesetzes (750MB, 764 files) | Done (6,820 ok, 0 failed) | Done | In progress | - | - | - |
+| DD Reports (19MB, 18 files) | Done | Done | Done | Done | In progress | - |
+| VDRs (6GB, 4.3K files) | Done (103 .xls/.doc failed) | Done | Done | Done | In progress | - |
+| de/gesetzes (750MB, 764 files) | Done | Done | Done | Done | In progress | - |
 
 **Step 2 totals:** 12,307 files → 134,474 parent chunks, 217,165 child chunks (2m 35s)
-**Step 3:** Re-classifying with improved JSON parser + versioned history table (running)
+**Step 3:** Done — reclassified with improved JSON parser + versioned history
+**Step 4:** Done — 217K child chunks enriched with context prefix (4h 51m, 16 concurrent)
+**Step 5:** In progress — ~14K/200K samples generated, 8 concurrent parents, ETA ~46h
 
 ### Phase 2 — Medium sources (~20GB)
 
@@ -360,17 +373,16 @@ Processing is done in phases due to storage constraints (~613GB free).
 
 Priority items:
 
-1. **Complete Step 3 reclassification** — running now (~55 min total)
-2. **Run Step 4** (contextual enrichment) — ~3-4 hours, needs LLM container
-3. **Run Step 5** (training data generation) — ~10-15 hours, needs LLM container
-4. **Run Step 6** (embeddings) — ~1-2 hours, needs embedding container
-5. **Run Phase 2** — hf_cases, openlegaldata, Library (Steps 1-6)
-6. **Run Phase 3** — multilegalpile (German subset only)
-7. **Fine-tune Qwen2.5-7B** — using generated ~200K training samples
-8. **Integration tests** — test full RAG pipeline end-to-end
-9. **German reranker** — current MiniLM is English-only
-10. **CI/CD pipeline** — automated testing/deployment
-11. **Database migrations** — Alembic setup
+1. **Complete Step 5** — training data generation running (~46h ETA, 8 concurrent)
+2. **Run Step 6** (embeddings) — ~1-2 hours, needs Qwen3-Embedding-8B container
+3. **Run Phase 2** — hf_cases, openlegaldata, Library (Steps 1-6)
+4. **Run Phase 3** — multilegalpile (German subset only)
+5. **Fine-tune Qwen2.5-7B** — using generated ~200K training samples
+6. **Geocoding integration** — connect extracted locations to map API (Mapbox/Leaflet)
+7. **Integration tests** — test full RAG pipeline end-to-end
+8. **German reranker** — current MiniLM is English-only
+9. **CI/CD pipeline** — automated testing/deployment
+10. **Database migrations** — Alembic setup
 
 ---
 
@@ -378,8 +390,8 @@ Priority items:
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| Step 3 reclassification running | Previous run had JSON parse errors, re-running with fix | In progress |
-| Steps 4-6 not yet started | Enrichment, training data, embeddings pending | Awaiting Step 3 |
+| Step 5 running (~46h ETA) | Fine-tuning data generation in progress | Running, 8 concurrent |
+| Step 6 not yet started | Embeddings pending | Awaiting Step 5 |
 | Phase 2-3 data not yet processed | ~650GB remaining corpus | After Phase 1 completes |
 | 103 VDR files failed Step 1 | Mostly legacy .xls/.doc formats | Install LibreOffice for conversion |
 | Reranker is English-only (MiniLM) | Suboptimal for German text | Evaluate German alternatives |
@@ -395,6 +407,8 @@ Priority items:
 |------|-------|
 | App config | [src/lai/core/config.py](../src/lai/core/config.py) |
 | Data pipeline | [src/lai/pipeline/](../src/lai/pipeline/) — Steps 1-6 |
+| Location extraction | [src/lai/extraction/](../src/lai/extraction/) — LLM-based geo extraction |
+| Extraction test script | [scripts/test_extraction.py](../scripts/test_extraction.py) |
 | Pipeline progress report | [PIPELINE_PROGRESS_REPORT.md](PIPELINE_PROGRESS_REPORT.md) |
 | Pipeline CLI | `python -m lai.pipeline.cli step1 --help` |
 | RAG pipeline | [src/lai/api/pipeline.py](../src/lai/api/pipeline.py) |
