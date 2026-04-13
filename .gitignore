@@ -68,3 +68,27 @@ Flow Diagram/
 # Processed training data
 LAI/processed/
 Docker/synth-generator/model-cache/
+
+# Runtime caches (HuggingFace model downloads, vLLM compile cache, etc.)
+LAI/.runtime-cache/
+.runtime-cache/
+
+# Additional virtualenvs outside LAI/.venv
+vllm-env/
+*/venv/
+
+# MinIO backups (can be 1TB+ per bucket)
+minio-backup/
+minio-local/
+
+# Native vLLM server logs
+LAI/logs/vllm/
+
+# Pipeline checkpoints and local SQLite DBs
+LAI/processed/*.db
+LAI/processed/*.db-*
+LAI/processed/db_export/
+LAI/processed/pipeline_local.db*
+
+# Top-level scripts folder (personal scripts, not project code)
+/scripts/

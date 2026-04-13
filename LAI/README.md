@@ -59,6 +59,33 @@ uv run python -m lai.pipeline.cli step6 --create-indexes
 
 All steps are idempotent, support `--dry-run`, and handle graceful shutdown (SIGINT/SIGTERM).
 
+## Docker-free Operation
+
+The pipeline can run without PostgreSQL/MinIO/Redis — only the LLM container is required. State lives in SQLite at `processed/pipeline_local.db`.
+
+```bash
+# One-shot resume (auto-starts vLLM container + Step 5)
+./scripts/resume_step5.sh
+./scripts/resume_step5.sh --status   # check progress
+./scripts/resume_step5.sh --stop     # stop Step 5 (keeps LLM up)
+
+# Or run any step in --local mode (reads MinIO bind-mount, writes SQLite)
+uv run python -m lai.pipeline.cli step2 --local
+uv run python -m lai.pipeline.cli step5 --local
+```
+
+Portable database snapshots (built with `python scripts/export_to_sqlite.py all`):
+- `processed/db_export/pipeline.db` (1 GB) — chunks, training samples, classifications
+- `processed/db_export/app.db` (284 GB) — chunks with embeddings as binary BLOBs
+
+Read with no PostgreSQL required:
+```python
+import sqlite3, struct
+conn = sqlite3.connect('processed/db_export/app.db')
+blob = conn.execute("SELECT embedding FROM chunks LIMIT 1").fetchone()[0]
+embedding = list(struct.unpack('1024f', blob))  # 1024-dim vector
+```
+
 ## Documentation
 
 - [Project Status](docs/PROJECT_STATUS.md) — Start here if you're new to the project

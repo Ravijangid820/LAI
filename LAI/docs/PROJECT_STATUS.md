@@ -1,6 +1,6 @@
 # LAI Project Status
 
-> Last updated: 2026-03-29
+> Last updated: 2026-04-12
 
 This document explains the current state of the LAI project for developers joining the team.
 
@@ -351,7 +351,7 @@ Processing is done in phases due to storage constraints (~613GB free).
 **Step 2 totals:** 12,307 files → 134,474 parent chunks, 217,165 child chunks (2m 35s)
 **Step 3:** Done — reclassified with improved JSON parser + versioned history
 **Step 4:** Done — 217K child chunks enriched with context prefix (4h 51m, 16 concurrent)
-**Step 5:** In progress — ~14K/200K samples generated, 8 concurrent parents, ETA ~46h
+**Step 5:** In progress — **~90K/200K samples** (45%) as of 2026-04-12, container LLM (`lai_synth_generator`), 8 concurrent parents
 
 ### Phase 2 — Medium sources (~20GB)
 
@@ -373,7 +373,7 @@ Processing is done in phases due to storage constraints (~613GB free).
 
 Priority items:
 
-1. **Complete Step 5** — training data generation running (~46h ETA, 8 concurrent)
+1. **Complete Step 5** — ~90K/200K samples (45%), resumable via [scripts/resume_step5.sh](../scripts/resume_step5.sh)
 2. **Run Step 6** (embeddings) — ~1-2 hours, needs Qwen3-Embedding-8B container
 3. **Run Phase 2** — hf_cases, openlegaldata, Library (Steps 1-6)
 4. **Run Phase 3** — multilegalpile (German subset only)
@@ -390,7 +390,8 @@ Priority items:
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| Step 5 running (~46h ETA) | Fine-tuning data generation in progress | Running, 8 concurrent |
+| Step 5 in progress (90K/200K, ~45%) | Fine-tuning data generation | Resumable via `scripts/resume_step5.sh`; container vLLM on port 8005 |
+| GPU contention with shared users | vLLM may OOM if other users overfill GPU | Use `--status` flag to check; resume cleanly via SQLite checkpoint |
 | Step 6 not yet started | Embeddings pending | Awaiting Step 5 |
 | Phase 2-3 data not yet processed | ~650GB remaining corpus | After Phase 1 completes |
 | 103 VDR files failed Step 1 | Mostly legacy .xls/.doc formats | Install LibreOffice for conversion |
@@ -398,6 +399,50 @@ Priority items:
 | No fine-tuned model yet | Using base Qwen2.5-7B | Generate training data first (Step 5) |
 | No CI/CD | Manual testing only | Set up GitHub Actions |
 | `LAI/embedding_server/` (2.2GB) | Old BGE-M3 cache, not used by any docker-compose | Safe to delete |
+
+---
+
+## Docker-free Operation (added 2026-04-12)
+
+The pipeline can run with **only the LLM container** (no PostgreSQL, no MinIO, no Redis). All pipeline state lives in SQLite.
+
+### Resume the running pipeline (one command)
+```bash
+./scripts/resume_step5.sh           # starts vLLM container + Step 5
+./scripts/resume_step5.sh --status  # show progress
+./scripts/resume_step5.sh --stop    # stop Step 5 (keeps LLM up)
+```
+
+The script auto-detects whichever container is publishing port 8005
+(`lai-teacher-llm-gpu0`, `lai_synth_generator`, etc.). All Step 5 progress is checkpointed to `processed/pipeline_local.db` after every batch — safe to interrupt at any time.
+
+### Local-mode CLI
+Every pipeline step accepts `--local`:
+```bash
+python -m lai.pipeline.cli step2 --local
+python -m lai.pipeline.cli step5 --local
+```
+Local mode uses [local_storage.py](../src/lai/pipeline/local_storage.py) to:
+- Read MinIO objects directly from `/data/projects/lai/Docker/database/minio/data/`
+- Use SQLite (`processed/pipeline_local.db`) instead of PostgreSQL
+
+### Portable database exports
+SQLite exports of both PG databases live at `LAI/processed/db_export/`:
+- `pipeline.db` (1 GB) — chunks, training samples, classifications
+- `app.db` (284 GB) — chunks with embeddings as binary BLOBs (1024 floats per row)
+
+Decode an embedding in pure Python (no PostgreSQL needed):
+```python
+import sqlite3, struct
+conn = sqlite3.connect('LAI/processed/db_export/app.db')
+blob = conn.execute("SELECT embedding FROM chunks LIMIT 1").fetchone()[0]
+embedding = list(struct.unpack('1024f', blob))  # 1024-dim vector
+```
+
+Regenerate exports anytime PostgreSQL is up:
+```bash
+python scripts/export_to_sqlite.py all
+```
 
 ---
 
@@ -411,6 +456,10 @@ Priority items:
 | Extraction test script | [scripts/test_extraction.py](../scripts/test_extraction.py) |
 | Pipeline progress report | [PIPELINE_PROGRESS_REPORT.md](PIPELINE_PROGRESS_REPORT.md) |
 | Pipeline CLI | `python -m lai.pipeline.cli step1 --help` |
+| Local mode (no PostgreSQL) | `python -m lai.pipeline.cli step2 --local` — see [local_storage.py](../src/lai/pipeline/local_storage.py) |
+| Resume Step 5 (one-shot) | `./scripts/resume_step5.sh` — auto-starts vLLM container + Step 5 |
+| SQLite export of all DB data | `python scripts/export_to_sqlite.py all` — creates portable `.db` files |
+| SQLite exports (location) | `LAI/processed/db_export/pipeline.db` (1GB) and `app.db` (284GB) |
 | RAG pipeline | [src/lai/api/pipeline.py](../src/lai/api/pipeline.py) |
 | Hybrid search SQL | [src/lai/search/hybrid_search.py](../src/lai/search/hybrid_search.py) |
 | Prompt templates | [src/lai/generation/prompt_builder.py](../src/lai/generation/prompt_builder.py) |

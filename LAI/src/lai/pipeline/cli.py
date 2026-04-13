@@ -1028,7 +1028,24 @@ def main():
     p6.add_argument("--dry-run", action="store_true")
     p6.add_argument("--create-indexes", action="store_true", help="Create HNSW + GIN indexes after embedding")
 
+    # Global --local flag on each subparser
+    for p in [p1, p2, p3, p4, p5, p6]:
+        p.add_argument("--local", action="store_true",
+                        help="Run without Docker (read MinIO from disk, use SQLite instead of PostgreSQL)")
+        p.add_argument("--minio-data-dir", type=str, default=None,
+                        help="Path to MinIO bind-mount data dir (auto-detected if omitted)")
+        p.add_argument("--db-path", type=str, default=None,
+                        help="Path to local SQLite database (auto-detected if omitted)")
+
     args = parser.parse_args()
+
+    # Activate local mode if requested
+    if getattr(args, "local", False):
+        from lai.pipeline.local_storage import patch_cli_for_local
+        patch_cli_for_local(
+            minio_data_dir=getattr(args, "minio_data_dir", None),
+            db_path=getattr(args, "db_path", None),
+        )
 
     # Setup logging with auto file output
     log_name = _build_log_name(args.step, args)
