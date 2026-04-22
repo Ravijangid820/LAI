@@ -46,6 +46,19 @@ DATA_DIR    = LAI_DIR / "training" / "fine_tuning" / "data"
 DEFAULT_OUT = LAI_DIR / "training" / "fine_tuning" / "output" / "qwen25-7b-legal-lora"
 
 
+def _pick_attn_impl() -> str:
+    """Return the fastest attention impl actually available.
+
+    flash-attn > sdpa > eager. flash-attn requires a separate compiled
+    package; we don't pin it because it's fragile across CUDA versions.
+    """
+    try:
+        import flash_attn  # noqa: F401
+        return "flash_attention_2"
+    except ImportError:
+        return "sdpa"
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--base-model", default="Qwen/Qwen2.5-7B-Instruct")
@@ -57,6 +70,11 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--per-device-batch", type=int, default=2)
     p.add_argument("--grad-accum", type=int, default=8)
+    p.add_argument("--eval-batch", type=int, default=8,
+                   help="Per-device eval batch size. Larger is safe because eval "
+                        "uses no gradients/optimizer state; bumping this from 2 to "
+                        "8+ makes eval ~4x faster, which matters a lot when evals "
+                        "happen every N train steps.")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--warmup-ratio", type=float, default=0.03)
 
@@ -65,11 +83,19 @@ def parse_args():
     p.add_argument("--lora-dropout", type=float, default=0.05)
 
     p.add_argument("--save-steps",   type=int, default=500)
-    p.add_argument("--eval-steps",   type=int, default=500)
+    p.add_argument("--eval-steps",   type=int, default=1000,
+                   help="Eval every N training steps. Each eval currently takes "
+                        "~2-3 min at --eval-batch=8 on 10K val samples, so eval "
+                        "every 1000 is a reasonable balance vs. total training "
+                        "time (~20 evals over a 24K-step run).")
     p.add_argument("--log-steps",    type=int, default=25)
     p.add_argument("--seed",         type=int, default=42)
     p.add_argument("--no-4bit", action="store_true",
                    help="Disable 4-bit base load (uses bf16 for debugging).")
+    p.add_argument("--no-grad-ckpt", action="store_true",
+                   help="Disable gradient checkpointing — faster but uses more VRAM. "
+                        "Default is on; turn off only when you have headroom "
+                        "(RTX Pro 6000 with batch<=8, seq<=4k has plenty).")
     p.add_argument("--resume", action="store_true",
                    help="Resume from the latest checkpoint in --output-dir.")
     p.add_argument("--limit", type=int, default=0,
@@ -109,7 +135,9 @@ def main():
             args.base_model,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            # transformers picks the best available attention impl; use
+            # flash_attention_2 only if the flash-attn package is installed.
+            attn_implementation=_pick_attn_impl(),
         )
     else:
         bnb = BitsAndBytesConfig(
@@ -122,7 +150,9 @@ def main():
             args.base_model,
             quantization_config=bnb,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            # transformers picks the best available attention impl; use
+            # flash_attention_2 only if the flash-attn package is installed.
+            attn_implementation=_pick_attn_impl(),
         )
     # Prefill cache unused during training; save VRAM
     model.config.use_cache = False
@@ -140,12 +170,16 @@ def main():
         ],
     )
 
+    # load_best_model_at_end requires save_steps to be a multiple of eval_steps;
+    # simplest contract is to save at every eval.
+    save_steps = args.eval_steps
+
     # ---- SFT config ----
     sft = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.per_device_batch,
-        per_device_eval_batch_size=args.per_device_batch,
+        per_device_eval_batch_size=args.eval_batch,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         warmup_ratio=args.warmup_ratio,
@@ -153,13 +187,18 @@ def main():
         optim="paged_adamw_8bit" if not args.no_4bit else "adamw_torch",
         bf16=True,
         tf32=True,
-        gradient_checkpointing=True,
+        gradient_checkpointing=not args.no_grad_ckpt,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=args.log_steps,
-        save_steps=args.save_steps,
+        save_steps=save_steps,
         save_total_limit=3,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
+        # Pick the checkpoint with the lowest val loss at the end. save_total_limit=3
+        # keeps only the 3 best checkpoints on disk, so old worse ones are pruned.
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         max_length=args.max_seq_len,
         packing=False,                 # packing + chat template can corrupt labels
         dataset_text_field="text",

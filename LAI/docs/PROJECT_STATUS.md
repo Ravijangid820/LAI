@@ -377,19 +377,69 @@ Processing is done in phases due to storage constraints (~613GB free).
 
 ---
 
+## Fine-tuning (in progress as of 2026-04-22)
+
+Qwen2.5-7B-Instruct is being LoRA-fine-tuned on the 200K synthetic samples
+from Step 5. Running in tmux session `finetune` on GPU 1.
+
+**Data prep** — [training/fine_tuning/scripts/export_training_data.py](../training/fine_tuning/scripts/export_training_data.py)
+exports `training_samples` from the local SQLite to ChatML JSONL with a
+95/5 stratified split by task_type:
+
+| Task            | Train   | Val   |
+|-----------------|--------:|------:|
+| rag_qa          | 64,163  | 3,377 |
+| classify_qa     | 28,120  | 1,479 |
+| compare         | 27,957  | 1,471 |
+| summarize       | 27,344  | 1,439 |
+| explain         | 26,832  | 1,412 |
+| extract         | 9,354   |   492 |
+| refusal         | 6,238   |   328 |
+| **Total**       | **190,008** | **9,998** |
+
+**Trainer** — [training/fine_tuning/scripts/run_lora.py](../training/fine_tuning/scripts/run_lora.py)
+uses TRL SFTTrainer + PEFT LoRA on a 4-bit-quantized base (bnb NF4, double
+quant, bf16 compute, paged_adamw_8bit). No Unsloth dep. Best checkpoint
+is kept automatically (`load_best_model_at_end`).
+
+**Config in use:**
+- LoRA r=128, α=256, dropout 0.05 on all 7 Qwen projection matrices
+- effective batch = 16 (per-device 2 × grad-accum 8)
+- eval batch = 8 (no gradients → safe to be larger; 4× faster eval)
+- cosine LR 2e-4, warmup 3%, 2 epochs, max_seq_len 4096
+- gradient_checkpointing OFF (RTX Pro 6000 has headroom; ~30% faster)
+- `PYTORCH_ALLOC_CONF=expandable_segments:True` to avoid fragmentation OOM
+- eval + save every 1000 steps (≈20 evals over a ~24K-step run)
+
+**Expected:** ~14h for 2 epochs (with load_best picking the lowest eval_loss checkpoint).
+
+**Lessons learned during tuning** (documented here so nobody repeats them):
+- `per_device_batch=4` triggers a 3.8 GB logits-tensor spike inside TRL's
+  loss path (`shift_logits.contiguous()`) and OOMs even when baseline is 89 GB.
+  Stick to 2 for training, 8 for eval.
+- `eval_strategy="steps"` with `per_device_eval_batch_size=per_device_batch`
+  ends up spending 50% of wall time on eval (10K val samples × 2 bs ≈ 10 min/eval).
+  Use a separate, larger `--eval-batch` and crank up `--eval-steps`.
+- `attn_implementation="flash_attention_2"` hard-fails if flash-attn isn't
+  installed. `run_lora.py::_pick_attn_impl` auto-downgrades to SDPA.
+
 ## What's Next
 
 Priority items:
 
-1. **Fine-tune Qwen2.5-7B** — 200,006 training samples ready in `training_samples` (ChatML, balanced across rag_qa/summarize/explain/compare/extract/classify_qa/refusal)
-2. **Run Phase 2** — hf_cases, openlegaldata, Library (Steps 1-6)
-3. **Run Phase 3** — multilegalpile (German subset only)
-4. **End-to-end RAG smoke test** — query → hybrid search → retrieval → answer
-6. **Geocoding integration** — connect extracted locations to map API (Mapbox/Leaflet)
-7. **Integration tests** — test full RAG pipeline end-to-end
-8. **German reranker** — current MiniLM is English-only
-9. **CI/CD pipeline** — automated testing/deployment
-10. **Database migrations** — Alembic setup
+1. **Wait for fine-tune to finish** (ETA 2026-04-23 ~13:00), inspect
+   eval_loss curve, merge best adapter into a deployable checkpoint
+2. **Evaluate fine-tuned model** against base Qwen2.5-7B on a held-out
+   set of German legal Q&A (reuse val.jsonl)
+3. **Wire fine-tuned model into the RAG pipeline** (replace `Qwen/Qwen2.5-7B-Instruct` in config with the merged model path)
+4. **Run Phase 2** — hf_cases, openlegaldata, Library (Steps 1-6)
+5. **Run Phase 3** — multilegalpile (German subset only)
+6. **End-to-end RAG smoke test** — query → hybrid search → retrieval → answer
+7. **Geocoding integration** — connect extracted locations to map API (Mapbox/Leaflet)
+8. **Integration tests** — test full RAG pipeline end-to-end
+9. **German reranker** — current MiniLM is English-only
+10. **CI/CD pipeline** — automated testing/deployment
+11. **Database migrations** — Alembic setup
 
 ---
 
@@ -398,13 +448,12 @@ Priority items:
 | Issue | Impact | Status |
 |-------|--------|--------|
 | Phase 1 Steps 1-6 all complete | Pipeline data ready for training + RAG | — |
+| Fine-tune running | LoRA on Qwen2.5-7B, tmux session `finetune`, GPU 1 | ETA ~14h (see Fine-tuning section) |
 | GPU contention with shared users | vLLM may OOM if another job overfills a GPU | `./scripts/resume_step5.sh --status` to diagnose; resume cleanly via SQLite checkpoint |
 | No HNSW index on embeddings | 4096 dims > halfvec HNSW limit of 4000 | Use exact cosine search with domain/doc_type pre-filters; 217K rows is fast enough |
-| Step 6 not yet started | Embeddings pending | Awaiting Step 5 |
 | Phase 2-3 data not yet processed | ~650GB remaining corpus | After Phase 1 completes |
 | 103 VDR files failed Step 1 | Mostly legacy .xls/.doc formats | Install LibreOffice for conversion |
 | Reranker is English-only (MiniLM) | Suboptimal for German text | Evaluate German alternatives |
-| No fine-tuned model yet | Using base Qwen2.5-7B | Generate training data first (Step 5) |
 | No CI/CD | Manual testing only | Set up GitHub Actions |
 | `LAI/embedding_server/` (2.2GB) | Old BGE-M3 cache, not used by any docker-compose | Safe to delete |
 
@@ -468,6 +517,9 @@ python scripts/export_to_sqlite.py all
 | Resume Step 5 (one-shot) | `./scripts/resume_step5.sh` — auto-starts vLLM container + Step 5 |
 | SQLite export of all DB data | `python scripts/export_to_sqlite.py all` — creates portable `.db` files |
 | SQLite exports (location) | `LAI/processed/db_export/pipeline.db` (1GB) and `app.db` (284GB) |
+| Export training data to JSONL | `python -m training.fine_tuning.scripts.export_training_data` |
+| Run LoRA fine-tune | `python -m training.fine_tuning.scripts.run_lora --epochs 2` (see script for all flags) |
+| Training outputs | `training/fine_tuning/output/qwen25-7b-legal-lora/` (adapter + best checkpoint) |
 | RAG pipeline | [src/lai/api/pipeline.py](../src/lai/api/pipeline.py) |
 | Hybrid search SQL | [src/lai/search/hybrid_search.py](../src/lai/search/hybrid_search.py) |
 | Prompt templates | [src/lai/generation/prompt_builder.py](../src/lai/generation/prompt_builder.py) |
