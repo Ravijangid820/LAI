@@ -93,3 +93,7 @@ LAI/processed/pipeline_local.db*
 
 # Top-level scripts folder (personal scripts, not project code)
 /scripts/
+
+# Fine-tune JSONL exports and checkpoints (large, reproducible from SQLite)
+LAI/training/fine_tuning/data/
+LAI/training/fine_tuning/output/
