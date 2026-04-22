@@ -299,6 +299,21 @@ class LocalDB:
         )
         conn.commit()
 
+    def executemany(self, query: str, rows: list):
+        """Batch write — single commit for the whole batch.
+
+        Use this instead of calling execute() in a loop when writing many
+        rows; a per-row commit triggers an fsync and is ~100x slower.
+        """
+        conn = self._get_conn()
+        query = _pg_to_sqlite(query)
+        try:
+            conn.executemany(query, rows)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
     def close(self):
         if hasattr(self._local, "conn") and self._local.conn:
             self._local.conn.close()

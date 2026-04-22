@@ -93,13 +93,22 @@ class MinIOSettings(BaseSettings):
 # ---------------------------------------------------------------------------
 
 class EmbeddingSettings(BaseSettings):
-    """Embedding service configuration (Qwen3-Embedding-8B via vLLM)."""
+    """Embedding service configuration (Qwen3-Embedding-8B via vLLM).
+
+    Qwen3-Embedding-8B is a dense 4096-dim embedding model (native hidden_size).
+    The model does NOT support Matryoshka truncation, so we use full dims.
+
+    Storage: pgvector `halfvec(4096)` (fp16, 2x smaller than fp32 vector).
+    Index: exact cosine search — 4096 dims exceeds pgvector's HNSW limit
+    (vector: 2000, halfvec: 4000). At 217K rows, exact search is fast
+    enough (<100ms/query) with pre-filters on domain/doc_type.
+    """
 
     model_config = SettingsConfigDict(**{**_COMMON_CONFIG, "env_prefix": "EMBEDDING_"})
 
     url: str = "http://localhost:8003"
     model: str = "Qwen/Qwen3-Embedding-8B"
-    dimension: int = Field(default=1024, ge=1)
+    dimension: int = Field(default=4096, ge=1)
     batch_size: int = Field(default=32, ge=1, le=256)
     timeout: float = Field(default=60.0, ge=1, le=300)
     max_retries: int = Field(default=3, ge=0, le=10)

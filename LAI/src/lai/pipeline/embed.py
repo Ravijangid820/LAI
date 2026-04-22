@@ -44,6 +44,10 @@ def embed_batch(
         payload = {
             "model": embed_model,
             "input": batch,
+            # Belt-and-suspenders truncation at the tokenizer level. The
+            # embedding service runs with max-model-len=32768, so this only
+            # kicks in for pathologically long chunks.
+            "truncate_prompt_tokens": 32000,
         }
 
         try:
@@ -54,7 +58,9 @@ def embed_batch(
             )
             resp.raise_for_status()
         except httpx.HTTPError as e:
-            logger.error(f"Embedding API request failed (batch {batch_num}/{total_batches}): {e}")
+            logger.error(
+                f"Embedding API request failed (batch {batch_num}/{total_batches}): {e}"
+            )
             raise
 
         data = resp.json()["data"]

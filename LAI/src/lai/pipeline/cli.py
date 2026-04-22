@@ -869,43 +869,101 @@ def run_step5(args):
 # Step 6: Embeddings → pgvector
 # ============================================================
 
+def _format_pgvector(emb):
+    """Format a Python list of floats as a pgvector/halfvec string literal.
+
+    pgvector accepts '[f1,f2,...]' for both `vector` and `halfvec` when
+    cast explicitly (`::halfvec`). This avoids needing the pgvector-python
+    adapter while still being type-safe.
+    """
+    return "[" + ",".join(f"{x:.7g}" for x in emb) + "]"
+
+
 def run_step6(args):
-    """Step 6: Generate embeddings and tsvector for child chunks."""
+    """Step 6: Generate embeddings and tsvector for child chunks.
+
+    Qwen3-Embedding-8B outputs 4096-dim vectors natively. Stored as
+    `halfvec(4096)` (fp16) in pgvector, which halves storage vs `vector`.
+    No HNSW index — 4096 dims exceed pgvector's HNSW limit (4000 for halfvec).
+    Exact cosine search is fast enough for 217K rows with pre-filters.
+
+    In --local mode embeddings are written as INSERTs to a dedicated
+    `child_embeddings(child_id PK, embedding BLOB)` table. UPDATE on a
+    BLOB column in the main child_chunks table triggers btree rebalancing
+    and is ~100× slower than a clean INSERT into a fresh table.
+    """
     from lai.pipeline.embed import embed_batch, build_search_text
 
     settings = get_settings()
     embed_cfg = settings.embedding
     batch_size = args.batch_size
     embed_batch_size = args.embed_batch_size
+    local_mode = getattr(args, "local", False)
 
     logger.info("=" * 60)
-    logger.info("Step 6: Embeddings → pgvector")
+    logger.info("Step 6: Embeddings → pgvector (halfvec 4096)")
     logger.info(f"  Model: {embed_cfg.model}")
     logger.info(f"  URL: {embed_cfg.url}")
     logger.info(f"  Dimension: {embed_cfg.dimension}")
+    logger.info(f"  Mode: {'local (SQLite)' if local_mode else 'postgres (halfvec)'}")
     logger.info("=" * 60)
 
-    # Count children without embeddings
-    rows = _db_fetch("SELECT COUNT(*) FROM child_chunks WHERE embedding IS NULL")
-    total_unembedded = rows[0][0]
+    # In local mode, ensure the sidecar table exists and is populated from
+    # any pre-existing embeddings in child_chunks (from an older run).
+    if local_mode:
+        pool = _get_db()
+        pool.execute("""
+            CREATE TABLE IF NOT EXISTS child_embeddings (
+                child_id  INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        # Migrate legacy rows where the embedding was written into child_chunks.
+        pool.execute("""
+            INSERT OR IGNORE INTO child_embeddings (child_id, embedding)
+            SELECT id, embedding FROM child_chunks WHERE embedding IS NOT NULL
+        """)
+        total_unembedded = pool.fetch("""
+            SELECT COUNT(*) FROM child_chunks c
+            WHERE NOT EXISTS (SELECT 1 FROM child_embeddings e WHERE e.child_id = c.id)
+        """)[0][0]
+    else:
+        rows = _db_fetch("SELECT COUNT(*) FROM child_chunks WHERE embedding IS NULL")
+        total_unembedded = rows[0][0]
+
     logger.info(f"Found {total_unembedded} child chunks without embeddings")
 
     if args.dry_run:
         return
 
     embedded = 0
+    last_id = 0  # primary-key cursor
 
     while not _shutdown:
-        child_rows = _db_fetch("""
-            SELECT id, content, context_prefix
-            FROM child_chunks
-            WHERE embedding IS NULL
-            ORDER BY id
-            LIMIT %s
-        """, (batch_size,))
+        if local_mode:
+            # LEFT join against the sidecar table — primary-key index on
+            # both sides, so this is O(log n) per iteration.
+            child_rows = _db_fetch("""
+                SELECT c.id, c.content, c.context_prefix
+                FROM child_chunks c
+                LEFT JOIN child_embeddings e ON e.child_id = c.id
+                WHERE c.id > %s AND e.child_id IS NULL
+                ORDER BY c.id
+                LIMIT %s
+            """, (last_id, batch_size))
+        else:
+            child_rows = _db_fetch("""
+                SELECT id, content, context_prefix
+                FROM child_chunks
+                WHERE id > %s AND embedding IS NULL
+                ORDER BY id
+                LIMIT %s
+            """, (last_id, batch_size))
 
         if not child_rows:
             break
+        last_id = child_rows[-1][0]
 
         ids = [r[0] for r in child_rows]
         texts = [build_search_text(r[1], r[2] or "") for r in child_rows]
@@ -922,41 +980,60 @@ def run_step6(args):
             logger.error(f"Embedding API error: {e}")
             break
 
-        pool = _get_db()
-        conn = pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                for child_id, emb, text in zip(ids, embeddings, texts):
-                    # Update embedding and tsvector
-                    cur.execute("""
-                        UPDATE child_chunks
-                        SET embedding = %s::vector,
-                            search_vector = to_tsvector('german', %s)
-                        WHERE id = %s
-                    """, (emb, text[:50000], child_id))
-            conn.commit()
+        if local_mode:
+            # SQLite path: INSERT into a dedicated child_embeddings table.
+            # UPDATE on the main child_chunks table's embedding column
+            # triggers btree page splits and is ~100× slower.
+            # search_vector is not populated in local mode (SQLite lacks
+            # tsvector); BM25 is only used on the postgres deployment.
+            import struct
+            pool = _get_db()  # patched to LocalDB
+            insert_rows = [
+                (child_id, struct.pack(f"{len(emb)}f", *emb))
+                for child_id, emb in zip(ids, embeddings)
+            ]
+            pool.executemany(
+                "INSERT OR REPLACE INTO child_embeddings (child_id, embedding) VALUES (?, ?)",
+                insert_rows,
+            )
             embedded += len(ids)
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"DB update error: {e}")
-            break
-        finally:
-            pool.putconn(conn)
+        else:
+            # PostgreSQL path: cast to halfvec(4096)
+            pool = _get_db()
+            conn = pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    for child_id, emb, text in zip(ids, embeddings, texts):
+                        cur.execute("""
+                            UPDATE child_chunks
+                            SET embedding = %s::halfvec,
+                                search_vector = to_tsvector('german', %s)
+                            WHERE id = %s
+                        """, (_format_pgvector(emb), text[:50000], child_id))
+                conn.commit()
+                embedded += len(ids)
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"DB update error: {e}")
+                break
+            finally:
+                pool.putconn(conn)
 
         logger.info(f"Progress: {embedded}/{total_unembedded} embedded")
 
-    # Optionally create indexes after all embeddings are done
-    if args.create_indexes and not _shutdown:
-        logger.info("Creating HNSW index on embeddings (this may take a while)...")
-        _db_execute("""
-            CREATE INDEX IF NOT EXISTS idx_child_embedding ON child_chunks
-            USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 200)
-        """)
-        logger.info("Creating GIN index on search_vector...")
+    # Only GIN index on search_vector (BM25); no HNSW — dims too large.
+    # Exact cosine search is used at query time.
+    if args.create_indexes and not _shutdown and not local_mode:
+        logger.info("Creating GIN index on search_vector (BM25)...")
         _db_execute("""
             CREATE INDEX IF NOT EXISTS idx_child_search ON child_chunks
             USING gin (search_vector)
         """)
+        logger.info(
+            "Skipping HNSW on embedding: 4096 dims > pgvector halfvec HNSW "
+            "limit of 4000. Use exact search at query time (fast enough for "
+            "217K rows with pre-filters)."
+        )
         logger.info("Indexes created successfully")
 
     logger.info(f"Step 6 complete: {embedded} child chunks embedded")

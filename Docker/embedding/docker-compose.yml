@@ -1,7 +1,16 @@
 # Embedding Service (Qwen3-Embedding-8B via vLLM) — GPU 0
+#
+# Qwen3-Embedding-8B: #1 multilingual MTEB, 1024-dim vectors, matches DB schema.
+# vLLM 0.8+ auto-detects embedding models — no --task flag needed.
+#
 # Usage:
 #   docker compose up -d
 #   docker compose down
+#
+# Memory notes:
+#   - ~16GB weights (fp16) + KV cache; stay under GPU free memory
+#   - If GPU 0 is busy (e.g. Qwen 72B running), drop gpu-memory-utilization
+#     or move to GPU 1 via `device_ids: ['1']`
 
 services:
   embedding:
@@ -9,13 +18,16 @@ services:
     container_name: lai_embedding
     restart: unless-stopped
     ipc: host
+    # Model as positional arg (the `--model` flag is deprecated in vLLM 0.8+)
+    # max-model-len 32768: matches Qwen3 training (up to 40960); embeds full
+    # child chunks without truncation. Needs headroom — set EMBEDDING_GPU_MEM
+    # to 0.45+ if teacher LLM is stopped, or keep 0.22 only if max-len is small.
     command: >
-      --model ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-8B}
-      --task embed
+      ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-8B}
       --dtype auto
       --trust-remote-code
-      --max-model-len 8192
-      --gpu-memory-utilization 0.15
+      --max-model-len 32768
+      --gpu-memory-utilization ${EMBEDDING_GPU_MEM:-0.45}
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
     volumes:
@@ -27,7 +39,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 10
-      start_period: 180s
+      start_period: 300s
     networks:
       - lai_network
     deploy:
@@ -35,7 +47,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['0']
+              device_ids: ['${EMBEDDING_GPU:-0}']
               capabilities: [gpu]
 
 networks:

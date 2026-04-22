@@ -1,6 +1,6 @@
 # LAI Project Status
 
-> Last updated: 2026-04-12
+> Last updated: 2026-04-22
 
 This document explains the current state of the LAI project for developers joining the team.
 
@@ -344,14 +344,22 @@ Processing is done in phases due to storage constraints (~613GB free).
 
 | Source | Step 1 (Convert) | Step 2 (Chunk) | Step 3 (Classify) | Step 4 (Enrich) | Step 5 (Generate) | Step 6 (Embed) |
 |--------|:-:|:-:|:-:|:-:|:-:|:-:|
-| DD Reports (19MB, 18 files) | Done | Done | Done | Done | In progress | - |
-| VDRs (6GB, 4.3K files) | Done (103 .xls/.doc failed) | Done | Done | Done | In progress | - |
-| de/gesetzes (750MB, 764 files) | Done | Done | Done | Done | In progress | - |
+| DD Reports (19MB, 18 files) | Done | Done | Done | Done | Done | Done |
+| VDRs (6GB, 4.3K files) | Done (103 .xls/.doc failed) | Done | Done | Done | Done | Done |
+| de/gesetzes (750MB, 764 files) | Done | Done | Done | Done | Done | Done |
 
-**Step 2 totals:** 12,307 files → 134,474 parent chunks, 217,165 child chunks (2m 35s)
-**Step 3:** Done — reclassified with improved JSON parser + versioned history
-**Step 4:** Done — 217K child chunks enriched with context prefix (4h 51m, 16 concurrent)
-**Step 5:** In progress — **~90K/200K samples** (45%) as of 2026-04-12, container LLM (`lai_synth_generator`), 8 concurrent parents
+**Phase 1 all steps complete (as of 2026-04-22):**
+- **Step 2:** 12,307 files → 134,474 parent chunks, 217,165 child chunks (2m 35s)
+- **Step 3:** reclassified with improved JSON parser + versioned history
+- **Step 4:** 217K child chunks enriched with context prefix (4h 51m, 16 concurrent)
+- **Step 5:** 200,006 fine-tuning samples generated (target: 200,000; overshoot by 6)
+- **Step 6:** 217,165 child chunks embedded with Qwen3-Embedding-8B (4096-dim, halfvec on PG, fp32 BLOB in SQLite; 1h 36m)
+
+**Embedding storage change (2026-04-22):**
+- Dimension **1024 → 4096** (Qwen3-Embedding-8B's native, no Matryoshka support)
+- Schema **`vector(1024)` → `halfvec(4096)`** on PostgreSQL (migration [`02_migrate_halfvec.sql`](../../Docker/database/pgvector/init/02_migrate_halfvec.sql))
+- No HNSW index (4096 dims exceeds pgvector's 4000 halfvec limit) — use exact cosine search with pre-filters
+- In `--local` mode, embeddings live in a dedicated `child_embeddings(child_id PK, embedding BLOB)` SQLite table (INSERT is ~100× faster than UPDATEing a BLOB column on the main `child_chunks` table)
 
 ### Phase 2 — Medium sources (~20GB)
 
@@ -373,11 +381,10 @@ Processing is done in phases due to storage constraints (~613GB free).
 
 Priority items:
 
-1. **Complete Step 5** — ~90K/200K samples (45%), resumable via [scripts/resume_step5.sh](../scripts/resume_step5.sh)
-2. **Run Step 6** (embeddings) — ~1-2 hours, needs Qwen3-Embedding-8B container
-3. **Run Phase 2** — hf_cases, openlegaldata, Library (Steps 1-6)
-4. **Run Phase 3** — multilegalpile (German subset only)
-5. **Fine-tune Qwen2.5-7B** — using generated ~200K training samples
+1. **Fine-tune Qwen2.5-7B** — 200,006 training samples ready in `training_samples` (ChatML, balanced across rag_qa/summarize/explain/compare/extract/classify_qa/refusal)
+2. **Run Phase 2** — hf_cases, openlegaldata, Library (Steps 1-6)
+3. **Run Phase 3** — multilegalpile (German subset only)
+4. **End-to-end RAG smoke test** — query → hybrid search → retrieval → answer
 6. **Geocoding integration** — connect extracted locations to map API (Mapbox/Leaflet)
 7. **Integration tests** — test full RAG pipeline end-to-end
 8. **German reranker** — current MiniLM is English-only
@@ -390,8 +397,9 @@ Priority items:
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| Step 5 in progress (90K/200K, ~45%) | Fine-tuning data generation | Resumable via `scripts/resume_step5.sh`; container vLLM on port 8005 |
-| GPU contention with shared users | vLLM may OOM if other users overfill GPU | Use `--status` flag to check; resume cleanly via SQLite checkpoint |
+| Phase 1 Steps 1-6 all complete | Pipeline data ready for training + RAG | — |
+| GPU contention with shared users | vLLM may OOM if another job overfills a GPU | `./scripts/resume_step5.sh --status` to diagnose; resume cleanly via SQLite checkpoint |
+| No HNSW index on embeddings | 4096 dims > halfvec HNSW limit of 4000 | Use exact cosine search with domain/doc_type pre-filters; 217K rows is fast enough |
 | Step 6 not yet started | Embeddings pending | Awaiting Step 5 |
 | Phase 2-3 data not yet processed | ~650GB remaining corpus | After Phase 1 completes |
 | 103 VDR files failed Step 1 | Mostly legacy .xls/.doc formats | Install LibreOffice for conversion |

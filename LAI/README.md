@@ -8,7 +8,7 @@ Legal AI platform for wind energy due diligence. Answers legal questions using R
 - **Data Pipeline:** Raw documents → segments → parent-child chunks → domain classification → contextual enrichment → fine-tuning data → embeddings
 - **Models:**
   - LLM: Qwen2.5-7B-Instruct (inference), Qwen2.5-72B-Instruct-AWQ (pipeline, tensor-parallel 2 GPUs)
-  - Embedding: Qwen3-Embedding-8B (1024 dims, #1 MTEB multilingual)
+  - Embedding: Qwen3-Embedding-8B (**4096 dims**, #1 MTEB multilingual; `halfvec(4096)` on Postgres, exact cosine search — 4096 exceeds pgvector's HNSW limit)
   - Reranker: ms-marco-MiniLM-L-12-v2
 - **Infrastructure:** PostgreSQL + pgvector, Redis, MinIO, vLLM — all self-hosted
 - **Hardware:** 2x RTX Pro 6000 GPUs (96GB VRAM each)

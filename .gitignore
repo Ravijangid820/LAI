@@ -44,6 +44,7 @@ Libary/
 qdrant/
 logs/
 LAIV1/
+LAIV3
 
 # Office docs (not code)
 *.docx
