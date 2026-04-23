@@ -1,0 +1,433 @@
+{
+  "task": "rag_qa",
+  "n": 10,
+  "metrics": {
+    "recall@1": 0.3,
+    "recall@3": 0.6,
+    "recall@5": 0.7,
+    "recall@10": 0.7,
+    "mrr": 0.4533333333333333
+  },
+  "results": [
+    {
+      "question": "Welche technischen Parameter sind im Vorhaben- und Erschließungsplan der Gemeinde Hatten für Windenergieanlagen (WEA) festgesetzt worden?",
+      "ref_answer": "Im Vorhaben- und Erschließungsplan der Gemeinde Hatten aus dem Jahr 2001 wurden die folgenden technischen Parameter für Windenergieanlagen festgesetzt: max. Nabenhöhen von 98 m, eine max. Nennleistung von 1,8 MW und ein max. Rotordurchmesser von 70 m (siehe Rechtstext, letzter Absatz vor dem letzten Satz).",
+      "gold_parent": 287,
+      "top_parents": [
+        287,
+        286,
+        292,
+        573,
+        573,
+        573,
+        282,
+        284,
+        573,
+        32744
+      ],
+      "top_child_ids": [
+        337,
+        336,
+        347,
+        1335,
+        1334,
+        1336,
+        332,
+        334,
+        1333,
+        51758
+      ],
+      "top_sims": [
+        0.785218358039856,
+        0.747794508934021,
+        0.6778860092163086,
+        0.6515805721282959,
+        0.643632173538208,
+        0.6347489356994629,
+        0.6236070990562439,
+        0.6196483373641968,
+        0.6065635681152344,
+        0.604604184627533
+      ],
+      "rank": 1
+    },
+    {
+      "question": "Welche Steuerberatungsgesellschaft ist für die NeXtWind Windpark Beteiligung III GmbH & Co. KG zuständig und welche Kontaktdaten sind hierfür angegeben?",
+      "ref_answer": "Die zuständige Steuerberatungsgesellschaft für die NeXtWind Windpark Beteiligung III GmbH & Co. KG ist die Steuerberatungsgesellschaft mbH Dantax mit den folgenden Kontaktdaten: Sigrun Scherff, Telefon +49 461 700 35-0, Fax +49 461 700 35-99, E-Mail scherff@dantax.dk, Web: www.dantax.dk.",
+      "gold_parent": 294,
+      "top_parents": [
+        302,
+        294,
+        2038,
+        2038,
+        5897,
+        5638,
+        5903,
+        5559,
+        5882,
+        5625
+      ],
+      "top_child_ids": [
+        359,
+        349,
+        2948,
+        2947,
+        8523,
+        8184,
+        8533,
+        8080,
+        8506,
+        8165
+      ],
+      "top_sims": [
+        0.8102083206176758,
+        0.8100596070289612,
+        0.6301944851875305,
+        0.626273512840271,
+        0.6004117727279663,
+        0.5958189964294434,
+        0.5956372618675232,
+        0.5923405885696411,
+        0.5916132926940918,
+        0.590449333190918
+      ],
+      "rank": 2
+    },
+    {
+      "question": "Welches Verantwortungsspektrum haben die Prüfer im Zusammenhang mit der Lektüre und Bewertung der Leitungsaussage?",
+      "ref_answer": "Die Prüfer sind verantwortlich, die Leitungsaussage zu lesen und zu überprüfen, ob sie wesentlich inkonsistent mit dem Jahresabschluss oder dem Wissen ist, das bei der erweiterten Prüfung des Jahresabschlusses erlangt wurde, oder ob sie wesentliche Fehlinformationen enthält (vgl. 'I tilknytning til vores udvidede gennemgang af årsregnskabet er det vores ansvar at læse ledelsesberetningen og i den forbindelse overveje, om ledelsesberetningen er væsentligt inkonsistent med årsregnskabet eller vores viden opnået ved den udvidede gennemgang eller på anden måde synes at indeholde væsentlig fejlinformation'). Zudem müssen die Prüfer prüfen, ob die Leitungsaussage die nach Gesetz geforderten Informationen enthält (vgl. 'Vores ansvar er derudover at overveje, om ledelsesberetningen indeholder krævede oplysninger i henhold til årsregnskabsloven').",
+      "gold_parent": 329,
+      "top_parents": [
+        3247,
+        104542,
+        4028,
+        3258,
+        1110,
+        1247,
+        1048,
+        1083,
+        1187,
+        1220
+      ],
+      "top_child_ids": [
+        4483,
+        102220,
+        5500,
+        4494,
+        1652,
+        1810,
+        1580,
+        1620,
+        1742,
+        1779
+      ],
+      "top_sims": [
+        0.6689389944076538,
+        0.667375922203064,
+        0.6486566662788391,
+        0.6476564407348633,
+        0.6315213441848755,
+        0.6309595704078674,
+        0.6272752285003662,
+        0.6261188983917236,
+        0.6236647963523865,
+        0.623563826084137
+      ],
+      "rank": null
+    },
+    {
+      "question": "Welche Kriterien müssen erfüllt sein, damit ein Aktiv in die Bilanz aufgenommen wird?",
+      "ref_answer": "Ein Aktiv wird in die Bilanz aufgenommen, wenn es aufgrund einer früheren Ereignis wahrscheinlich ist, dass zukünftige wirtschaftliche Vorteile dem Unternehmen zufallen werden, und wenn der Wert des Aktivs zuverlässig gemessen werden kann (siehe Text: 'Aktiver indregnes i balancen, når det som følge af en tidligere begivenhed er sandsynligt, at fremtidige økonomiske fordele vil tilflyd virksomheden, og aktivets værdi kan måles pålideligt.')",
+      "gold_parent": 346,
+      "top_parents": [
+        2748,
+        2795,
+        2773,
+        3207,
+        3218,
+        3228,
+        3291,
+        3238,
+        4050,
+        4000
+      ],
+      "top_child_ids": [
+        3789,
+        3860,
+        3824,
+        4443,
+        4454,
+        4464,
+        4527,
+        4474,
+        5522,
+        5472
+      ],
+      "top_sims": [
+        0.6706094145774841,
+        0.6706094145774841,
+        0.6705403923988342,
+        0.6555860042572021,
+        0.6553499698638916,
+        0.6553499698638916,
+        0.6553499698638916,
+        0.6553499102592468,
+        0.654304027557373,
+        0.654304027557373
+      ],
+      "rank": null
+    },
+    {
+      "question": "Welche Dokumente sind erforderlich, um die aktuelle rechtliche Struktur und den Gesellschafterstand der SPV und der Infrastrukturgesellschaften vollständig zu dokumentieren?",
+      "ref_answer": "Um die aktuelle rechtliche Struktur und den Gesellschafterstand der SPV und der Infrastrukturgesellschaften vollständig zu dokumentieren, sind die folgenden Dokumente erforderlich:\n- Die Satzung (in beglaubigter Form) in der derzeit geltenden Fassung und aktuelle Eintragungen aus dem Handelsregister für die SPV oder ältere Eintragungen, falls die SPV unter einer anderen Nummer oder bei einem anderen Handelsregister eingetragen war, sowie anhängige Anträge.\n- Alle Gesellschafterbeschlüsse.\n- Kopien der Jahresabschlüsse der SPV (und der Infrastrukturgesellschaften) für die gesamte Dauer des Windparks, mindestens für die letzten drei Jahre.\n- Details, einschließlich Kopien aller Vereinbarungen, anderer relevanter Dokumente oder anderer Anordnungen, die Optionen, Rechte bei einem Kontrollwechsel, Vorkaufsrechte und andere Rechte zur Erwerb von Beteiligungen an der SPV (und den Infrastrukturgesellschaften) geschaffen haben (oder schaffen können).\n- Vollständige Details über alle Beteiligungen oder Aktien, die von der SPV (und den Infrastrukturgesellschaften) gehalten werden, einschließlich der aktuellen Gesellschafterliste, die beim Handelsregister eingetragen ist, durch eine vollständige Kette der Titel, Gründungsurkunden (z.B. Gründungsurkunde oder Satzung) und Satzungen aller jeweiligen Tochtergesellschaften, stille Gesellschaften sowie die Gewährung von Gewinnbeteiligungsrrechten und Unterbeteiligungen oder Darlehen mit Gewinnbeteiligung und aller Vereinbarungen über die Aktien sowie Vereinbarungen jeglicher Art bezüglich Sicherheiten auf die Aktien in Sach- oder Persönlichkeitsrechten (Pfandrecht, Sicherheitsabtretungen, Nutzungsrecht und Übertragung von Rechten an Aktien, Gewährung von Aktienoptionen) oder Einschränkungen der Veräußerung der Aktien, jegliche Treuhand- oder Treuhandbeziehungen.",
+      "gold_parent": 348,
+      "top_parents": [
+        79915,
+        79915,
+        348,
+        79915,
+        504,
+        170771,
+        79915,
+        502,
+        163151,
+        504
+      ],
+      "top_child_ids": [
+        62398,
+        62394,
+        405,
+        62396,
+        1130,
+        212648,
+        62397,
+        1124,
+        200707,
+        1129
+      ],
+      "top_sims": [
+        0.6976613402366638,
+        0.6685646176338196,
+        0.6606776714324951,
+        0.6414052248001099,
+        0.6330217123031616,
+        0.6230008602142334,
+        0.6187743544578552,
+        0.6102324724197388,
+        0.6071503162384033,
+        0.6066107749938965
+      ],
+      "rank": 3
+    },
+    {
+      "question": "Welche Kosten sind laut § 6 des Gesellschaftsvertrages von der Hude Netz GbR zu tragen und wie werden die Einnahmen verteilt?",
+      "ref_answer": "Laut § 6 des Gesellschaftsvertrages sind die Kosten für elektrische Energie, Telekommunikation, Wartung und Instandhaltung der gemeinsamen Infrastruktureinrichtungen sowie die Kosten für die EPK-Verträge und die Vergütung an sämtliche Grundstückseigentümer sowie sonstige GbR-bezogene Kosten von der Hude Netz GbR zu tragen. Der nach Abzug der vorgenannten Kosten verbleibende Betrag wird an die Betreiber der 9 WEA entsprechend der tatsächlichen Produktion der einzelnen WEA von der Hude Netz GbR an die 9 WEA-Betreiber ausgekehrt. Dementsprechend findet kein Pooling der Einnahmen der 9 WEA statt.",
+      "gold_parent": 372,
+      "top_parents": [
+        372,
+        371,
+        372,
+        28608,
+        371,
+        29339,
+        24567,
+        35361,
+        79151,
+        38140
+      ],
+      "top_child_ids": [
+        537,
+        533,
+        536,
+        44618,
+        532,
+        45561,
+        39327,
+        55263,
+        61295,
+        58704
+      ],
+      "top_sims": [
+        0.7370337247848511,
+        0.7140192985534668,
+        0.6811734437942505,
+        0.6322541832923889,
+        0.6205325126647949,
+        0.6173986196517944,
+        0.6164894104003906,
+        0.6019980907440186,
+        0.6019980907440186,
+        0.6019980907440186
+      ],
+      "rank": 1
+    },
+    {
+      "question": "Welche Sicherheiten wurden für die Finanzierung der K/S Wind Partner 35 bei der Jyske Bank A/S vereinbart und welche Laufzeiten gelten für diese Kredite?",
+      "ref_answer": "Für die Finanzierung der K/S Wind Partner 35 bei der Jyske Bank A/S wurden folgende Sicherheiten vereinbart: Kreditbürgschaften und persönliche Bürgschaften der 3 Gesellschafter sowie die Sicherungsübereignung der WEA. Die Laufzeit der Kredite bei der Jyske Bank A/S läuft bis zum 01.09.2020 (siehe Rechtstext: 'Die Laufzeit der Kredite bei der Jyske Bank A/S laufen für die K/S Wind Partner 35 bis zum 01.09.2020.').",
+      "gold_parent": 387,
+      "top_parents": [
+        387,
+        392,
+        387,
+        32139,
+        2202,
+        25657,
+        406,
+        405,
+        26209,
+        32139
+      ],
+      "top_child_ids": [
+        626,
+        653,
+        625,
+        49947,
+        3150,
+        40954,
+        726,
+        725,
+        41655,
+        49948
+      ],
+      "top_sims": [
+        0.8567705154418945,
+        0.7432193756103516,
+        0.732225239276886,
+        0.6999861001968384,
+        0.6549057364463806,
+        0.6541838645935059,
+        0.6535589694976807,
+        0.6453092098236084,
+        0.6401593685150146,
+        0.6272556781768799
+      ],
+      "rank": 1
+    },
+    {
+      "question": "Welche Klausel des AOM 4000-Vertrags regelt die Laufzeitverlängerung und bis wann wurde der Vertrag verlängert?",
+      "ref_answer": "Ziffer 26.1 des AOM 4000-Vertrags regelt die Laufzeitverlängerung. Auf Grundlage dieser Klausel wurde der Vertrag bis zum 8.6.2024 verlängert.",
+      "gold_parent": 390,
+      "top_parents": [
+        81765,
+        25983,
+        26839,
+        28651,
+        29381,
+        28067,
+        31739,
+        21565,
+        12902,
+        2080
+      ],
+      "top_child_ids": [
+        65497,
+        41302,
+        42369,
+        44683,
+        45632,
+        43950,
+        49141,
+        34008,
+        20011,
+        3001
+      ],
+      "top_sims": [
+        0.6204018592834473,
+        0.6057531833648682,
+        0.6026901006698608,
+        0.6026901006698608,
+        0.6025367975234985,
+        0.5950645804405212,
+        0.5939465165138245,
+        0.5902906060218811,
+        0.5902906060218811,
+        0.5897000432014465
+      ],
+      "rank": null
+    },
+    {
+      "question": "Welche Vergütungen wurden im Netzanschlussvertrag zwischen der Windpark Schweringen-Sebbenhausen-Netz-GbR und der Avacon AG festgelegt und welche Kündigungsfrist gilt für diesen Vertrag?",
+      "ref_answer": "Im Netzanschlussvertrag zwischen der Windpark Schweringen-Sebbenhausen-Netz-GbR und der Avacon AG wurde eine Vergütung von 650,00 € pro Jahr plus einer aufwandsbezogenen Vergütung festgelegt. Die Kündigungsfrist beträgt 3 Monate zum Ende des Jahres, erstmals zu Ende 2005 (siehe Vertrag vom 22.04./01.06.2004).",
+      "gold_parent": 405,
+      "top_parents": [
+        386,
+        391,
+        385,
+        391,
+        405,
+        390,
+        391,
+        405,
+        391,
+        404
+      ],
+      "top_child_ids": [
+        620,
+        647,
+        617,
+        648,
+        720,
+        644,
+        649,
+        721,
+        646,
+        716
+      ],
+      "top_sims": [
+        0.8249213695526123,
+        0.8136098384857178,
+        0.8091528415679932,
+        0.7918330430984497,
+        0.7914259433746338,
+        0.7868451476097107,
+        0.7532908916473389,
+        0.7514404058456421,
+        0.7449958324432373,
+        0.7442265748977661
+      ],
+      "rank": 5
+    },
+    {
+      "question": "Welche Genehmigungen für die Errichtung und den Betrieb von Windenergieanlagen (WEA) im Windpark Lamstedt wurden durch das Urteil des Oberverwaltungsgerichts Lüneburg vom 16.02.2017 aufgehoben, und welche WEA sind davon betroffen?",
+      "ref_answer": "Nach dem Urteil des Oberverwaltungsgerichts Lüneburg vom 16.02.2017 wurde die Genehmigung des Landkreises Cuxhaven vom 06.04.2005 in der Fassung der Änderungsgenehmigungen vom 20.07.2007 und 17.06.2008 sowie des Widerspruchsbescheids vom 23.09.2010 aufgehoben, soweit diese Genehmigungen die Errichtung und den Betrieb von 3 WEA im Windpark Lamstedt betrafen. Die betroffenen WEA haben die Seriennummern 782129, 782130 und 782131. (vgl. Urteil des Oberverwaltungsgerichts Lüneburg vom 16.02.2017, Az.: 12 LC 54/15)",
+      "gold_parent": 408,
+      "top_parents": [
+        424,
+        408,
+        29766,
+        408,
+        424,
+        407,
+        423,
+        29767,
+        426,
+        410
+      ],
+      "top_child_ids": [
+        826,
+        737,
+        46146,
+        738,
+        827,
+        728,
+        817,
+        46152,
+        839,
+        750
+      ],
+      "top_sims": [
+        0.8131415843963623,
+        0.8131415843963623,
+        0.7513924837112427,
+        0.7456828951835632,
+        0.7456828951835632,
+        0.7435921430587769,
+        0.7435921430587769,
+        0.7290607690811157,
+        0.7215275168418884,
+        0.7215275168418884
+      ],
+      "rank": 2
+    }
+  ]
+}

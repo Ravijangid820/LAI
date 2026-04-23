@@ -9,7 +9,7 @@ Legal AI platform for wind energy due diligence. Answers legal questions using R
 - **Models:**
   - LLM: Qwen2.5-7B-Instruct (inference), Qwen2.5-72B-Instruct-AWQ (pipeline, tensor-parallel 2 GPUs)
   - Embedding: Qwen3-Embedding-8B (**4096 dims**, #1 MTEB multilingual; `halfvec(4096)` on Postgres, exact cosine search — 4096 exceeds pgvector's HNSW limit)
-  - Reranker: ms-marco-MiniLM-L-12-v2
+  - Reranker: **Qwen3-Reranker-8B** (multilingual, replaced English-only MiniLM — 2026-04)
 - **Infrastructure:** PostgreSQL + pgvector, Redis, MinIO, vLLM — all self-hosted
 - **Hardware:** 2x RTX Pro 6000 GPUs (96GB VRAM each)
 - **Multi-tenancy:** Per-user PostgreSQL schemas for uploaded documents
@@ -116,6 +116,69 @@ Flags to know:
 - `--eval-batch 8` — eval uses no gradients, larger batches are safe and 4× faster
 - `--resume` — resume from the latest checkpoint in `--output-dir`
 - `--limit N` — process only the first N train rows (smoke test)
+
+> **Status (2026-04-23):** the first fine-tune completed (eval_loss 0.977 → 0.553,
+> token accuracy 76% → 86%), but an audit of the teacher-generated training
+> data found **15.8% of cited §§ / clauses are fabricated** by the 72B teacher.
+> Fine-tuning is shelved until we regenerate data with a verification loop.
+> See `scripts/audit_training_data.py` and the *Known Issues* section of
+> [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
+
+## Corpus Processing (Phase 2)
+
+Beyond the 6-step generic pipeline, there are **format-specific processors**
+for corpora whose structure matters (court decisions have semantic sections
+— Tenor / Tatbestand / Gründe — that a generic char-chunker loses). These
+live in `scripts/temp/`:
+
+```bash
+# Unified processor for German court decisions:
+#   - hf_cases     (251K cases, one per file)
+#   - openlegaldata (41K cases, 10 per page file)
+# Handles all 7 schema variants, 28 raw-type values, recovers ~57% of
+# missing court_level via court.name parsing. Deduplicates by ECLI/slug.
+python scripts/temp/process_court_decisions.py --source all
+# → data/lai-segments/legal_data/{hf_cases,openlegaldata}/*.segments.jsonl
+# → Step-1-compatible; feeds into the existing Step 2 / Step 6.
+```
+
+## RAG Evaluation
+
+`scripts/rag_eval.py` measures retrieval quality end-to-end on stratified
+val queries whose gold `parent_id` is known:
+
+```bash
+python scripts/rag_eval.py --mode hybrid_rerank --n 500
+```
+
+Modes (compared head-to-head on the same queries):
+
+| Mode | R@1 | R@5 | MRR |
+|---|---:|---:|---:|
+| dense (baseline) | 26% | 58% | 0.381 |
+| dense + Qwen3 query prefix | 30% | 55% | 0.407 |
+| bm25 | 29% | 47% | 0.360 |
+| hybrid (dense + bm25, RRF) | 33% | 61% | 0.447 |
+| hybrid + prefix | 38% | 61% | 0.480 |
+| **hybrid + prefix + Qwen3-Reranker-8B** | **40%** | **75%** | **0.531** |
+
+Followup: `scripts/rag_audit_analysis.py` slices the failures by task,
+query specificity, and doc_type to show where the remaining 25% of R@5
+misses are concentrated.
+
+## Training-data Quality Audit
+
+Before spending more GPU time on fine-tuning, run the citation-grounding
+audit:
+
+```bash
+python scripts/audit_training_data.py
+```
+
+It parses every `§`/`Art.`/`Klausel` reference in answers and checks
+whether the same identifier exists in the parent chunk. Output: per-task
+table of citation-verify rates + word-overlap distribution + a JSON
+dump of worst offenders. **Run this before every retraining.**
 
 See [docs/PROJECT_STATUS.md#fine-tuning-in-progress-as-of-2026-04-22](docs/PROJECT_STATUS.md)
 for the current run's config and lessons learned.

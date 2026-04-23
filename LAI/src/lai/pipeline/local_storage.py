@@ -35,19 +35,42 @@ MINIO_HEADER_BYTES = 32  # MinIO prepends a binary header to stored objects
 
 
 class LocalMinIO:
-    """Drop-in replacement for MinIO operations using the bind-mount directory.
+    """Drop-in replacement for MinIO operations using a local directory.
 
-    MinIO stores objects as files at:
-        <data_dir>/<bucket>/<object_key>/<uuid>/part.1
+    Supports **two layouts** and auto-detects per-bucket:
 
-    Each part.1 file has a ~32-byte binary header before the actual content.
+    1. **MinIO internal format** (the live bind-mount used to look like this):
+           <data_dir>/<bucket>/<object_key>/<uuid>/part.1  + xl.meta
+
+    2. **Plain filesystem format** (what ``mc cp --recursive`` produces, and
+       what we have after moving the corpus into ``LAI/data/``):
+           <data_dir>/<bucket>/<object_key>    (just the raw file)
+
+    The format is detected lazily per-bucket on first access: if the bucket
+    contains any ``xl.meta`` files, it's treated as MinIO-internal; otherwise
+    as plain.
     """
 
     def __init__(self, data_dir: str):
         self.data_dir = Path(data_dir)
         if not self.data_dir.exists():
             raise FileNotFoundError(f"MinIO data directory not found: {data_dir}")
+        self._bucket_is_minio: dict[str, bool] = {}
         logger.info(f"LocalMinIO initialized: {data_dir}")
+
+    def _detect_format(self, bucket: str) -> bool:
+        """Return True if the bucket uses MinIO's internal xl.meta/part.1 layout."""
+        if bucket in self._bucket_is_minio:
+            return self._bucket_is_minio[bucket]
+        bucket_dir = self.data_dir / bucket
+        if not bucket_dir.is_dir():
+            is_minio = True  # default for new/empty buckets we create
+        else:
+            # If we can find any xl.meta within 4 levels, it's MinIO-internal
+            found = next(bucket_dir.rglob("xl.meta"), None)
+            is_minio = found is not None
+        self._bucket_is_minio[bucket] = is_minio
+        return is_minio
 
     def bucket_exists(self, bucket: str) -> bool:
         return (self.data_dir / bucket).is_dir()
@@ -56,74 +79,74 @@ class LocalMinIO:
         (self.data_dir / bucket).mkdir(parents=True, exist_ok=True)
 
     def list_objects(self, bucket: str, prefix: str = "", recursive: bool = True):
-        """Yield object info dicts matching the MinIO list_objects interface."""
         bucket_dir = self.data_dir / bucket
         if not bucket_dir.exists():
             return
 
-        # MinIO stores each object as: <bucket>/<key>/<uuid>/part.1
-        # The <key> path mirrors the original object key, with xl.meta alongside
-        for xl_meta in bucket_dir.rglob("xl.meta"):
-            obj_dir = xl_meta.parent
-            # The object key is the relative path from bucket to the xl.meta's parent
-            obj_key = str(obj_dir.relative_to(bucket_dir))
-
-            if prefix and not obj_key.startswith(prefix):
-                continue
-
-            # Find the actual data file (part.1, part.2, etc.)
-            part_files = sorted(obj_dir.glob("*/part.*"))
-            if not part_files:
-                continue
-
-            total_size = sum(f.stat().st_size for f in part_files)
-            yield _ObjectInfo(name=obj_key, size=total_size, is_dir=False)
+        if self._detect_format(bucket):
+            # MinIO internal: walk xl.meta markers
+            for xl_meta in bucket_dir.rglob("xl.meta"):
+                obj_dir = xl_meta.parent
+                obj_key = str(obj_dir.relative_to(bucket_dir))
+                if prefix and not obj_key.startswith(prefix):
+                    continue
+                part_files = sorted(obj_dir.glob("*/part.*"))
+                if not part_files:
+                    continue
+                total_size = sum(f.stat().st_size for f in part_files)
+                yield _ObjectInfo(name=obj_key, size=total_size, is_dir=False)
+        else:
+            # Plain filesystem: every regular file is an object
+            for f in bucket_dir.rglob("*"):
+                if not f.is_file():
+                    continue
+                # Skip hidden files (.DS_Store, .minio.sys, etc.)
+                if any(p.startswith(".") for p in f.relative_to(bucket_dir).parts):
+                    continue
+                obj_key = str(f.relative_to(bucket_dir))
+                if prefix and not obj_key.startswith(prefix):
+                    continue
+                yield _ObjectInfo(name=obj_key, size=f.stat().st_size, is_dir=False)
 
     def get_object(self, bucket: str, key: str) -> "_LocalResponse":
-        """Read an object from the local filesystem."""
-        obj_dir = self.data_dir / bucket / key
-        if not obj_dir.is_dir():
-            raise FileNotFoundError(f"Object not found: {bucket}/{key}")
-
-        # Find part files
-        part_files = sorted(obj_dir.rglob("part.*"))
-        if not part_files:
-            raise FileNotFoundError(f"No part files for: {bucket}/{key}")
-
-        # Concatenate all parts
-        data = b""
-        for pf in part_files:
-            data += pf.read_bytes()
-
-        return _LocalResponse(data)
+        if self._detect_format(bucket):
+            obj_dir = self.data_dir / bucket / key
+            if not obj_dir.is_dir():
+                raise FileNotFoundError(f"Object not found: {bucket}/{key}")
+            part_files = sorted(obj_dir.rglob("part.*"))
+            if not part_files:
+                raise FileNotFoundError(f"No part files for: {bucket}/{key}")
+            data = b"".join(pf.read_bytes() for pf in part_files)
+            return _LocalResponse(data)
+        else:
+            path = self.data_dir / bucket / key
+            if not path.is_file():
+                raise FileNotFoundError(f"Object not found: {bucket}/{key}")
+            return _LocalResponse(path.read_bytes())
 
     def stat_object(self, bucket: str, key: str):
-        """Check if an object exists (raises if not)."""
-        obj_dir = self.data_dir / bucket / key
-        if not obj_dir.is_dir():
-            raise FileNotFoundError(f"Object not found: {bucket}/{key}")
-        part_files = list(obj_dir.rglob("part.*"))
-        if not part_files:
-            raise FileNotFoundError(f"No part files for: {bucket}/{key}")
+        if self._detect_format(bucket):
+            obj_dir = self.data_dir / bucket / key
+            if not obj_dir.is_dir():
+                raise FileNotFoundError(f"Object not found: {bucket}/{key}")
+            if not list(obj_dir.rglob("part.*")):
+                raise FileNotFoundError(f"No part files for: {bucket}/{key}")
+        else:
+            path = self.data_dir / bucket / key
+            if not path.is_file():
+                raise FileNotFoundError(f"Object not found: {bucket}/{key}")
         return True
 
     def put_object(self, bucket: str, key: str, data: io.BytesIO, length: int,
                    content_type: str = "application/octet-stream"):
-        """Write an object to the local filesystem (for Step 1 output)."""
-        import uuid
-        obj_dir = self.data_dir / bucket / key
-        obj_dir.mkdir(parents=True, exist_ok=True)
-
-        part_id = str(uuid.uuid4())
-        part_dir = obj_dir / part_id
-        part_dir.mkdir(exist_ok=True)
-
+        """Write an object. Uses plain-file layout by default (MinIO-compatible
+        buckets are read-only in our local mode)."""
         data.seek(0)
-        # Write without MinIO header — our reader skips to first { anyway
-        (part_dir / "part.1").write_bytes(data.read())
-
-        # Write a minimal xl.meta so list_objects can find it
-        (obj_dir / "xl.meta").write_bytes(b"")
+        path = self.data_dir / bucket / key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data.read())
+        # Record the bucket as plain so subsequent reads don't re-detect
+        self._bucket_is_minio[bucket] = False
 
 
 class _ObjectInfo:
@@ -371,19 +394,36 @@ def _pg_to_sqlite(query: str) -> str:
 # ============================================================
 
 def _find_minio_data_dir() -> str:
-    """Auto-detect the MinIO bind-mount directory."""
+    """Auto-detect the MinIO-compatible data directory.
+
+    The directory must contain subdirs named like MinIO buckets
+    (e.g. ``lai-raw/``, ``lai-segments/``) so LocalMinIO can navigate
+    ``<data_dir>/<bucket>/<object_key>/<uuid>/part.1``.
+
+    Preference order:
+      1. ``LAI/data/`` — current home of the moved corpus
+      2. ``Docker/database/minio/data/`` — old bind-mount location
+      3. ``minio-backup/`` — archive location (legacy)
+    """
     candidates = [
-        # Relative to project root
+        # Current: moved into the LAI project
+        os.path.join(os.getcwd(), "LAI", "data"),
+        "/data/projects/lai/LAI/data",
+        # Legacy: old Docker MinIO bind-mount
         os.path.join(os.getcwd(), "Docker", "database", "minio", "data"),
-        # Absolute common path
         "/data/projects/lai/Docker/database/minio/data",
+        # Legacy: the transfer-out archive
+        os.path.join(os.getcwd(), "minio-backup"),
+        "/data/projects/lai/minio-backup",
     ]
     for c in candidates:
-        if os.path.isdir(c):
+        # Also require the expected buckets to exist, not just the parent —
+        # otherwise we might pick an empty dir.
+        if os.path.isdir(os.path.join(c, "lai-raw")):
             return c
     raise FileNotFoundError(
-        "Cannot find MinIO data directory. "
-        "Pass --minio-data-dir or run from the project root."
+        "Cannot find a MinIO-compatible data directory with a lai-raw/ bucket. "
+        "Pass --minio-data-dir explicitly."
     )
 
 

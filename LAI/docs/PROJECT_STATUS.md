@@ -1,6 +1,6 @@
 # LAI Project Status
 
-> Last updated: 2026-04-22
+> Last updated: 2026-04-23
 
 This document explains the current state of the LAI project for developers joining the team.
 
@@ -31,8 +31,8 @@ LAI (Legal AI) is a **German legal AI platform for wind energy due diligence**. 
 | Object storage | MinIO |
 | LLM (inference) | Qwen/Qwen2.5-7B-Instruct via vLLM |
 | LLM (pipeline) | Qwen/Qwen2.5-72B-Instruct-AWQ via vLLM (tensor-parallel, 2 GPUs) |
-| Embedding | Qwen/Qwen3-Embedding-8B (1024 dims) via vLLM |
-| Reranker | ms-marco-MiniLM-L-12-v2 via vLLM |
+| Embedding | Qwen/Qwen3-Embedding-8B (**4096 dims**, max-model-len 32k) via vLLM |
+| Reranker | **Qwen/Qwen3-Reranker-8B** via Transformers (multilingual, replaced MiniLM 2026-04) |
 | Experiment tracking | MLflow |
 | Monitoring | Prometheus + Grafana |
 
@@ -361,26 +361,51 @@ Processing is done in phases due to storage constraints (~613GB free).
 - No HNSW index (4096 dims exceeds pgvector's 4000 halfvec limit) — use exact cosine search with pre-filters
 - In `--local` mode, embeddings live in a dedicated `child_embeddings(child_id PK, embedding BLOB)` SQLite table (INSERT is ~100× faster than UPDATEing a BLOB column on the main `child_chunks` table)
 
-### Phase 2 — Medium sources (~20GB)
+### Phase 2 — Court decisions + legal reference (~20 GB)
 
-| Source | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 | Step 6 |
-|--------|:-:|:-:|:-:|:-:|:-:|:-:|
-| hf_cases (14GB, 14K files) | - | - | - | - | - | - |
-| openlegaldata (1.5GB, 4K files) | - | - | - | - | - | - |
-| Library (5.4GB, 2.1K PDFs) | - | - | - | - | - | - |
+Original size estimates were off; the corpora are much bigger than docs said:
 
-### Phase 3 — Large source (~30-50GB German subset)
+| Source | Actual size | Cases | Step 1 | Step 2 | Step 6 | Notes |
+|--------|---|---|:-:|:-:|:-:|---|
+| **hf_cases** | 13 GB | **251,038** | ✅ done (2026-04-23) | pending | pending | Custom processor: `scripts/temp/process_court_decisions.py` |
+| **openlegaldata** | 1.5 GB | **41,740** | ✅ done (2026-04-23) | pending | pending | Same processor; 0.2% overlap with hf_cases, dedupe by ECLI/slug |
+| **Library** | 5.4 GB | 2,326 PDFs | pending | pending | pending | Use existing Step 1 Docling path |
 
-| Source | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 | Step 6 |
-|--------|:-:|:-:|:-:|:-:|:-:|:-:|
-| multilegalpile (643GB, filter to `de`) | - | - | - | - | - | - |
+**Phase 2 Step 1 results** (court decisions only, PDFs pending):
+- **292,486 emitted** from 292,778 seen (99.9%)
+- 284 skipped (empty content), 8 dedupes (ECLI collisions)
+- Runtime: 191 s total → 6.8 GB of segments JSONL in 586 batch files
+- Doc types: urteil 157K / beschluss 132K / gerichtsbescheid 1.3K / sonstige 1.7K
+- Courts cover: OLG, VG, OVG, BGH, LG, LAG, LSG, FG, AG, SG, VGH + all Bundesgerichte
+
+Pipeline steps 3-5 (classify/enrich/synth) **deliberately skipped for Phase 2** —
+they depend on the 72B teacher which we found fabricates citations in
+15.8% of samples (see *Known Issues*). RAG retrieval is now the focus.
+
+### Phase 3 — Large corpus (deferred)
+
+| Source | Size | Notes |
+|--------|---|---|
+| multilegalpile | 643 GB | 96% non-German; filter to `de` (~30-50 GB) before processing |
+
+Deferred until Phase 2 is fully embedded and retrieval quality re-measured.
 
 ---
 
-## Fine-tuning (in progress as of 2026-04-22)
+## Fine-tuning (complete 2026-04-23 — shelved for now)
 
-Qwen2.5-7B-Instruct is being LoRA-fine-tuned on the 200K synthetic samples
-from Step 5. Running in tmux session `finetune` on GPU 1.
+Qwen2.5-7B-Instruct was LoRA-fine-tuned on the 200K synthetic samples
+from Step 5. Best checkpoint: **checkpoint-23000, eval_loss 0.553,
+token_accuracy 85.6%** (from 0.977 / 76% at step 1000). Merged adapter
+at `/data/projects/lai/models/qwen25-7b-legal-lora-v2-merged` (14.2 GB).
+
+**Why shelved**: a quality audit (`scripts/audit_training_data.py`)
+revealed **15.8% of legal citations in training answers are fabricated**
+by the 72B teacher. `rag_qa` (our core task) has an 18.8% citation
+fabrication rate. End-to-end RAG testing confirmed the FT model still
+hallucinates list-type items. Decision: improve RAG first, revisit
+training later with cleaner synthetic-data generation (stricter prompts
++ post-generation verification loop).
 
 **Data prep** — [training/fine_tuning/scripts/export_training_data.py](../training/fine_tuning/scripts/export_training_data.py)
 exports `training_samples` from the local SQLite to ChatML JSONL with a
@@ -423,23 +448,73 @@ is kept automatically (`load_best_model_at_end`).
 - `attn_implementation="flash_attention_2"` hard-fails if flash-attn isn't
   installed. `run_lora.py::_pick_attn_impl` auto-downgrades to SDPA.
 
+## RAG Retrieval (measured 2026-04-23)
+
+Best pipeline today:
+
+```
+Query  →  Qwen3-Embedding-8B (with query prefix)
+           + BM25 over SQLite FTS5
+           → RRF fusion (top 50 candidates)
+           → Qwen3-Reranker-8B (top 10)
+```
+
+### 100-query smoke-test results (2026-04-22, initial read)
+
+| Mode | R@1 | R@3 | R@5 | R@10 | MRR |
+|---|---:|---:|---:|---:|---:|
+| dense baseline | 26% | 46% | 58% | 65% | 0.381 |
+| dense + Qwen3 query prefix | 30% | 48% | 55% | 63% | 0.407 |
+| bm25 only | 29% | 39% | 47% | 52% | 0.360 |
+| hybrid (dense + bm25) | 33% | 55% | 61% | 66% | 0.447 |
+| hybrid + prefix | 38% | 56% | 61% | 68% | 0.480 |
+| hybrid + prefix + Qwen3-Reranker-8B | 40% | 61% | 75% | 80% | 0.531 |
+
+### 500-query audit (2026-04-23, honest baseline)
+
+| Mode | R@1 | R@3 | R@5 | R@10 | MRR |
+|---|---:|---:|---:|---:|---:|
+| **hybrid + prefix + Qwen3-Reranker-8B** | **23.2%** | **46.2%** | **58.0%** | **70.0%** | **0.373** |
+
+**The larger sample revealed the first 100 queries were an easier subset.**
+The real baseline is weaker: R@5 = 58% and R@1 = 23% — meaning we miss
+the right chunk in the top 5 on nearly half of queries. This is where
+**metadata filtering** and **more corpus coverage** (Phase 2) matter
+most. Reranker still helps — raw dense baseline would be worse — but
+the ceiling at R@10 = 70% means ~30% of queries genuinely can't find
+their gold chunk in the current corpus even with the best retriever.
+
+Phase 2 (290K court decisions being added) should lift this substantially
+for queries whose gold answer exists in court decisions.
+
+**Key script**: [`scripts/rag_eval.py`](../scripts/rag_eval.py) — runs
+any of the 6 modes above on N val queries; per-query and aggregated
+metrics saved to `scripts/rag_eval_results/`.
+
 ## What's Next
 
-Priority items:
+Ordered by leverage:
 
-1. **Wait for fine-tune to finish** (ETA 2026-04-23 ~13:00), inspect
-   eval_loss curve, merge best adapter into a deployable checkpoint
-2. **Evaluate fine-tuned model** against base Qwen2.5-7B on a held-out
-   set of German legal Q&A (reuse val.jsonl)
-3. **Wire fine-tuned model into the RAG pipeline** (replace `Qwen/Qwen2.5-7B-Instruct` in config with the merged model path)
-4. **Run Phase 2** — hf_cases, openlegaldata, Library (Steps 1-6)
-5. **Run Phase 3** — multilegalpile (German subset only)
-6. **End-to-end RAG smoke test** — query → hybrid search → retrieval → answer
-7. **Geocoding integration** — connect extracted locations to map API (Mapbox/Leaflet)
-8. **Integration tests** — test full RAG pipeline end-to-end
-9. **German reranker** — current MiniLM is English-only
-10. **CI/CD pipeline** — automated testing/deployment
-11. **Database migrations** — Alembic setup
+1. **Chunk + embed Phase 2** — run existing Step 2 and Step 6 on the
+   586 court-decisions batch files already written. Expect +~1M chunks
+   added to `pipeline_local.db` (overnight: Step 6 embedding at ~25/s).
+2. **Process Library PDFs** via existing Step 1 (Docling) with
+   `--source Libary/` — 2,326 files, ~2-3 h.
+3. **Metadata filter at query time** — `child_chunks` now has rich
+   metadata (court_name, court_level, jurisdiction, decision_date,
+   ecli, file_number). Add pre-filters for "since 2020", "BGH only",
+   "Verwaltungsrecht only" before retrieval — highest-leverage quality
+   win we haven't pulled.
+4. **Re-measure retrieval** on the bigger corpus. Expect R@5 → 85%+.
+5. **Citation verifier at query time** — regex-extract §§ / case IDs
+   from the generated answer, confirm each appears in the retrieved
+   chunks; reject + retry if fabricated.
+6. **Regenerate training data with verification loop** (when we come
+   back to fine-tuning) — stricter prompts and post-gen check that
+   every citation is grounded.
+7. **Phase 3** — multilegalpile German subset (~30-50 GB after filter).
+8. **Geocoding, German reranker, CI/CD, Alembic** — unchanged priorities
+   from before.
 
 ---
 
@@ -447,15 +522,17 @@ Priority items:
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| Phase 1 Steps 1-6 all complete | Pipeline data ready for training + RAG | — |
-| Fine-tune running | LoRA on Qwen2.5-7B, tmux session `finetune`, GPU 1 | ETA ~14h (see Fine-tuning section) |
-| GPU contention with shared users | vLLM may OOM if another job overfills a GPU | `./scripts/resume_step5.sh --status` to diagnose; resume cleanly via SQLite checkpoint |
-| No HNSW index on embeddings | 4096 dims > halfvec HNSW limit of 4000 | Use exact cosine search with domain/doc_type pre-filters; 217K rows is fast enough |
-| Phase 2-3 data not yet processed | ~650GB remaining corpus | After Phase 1 completes |
+| Phase 1 Steps 1-6 complete; fine-tune complete | Baseline RAG works | Shelved fine-tune, focusing on RAG quality |
+| **15.8% of training citations are fabricated** | FT model hallucinates §§/clauses | Captured in `scripts/audit_training_data.py`; regenerate with verification loop before retraining |
+| GPU contention with shared users | Training/eval may OOM | `./scripts/resume_step5.sh --status` to diagnose; resume cleanly via SQLite checkpoint |
+| No HNSW index on embeddings | 4096 dims > halfvec HNSW limit of 4000 | Use exact cosine search with metadata pre-filters |
+| `openlegaldata_api_dump/` has 4,174 legacy pre-V5 segment files | Will be picked up by Step 2 alongside our 84 new batches — may create noise | Inspect before Step 2; either delete or verify schema match |
+| Phase 2 chunk+embed pending | 290K court decisions processed but not yet in DB | Steps 2 + 6 next |
+| Phase 3 (multilegalpile 643 GB) not processed | Low priority; 96% non-German | Defer until Phase 2 retrieval measured |
 | 103 VDR files failed Step 1 | Mostly legacy .xls/.doc formats | Install LibreOffice for conversion |
-| Reranker is English-only (MiniLM) | Suboptimal for German text | Evaluate German alternatives |
+| Reranker **fixed** | Was English-only MiniLM | Now Qwen3-Reranker-8B (multilingual SOTA) |
 | No CI/CD | Manual testing only | Set up GitHub Actions |
-| `LAI/embedding_server/` (2.2GB) | Old BGE-M3 cache, not used by any docker-compose | Safe to delete |
+| `LAI/embedding_server/` (2.2GB) | Old BGE-M3 cache, not used | Safe to delete |
 
 ---
 
@@ -520,6 +597,12 @@ python scripts/export_to_sqlite.py all
 | Export training data to JSONL | `python -m training.fine_tuning.scripts.export_training_data` |
 | Run LoRA fine-tune | `python -m training.fine_tuning.scripts.run_lora --epochs 2` (see script for all flags) |
 | Training outputs | `training/fine_tuning/output/qwen25-7b-legal-lora/` (adapter + best checkpoint) |
+| **Process court decisions** | `python scripts/temp/process_court_decisions.py --source all` (handles hf_cases + openlegaldata, writes Step-1-compatible segments) |
+| **Training-data quality audit** | `python scripts/audit_training_data.py` (citations verified against parent chunks; found 15.8% fabrication rate) |
+| **Retrieval eval harness** | `python scripts/rag_eval.py --mode hybrid_rerank --n 500` (6 modes; writes results to `scripts/rag_eval_results/`) |
+| **Retrieval failure analysis** | `python scripts/rag_audit_analysis.py <results.json>` (breaks down recall by task, specificity, doc_type) |
+| **End-to-end RAG test** | `python scripts/rag_generate_test.py --n 5` (retrieve + generate with base + FT, side-by-side) |
+| **Raw corpus layout** | `LAI/data/lai-raw/` (671 GB source docs) + `LAI/data/lai-segments/` (1.7 GB Step-1 output) — moved from `minio-backup/` 2026-04-23 |
 | RAG pipeline | [src/lai/api/pipeline.py](../src/lai/api/pipeline.py) |
 | Hybrid search SQL | [src/lai/search/hybrid_search.py](../src/lai/search/hybrid_search.py) |
 | Prompt templates | [src/lai/generation/prompt_builder.py](../src/lai/generation/prompt_builder.py) |

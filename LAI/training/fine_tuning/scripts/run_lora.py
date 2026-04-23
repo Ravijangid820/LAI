@@ -100,6 +100,10 @@ def parse_args():
                    help="Resume from the latest checkpoint in --output-dir.")
     p.add_argument("--limit", type=int, default=0,
                    help="If >0, use only the first N train rows (for smoke tests).")
+    p.add_argument("--val-limit", type=int, default=0,
+                   help="If >0, subsample the val set to N rows. Full 10K val takes "
+                        "several minutes per eval; 1-2K samples give a statistically "
+                        "reliable eval_loss (std ~0.01) and cut total eval time ~10x.")
     return p.parse_args()
 
 
@@ -116,6 +120,9 @@ def main():
     ds = load_dataset("json", data_files=data_files)
     if args.limit > 0:
         ds["train"] = ds["train"].select(range(min(args.limit, len(ds["train"]))))
+    if args.val_limit > 0 and args.val_limit < len(ds["val"]):
+        # Deterministic subsample so eval metric is comparable across runs
+        ds["val"] = ds["val"].shuffle(seed=args.seed).select(range(args.val_limit))
 
     def to_text(example):
         # Render ChatML from the stored messages

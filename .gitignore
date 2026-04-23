@@ -74,6 +74,12 @@ Docker/synth-generator/model-cache/
 LAI/.runtime-cache/
 .runtime-cache/
 
+# Raw corpus (671 GB of legal source docs; lives in LAI/data/raw/)
+LAI/data/
+
+# Benchmark files copied out of raw corpus by process_gerdalir.py (~14 MB, regeneratable)
+LAI/scripts/rag_eval_results/gerdalir_benchmark/
+
 # Additional virtualenvs outside LAI/.venv
 vllm-env/
 */venv/
