@@ -16,6 +16,10 @@ Fix: backfill with a safe offset (100,000,000) so new ids live in a
 disjoint range. Also rewrite cc.parent_id for new rows so it points to
 the backfilled pc.id (not pc.rowid).
 
+Batched per `--batch-rows` rows per COMMIT. This keeps WAL small
+(~1 GB per batch instead of >150 GB for a single monolithic UPDATE)
+and gives incremental progress visibility.
+
 Usage:
     python scripts/backfill_chunk_ids.py              # dry-run counts
     python scripts/backfill_chunk_ids.py --apply      # perform backfill
@@ -42,16 +46,60 @@ def status(conn: sqlite3.Connection) -> None:
               f"id range=[{min_id}, {max_id}]")
 
 
+def batched_update(conn: sqlite3.Connection, label: str, sql: str,
+                   batch_rows: int) -> int:
+    """Apply `sql` in rowid-range batches of `batch_rows` each.
+
+    `sql` must contain two `?` placeholders for (min_rowid, max_rowid).
+    Returns total rows updated.
+    """
+    # We can't easily know the target rowid range here — caller passes
+    # sql parameterized on rowid windows. We just iterate until no rows
+    # are updated in a batch.
+    total = 0
+    t0 = time.time()
+    # Determine upper bound from a COUNT / MAX
+    # (caller should size batches reasonably)
+    start = 1
+    table = "parent_chunks" if "parent_chunks" in sql.split("SET")[0] else "child_chunks"
+    max_rowid = conn.execute(f"SELECT MAX(rowid) FROM {table}").fetchone()[0] or 0
+    print(f"  [{label}] target max_rowid={max_rowid:,}")
+
+    while start <= max_rowid:
+        end = start + batch_rows - 1
+        t_batch = time.time()
+        n = conn.execute(sql, (start, end)).rowcount
+        conn.commit()
+        if n > 0:
+            total += n
+            rate = total / (time.time() - t0)
+            eta = (max_rowid - end) / (batch_rows / max(time.time() - t_batch, 0.001)) / 60
+            print(f"  [{label}] rowid {start:>10,}-{end:>10,}  "
+                  f"updated={n:>8,}  total={total:>12,}  "
+                  f"({time.time()-t_batch:.1f}s/batch, {rate:.0f} rows/s, ETA {eta:.1f} min)",
+                  flush=True)
+        start = end + 1
+    print(f"  [{label}] DONE: {total:,} rows updated in {(time.time()-t0)/60:.1f} min")
+    return total
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--apply", action="store_true", help="Perform the backfill")
+    p.add_argument("--batch-rows", type=int, default=1_000_000,
+                   help="Rows per batch commit (default: 1M)")
     args = p.parse_args()
 
     conn = sqlite3.connect(DB)
+    # Safer than OFF, faster than FULL — survives process crashes (WAL intact)
+    # but not OS power loss (no fsync). Acceptable trade for batch work.
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+
     print("Before:")
     status(conn)
 
-    # Sanity: ensure OFFSET is larger than the max existing id in both tables
     max_pc = conn.execute("SELECT MAX(id) FROM parent_chunks").fetchone()[0] or 0
     max_cc = conn.execute("SELECT MAX(id) FROM child_chunks").fetchone()[0] or 0
     if OFFSET <= max(max_pc, max_cc):
@@ -64,33 +112,38 @@ def main():
         return
 
     # 1. Backfill parent_chunks.id from rowid + OFFSET
-    t0 = time.time()
-    n = conn.execute(
-        f"UPDATE parent_chunks SET id = rowid + {OFFSET} WHERE id IS NULL"
-    ).rowcount
-    conn.commit()
-    print(f"  parent_chunks: backfilled {n:,} rows in {time.time()-t0:.1f}s")
+    batched_update(
+        conn, "parent_chunks.id",
+        f"UPDATE parent_chunks SET id = rowid + {OFFSET} "
+        f"WHERE id IS NULL AND rowid BETWEEN ? AND ?",
+        args.batch_rows,
+    )
 
-    # 2. Fix cc.parent_id for new children — they were inserted with
-    # pc.rowid (because pc.id was NULL); now pc.id = pc.rowid + OFFSET,
-    # so cc.parent_id also needs the offset added.
-    t0 = time.time()
-    n = conn.execute(
+    # 2. Shift cc.parent_id for new children
+    # cc.id IS NULL identifies new rows (pre-backfill).
+    # Those rows have cc.parent_id = pc.rowid; we need cc.parent_id = pc.id = pc.rowid + OFFSET
+    batched_update(
+        conn, "child_chunks.parent_id (shift)",
         f"UPDATE child_chunks SET parent_id = parent_id + {OFFSET} "
-        f"WHERE id IS NULL"
-    ).rowcount
-    conn.commit()
-    print(f"  child_chunks.parent_id: shifted {n:,} rows in {time.time()-t0:.1f}s")
+        f"WHERE id IS NULL AND rowid BETWEEN ? AND ?",
+        args.batch_rows,
+    )
 
     # 3. Backfill child_chunks.id
-    t0 = time.time()
-    n = conn.execute(
-        f"UPDATE child_chunks SET id = rowid + {OFFSET} WHERE id IS NULL"
-    ).rowcount
-    conn.commit()
-    print(f"  child_chunks.id: backfilled {n:,} rows in {time.time()-t0:.1f}s")
+    batched_update(
+        conn, "child_chunks.id",
+        f"UPDATE child_chunks SET id = rowid + {OFFSET} "
+        f"WHERE id IS NULL AND rowid BETWEEN ? AND ?",
+        args.batch_rows,
+    )
 
-    # 4. Verify integrity: every child's parent_id should resolve to a parent
+    # 4. Checkpoint the WAL so it shrinks
+    print("\nCheckpointing WAL...")
+    t0 = time.time()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    print(f"  checkpoint done in {time.time()-t0:.1f}s")
+
+    # 5. Verify integrity
     orphans = conn.execute("""
         SELECT COUNT(*) FROM child_chunks cc
         WHERE NOT EXISTS (SELECT 1 FROM parent_chunks pc WHERE pc.id = cc.parent_id)

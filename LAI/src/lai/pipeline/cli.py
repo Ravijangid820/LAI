@@ -940,6 +940,27 @@ def run_step6(args):
     embedded = 0
     last_id = 0  # primary-key cursor
 
+    # Dual-write every batch of embeddings to disk alongside the DB insert.
+    # A DB corruption otherwise forces a ~48h Step-6 re-run; files on disk
+    # can be slurped back in ~20 min via scripts/restore_db_from_files.py.
+    # Disabled with --no-backup-embeddings.
+    backup_embeddings = getattr(args, "backup_embeddings", True)
+    backup_dir = None
+    backup_batch_idx = 0
+    if backup_embeddings and local_mode:
+        from pathlib import Path as _Path
+        backup_dir = _Path(__file__).resolve().parents[3] / "data" / "lai-embeddings" / "child_embeddings"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        # Continue numbering from whatever files already exist
+        existing = sorted(backup_dir.glob("child_embeddings_*.npz"))
+        if existing:
+            last_name = existing[-1].stem
+            try:
+                backup_batch_idx = int(last_name.rsplit("_", 1)[-1]) + 1
+            except ValueError:
+                pass
+        logger.info(f"  Embedding backup -> {backup_dir} (starting batch #{backup_batch_idx})")
+
     # Optional: exclude children whose parent's metadata.raw_type matches.
     # Used to drop noisy buckets (e.g. multilegalpile legal-mc4) without
     # re-chunking. Pilot A/B showed legal-mc4 doesn't hurt retrieval, but
@@ -1017,6 +1038,16 @@ def run_step6(args):
                 "INSERT OR REPLACE INTO child_embeddings (child_id, embedding) VALUES (?, ?)",
                 insert_rows,
             )
+            # Mirror to disk so the 48h of embedding work survives DB loss
+            if backup_dir is not None:
+                import numpy as _np
+                fp = backup_dir / f"child_embeddings_{backup_batch_idx:06d}.npz"
+                _np.savez_compressed(
+                    fp,
+                    child_ids=_np.asarray(ids, dtype=_np.int64),
+                    embeddings=_np.asarray(embeddings, dtype=_np.float32),
+                )
+                backup_batch_idx += 1
             embedded += len(ids)
         else:
             # PostgreSQL path: cast to halfvec(4096)
@@ -1129,6 +1160,10 @@ def main():
                     default=[],
                     help="Skip children whose parent's metadata.raw_type is in this comma-separated "
                          "list. Use for dropping noisy buckets like 'legal-mc4' from multilegalpile.")
+    p6.add_argument("--no-backup-embeddings", dest="backup_embeddings", action="store_false",
+                    help="Skip mirroring each embedding batch to disk at "
+                         "data/lai-embeddings/. Default: backup enabled in --local mode.")
+    p6.set_defaults(backup_embeddings=True)
 
     # Global --local flag on each subparser
     for p in [p1, p2, p3, p4, p5, p6]:
