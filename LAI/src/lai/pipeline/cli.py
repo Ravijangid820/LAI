@@ -940,18 +940,39 @@ def run_step6(args):
     embedded = 0
     last_id = 0  # primary-key cursor
 
+    # Optional: exclude children whose parent's metadata.raw_type matches.
+    # Used to drop noisy buckets (e.g. multilegalpile legal-mc4) without
+    # re-chunking. Pilot A/B showed legal-mc4 doesn't hurt retrieval, but
+    # it costs ~67% of multilegalpile embedding time with no measurable
+    # gain, so dropping it is pure compute savings.
+    exclude_raw = getattr(args, "exclude_raw_types", None) or []
+    if exclude_raw:
+        logger.info(f"  Excluding raw_type IN {exclude_raw}")
+    exclude_join_sql = exclude_where_sql = ""
+    exclude_params: tuple = ()
+    if exclude_raw:
+        placeholders = ",".join("?" * len(exclude_raw))
+        exclude_join_sql = "JOIN parent_chunks p ON p.id = c.parent_id"
+        exclude_where_sql = (
+            f"AND (json_extract(p.metadata, '$.raw_type') IS NULL "
+            f"     OR json_extract(p.metadata, '$.raw_type') NOT IN ({placeholders}))"
+        )
+        exclude_params = tuple(exclude_raw)
+
     while not _shutdown:
         if local_mode:
             # LEFT join against the sidecar table — primary-key index on
             # both sides, so this is O(log n) per iteration.
-            child_rows = _db_fetch("""
+            child_rows = _db_fetch(f"""
                 SELECT c.id, c.content, c.context_prefix
                 FROM child_chunks c
                 LEFT JOIN child_embeddings e ON e.child_id = c.id
+                {exclude_join_sql}
                 WHERE c.id > %s AND e.child_id IS NULL
+                  {exclude_where_sql}
                 ORDER BY c.id
                 LIMIT %s
-            """, (last_id, batch_size))
+            """, (last_id, *exclude_params, batch_size))
         else:
             child_rows = _db_fetch("""
                 SELECT id, content, context_prefix
@@ -1104,6 +1125,10 @@ def main():
     p6.add_argument("--embed-batch-size", type=int, default=32, help="Embedding API batch size")
     p6.add_argument("--dry-run", action="store_true")
     p6.add_argument("--create-indexes", action="store_true", help="Create HNSW + GIN indexes after embedding")
+    p6.add_argument("--exclude-raw-types", type=lambda s: [x for x in s.split(",") if x],
+                    default=[],
+                    help="Skip children whose parent's metadata.raw_type is in this comma-separated "
+                         "list. Use for dropping noisy buckets like 'legal-mc4' from multilegalpile.")
 
     # Global --local flag on each subparser
     for p in [p1, p2, p3, p4, p5, p6]:
