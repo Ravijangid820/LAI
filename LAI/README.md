@@ -206,6 +206,39 @@ python scripts/rag_generate_test.py --n 5 --top-k 3 \
   --ft   /data/projects/lai/models/qwen25-7b-legal-merged
 ```
 
+## Multi-model RAG comparison
+
+`scripts/multi_model_compare.py` runs the same retrieval contexts
+through several LLMs side-by-side and writes a markdown report to
+`scripts/rag_eval_results/multi_model_compare.md`.
+
+```bash
+# Small models that fit alongside the embedding container (lai_embedding ~44 GB on GPU)
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/multi_model_compare.py \
+    --n 5 --top-k 3 \
+    --models qwen25-ft qwen25-base gemma4 llama3
+
+# 27B models (need lai_embedding STOPPED first — ~54 GB needed in bf16)
+docker stop lai_embedding
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/multi_model_compare.py \
+    --n 5 --top-k 3 --models qwen35 qwen36
+docker start lai_embedding   # restore service after eval
+```
+
+Registered model keys (full inventory in
+`/data/home/rj/.claude/projects/-data-projects-lai/memory/model-inventory.md`):
+
+| Key | Path | Size | Notes |
+|---|---|---|---|
+| `qwen25-ft` | `/data/projects/lai/models/qwen25-7b-legal-merged` | 15 GB | Our LoRA fine-tune merged in (default in `serve_rag.py`) |
+| `qwen25-base` | `Qwen/Qwen2.5-7B-Instruct` | 15 GB | Base, same architecture as our FT |
+| `qwen35` | `Qwen/Qwen3.5-27B` | 52 GB | Larger, newer Qwen |
+| `qwen36` | `Qwen/Qwen3.6-27B` | 52 GB | Larger, newer Qwen |
+| `gemma4` | `google/gemma-4-E4B-it` | 15 GB | 4B effective, fast |
+| `llama3` | `meta-llama/Meta-Llama-3-8B-Instruct` | 16 GB | General-purpose comparison |
+| `leo7b` | `/data/projects/lai/models/leo-hessianai-7b` | ~14 GB | German foundation, no legal FT |
+| `saul7b` | `/data/projects/lai/models/Saul-7B-Instruct-v1` | ~14 GB | Equall.ai legal model (EN/FR) |
+
 ## Training-data Quality Audit
 
 Before spending more GPU time on fine-tuning, run the citation-grounding
