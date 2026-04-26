@@ -117,6 +117,9 @@ def main():
 
     # ---- 2. Set up retriever (hybrid + prefix + rerank)
     conn = sqlite3.connect(str(DB))
+    # Some rows from .recover'd corpus have stray non-UTF-8 bytes (mangled
+    # umlauts from PDF extraction). Replace rather than crash.
+    conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
     corpus = load_embeddings(conn)
     ensure_bm25(corpus, conn)
     parent_text = load_parent_texts(conn)

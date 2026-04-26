@@ -2,13 +2,13 @@
   "mode": "dense_prefix",
   "metrics": {
     "n": 100,
-    "elapsed": 5.3,
-    "q_per_s": 18.88,
-    "recall@1": 0.3,
+    "elapsed": 68.8,
+    "q_per_s": 1.45,
+    "recall@1": 0.31,
     "recall@3": 0.48,
     "recall@5": 0.55,
     "recall@10": 0.63,
-    "mrr": 0.407
+    "mrr": 0.413
   },
   "per_query": [
     {
@@ -21,10 +21,10 @@
         573,
         282,
         32781,
-        284,
-        289,
-        27628,
-        26423
+        101237672,
+        101917517,
+        100628974,
+        100607500
       ],
       "rank": 1
     },
@@ -49,6 +49,7 @@
       "question": "Welches Verantwortungsspektrum haben die Prüfer im Zusammenhang mit der Lektüre und Bewertung der Leitungsaussage?",
       "gold_parent": 329,
       "top_parents": [
+        100942944,
         1110,
         4038,
         3272,
@@ -57,8 +58,7 @@
         1048,
         1083,
         1187,
-        1220,
-        104542
+        1220
       ],
       "rank": null
     },
@@ -68,14 +68,14 @@
       "top_parents": [
         335,
         346,
-        2748,
         2795,
+        2748,
         2773,
+        101463339,
         3450,
         8144,
         3480,
-        3207,
-        3238
+        3207
       ],
       "rank": 2
     },
@@ -105,11 +105,11 @@
         28608,
         29339,
         26185,
+        101829069,
         28237,
-        29365,
         27230,
-        26102,
-        25527
+        29365,
+        26102
       ],
       "rank": 1
     },
@@ -135,9 +135,9 @@
       "gold_parent": 390,
       "top_parents": [
         29987,
-        30014,
-        29996,
         30005,
+        29996,
+        30014,
         29970,
         29979,
         1962,
@@ -157,8 +157,8 @@
         390,
         405,
         404,
-        1991,
         2041,
+        1991,
         1652,
         961
       ],
@@ -170,12 +170,12 @@
       "top_parents": [
         424,
         408,
-        407,
         423,
+        407,
         29766,
         29767,
-        410,
         426,
+        410,
         409,
         425
       ],
@@ -185,27 +185,27 @@
       "question": "Welche Verpflichtungen hat die EED GmbH & Co. KG gemäß dem bestehenden Betriebsführungsvertrag hinsichtlich der Pachtzahlungen an den Grundstückseigentümer der Ausgleichsflächen?",
       "gold_parent": 421,
       "top_parents": [
-        437,
         421,
+        437,
         28212,
         27045,
         26801,
-        34371,
-        37334,
         79610,
-        78566,
-        34382
+        34382,
+        37334,
+        34371,
+        78566
       ],
-      "rank": 2
+      "rank": 1
     },
     {
       "question": "Welche rechtlichen Voraussetzungen müssen erfüllt sein, damit die Genehmigungen für die 8 WEA im Windpark Lamstedt von der Windpower Lamstedt GmbH & Co. KG auf die NeXtWind Windpark Beteiligung II GmbH & Co. KG übertragen werden können?",
       "gold_parent": 425,
       "top_parents": [
-        409,
         425,
-        408,
+        409,
         424,
+        408,
         423,
         407,
         418,
@@ -213,14 +213,14 @@
         30445,
         431
       ],
-      "rank": 2
+      "rank": 1
     },
     {
       "question": "Welche Voraussetzungen müssen erfüllt sein, damit der ursprüngliche Nutzungsvertrag vom 30.11.2003 für eine Dauer von mehr als einem Jahr wirksam ist, und welche rechtlichen Aspekte müssen hierbei berücksichtigt werden?",
       "gold_parent": 427,
       "top_parents": [
-        30122,
         30105,
+        30122,
         30139,
         30156,
         30042,
@@ -228,7 +228,7 @@
         29995,
         30004,
         30013,
-        29969
+        29978
       ],
       "rank": null
     },
@@ -238,14 +238,14 @@
       "top_parents": [
         483,
         485,
+        102282243,
+        100709036,
         35941,
         35933,
         79664,
         33808,
         36817,
-        39162,
-        33828,
-        35929
+        39162
       ],
       "rank": 2
     },
@@ -253,6 +253,7 @@
       "question": "Welche Auflagen zur Übertragung oder zum Bauherrnwechsel gelten für die Windenergieanlagen gemäß den Genehmigungen und welche Unterlagen fehlen im Datenraum?",
       "gold_parent": 486,
       "top_parents": [
+        101263612,
         563,
         409,
         425,
@@ -261,8 +262,7 @@
         81635,
         81281,
         81267,
-        81621,
-        424
+        81621
       ],
       "rank": null
     },
@@ -295,8 +295,8 @@
         20091,
         26095,
         20269,
-        21558,
-        12895
+        12895,
+        21558
       ],
       "rank": null
     },
@@ -375,13 +375,13 @@
         888,
         914,
         31693,
-        27275,
         26124,
+        27275,
+        102343592,
+        101503889,
+        101843518,
         27270,
-        26119,
-        163576,
-        27191,
-        26147
+        26119
       ],
       "rank": 1
     },
@@ -389,6 +389,8 @@
       "question": "Welche Voraussetzungen müssen erfüllt sein, um den Anspruch auf die Marktprämie gemäß § 20 EEG 2017 geltend zu machen?",
       "gold_parent": 901,
       "top_parents": [
+        102204735,
+        100360868,
         117439,
         106986,
         106982,
@@ -396,8 +398,6 @@
         78730,
         37682,
         34871,
-        79558,
-        38553,
         35849
       ],
       "rank": null
@@ -409,9 +409,9 @@
         927,
         901,
         31706,
-        34889,
         78748,
         37700,
+        34889,
         35867,
         79576,
         38571,
@@ -443,13 +443,13 @@
         956,
         81736,
         6595,
+        102489482,
         7218,
         9521,
         6596,
-        22194,
-        16218,
-        13548,
-        18330
+        100486340,
+        102126111,
+        13548
       ],
       "rank": 1
     },
@@ -461,12 +461,12 @@
         80435,
         33721,
         36784,
+        100811762,
+        100811757,
         121214,
-        22715,
-        14367,
-        29826,
-        16052,
-        18166
+        101861209,
+        100459694,
+        14367
       ],
       "rank": null
     },
@@ -491,25 +491,25 @@
       "question": "Wie wird die Tilgodehavender in Bezug auf ihre Bewertung gemäß dem vorliegenden Rechtstext definiert und wie erfolgen die Nedskrivninger til imødegåelse af tab?",
       "gold_parent": 1060,
       "top_parents": [
-        28341,
-        26300,
         26273,
+        26300,
+        28341,
         26349,
-        1257,
         1230,
-        1121,
+        1257,
         1197,
-        1094,
-        1060
+        1060,
+        1121,
+        1094
       ],
-      "rank": 10
+      "rank": 8
     },
     {
       "question": "Wie werden langfristige Schulden gemäß dem Rechtstext zu Buche gestellt und bewertet?",
       "gold_parent": 1062,
       "top_parents": [
-        1259,
         1123,
+        1259,
         1035,
         1174,
         2992,
@@ -530,8 +530,8 @@
         2038,
         374,
         1990,
-        2108,
         2136,
+        2108,
         6578,
         2053,
         4088
@@ -563,12 +563,12 @@
         23975,
         24032,
         2994,
+        102539420,
         32338,
         32065,
         3523,
         32010,
-        2766,
-        1206
+        101933996
       ],
       "rank": null
     },
@@ -583,11 +583,11 @@
         23944,
         23970,
         3505,
-        1219,
         1047,
-        1082
+        1082,
+        1219
       ],
-      "rank": 10
+      "rank": 9
     },
     {
       "question": "Welche Unterabschnitte sind im Abschnitt 'Virksomhedsoplysninger' des vorliegenden Rechtsdokuments enthalten?",
@@ -602,7 +602,7 @@
         2053,
         983,
         348,
-        33670
+        39090
       ],
       "rank": null
     },
@@ -610,16 +610,16 @@
       "question": "Welche Bedingungen müssen erfüllt sein, damit die obige Aufstellung angewendet werden kann, gemäß der letzten Klausel des Rechtstextes?",
       "gold_parent": 1129,
       "top_parents": [
-        349,
-        458,
-        518,
-        446,
-        10906,
-        389,
-        4588,
-        107007,
-        448,
-        106947
+        101761213,
+        100491455,
+        102136534,
+        101738630,
+        100136112,
+        101957020,
+        102030868,
+        100828895,
+        100757474,
+        100757456
       ],
       "rank": null
     },
@@ -627,18 +627,18 @@
       "question": "Welches Verfahren wird zur Bestimmung des Abschreibungsbetrags für Produktionsanlagen und Maschinen angewendet und welche Bruttoperiode und Restwert werden hierfür angenommen?",
       "gold_parent": 1170,
       "top_parents": [
+        100872866,
         1170,
         1091,
         1118,
         1057,
         23954,
         23969,
-        23946,
-        1030,
-        23974,
-        26220
+        100750477,
+        101512019,
+        102530414
       ],
-      "rank": 1
+      "rank": 2
     },
     {
       "question": "Welche Meinung haben die Revisoren zum Jahresabschluss von K/S Wind Partner 33 für das Geschäftsjahr 2019 gemäß der dänischen Bilanzgesetzgebung?",
@@ -712,8 +712,8 @@
       "question": "Welche Verfügbarkeitsrate hat die WKA 02 - 18386 im Vergleich zum Mittelwert der Windenergieanlagen (WEA) und welche Faktoren beeinflussen diese Rate?",
       "gold_parent": 1349,
       "top_parents": [
-        1343,
         1524,
+        1343,
         1348,
         1429,
         1529,
@@ -732,8 +732,8 @@
         1431,
         1428,
         1429,
-        1524,
         1343,
+        1524,
         1430,
         1348,
         10610,
@@ -748,14 +748,14 @@
       "top_parents": [
         394,
         32285,
-        32498,
         32545,
-        36906,
+        32498,
+        101486514,
         39251,
+        36906,
         33917,
         1597,
-        32107,
-        79624
+        100296595
       ],
       "rank": null
     },
@@ -850,14 +850,14 @@
       "top_parents": [
         10528,
         10502,
+        100933578,
         4979,
-        22215,
-        16239,
-        13569,
+        100933577,
+        100747279,
         18351,
-        8591,
-        10835,
-        10627
+        13569,
+        16239,
+        22215
       ],
       "rank": null
     },
@@ -867,8 +867,8 @@
       "top_parents": [
         2152,
         2157,
-        2041,
         1991,
+        2041,
         1297,
         32780,
         2164,
@@ -883,8 +883,8 @@
       "gold_parent": 1525,
       "top_parents": [
         1348,
-        1343,
         1524,
+        1343,
         1529,
         1429,
         1431,
@@ -923,8 +923,8 @@
         8106,
         10294,
         34140,
-        37116,
         39430,
+        37116,
         35479
       ],
       "rank": 2
@@ -940,8 +940,8 @@
         39376,
         39325,
         39299,
-        33968,
-        79285,
+        37012,
+        34076,
         33994
       ],
       "rank": null
@@ -952,14 +952,14 @@
       "top_parents": [
         1734,
         28047,
+        79261,
         35496,
         38256,
-        79261,
         80670,
         24767,
         24745,
         1664,
-        37040
+        101112884
       ],
       "rank": 1
     },
@@ -969,14 +969,14 @@
       "top_parents": [
         1735,
         26865,
-        15340,
         23255,
+        15340,
         1771,
         26860,
         14540,
         22738,
         1736,
-        14541
+        22739
       ],
       "rank": 1
     },
@@ -985,51 +985,51 @@
       "gold_parent": 1795,
       "top_parents": [
         27011,
-        26068,
         28849,
+        26068,
         29530,
         1947,
         24949,
-        1795,
         1897,
+        1795,
         1946,
         1919
       ],
-      "rank": 7
+      "rank": 8
     },
     {
       "question": "Welche Anforderungen an den Sachkundigen für die Zustandsüberwachung von Windenergieanlagen sind im Rechtstext festgelegt?",
       "gold_parent": 1821,
       "top_parents": [
-        1821,
         1923,
+        1821,
         7657,
         10037,
-        16649,
-        18838,
         13991,
+        16649,
         22542,
+        18838,
         14804,
         22990
       ],
-      "rank": 1
+      "rank": 2
     },
     {
       "question": "Welche Bedingungen müssen erfüllt sein, damit die Versicherung stillschweigend verlängert wird?",
       "gold_parent": 1833,
       "top_parents": [
+        102471774,
         1833,
         7409,
         6052,
+        101014628,
         9712,
         6786,
         28078,
-        26896,
-        1892,
-        1938,
-        1790
+        102471776,
+        100511604
       ],
-      "rank": 1
+      "rank": 2
     },
     {
       "question": "Welche Bedingungen gelten für die Versicherung von Bußgeldern, die als Ergebnis einer öffentlichen Untersuchung auferlegt werden?",
@@ -1038,13 +1038,13 @@
         29475,
         29436,
         1855,
+        101033023,
+        100546650,
         1866,
-        122880,
-        118694,
-        29447,
-        29486,
-        29448,
-        29487
+        100670050,
+        100670051,
+        101178020,
+        101510767
       ],
       "rank": 3
     },
@@ -1052,16 +1052,16 @@
       "question": "Welche Rechte hat der Versicherer, wenn der Versicherungsnehmer seine Informationspflichten nach § 19 bis 21 VVG nicht erfüllt?",
       "gold_parent": 1905,
       "top_parents": [
+        101477093,
+        101930713,
         24959,
+        102019073,
+        100804672,
+        100797648,
+        101163135,
         25019,
-        25035,
-        30546,
-        25020,
-        24968,
-        24964,
-        30632,
-        1912,
-        24965
+        102181933,
+        102178223
       ],
       "rank": null
     },
@@ -1072,13 +1072,13 @@
         28048,
         1945,
         403,
+        101271536,
         390,
         25554,
         20373,
+        101924613,
         6421,
-        24806,
-        374,
-        400
+        24806
       ],
       "rank": 2
     },
@@ -1086,18 +1086,18 @@
       "question": "Welche Vorschriften gelten für die Erstattung von Mehrkosten durch den Nutzer an die WSV und welche Folgen treten ein, wenn die Forderung nicht beglichen wird?",
       "gold_parent": 1977,
       "top_parents": [
-        2123,
         1977,
+        2123,
         2095,
         20692,
-        2121,
-        1975,
-        2093,
-        24788,
-        12773,
-        21436
+        101827076,
+        102021022,
+        101458332,
+        102321230,
+        101423764,
+        100506002
       ],
-      "rank": 2
+      "rank": 1
     },
     {
       "question": "Welche Pflichten hat der Nutzer gemäß § 89 des Rechtstextes zur Vermeidung von Beeinträchtigungen von schutzwürdigen Gebieten und Flächen?",
@@ -1106,32 +1106,32 @@
         12403,
         21066,
         2125,
-        1979,
         2097,
+        1979,
         12272,
         20935,
         21992,
         13329,
-        20774
+        101608149
       ],
-      "rank": 4
+      "rank": 5
     },
     {
       "question": "Welche Haftungsverpflichtungen übernimmt der Nutzer gemäß § 813 Haftung des Nutzers?",
       "gold_parent": 1983,
       "top_parents": [
+        1983,
         2101,
         2129,
-        1983,
         20758,
         21097,
         12338,
-        12322,
-        22034,
-        20707,
-        21206
+        12956,
+        21303,
+        20120,
+        21866
       ],
-      "rank": 3
+      "rank": 1
     },
     {
       "question": "Welche Adresse hatte das Unternehmen vom 21.01.2007 bis zum 25.03.2009?",
@@ -1171,12 +1171,12 @@
       "question": "Welches ist das Geschäftszweck des Unternehmens gemäß den erweiterten Unternehmensinformationen?",
       "gold_parent": 2053,
       "top_parents": [
-        33670,
-        33652,
-        36733,
-        39090,
         39108,
         36715,
+        33652,
+        33670,
+        39090,
+        36733,
         30749,
         2053,
         18161,
@@ -1211,8 +1211,8 @@
         81130,
         12932,
         21595,
-        13036,
         21699,
+        13036,
         12521,
         21184
       ],
@@ -1245,10 +1245,10 @@
         35704,
         79428,
         35705,
-        38424,
         79429,
+        38424,
         6381,
-        34517
+        37344
       ],
       "rank": null
     },
@@ -1259,8 +1259,8 @@
         37051,
         34065,
         80672,
-        79263,
         35498,
+        79263,
         38258,
         31897,
         9778,
@@ -1310,13 +1310,13 @@
         25499,
         25085,
         156763,
-        25688,
-        25130,
-        25207,
-        25158,
         25227,
-        25178,
-        25110
+        25158,
+        25207,
+        25110,
+        25130,
+        25688,
+        25178
       ],
       "rank": null
     },
@@ -1347,10 +1347,10 @@
         2311,
         2318,
         6374,
+        102395665,
         2207,
         2305,
-        6074,
-        27298
+        6074
       ],
       "rank": 2
     },
@@ -1367,7 +1367,7 @@
         2311,
         2206,
         2297,
-        2318
+        102395665
       ],
       "rank": 2
     },
@@ -1379,12 +1379,12 @@
         2296,
         2310,
         27298,
+        102395665,
+        101233833,
         2205,
         2315,
         2303,
-        6373,
-        980,
-        25655
+        101035116
       ],
       "rank": 3
     },
@@ -1399,8 +1399,8 @@
         13341,
         22004,
         20858,
-        21892,
         13229,
+        21892,
         22067
       ],
       "rank": 1
@@ -1433,9 +1433,9 @@
         32395,
         2478,
         32404,
-        3538,
-        2587,
-        2409
+        101474096,
+        101474094,
+        101731353
       ],
       "rank": 2
     },
@@ -1446,8 +1446,8 @@
         2517,
         2458,
         2499,
-        2552,
         2534,
+        2552,
         2570,
         2486,
         2472,
@@ -1462,8 +1462,8 @@
       "top_parents": [
         3850,
         2632,
-        3823,
         3827,
+        3823,
         2452,
         3842,
         3846,
@@ -1546,15 +1546,15 @@
       "gold_parent": 2488,
       "top_parents": [
         2488,
+        100460865,
+        102082185,
+        101616226,
+        100473133,
+        101228454,
         2475,
-        2707,
-        2521,
-        2698,
-        2503,
-        2489,
-        2686,
-        2444,
-        2556
+        102136927,
+        101473441,
+        2707
       ],
       "rank": 1
     },
@@ -1602,8 +1602,8 @@
         2573,
         2734,
         2502,
-        2724,
         2555,
+        2724,
         2613,
         2410
       ],
@@ -1637,8 +1637,8 @@
         2505,
         2700,
         2413,
-        2558,
         2727,
+        2558,
         2708
       ],
       "rank": 3
@@ -1653,8 +1653,8 @@
         2410,
         2502,
         2613,
-        2724,
         2555,
+        2724,
         2381,
         2715
       ],
@@ -1706,8 +1706,8 @@
         2448,
         2516,
         2441,
-        2622,
-        2696
+        100872866,
+        2622
       ],
       "rank": 1
     }

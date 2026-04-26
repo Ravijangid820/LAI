@@ -900,10 +900,11 @@ def run_step6(args):
     embed_batch_size = args.embed_batch_size
     local_mode = getattr(args, "local", False)
 
+    embed_urls = getattr(args, "embed_urls", None) or embed_cfg.url
     logger.info("=" * 60)
     logger.info("Step 6: Embeddings → pgvector (halfvec 4096)")
     logger.info(f"  Model: {embed_cfg.model}")
-    logger.info(f"  URL: {embed_cfg.url}")
+    logger.info(f"  URL(s): {embed_urls}")
     logger.info(f"  Dimension: {embed_cfg.dimension}")
     logger.info(f"  Mode: {'local (SQLite)' if local_mode else 'postgres (halfvec)'}")
     logger.info("=" * 60)
@@ -943,10 +944,15 @@ def run_step6(args):
     # Dual-write every batch of embeddings to disk alongside the DB insert.
     # A DB corruption otherwise forces a ~48h Step-6 re-run; files on disk
     # can be slurped back in ~20 min via scripts/restore_db_from_files.py.
+    # Flushes one NPZ per BACKUP_FLUSH_ROWS rows to avoid creating hundreds
+    # of thousands of tiny files; in-memory buffer accumulates between flushes.
     # Disabled with --no-backup-embeddings.
+    BACKUP_FLUSH_ROWS = 10_000
     backup_embeddings = getattr(args, "backup_embeddings", True)
     backup_dir = None
     backup_batch_idx = 0
+    backup_buf_ids: list = []
+    backup_buf_embs: list = []
     if backup_embeddings and local_mode:
         from pathlib import Path as _Path
         backup_dir = _Path(__file__).resolve().parents[3] / "data" / "lai-embeddings" / "child_embeddings"
@@ -959,7 +965,25 @@ def run_step6(args):
                 backup_batch_idx = int(last_name.rsplit("_", 1)[-1]) + 1
             except ValueError:
                 pass
-        logger.info(f"  Embedding backup -> {backup_dir} (starting batch #{backup_batch_idx})")
+        logger.info(f"  Embedding backup -> {backup_dir} (starting batch #{backup_batch_idx}, flush every {BACKUP_FLUSH_ROWS:,})")
+
+    def _flush_backup(force: bool = False):
+        """Write buffered embeddings to a single NPZ file."""
+        nonlocal backup_batch_idx, backup_buf_ids, backup_buf_embs
+        if backup_dir is None or not backup_buf_ids:
+            return
+        if not force and len(backup_buf_ids) < BACKUP_FLUSH_ROWS:
+            return
+        import numpy as _np
+        fp = backup_dir / f"child_embeddings_{backup_batch_idx:06d}.npz"
+        _np.savez_compressed(
+            fp,
+            child_ids=_np.asarray(backup_buf_ids, dtype=_np.int64),
+            embeddings=_np.asarray(backup_buf_embs, dtype=_np.float32),
+        )
+        backup_batch_idx += 1
+        backup_buf_ids = []
+        backup_buf_embs = []
 
     # Optional: exclude children whose parent's metadata.raw_type matches.
     # Used to drop noisy buckets (e.g. multilegalpile legal-mc4) without
@@ -1013,7 +1037,7 @@ def run_step6(args):
         try:
             embeddings = embed_batch(
                 texts,
-                embed_url=embed_cfg.url,
+                embed_url=embed_urls,
                 embed_model=embed_cfg.model,
                 batch_size=embed_batch_size,
                 timeout=embed_cfg.timeout,
@@ -1038,16 +1062,11 @@ def run_step6(args):
                 "INSERT OR REPLACE INTO child_embeddings (child_id, embedding) VALUES (?, ?)",
                 insert_rows,
             )
-            # Mirror to disk so the 48h of embedding work survives DB loss
+            # Mirror to disk so the 50h of embedding work survives DB loss
             if backup_dir is not None:
-                import numpy as _np
-                fp = backup_dir / f"child_embeddings_{backup_batch_idx:06d}.npz"
-                _np.savez_compressed(
-                    fp,
-                    child_ids=_np.asarray(ids, dtype=_np.int64),
-                    embeddings=_np.asarray(embeddings, dtype=_np.float32),
-                )
-                backup_batch_idx += 1
+                backup_buf_ids.extend(ids)
+                backup_buf_embs.extend(embeddings)
+                _flush_backup()
             embedded += len(ids)
         else:
             # PostgreSQL path: cast to halfvec(4096)
@@ -1072,6 +1091,10 @@ def run_step6(args):
                 pool.putconn(conn)
 
         logger.info(f"Progress: {embedded}/{total_unembedded} embedded")
+
+    # Final flush of any partial backup buffer (on clean exit or shutdown)
+    if local_mode and backup_dir is not None:
+        _flush_backup(force=True)
 
     # Only GIN index on search_vector (BM25); no HNSW — dims too large.
     # Exact cosine search is used at query time.
@@ -1164,6 +1187,11 @@ def main():
                     help="Skip mirroring each embedding batch to disk at "
                          "data/lai-embeddings/. Default: backup enabled in --local mode.")
     p6.set_defaults(backup_embeddings=True)
+    p6.add_argument("--embed-urls", type=str, default=None,
+                    help="Comma-separated embedding server URLs. If multiple are given, "
+                         "batches are dispatched across them in parallel. Overrides "
+                         "EMBEDDING_URL / embed_cfg.url. Example: "
+                         "http://localhost:8003,http://localhost:8005")
 
     # Global --local flag on each subparser
     for p in [p1, p2, p3, p4, p5, p6]:

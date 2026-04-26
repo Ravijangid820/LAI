@@ -62,16 +62,57 @@ class Corpus:
 
     # For BM25 (optional, loaded on demand)
     bm25_conn: Optional[sqlite3.Connection] = None
+    # Pre-built rowid→corpus-index map; computed once after corpus load
+    # so per-query BM25 lookup is O(k) instead of rebuilding the 4.76M-entry
+    # dict each call.
+    _rowid_idx: Optional[dict] = None
 
 
-def load_embeddings(conn: sqlite3.Connection) -> Corpus:
+def load_embeddings(conn: sqlite3.Connection,
+                    exclude_source_corpus: list[str] | None = None,
+                    only_doc_types: list[str] | None = None) -> Corpus:
+    """Load embeddings into RAM with optional filters.
+
+    `exclude_source_corpus`: drop embeddings whose parent's metadata.source_corpus
+        matches (e.g. ['multilegalpile']). Phase 1 rows have NULL metadata —
+        they're kept either way.
+    `only_doc_types`: keep only rows where parent's doc_type is in this list
+        (e.g. ['vdr', 'gesetz', 'dd_report', 'fachbuch']). doc_type is shared
+        across corpora (multilegalpile legislation also has doc_type=gesetz),
+        so this is a coarse filter.
+    """
     print("Loading child embeddings into RAM...")
     t0 = time.time()
-    rows = conn.execute("""
-        SELECT e.child_id, c.parent_id, e.embedding
-        FROM child_embeddings e
-        JOIN child_chunks c ON c.id = e.child_id
-    """).fetchall()
+    where = ["1=1"]
+    params: list = []
+    if exclude_source_corpus:
+        placeholders = ",".join("?" * len(exclude_source_corpus))
+        where.append(
+            f"(json_extract(p.metadata, '$.source_corpus') IS NULL "
+            f"OR json_extract(p.metadata, '$.source_corpus') NOT IN ({placeholders}))"
+        )
+        params.extend(exclude_source_corpus)
+        print(f"  exclude_source_corpus={exclude_source_corpus}")
+    if only_doc_types:
+        placeholders = ",".join("?" * len(only_doc_types))
+        where.append(f"p.doc_type IN ({placeholders})")
+        params.extend(only_doc_types)
+        print(f"  only_doc_types={only_doc_types}")
+    if where == ["1=1"]:
+        rows = conn.execute("""
+            SELECT e.child_id, c.parent_id, e.embedding
+            FROM child_embeddings e
+            JOIN child_chunks c ON c.id = e.child_id
+        """).fetchall()
+    else:
+        sql = f"""
+            SELECT e.child_id, c.parent_id, e.embedding
+            FROM child_embeddings e
+            JOIN child_chunks c ON c.id = e.child_id
+            JOIN parent_chunks p ON p.id = c.parent_id
+            WHERE {' AND '.join(where)}
+        """
+        rows = conn.execute(sql, params).fetchall()
     n = len(rows)
 
     child_ids  = np.empty(n, dtype=np.int64)
@@ -147,8 +188,14 @@ def retrieve_bm25(query: str, corpus: Corpus, k: int) -> tuple[list[int], list[f
     # FTS5 MATCH needs special char handling; wrap in quotes
     # Also treat the query as a "simple" query (OR over tokens), not full MATCH syntax
     safe = query.replace('"', ' ').strip()
-    # Split into up-to 15 most informative-looking tokens; longer tokens first
-    tokens = sorted(set(t for t in safe.split() if len(t) > 2), key=len, reverse=True)[:15]
+    # Split into up-to 6 most informative-looking tokens (long-words first).
+    # Was 15 — too many OR terms make FTS5 scan a huge candidate set on a
+    # 50M-row index. 6 still captures the rare/specific terms that drive
+    # BM25 quality without blowing query time.
+    tokens = sorted(set(t for t in safe.split() if len(t) > 4), key=len, reverse=True)[:6]
+    if not tokens:
+        # Fallback for very short queries
+        tokens = sorted(set(t for t in safe.split() if len(t) > 2), key=len, reverse=True)[:6]
     if not tokens:
         return [], []
     match_expr = " OR ".join(f'"{t}"' for t in tokens)
@@ -163,7 +210,10 @@ def retrieve_bm25(query: str, corpus: Corpus, k: int) -> tuple[list[int], list[f
         return [], []
 
     # Map rowid -> position in corpus arrays (which are ordered by row in load)
-    rowid_to_idx = {int(c): i for i, c in enumerate(corpus.child_ids)}
+    # Built once on first BM25 call; reused across queries.
+    if corpus._rowid_idx is None:
+        corpus._rowid_idx = {int(c): i for i, c in enumerate(corpus.child_ids)}
+    rowid_to_idx = corpus._rowid_idx
     indices, scores = [], []
     for rowid, score in rows:
         if rowid in rowid_to_idx:
@@ -402,6 +452,13 @@ def main():
                    help="Qwen3-Reranker-* uses causal scoring (yes/no probs); "
                         "bge-reranker-* uses sequence-classification. Both work.")
     p.add_argument("--out", default=None)
+    p.add_argument("--exclude-source-corpus", type=str, default=None,
+                   help="Comma-separated metadata.source_corpus values to drop "
+                        "from the search pool. Example: multilegalpile")
+    p.add_argument("--only-doc-types", type=str, default=None,
+                   help="Comma-separated doc_type values to keep "
+                        "(coarse — Phase 2 sources may share doc_type names). "
+                        "Example: vdr,gesetz,dd_report,fachbuch")
     args = p.parse_args()
 
     OUT_DIR.mkdir(exist_ok=True)
@@ -412,7 +469,18 @@ def main():
     print(f"Loaded {len(queries)} val queries")
 
     conn = sqlite3.connect(str(DB))
-    corpus = load_embeddings(conn)
+    # Some rows from .recover'd corpus have stray non-UTF-8 bytes (e.g.
+    # mangled umlauts from PDF extraction). Replace rather than crash.
+    conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    excl = (
+        [s.strip() for s in args.exclude_source_corpus.split(",") if s.strip()]
+        if args.exclude_source_corpus else None
+    )
+    only_dt = (
+        [s.strip() for s in args.only_doc_types.split(",") if s.strip()]
+        if args.only_doc_types else None
+    )
+    corpus = load_embeddings(conn, exclude_source_corpus=excl, only_doc_types=only_dt)
 
     if args.mode in ("bm25", "hybrid", "hybrid_prefix", "hybrid_rerank"):
         ensure_bm25(corpus, conn)

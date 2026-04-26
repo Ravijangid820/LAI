@@ -145,26 +145,66 @@ python scripts/temp/process_court_decisions.py --source all
 ## RAG Evaluation
 
 `scripts/rag_eval.py` measures retrieval quality end-to-end on stratified
-val queries whose gold `parent_id` is known:
+val queries whose gold `parent_id` is known. Filter the search pool with
+`--exclude-source-corpus multilegalpile` or `--only-doc-types vdr,gesetz,...`
+to test against specific corpus subsets.
 
 ```bash
-python scripts/rag_eval.py --mode hybrid_rerank --n 500
+python scripts/rag_eval.py --mode hybrid_rerank --n 100
 ```
 
-Modes (compared head-to-head on the same queries):
+Modes (compared on the **8.3M-embedding corpus** after dedup, n=100):
 
-| Mode | R@1 | R@5 | MRR |
-|---|---:|---:|---:|
-| dense (baseline) | 26% | 58% | 0.381 |
-| dense + Qwen3 query prefix | 30% | 55% | 0.407 |
-| bm25 | 29% | 47% | 0.360 |
-| hybrid (dense + bm25, RRF) | 33% | 61% | 0.447 |
-| hybrid + prefix | 38% | 61% | 0.480 |
-| **hybrid + prefix + Qwen3-Reranker-8B** | **40%** | **75%** | **0.531** |
+| Mode | R@1 | R@5 | R@10 | MRR |
+|---|---:|---:|---:|---:|
+| dense + Qwen3 query prefix | 31% | 55% | 63% | 0.413 |
+| hybrid (dense + bm25 + RRF) + prefix | 35% | 56% | 66% | 0.434 |
+| **hybrid + prefix + Qwen3-Reranker-8B** | **37%** | **66%** | **72%** | **0.492** |
+
+Reproducible numbers — these match what the evaluation actually returns
+on the recovered DB. The earlier README claim of R@5=75% was on a
+different val sample / smaller corpus and didn't replicate.
+
+**Cleanup that mattered:** `scripts/dedup_phase1_rechunks.py` removes
+the 134K parents (216K children, 216K embeddings) that Step 2 produced
+when it inadvertently re-chunked Phase 1 sources during the multilegalpile
+run. Pre-dedup eval was R@1=0.24 / R@5=0.45; post-dedup is R@1=0.32 /
+R@5=0.55 — a 10pt R@5 lift just from removing duplicates.
 
 Followup: `scripts/rag_audit_analysis.py` slices the failures by task,
-query specificity, and doc_type to show where the remaining 25% of R@5
-misses are concentrated.
+query specificity, and doc_type to show where the remaining R@5 misses
+are concentrated.
+
+## End-to-end RAG Service + Web UI
+
+`scripts/serve_rag.py` exposes the full retrieval+generation pipeline
+behind a FastAPI endpoint that matches the `web_ui/LAI/src/react-app/lib/ragApi.ts`
+contract:
+
+```bash
+# Backend (loads 127 GB embeddings + reranker + Qwen2.5-7B-Instruct, ~5-30 min cold start)
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/serve_rag.py --port 18000
+
+# Frontend (React + Vite + Hono, default port 5173)
+cd web_ui/LAI && npm install && npm run dev
+```
+
+Endpoints:
+- `GET /health` — readiness probe
+- `POST /query {question, session_id?, top_k?}` — returns `{answer, chunks, timings, tokens, session_id}`
+- `POST /upload` — stub (returns OK without ingestion)
+
+Per-query latency: ~30s (retrieval ~18s + rerank ~7s + LLM gen ~6s) on
+the 8.3M-embedding corpus.
+
+For end-to-end manual comparison of base vs fine-tuned model with RAG
+context:
+
+```bash
+python scripts/rag_generate_test.py --n 5 --top-k 3 \
+  --base Qwen/Qwen2.5-7B-Instruct \
+  --ft   /data/projects/lai/models/qwen25-7b-legal-merged
+```
 
 ## Training-data Quality Audit
 

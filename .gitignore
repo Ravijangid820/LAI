@@ -97,6 +97,18 @@ LAI/processed/*.db-*
 LAI/processed/db_export/
 LAI/processed/pipeline_local.db*
 
+# DB-snapshot backups (post-recovery JSONL/NPZ — can be large)
+LAI/processed/backups/
+
+# Runtime logs (tmux/background scripts write here)
+LAI/logs/tmp/
+
+# Web UI dependencies + local env
+LAI/web_ui/**/node_modules/
+LAI/web_ui/**/.env
+LAI/web_ui/**/dist/
+LAI/web_ui/**/.wrangler/
+
 # Top-level scripts folder (personal scripts, not project code)
 /scripts/
 

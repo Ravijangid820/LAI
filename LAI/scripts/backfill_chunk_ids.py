@@ -100,12 +100,35 @@ def main():
     print("Before:")
     status(conn)
 
-    max_pc = conn.execute("SELECT MAX(id) FROM parent_chunks").fetchone()[0] or 0
-    max_cc = conn.execute("SELECT MAX(id) FROM child_chunks").fetchone()[0] or 0
-    if OFFSET <= max(max_pc, max_cc):
-        raise SystemExit(
-            f"ABORT: OFFSET={OFFSET} but existing max id is {max(max_pc, max_cc)}"
-        )
+    # Sanity: no id should exceed what this offset would produce
+    # (i.e. max_rowid + OFFSET). Ids above OFFSET are either from a
+    # previous partial backfill (id = rowid + OFFSET, legal to resume)
+    # or stale garbage (would overlap new backfill values, fatal).
+    for t in ("parent_chunks", "child_chunks"):
+        max_id, max_rowid = conn.execute(
+            f"SELECT MAX(id), MAX(rowid) FROM {t}"
+        ).fetchone()
+        max_id = max_id or 0
+        max_rowid = max_rowid or 0
+        legal_ceiling = max_rowid + OFFSET
+        if max_id > legal_ceiling:
+            raise SystemExit(
+                f"ABORT: {t} max(id)={max_id} exceeds legal ceiling "
+                f"max(rowid)+OFFSET={legal_ceiling}"
+            )
+        if max_id > OFFSET:
+            # Resumption path — verify the offset-region ids were
+            # produced by this script (id == rowid + OFFSET).
+            bad = conn.execute(
+                f"SELECT COUNT(*) FROM {t} "
+                f"WHERE id >= ? AND id != rowid + ?",
+                (OFFSET, OFFSET),
+            ).fetchone()[0]
+            if bad > 0:
+                raise SystemExit(
+                    f"ABORT: {t} has {bad} rows where id >= OFFSET but "
+                    f"id != rowid+OFFSET — not a clean partial backfill"
+                )
 
     if not args.apply:
         print(f"\n(dry-run; pass --apply to perform backfill with offset {OFFSET:,})")
