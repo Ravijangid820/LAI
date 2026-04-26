@@ -28,6 +28,38 @@ export interface RAGResponse {
     completion: number;
   };
   session_id: string;
+  // Backend reports which routing decision it made.
+  // "chat" = no retrieval; "rag" = corpus retrieval;
+  // "contract" = uses uploaded contract only;
+  // "rag+contract" = both.
+  mode?: "chat" | "rag" | "contract" | "rag+contract";
+}
+
+export interface ClauseIssue {
+  severity: "low" | "medium" | "high";
+  description: string;
+  recommendation?: string;
+  reason?: string;
+  type?: string;
+}
+
+export interface AnalyzedClause {
+  id: string;
+  title: string;
+  text: string;
+  type: string;
+  summary: string;
+  issues: ClauseIssue[];
+  citations: string[];
+}
+
+export interface AnalyzeResponse {
+  session_id: string;
+  filename: string;
+  n_clauses: number;
+  clauses: AnalyzedClause[];
+  missing_required_clauses: ClauseIssue[];
+  elapsed_s: number;
 }
 
 export interface UploadResponse {
@@ -68,6 +100,21 @@ export async function uploadDocument(file: File, sessionId: string | null = null
   if (!res.ok) {
     const error = await res.json().catch(() => ({}));
     throw new Error(error.detail || `Upload failed: ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export async function analyzeContract(sessionId: string): Promise<AnalyzeResponse> {
+  const res = await fetch(`${BACKEND_URL}/analyze-contract`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}));
+    throw new Error(error.detail || `Analysis failed: ${res.status}`);
   }
 
   return res.json();

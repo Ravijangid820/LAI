@@ -18,7 +18,7 @@ import { ChatInput } from "@/react-app/components/chat/ChatInput";
 import { TypingIndicator } from "@/react-app/components/chat/TypingIndicator";
 import { Button } from "@/react-app/components/ui/button";
 import type { Conversation } from "@/react-app/components/DashboardLayout";
-import { queryRAG, uploadDocument } from "@/react-app/lib/ragApi";
+import { queryRAG, uploadDocument, analyzeContract } from "@/react-app/lib/ragApi";
 
 const suggestedPrompts = [
   {
@@ -131,11 +131,18 @@ export default function DashboardChatPage() {
             currentSessionId = uploadResult.session_id;
             setSessionId(currentSessionId);
 
-            // Show upload success message
+            // Show upload success message with an "Analyze contract" CTA.
+            // The CTA is surfaced as a regular message so the user knows
+            // the option exists; clicking it triggers /analyze-contract.
             const uploadMessage: ChatMessageData = {
               id: crypto.randomUUID(),
               role: "assistant",
-              content: `📄 **Document uploaded:** ${uploadResult.filename}\n- Pages: ${uploadResult.pages}\n- Chunks: ${uploadResult.chunks}\n\nYou can now ask questions about this document.`,
+              content:
+                `📄 **Document uploaded:** ${uploadResult.filename}\n` +
+                `- Pages: ${uploadResult.pages}\n` +
+                `- Chunks: ${uploadResult.chunks}\n\n` +
+                `You can ask questions about this document, or type **"analyze contract"** ` +
+                `for a clause-by-clause review (issues, missing clauses, citations).`,
               timestamp: new Date(),
             };
             setMessages((prev) => [...prev, uploadMessage]);
@@ -144,22 +151,78 @@ export default function DashboardChatPage() {
         setIsUploading(false);
       }
 
-      // Now query with the question
-      const result = await queryRAG(content, currentSessionId);
+      // Special command: "analyze contract" runs the clause-by-clause
+      // analyzer on the currently-uploaded session document.
+      const trimmed = content.trim().toLowerCase();
+      const isAnalyzeCmd =
+        currentSessionId &&
+        (trimmed === "analyze contract" ||
+         trimmed === "analyse vertrag" ||
+         trimmed === "analysiere vertrag" ||
+         trimmed.startsWith("/analyze"));
 
-      // Store session_id for conversation continuity
-      if (result.session_id) {
-        setSessionId(result.session_id);
+      if (isAnalyzeCmd) {
+        const a = await analyzeContract(currentSessionId);
+        const lines: string[] = [];
+        lines.push(`**Contract analysis** — ${a.filename}`);
+        lines.push(`Detected ${a.n_clauses} clauses (analysis took ${a.elapsed_s}s)`);
+        lines.push("");
+        if (a.missing_required_clauses.length > 0) {
+          lines.push("### ❌ Missing required clauses");
+          for (const m of a.missing_required_clauses) {
+            lines.push(`- **[${m.severity.toUpperCase()}] ${m.type ?? ""}** — ${m.description}`);
+          }
+          lines.push("");
+        }
+        const flagged = a.clauses.filter((c) => c.issues && c.issues.length > 0);
+        if (flagged.length > 0) {
+          lines.push("### ⚠️ Flagged clauses");
+          for (const c of flagged) {
+            lines.push(`#### ${c.id} · ${c.type}`);
+            if (c.summary) lines.push(`> ${c.summary}`);
+            for (const i of c.issues) {
+              lines.push(
+                `- **[${i.severity.toUpperCase()}]** ${i.description}` +
+                (i.recommendation ? `\n   _Empfehlung: ${i.recommendation}_` : "")
+              );
+            }
+            if (c.citations.length > 0) {
+              lines.push(`- 📎 ${c.citations.join(", ")}`);
+            }
+            lines.push("");
+          }
+        } else {
+          lines.push("✅ No issues flagged in any clause.");
+        }
+        const aiMessage: ChatMessageData = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: lines.join("\n"),
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, aiMessage]);
+      } else {
+        // Normal /query path
+        const result = await queryRAG(content, currentSessionId);
+
+        if (result.session_id) {
+          setSessionId(result.session_id);
+        }
+
+        // Show mode badge inline so user can see whether retrieval ran.
+        const modeBadge = result.mode && result.mode !== "chat"
+          ? `\n\n<sub>_Mode: ${result.mode}_</sub>`
+          : "";
+
+        const aiMessage: ChatMessageData = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: result.answer + modeBadge,
+          timestamp: new Date(),
+        };
+
+        setMessages((prev) => [...prev, aiMessage]);
       }
-
-      const aiMessage: ChatMessageData = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: result.answer,
-        timestamp: new Date(),
-      };
-
-      setMessages((prev) => [...prev, aiMessage]);
     } catch (err: unknown) {
       setIsUploading(false);
       // Show the error as an assistant message so it's visible in chat
