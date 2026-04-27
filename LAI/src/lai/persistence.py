@@ -45,6 +45,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id                       TEXT PRIMARY KEY,
     user_id                  TEXT,
+    title                    TEXT,
     filename                 TEXT,
     contract_text            TEXT,
     n_pages                  INTEGER,
@@ -93,6 +94,11 @@ def init(db_path: Path, uploads_dir: Path) -> None:
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
 
+    # Forward-compat migration — older DBs predate the `title` column.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+    if "title" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+
     _STATE["conn"] = conn
     _STATE["uploads_dir"] = uploads_dir
 
@@ -112,6 +118,7 @@ def _row_to_session(r: sqlite3.Row) -> dict:
     return {
         "id": r["id"],
         "user_id": r["user_id"],
+        "title": r["title"] if "title" in r.keys() else None,
         "filename": r["filename"],
         "contract_text": r["contract_text"],
         "n_pages": r["n_pages"] or 0,
@@ -128,6 +135,23 @@ def _row_to_session(r: sqlite3.Row) -> dict:
     }
 
 
+def _display_title_sql_expr() -> str:
+    """SQL fragment that picks the best available title for a session:
+    user-set title → uploaded filename → first user message (truncated)
+    → ``Untitled chat``. Used in list_sessions so the sidebar always
+    shows something useful even when nothing was set explicitly."""
+    return (
+        "COALESCE("
+        "NULLIF(TRIM(sessions.title), ''),"
+        "NULLIF(TRIM(sessions.filename), ''),"
+        "(SELECT SUBSTR(content, 1, 80) FROM messages "
+        " WHERE messages.session_id = sessions.id AND role = 'user' "
+        " ORDER BY created_at ASC, id ASC LIMIT 1),"
+        "'Untitled chat'"
+        ")"
+    )
+
+
 # ---------------------------------------------------------------------------
 # sessions
 # ---------------------------------------------------------------------------
@@ -141,18 +165,21 @@ def load_session(sid: str) -> Optional[dict]:
 
 def save_session(sid: str, data: dict) -> None:
     """Upsert a session. Caller passes the same dict shape that was
-    historically stored under ``STATE["sessions"][sid]``."""
+    historically stored under ``STATE["sessions"][sid]``. Note: ``title``
+    is preserved on upsert when not explicitly set in ``data`` — it's a
+    user-controlled field, not derived from upload payloads."""
     now = time.time()
     with _STATE["lock"]:
         _conn().execute(
             """
             INSERT INTO sessions (
-                id, user_id, filename, contract_text, n_pages,
+                id, user_id, title, filename, contract_text, n_pages,
                 tables_json, clauses_json, analysis_json, extraction_quality_json,
                 upload_ext, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 user_id                 = COALESCE(excluded.user_id, sessions.user_id),
+                title                   = COALESCE(excluded.title, sessions.title),
                 filename                = excluded.filename,
                 contract_text           = excluded.contract_text,
                 n_pages                 = excluded.n_pages,
@@ -166,6 +193,7 @@ def save_session(sid: str, data: dict) -> None:
             (
                 sid,
                 data.get("user_id"),
+                data.get("title"),
                 data.get("filename"),
                 data.get("contract_text"),
                 int(data.get("n_pages") or 0),
@@ -178,6 +206,19 @@ def save_session(sid: str, data: dict) -> None:
                 now,
             ),
         )
+
+
+def update_session_title(sid: str, title: str) -> bool:
+    """Set the user-facing title for a session. Pass an empty string to
+    clear (which falls back to the COALESCE chain in list_sessions).
+    Returns True if a row was updated."""
+    cleaned = (title or "").strip()
+    with _STATE["lock"]:
+        cur = _conn().execute(
+            "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
+            (cleaned or None, time.time(), sid),
+        )
+        return cur.rowcount > 0
 
 
 def delete_session(sid: str) -> None:
@@ -195,34 +236,31 @@ def session_exists(sid: str) -> bool:
 
 def list_sessions(limit: int = 50, user_id: Optional[str] = None) -> list[dict]:
     """Light-weight list (no contract_text/analysis blobs) for UI sidebars."""
+    title_expr = _display_title_sql_expr()
+    base_select = f"""
+        SELECT id,
+               title AS user_title,
+               {title_expr} AS title,
+               filename, n_pages, created_at, updated_at,
+               (clauses_json IS NOT NULL) AS has_analysis,
+               (SELECT COUNT(*) FROM messages WHERE session_id = sessions.id) AS n_messages
+        FROM sessions
+    """
     if user_id is None:
         rows = _conn().execute(
-            """
-            SELECT id, filename, n_pages, created_at, updated_at,
-                   (clauses_json IS NOT NULL) AS has_analysis,
-                   (SELECT COUNT(*) FROM messages WHERE session_id = sessions.id) AS n_messages
-            FROM sessions
-            ORDER BY updated_at DESC
-            LIMIT ?
-            """,
+            base_select + " ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
     else:
         rows = _conn().execute(
-            """
-            SELECT id, filename, n_pages, created_at, updated_at,
-                   (clauses_json IS NOT NULL) AS has_analysis,
-                   (SELECT COUNT(*) FROM messages WHERE session_id = sessions.id) AS n_messages
-            FROM sessions
-            WHERE user_id = ?
-            ORDER BY updated_at DESC
-            LIMIT ?
-            """,
+            base_select + " WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
     return [
         {
             "id": r["id"],
+            "title": r["title"],          # always non-null (COALESCE chain)
+            "user_title": r["user_title"],  # what the user explicitly set, or null
             "filename": r["filename"],
             "n_pages": r["n_pages"] or 0,
             "uploaded_at": r["created_at"],

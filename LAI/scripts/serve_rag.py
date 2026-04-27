@@ -1146,6 +1146,20 @@ def delete_session_endpoint(session_id: str):
     return {"ok": True}
 
 
+class RenameReq(BaseModel):
+    title: str
+
+
+@app.patch("/sessions/{session_id}")
+def rename_session(session_id: str, req: RenameReq):
+    """Set a user-facing title for the conversation. Empty string clears
+    the override and the display title falls back to filename / first
+    user message / 'Untitled chat'."""
+    if not persistence.update_session_title(session_id, req.title):
+        raise HTTPException(404, "session_id not found")
+    return {"ok": True, "title": req.title.strip()}
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------

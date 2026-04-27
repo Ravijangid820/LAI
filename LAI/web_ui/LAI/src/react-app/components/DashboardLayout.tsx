@@ -1,5 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
-import { listSessions, deleteSession as apiDeleteSession } from "@/react-app/lib/ragApi";
+import {
+  listSessions,
+  deleteSession as apiDeleteSession,
+  renameSession as apiRenameSession,
+} from "@/react-app/lib/ragApi";
 import { Link, useLocation, Outlet, useNavigate } from "react-router";
 import { Logo } from "@/react-app/components/Logo";
 import { useAuth } from "@/react-app/contexts/AuthContext";
@@ -57,8 +61,10 @@ export default function DashboardLayout() {
     const sessions = await listSessions(50);
     setConversations(
       sessions.map((s) => ({
+        // Backend computes a sensible display title via COALESCE chain
+        // (user-set title → filename → first user message → "Untitled chat").
         id: s.id,
-        title: s.filename || "Untitled chat",
+        title: s.title,
         preview: s.has_analysis
           ? `${s.n_pages} pages · analyzed · ${s.n_messages} msgs`
           : `${s.n_messages} message${s.n_messages === 1 ? "" : "s"}`,
@@ -66,6 +72,19 @@ export default function DashboardLayout() {
       })),
     );
   }, []);
+
+  const handleRename = useCallback(
+    async (id: string, currentTitle: string) => {
+      const next = window.prompt("Rename conversation:", currentTitle);
+      if (next === null) return; // user cancelled
+      const trimmed = next.trim();
+      // Empty string is allowed → backend clears the override and the
+      // display title falls back to the COALESCE chain.
+      const ok = await apiRenameSession(id, trimmed);
+      if (ok) await refreshConversations();
+    },
+    [refreshConversations],
+  );
 
   useEffect(() => {
     refreshConversations();
@@ -295,6 +314,11 @@ export default function DashboardLayout() {
                         </button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          onClick={() => handleRename(conv.id, conv.title)}
+                        >
+                          Rename
+                        </DropdownMenuItem>
                         <DropdownMenuItem
                           onClick={async () => {
                             // Optimistic remove — refresh from server below

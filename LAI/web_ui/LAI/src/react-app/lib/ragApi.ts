@@ -152,6 +152,8 @@ export interface SessionDetail {
 
 export interface SessionSummary {
   id: string;
+  title: string;                 // always non-null — backend COALESCE chain
+  user_title: string | null;     // what the user explicitly set, or null
   filename: string | null;
   n_pages: number;
   uploaded_at: number;
@@ -192,6 +194,19 @@ export async function listSessions(limit = 50): Promise<SessionSummary[]> {
 export async function deleteSession(sessionId: string): Promise<boolean> {
   try {
     const res = await fetch(`${BACKEND_URL}/sessions/${sessionId}`, { method: "DELETE" });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function renameSession(sessionId: string, title: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${BACKEND_URL}/sessions/${sessionId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
     return res.ok;
   } catch {
     return false;
