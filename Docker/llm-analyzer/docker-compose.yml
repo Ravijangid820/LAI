@@ -1,0 +1,51 @@
+# Analyzer LLM (Qwen3.6-27B with thinking + JSON-guided decoding) — GPU 0
+#
+# Used by /analyze-contract V2 in serve_rag.py.
+# Conversational /query keeps using the fast 7B model on GPU 1.
+#
+# Usage:
+#   docker compose up -d
+#   curl -s http://localhost:8005/v1/models | jq
+
+services:
+  analyzer-llm:
+    image: vllm/vllm-openai:latest
+    container_name: lai_analyzer_llm
+    restart: unless-stopped
+    ipc: host
+    command: >
+      --model ${ANALYZER_MODEL:-Qwen/Qwen3.6-27B}
+      --served-model-name ${ANALYZER_SERVED_NAME:-qwen3.6-27b}
+      --max-model-len ${ANALYZER_MAX_MODEL_LEN:-32768}
+      --max-num-seqs ${ANALYZER_MAX_NUM_SEQS:-8}
+      --dtype bfloat16
+      --trust-remote-code
+      --gpu-memory-utilization ${ANALYZER_GPU_MEM_UTIL:-0.85}
+      --reasoning-parser qwen3
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - /data/projects/lai/LAI/.runtime-cache/hf:/root/.cache/huggingface
+    ports:
+      - "${ANALYZER_PORT:-8005}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 30
+      start_period: 600s
+    networks:
+      - lai_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${ANALYZER_CUDA_DEVICE:-0}']
+              capabilities: [gpu]
+
+networks:
+  lai_network:
+    external: true

@@ -50,15 +50,26 @@ LAI_DIR = Path(__file__).resolve().parents[1]
 DB      = LAI_DIR / "processed" / "pipeline_local.db"
 
 sys.path.insert(0, str(LAI_DIR / "scripts"))
+sys.path.insert(0, str(LAI_DIR / "src"))
 from rag_eval import (  # type: ignore[import-not-found]
     Corpus, load_embeddings, ensure_bm25, embed_query,
     retrieve_dense, retrieve_bm25, rrf_fuse, Reranker,
     load_parent_texts, dedupe_by_parent,
 )
+from lai.analyzer import pipeline as analyzer_pipeline  # noqa: E402
+from lai.analyzer import llm_client as analyzer_llm     # noqa: E402
 
 STATE: dict = {
     "corpus": None, "conn": None, "parent_text": None,
-    "reranker": None, "lm": None, "tok": None,
+    "reranker": None,
+    # Local LLM (transformers) — used if LLM_API_URL is unset
+    "lm": None, "tok": None,
+    # Remote LLM (vLLM container, OpenAI-compatible) — preferred when set
+    "llm_api_url": None,
+    "llm_model_name": None,
+    # Analyzer V2 — separate vLLM endpoint, Qwen3.6-27B with thinking mode
+    "analyzer_cfg": None,
+    "analyzer_version_default": "1",  # "1" | "2"
     "sessions": {},  # session_id -> {"contract_text": str, "filename": str, "clauses": [...], "analysis": {...}}
 }
 
@@ -194,17 +205,68 @@ def build_contract_uses_messages(question: str) -> list[dict]:
 # LLM helpers
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
+def _messages_for_remote_model(messages: list[dict], model_path: str) -> list[dict]:
+    """Some models (Gemma family) reject the system role in the chat
+    template. Merge system into the first user message for those."""
+    if "gemma" in model_path.lower():
+        sys_msgs = [m["content"] for m in messages if m["role"] == "system"]
+        rest = [m for m in messages if m["role"] != "system"]
+        if sys_msgs and rest and rest[0]["role"] == "user":
+            rest[0] = {
+                "role": "user",
+                "content": "\n\n".join(sys_msgs) + "\n\n" + rest[0]["content"],
+            }
+            return rest
+    return messages
+
+
+def _strip_reasoning_trace(text: str) -> str:
+    """Reasoning models (Qwen3.x) emit `<think>...</think>` before the
+    final answer. Strip that prefix for the user-facing reply."""
+    m = re.search(r"</think>\s*", text)
+    if m:
+        return text[m.end():].strip()
+    return text
+
+
 def llm_generate(messages: list[dict], max_new_tokens: int = 400) -> tuple[str, int, int]:
+    """Two backends:
+
+    1. Remote (LLM_API_URL set) — POST to an OpenAI-compatible /v1/chat/completions
+       endpoint. Used to swap the LLM (e.g. Gemma 4 in vLLM) without
+       breaking when transformers can't load the architecture.
+    2. Local — load via transformers (legacy path, still default if no
+       LLM_API_URL).
+    """
+    if STATE["llm_api_url"]:
+        # Remote vLLM endpoint
+        url = STATE["llm_api_url"].rstrip("/") + "/v1/chat/completions"
+        msgs = _messages_for_remote_model(messages, STATE["llm_model_name"])
+        body = {
+            "model": STATE["llm_model_name"],
+            "messages": msgs,
+            "max_tokens": max_new_tokens,
+            "temperature": 0.0,
+        }
+        r = httpx.post(url, json=body, timeout=600.0)
+        r.raise_for_status()
+        data = r.json()
+        text = data["choices"][0]["message"]["content"]
+        text = _strip_reasoning_trace(text)
+        usage = data.get("usage", {}) or {}
+        return text.strip(), int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))
+
+    # Local transformers path
     tok = STATE["tok"]; model = STATE["lm"]
     text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inp = tok(text, return_tensors="pt", truncation=True, max_length=8192).to(model.device)
     prompt_tokens = int(inp.input_ids.shape[1])
-    out = model.generate(
-        **inp, max_new_tokens=max_new_tokens, do_sample=False,
-        temperature=1.0, repetition_penalty=1.05,
-        pad_token_id=tok.pad_token_id,
-    )
+    with torch.no_grad():
+        out = model.generate(
+            **inp, max_new_tokens=max_new_tokens, do_sample=False,
+            temperature=1.0, repetition_penalty=1.05,
+            pad_token_id=tok.pad_token_id,
+        )
     gen_ids = out[0][inp.input_ids.shape[1]:]
     completion_tokens = int(gen_ids.shape[0])
     return tok.decode(gen_ids, skip_special_tokens=True).strip(), prompt_tokens, completion_tokens
@@ -306,17 +368,18 @@ def session_uses_contract(session_id: str | None, question: str) -> bool:
 _DOCLING_CONVERTER = None  # lazy
 
 
-def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int]:
-    """Convert uploaded document to markdown text.
+def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int, list[dict]]:
+    """Convert uploaded document to markdown + structured tables.
 
     Plain text and markdown are decoded directly (Docling refuses .txt).
     Everything else goes through Docling (PDF, DOCX, HTML, etc.).
-    Returns (markdown_text, num_pages — 0 when not a paginated format).
+    Returns (markdown_text, num_pages, tables).
+        tables: list of {"title", "rows": [{col_label: cell, ...}, ...]}
     """
     suffix = Path(filename).suffix.lower()
     if suffix in (".txt", ".md", ".markdown"):
         try:
-            return file_bytes.decode("utf-8", errors="replace"), 0
+            return file_bytes.decode("utf-8", errors="replace"), 0, []
         except Exception as e:
             raise RuntimeError(f"Could not decode text file: {e}")
 
@@ -337,9 +400,38 @@ def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int]:
             num_pages = len(result.document.pages) if hasattr(result.document, "pages") else 0
         except Exception:
             num_pages = 0
-        return md, num_pages
+        tables = _extract_docling_tables(result.document)
+        return md, num_pages, tables
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def _extract_docling_tables(doc) -> list[dict]:
+    """Pull tables out of a Docling document into row-dicts.
+
+    Each table → {"title": <caption-or-heading>, "rows": [{col: cell}, ...]}.
+    Falls back to empty list on any failure — analyzer treats missing
+    tables as "nothing to reconcile."
+    """
+    out: list[dict] = []
+    tables = getattr(doc, "tables", None) or []
+    for tbl in tables:
+        try:
+            df = tbl.export_to_dataframe() if hasattr(tbl, "export_to_dataframe") else None
+            if df is None or df.empty:
+                continue
+            df = df.fillna("")
+            rows = df.to_dict(orient="records")
+            caption = ""
+            cap_attr = getattr(tbl, "captions", None) or getattr(tbl, "caption", None)
+            if cap_attr:
+                if isinstance(cap_attr, list) and cap_attr:
+                    cap_attr = cap_attr[0]
+                caption = getattr(cap_attr, "text", str(cap_attr)) or ""
+            out.append({"title": caption or "Tabelle", "rows": rows})
+        except Exception:
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +583,7 @@ class ClauseOut(BaseModel):
 
 class AnalyzeReq(BaseModel):
     session_id: str
+    version: Optional[str] = None  # "1" | "2" | None (defaults to env-driven)
 
 
 class AnalyzeResp(BaseModel):
@@ -500,6 +593,7 @@ class AnalyzeResp(BaseModel):
     clauses: list[ClauseOut]
     missing_required_clauses: list[IssueOut]
     elapsed_s: float
+    analyzer_version: str = "1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -521,22 +615,54 @@ async def lifespan(app: FastAPI):
     reranker = Reranker("Qwen/Qwen3-Reranker-8B")
     print(f"[startup]   reranker: {time.time()-t0:.1f}s", flush=True)
 
-    t0 = time.time()
+    LLM_API_URL = os.environ.get("LLM_API_URL")
     LLM_MODEL = os.environ.get(
         "LLM_MODEL",
         "/data/projects/lai/models/qwen25-7b-legal-merged",
     )
-    print(f"[startup]   LLM: loading {LLM_MODEL}", flush=True)
-    tok = AutoTokenizer.from_pretrained(LLM_MODEL, trust_remote_code=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    lm = AutoModelForCausalLM.from_pretrained(
-        LLM_MODEL, torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True,
-    ).eval()
-    print(f"[startup]   LLM ready in {time.time()-t0:.1f}s", flush=True)
 
-    STATE.update(corpus=corpus, conn=conn, parent_text=parent_text,
-                 reranker=reranker, lm=lm, tok=tok)
+    if LLM_API_URL:
+        # Remote vLLM endpoint — verify it's reachable; no in-process load.
+        print(f"[startup]   LLM: remote endpoint {LLM_API_URL} (model={LLM_MODEL})", flush=True)
+        try:
+            r = httpx.get(f"{LLM_API_URL.rstrip('/')}/v1/models", timeout=5)
+            if r.status_code != 200:
+                raise RuntimeError(f"LLM endpoint returned {r.status_code}")
+        except Exception as e:
+            raise RuntimeError(f"LLM endpoint {LLM_API_URL} not reachable: {e}")
+        STATE.update(corpus=corpus, conn=conn, parent_text=parent_text,
+                     reranker=reranker, lm=None, tok=None,
+                     llm_api_url=LLM_API_URL, llm_model_name=LLM_MODEL)
+    else:
+        t0 = time.time()
+        print(f"[startup]   LLM: loading {LLM_MODEL}", flush=True)
+        tok = AutoTokenizer.from_pretrained(LLM_MODEL, trust_remote_code=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        lm = AutoModelForCausalLM.from_pretrained(
+            LLM_MODEL, torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True,
+        ).eval()
+        print(f"[startup]   LLM ready in {time.time()-t0:.1f}s", flush=True)
+        STATE.update(corpus=corpus, conn=conn, parent_text=parent_text,
+                     reranker=reranker, lm=lm, tok=tok,
+                     llm_api_url=None, llm_model_name=LLM_MODEL)
+
+    # Analyzer V2 config — optional. If env not set, V2 is unavailable
+    # and /analyze-contract falls back to V1 regardless of `version` flag.
+    analyzer_cfg = analyzer_llm.from_env()
+    if analyzer_cfg is not None:
+        try:
+            r = httpx.get(f"{analyzer_cfg.api_url.rstrip('/')}/v1/models", timeout=5)
+            if r.status_code != 200:
+                raise RuntimeError(f"analyzer endpoint returned {r.status_code}")
+            print(f"[startup]   analyzer LLM: {analyzer_cfg.api_url} (model={analyzer_cfg.model})", flush=True)
+            STATE["analyzer_cfg"] = analyzer_cfg
+            STATE["analyzer_version_default"] = os.environ.get("ANALYZER_VERSION_DEFAULT", "2")
+        except Exception as e:
+            print(f"[startup]   analyzer LLM unreachable ({e}) — V2 disabled, V1 default", flush=True)
+    else:
+        print("[startup]   analyzer LLM not configured (ANALYZER_LLM_API_URL unset) — V1 only", flush=True)
+
     print("[startup] READY", flush=True)
     yield
 
@@ -553,9 +679,12 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
+    llm_ready = STATE["lm"] is not None or STATE["llm_api_url"] is not None
     return {
         "ok": True,
-        "loaded": STATE["lm"] is not None,
+        "loaded": llm_ready,
+        "llm_backend": "remote" if STATE["llm_api_url"] else "local",
+        "llm_model": STATE["llm_model_name"],
         "n_sessions": len(STATE["sessions"]),
     }
 
@@ -615,7 +744,7 @@ def _do_rag(question: str, top_k: int, candidate_k: int) -> tuple[list[ChunkOut]
 
 @app.post("/query", response_model=QueryResp)
 def query(req: QueryReq):
-    if STATE["lm"] is None:
+    if STATE["lm"] is None and STATE["llm_api_url"] is None:
         raise HTTPException(503, "Service still loading")
 
     sid = req.session_id or str(uuid.uuid4())
@@ -683,7 +812,7 @@ async def upload(file: UploadFile = File(...), session_id: str | None = Form(Non
     # Run Docling in a thread to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     try:
-        md, num_pages = await loop.run_in_executor(None, docling_convert, contents, fname)
+        md, num_pages, tables = await loop.run_in_executor(None, docling_convert, contents, fname)
     except Exception as e:
         raise HTTPException(422, f"Could not parse document: {e}")
 
@@ -691,6 +820,7 @@ async def upload(file: UploadFile = File(...), session_id: str | None = Form(Non
         "filename": fname,
         "contract_text": md,
         "n_pages": num_pages,
+        "tables": tables,    # used by analyzer V2
         "uploaded_at": time.time(),
         "clauses": None,     # filled by /analyze-contract
         "analysis": None,
@@ -702,14 +832,27 @@ async def upload(file: UploadFile = File(...), session_id: str | None = Form(Non
     )
 
 
-@app.post("/analyze-contract", response_model=AnalyzeResp)
-def analyze_contract(req: AnalyzeReq):
-    sess = STATE["sessions"].get(req.session_id)
-    if not sess:
-        raise HTTPException(404, "session_id not found — upload a document first")
-    if not sess.get("contract_text"):
-        raise HTTPException(400, "no contract text in session")
+def _v1_issue_to_out(i: dict) -> IssueOut:
+    """Coerce V2 Issue dict (severity int 1-5, has rationale) into V1 IssueOut.
 
+    V1 IssueOut expects severity as a string ('low'|'medium'|'high'). Map
+    1-2 → low, 3 → medium, 4-5 → high.
+    """
+    sev = i.get("severity")
+    if isinstance(sev, int):
+        sev_s = "low" if sev <= 2 else "medium" if sev == 3 else "high"
+    else:
+        sev_s = str(sev or "medium")
+    desc = i.get("description") or i.get("title") or ""
+    rec = i.get("suggested_redline") or i.get("recommendation")
+    rationale = i.get("rationale") or i.get("reason")
+    typ = i.get("type") or (i.get("title", "")[:80] if i.get("title") else None)
+    return IssueOut(severity=sev_s, description=desc, recommendation=rec,
+                    reason=rationale, type=typ)
+
+
+def _analyze_v1(req: AnalyzeReq) -> AnalyzeResp:
+    sess = STATE["sessions"][req.session_id]
     t0 = time.time()
     text = sess["contract_text"]
 
@@ -731,12 +874,52 @@ def analyze_contract(req: AnalyzeReq):
         ))
 
     missing = [IssueOut(**m) for m in check_playbook(types_present)]
-
     sess["clauses"] = [c.model_dump() for c in clauses_out]
     sess["analysis"] = {
         "n_clauses": len(clauses_out),
         "missing_required_clauses": [m.model_dump() for m in missing],
     }
+    return AnalyzeResp(
+        session_id=req.session_id,
+        filename=sess["filename"],
+        n_clauses=len(clauses_out),
+        clauses=clauses_out,
+        missing_required_clauses=missing,
+        elapsed_s=round(time.time() - t0, 1),
+        analyzer_version="1.0",
+    )
+
+
+def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
+    sess = STATE["sessions"][req.session_id]
+    cfg = STATE["analyzer_cfg"]
+    t0 = time.time()
+
+    # Reuse fast-path clause segmentation — V2 reasons over the segmentation
+    # result rather than re-segmenting. Cheaper and consistent across versions.
+    clauses_raw = segment_clauses(sess["contract_text"])
+
+    result = analyzer_pipeline.analyze(
+        contract_text=sess["contract_text"],
+        cfg=cfg,
+        clauses_input=clauses_raw,
+        docling_tables=sess.get("tables") or [],
+    )
+
+    # Project V2 result onto the existing AnalyzeResp shape — UI keeps working.
+    clauses_out: list[ClauseOut] = []
+    for c in result.clauses:
+        clauses_out.append(ClauseOut(
+            id=c.id, title=c.title, text=c.text, type=c.type,
+            summary=c.summary,
+            issues=[_v1_issue_to_out(i.model_dump()) for i in c.issues],
+            citations=[],  # V2 carries legal_basis on each Issue instead
+        ))
+    missing = [_v1_issue_to_out(i.model_dump()) for i in result.missing_required_clauses]
+
+    # Persist the full V2 result on the session for richer UI consumption later
+    sess["clauses"] = [c.model_dump() for c in clauses_out]
+    sess["analysis"] = result.model_dump()
 
     return AnalyzeResp(
         session_id=req.session_id,
@@ -745,7 +928,34 @@ def analyze_contract(req: AnalyzeReq):
         clauses=clauses_out,
         missing_required_clauses=missing,
         elapsed_s=round(time.time() - t0, 1),
+        analyzer_version="2.0",
     )
+
+
+@app.post("/analyze-contract", response_model=AnalyzeResp)
+def analyze_contract(req: AnalyzeReq):
+    sess = STATE["sessions"].get(req.session_id)
+    if not sess:
+        raise HTTPException(404, "session_id not found — upload a document first")
+    if not sess.get("contract_text"):
+        raise HTTPException(400, "no contract text in session")
+
+    requested = (req.version or STATE["analyzer_version_default"]).strip()
+    use_v2 = requested == "2" and STATE["analyzer_cfg"] is not None
+    return _analyze_v2(req) if use_v2 else _analyze_v1(req)
+
+
+@app.get("/analyze-contract/full")
+def analyze_contract_full(session_id: str):
+    """Return the full V2 ContractAnalysis for a session (parcels, tables,
+    cross-clause findings — fields the legacy AnalyzeResp doesn't carry)."""
+    sess = STATE["sessions"].get(session_id)
+    if not sess:
+        raise HTTPException(404, "session_id not found")
+    analysis = sess.get("analysis")
+    if not analysis or analysis.get("analyzer_version") != "2.0":
+        raise HTTPException(409, "no V2 analysis on this session — call /analyze-contract with version='2' first")
+    return analysis
 
 
 # ---------------------------------------------------------------------------
