@@ -57,11 +57,17 @@ interface OutletContextType {
   setActiveConversationId: (id: string | null) => void;
   conversations: Conversation[];
   setConversations: (convs: Conversation[]) => void;
+  refreshConversations: () => Promise<void>;
 }
 
 export default function DashboardChatPage() {
   const context = useOutletContext<OutletContextType>();
-  const { activeConversationId, conversations } = context || {};
+  const {
+    activeConversationId,
+    conversations,
+    setActiveConversationId,
+    refreshConversations,
+  } = context || {};
 
   const [messages, setMessages] = useState<ChatMessageData[]>([]);
   const [isTyping, setIsTyping] = useState(false);
@@ -199,6 +205,10 @@ export default function DashboardChatPage() {
             const uploadResult = await uploadDocument(attachment.file, currentSessionId);
             currentSessionId = uploadResult.session_id;
             setSessionId(currentSessionId);
+            // Sync sidebar — make this conversation the active entry
+            // and refresh the list so it appears immediately.
+            setActiveConversationId?.(currentSessionId);
+            refreshConversations?.();
 
             // Show upload success message with an "Analyze contract" CTA.
             // The CTA is surfaced as a regular message so the user knows
@@ -276,6 +286,12 @@ export default function DashboardChatPage() {
 
         if (result.session_id) {
           setSessionId(result.session_id);
+          // First message of a chat creates a session row server-side;
+          // sync the sidebar so the new conversation shows up immediately.
+          if (!activeConversationId || activeConversationId !== result.session_id) {
+            setActiveConversationId?.(result.session_id);
+            refreshConversations?.();
+          }
         }
 
         // Show mode badge inline so user can see whether retrieval ran.

@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { listSessions, deleteSession as apiDeleteSession } from "@/react-app/lib/ragApi";
 import { Link, useLocation, Outlet, useNavigate } from "react-router";
 import { Logo } from "@/react-app/components/Logo";
 import { useAuth } from "@/react-app/contexts/AuthContext";
-import { randomId } from "@/react-app/utils/uuid";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -35,26 +35,8 @@ export interface Conversation {
   timestamp: Date;
 }
 
-const demoConversations: Conversation[] = [
-  {
-    id: "1",
-    title: "Nordwind Park permit analysis",
-    preview: "Reviewing BImSchG permits and environmental...",
-    timestamp: new Date(),
-  },
-  {
-    id: "2",
-    title: "Land lease agreement review",
-    preview: "Analyzing clause 4.2 regarding termination...",
-    timestamp: new Date(Date.now() - 86400000),
-  },
-  {
-    id: "3",
-    title: "Grid connection contracts",
-    preview: "What are the key risks in the Einspeisezusage...",
-    timestamp: new Date(Date.now() - 86400000 * 3),
-  },
-];
+// Demo sidebar entries are gone — we now load the real session list from
+// the backend (GET /sessions). See `loadConversations` below.
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -62,12 +44,32 @@ export default function DashboardLayout() {
   const navigate = useNavigate();
   const { user, logout } = useAuth();
   const [collapsed, setCollapsed] = useState(false);
-  const [conversations, setConversations] =
-    useState<Conversation[]>(demoConversations);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<
     string | null
   >(null);
   const location = useLocation();
+
+  // ── Sidebar list ──────────────────────────────────────────────────────
+  // Pull the persisted session list from the backend on mount, and expose
+  // refresh() so child views can trigger a re-fetch after upload/chat.
+  const refreshConversations = useCallback(async () => {
+    const sessions = await listSessions(50);
+    setConversations(
+      sessions.map((s) => ({
+        id: s.id,
+        title: s.filename || "Untitled chat",
+        preview: s.has_analysis
+          ? `${s.n_pages} pages · analyzed · ${s.n_messages} msgs`
+          : `${s.n_messages} message${s.n_messages === 1 ? "" : "s"}`,
+        timestamp: new Date((s.updated_at || s.uploaded_at) * 1000),
+      })),
+    );
+  }, []);
+
+  useEffect(() => {
+    refreshConversations();
+  }, [refreshConversations]);
 
   const handleLogout = () => {
     logout();
@@ -91,17 +93,12 @@ export default function DashboardLayout() {
       .map((c) => c.toUpperCase())
       .join("") || "JD";
 
-  // ── FIX 3: New Chat — creates a real conversation and sets it active ──────
+  // New Chat — clear the active conversation. The actual session row is
+  // created server-side on the user's first /upload or /query and gets
+  // pulled into the sidebar via refreshConversations() at that point.
+  // Avoids cluttering the list with empty "New Chat" placeholders.
   const handleNewChat = () => {
-    const newConversation: Conversation = {
-      id: randomId(),
-      title: "New Chat",
-      preview: "Start a new conversation...",
-      timestamp: new Date(),
-    };
-    // Prepend to list so it appears at the top
-    setConversations((prev) => [newConversation, ...prev]);
-    setActiveConversationId(newConversation.id);
+    setActiveConversationId(null);
   };
 
   return (
@@ -299,12 +296,23 @@ export default function DashboardLayout() {
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
                         <DropdownMenuItem
-                          onClick={() => {
+                          onClick={async () => {
+                            // Optimistic remove — refresh from server below
+                            // either confirms or restores if delete failed.
                             setConversations((prev) =>
                               prev.filter((c) => c.id !== conv.id),
                             );
                             if (activeConversationId === conv.id)
                               setActiveConversationId(null);
+                            try {
+                              localStorage.removeItem(
+                                "lai.session." + conv.id,
+                              );
+                            } catch {
+                              /* ignore */
+                            }
+                            await apiDeleteSession(conv.id);
+                            await refreshConversations();
                           }}
                           className="text-destructive"
                         >
@@ -369,6 +377,7 @@ export default function DashboardLayout() {
             setActiveConversationId,
             conversations,
             setConversations,
+            refreshConversations,
           }}
         />
       </main>
