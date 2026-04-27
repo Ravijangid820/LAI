@@ -315,6 +315,18 @@ LEGAL_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# When a contract is already in session, only fire RAG retrieval if the
+# question asks about EXTERNAL law/precedent — not when it just asks
+# about the uploaded doc. Without this, e.g. "tell me about this
+# contract" pulled in chunks from other VDR contracts and the model
+# confused them with the user's upload.
+EXTERNAL_LAW_REFS = re.compile(
+    r"§|Art\.|\bBImSchG\b|\bBauGB\b|\bEEG\b|\bBGB\b|\bStGB\b|\bUStG\b|\bHGB\b|"
+    r"\bUrteil\b|\bBeschluss\b|\bRechtsprechung\b|\bBGH\b|\bOLG\b|\bLG\b|"
+    r"\bgesetzlich\b|\bvorschrift\b",
+    re.IGNORECASE,
+)
+
 
 def needs_rag(question: str) -> bool:
     """Decide whether to retrieve. Heuristic-first; LLM classifier as fallback
@@ -811,6 +823,12 @@ def query(req: QueryReq):
     use_contract = session_uses_contract(sid, req.question)
     if req.force_mode in ("rag", "chat"):
         use_rag = req.force_mode == "rag"
+    elif use_contract:
+        # Question is about the uploaded doc. Only also fire RAG when the
+        # user explicitly asks for external law/precedent context — without
+        # this guard, "tell me about this contract" pulled in chunks from
+        # other VDR contracts and the model conflated them with the upload.
+        use_rag = bool(EXTERNAL_LAW_REFS.search(req.question))
     else:
         use_rag = needs_rag(req.question)
 
@@ -834,14 +852,27 @@ def query(req: QueryReq):
 
     if use_rag and use_contract:
         mode = "rag+contract"
-        sources = [f"[Hochgeladener Vertrag]\n{contract_text}"] + rag_sources
-        msgs = build_rag_messages(req.question, sources)
+        # Make the upload's authority explicit so the model doesn't conflate
+        # it with retrieved chunks from OTHER contracts in the corpus.
+        contract_block = (
+            "[HOCHGELADENER VERTRAG — dies ist DER konkrete Vertrag, "
+            "nach dem der Nutzer fragt. Behandle ihn als primäre Quelle.]\n"
+            + contract_text
+        )
+        bg_blocks = [
+            "[Hintergrund-Quelle aus dem Korpus — nur für Kontext, NICHT der Vertrag des Nutzers]\n" + s
+            for s in rag_sources
+        ]
+        msgs = build_rag_messages(req.question, [contract_block] + bg_blocks)
     elif use_rag:
         mode = "rag"
         msgs = build_rag_messages(req.question, rag_sources)
     elif use_contract:
         mode = "contract"
-        msgs = build_rag_messages(req.question, [f"[Hochgeladener Vertrag]\n{contract_text}"])
+        msgs = build_rag_messages(
+            req.question,
+            ["[HOCHGELADENER VERTRAG]\n" + contract_text],
+        )
     else:
         mode = "chat"
         msgs = build_chat_messages(req.question)
