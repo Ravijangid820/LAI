@@ -80,6 +80,12 @@ export default function DashboardChatPage() {
   const [isTyping, setIsTyping] = useState(false);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  // Set true just before WE programmatically change activeConversationId
+  // (e.g. after a fresh upload creates a new session). Tells the
+  // rehydration useEffect to skip its setMessages([]) reset for that
+  // single transition — otherwise the chat thread we just built up
+  // gets wiped and replaced with the server-side message list.
+  const skipNextRehydrate = useRef(false);
   const [isUploading, setIsUploading] = useState(false);
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -119,6 +125,12 @@ export default function DashboardChatPage() {
   // messages from the backend and replay them into the UI so the user's
   // chat history survives page refreshes and serve_rag restarts.
   useEffect(() => {
+    if (skipNextRehydrate.current) {
+      // We just set activeConversationId ourselves (post-upload /
+      // post-first-query). Keep the in-flight chat thread; don't reset.
+      skipNextRehydrate.current = false;
+      return;
+    }
     setMessages([]);
     setShowScrollBtn(false);
     setSessionId(null);
@@ -213,8 +225,14 @@ export default function DashboardChatPage() {
             currentSessionId = uploadResult.session_id;
             setSessionId(currentSessionId);
             // Sync sidebar — make this conversation the active entry
-            // and refresh the list so it appears immediately.
-            setActiveConversationId?.(currentSessionId);
+            // and refresh the list so it appears immediately. Mark the
+            // upcoming activeConversationId change as self-induced so
+            // the rehydration effect doesn't wipe the chat thread we
+            // are actively building up.
+            if (activeConversationId !== currentSessionId) {
+              skipNextRehydrate.current = true;
+              setActiveConversationId?.(currentSessionId);
+            }
             refreshConversations?.();
 
             // Show upload success message with an "Analyze contract" CTA.
@@ -375,7 +393,10 @@ export default function DashboardChatPage() {
           setSessionId(result.session_id);
           // First message of a chat creates a session row server-side;
           // sync the sidebar so the new conversation shows up immediately.
+          // Same self-induced-change guard as the upload path — keep
+          // the in-flight chat thread instead of wiping it.
           if (!activeConversationId || activeConversationId !== result.session_id) {
+            skipNextRehydrate.current = true;
             setActiveConversationId?.(result.session_id);
             refreshConversations?.();
           }
