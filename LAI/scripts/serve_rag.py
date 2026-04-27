@@ -885,16 +885,25 @@ def query(req: QueryReq):
     timings.total_s = round(time.time() - t_total0, 3)
 
     # Persist chat messages so the UI can rehydrate the thread on refresh.
-    # We only persist when there's a session bound to a real upload — bare
-    # chat (no upload) doesn't currently produce a session row, so we'd be
-    # writing orphaned messages otherwise. Best-effort; never fail the
-    # request because of a write hiccup.
-    if persistence.session_exists(sid):
-        try:
-            persistence.add_message(sid, "user", req.question, mode=mode)
-            persistence.add_message(sid, "assistant", answer, mode=mode)
-        except Exception as e:
-            print(f"[warn] failed to persist messages for {sid}: {e}", flush=True)
+    # If there's no session row yet (e.g. chat-only, no upload), create a
+    # bare one first so the messages have somewhere to attach. Without this
+    # every chat that didn't follow an /upload was getting silently dropped.
+    # Best-effort; never fail the request because of a write hiccup.
+    try:
+        if not persistence.session_exists(sid):
+            persistence.save_session(sid, {
+                "filename": None,         # chat-only session, no upload
+                "contract_text": None,
+                "n_pages": 0,
+                "tables": [],
+                "uploaded_at": time.time(),
+                "clauses": None,
+                "analysis": None,
+            })
+        persistence.add_message(sid, "user", req.question, mode=mode)
+        persistence.add_message(sid, "assistant", answer, mode=mode)
+    except Exception as e:
+        print(f"[warn] failed to persist messages for {sid}: {e}", flush=True)
 
     return QueryResp(
         answer=answer, chunks=chunks_out, timings=timings,
