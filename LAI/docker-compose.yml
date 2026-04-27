@@ -1,40 +1,155 @@
-# LAI master compose — brings up the runtime essentials in one command.
+# LAI runtime — self-contained.
 #
-# The actual service definitions still live in per-component files under
-# Docker/ so each service stays independently start/stop/log-able for
-# tinkering. This file is a thin `include:` wrapper.
+# All four runtime-essential services defined inline here, intentionally
+# decoupled from per-service files under Docker/. The Docker/ directory
+# stays as a scratch space for isolated tinkering / experiments
+# (different image variants, alt configs, etc.); this file is the
+# canonical runtime config.
 #
 # Quick reference:
-#   docker compose up -d            # bring everything up
-#   docker compose ps               # status
-#   docker compose logs -f analyzer # tail one service
-#   docker compose down             # tear down
+#   docker compose up -d         # bring everything up
+#   docker compose ps            # status
+#   docker compose logs -f analyzer-llm
+#   docker compose down          # tear down (data survives)
+#   docker compose down -v       # also wipe pgvector + redis data
 #
-# Or, to bring up just one service in isolation (the per-component files
-# remain authoritative):
-#   docker compose -f Docker/llm-analyzer/docker-compose.yml up -d
+# Bring up host processes (serve_rag.py, Vite UI) via scripts/start.sh.
 #
-# Bring up the FastAPI backend (serve_rag.py) + Vite UI separately via
-# scripts/start.sh — they run on the host (no container) so editing code
-# and reloading is fast.
+# Trust model: by default services bind to 127.0.0.1. Override with
+# ANALYZER_BIND_HOST / PG_BIND_HOST / REDIS_BIND_HOST / EMBEDDING_BIND_HOST
+# (typically all set to 0.0.0.0 for VPN-trusted deployments). See
+# docs/SECURITY.md.
+#
+# Data layout:
+#   ./data/postgres   — pgvector PGDATA (created on first up)
+#   ./data/postgres-init/  — schema bootstrap files (optional)
+#   ./data/redis      — redis appendonly storage
+#   .runtime-cache/hf — HuggingFace cache (large; multi-tens of GB)
+# Existing pgvector / redis data continues to live under
+# Docker/database/<svc>/data via the LAI_PG_DATA / LAI_REDIS_DATA env
+# vars below — set them to migrate to the LAI/ layout when convenient.
 
 name: lai
 
-include:
-  # Analyzer LLM (Qwen3.6-27B with thinking mode) — port 8005
-  - ../Docker/llm-analyzer/docker-compose.yml
-  # Embedding service (Qwen3-Embedding-8B) — port 8003
-  - ../Docker/embedding/docker-compose.yml
-  # Pipeline DB (pgvector) — port 5434
-  - ../Docker/database/pgvector/docker-compose.yml
-  # Redis — port 6380 (used by Celery / future caching)
-  - ../Docker/database/redis/docker-compose.yml
+services:
+  # ── Analyzer LLM (Qwen3.6-27B with thinking + JSON-guided decoding) ──
+  analyzer-llm:
+    image: vllm/vllm-openai:latest
+    container_name: lai_analyzer_llm
+    restart: unless-stopped
+    ipc: host
+    command: >
+      --model ${ANALYZER_MODEL:-Qwen/Qwen3.6-27B}
+      --served-model-name ${ANALYZER_SERVED_NAME:-qwen3.6-27b}
+      --max-model-len ${ANALYZER_MAX_MODEL_LEN:-32768}
+      --max-num-seqs ${ANALYZER_MAX_NUM_SEQS:-8}
+      --dtype bfloat16
+      --trust-remote-code
+      --gpu-memory-utilization ${ANALYZER_GPU_MEM_UTIL:-0.75}
+      --reasoning-parser qwen3
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ./.runtime-cache/hf:/root/.cache/huggingface
+    ports:
+      - "${ANALYZER_BIND_HOST:-127.0.0.1}:${ANALYZER_PORT:-8005}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 30
+      start_period: 600s
+    networks:
+      - lai_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${ANALYZER_CUDA_DEVICE:-0}']
+              capabilities: [gpu]
 
-# Reranker is intentionally NOT included here:
-#   - serve_rag.py loads Qwen3-Reranker-8B in-process (lifespan startup);
-#     no out-of-process service is needed for the current /query path.
-#   - Docker/reranker/docker-compose.yml ships an old MiniLM cross-encoder
-#     and would clash on :8004 with a separate `lai-test-reranker` setup
-#     that some hosts already run.
-# To bring up the standalone reranker for testing, run it on its own:
-#     docker compose -f Docker/reranker/docker-compose.yml up -d
+  # ── Embedding service (Qwen3-Embedding-8B) ───────────────────────────
+  embedding:
+    image: vllm/vllm-openai:latest
+    container_name: lai_embedding
+    restart: unless-stopped
+    ipc: host
+    command: >
+      ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-8B}
+      --dtype auto
+      --trust-remote-code
+      --max-model-len 32768
+      --gpu-memory-utilization ${EMBEDDING_GPU_MEM:-0.45}
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./.runtime-cache/hf:/root/.cache/huggingface
+    ports:
+      - "${EMBEDDING_BIND_HOST:-127.0.0.1}:${EMBEDDING_PORT:-8003}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+    networks:
+      - lai_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${EMBEDDING_CUDA_DEVICE:-0}']
+              capabilities: [gpu]
+
+  # ── PostgreSQL + pgvector ────────────────────────────────────────────
+  # Default data path: ./data/postgres. Existing deployments may set
+  # LAI_PG_DATA=/data/projects/lai/Docker/database/pgvector/data to keep
+  # using the legacy location.
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: lai_postgres_main
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-lai_db}
+      POSTGRES_USER: ${PGUSER:-lai_user}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-lai_test_password_2024}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ${LAI_PG_DATA:-./data/postgres}:/var/lib/postgresql/data
+      - ${LAI_PG_INIT:-./data/postgres-init}:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${PG_BIND_HOST:-127.0.0.1}:${PGPORT:-5434}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-lai_user} -d ${PGDATABASE:-lai_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lai_network
+
+  # ── Redis ────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: lai_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - ${LAI_REDIS_DATA:-./data/redis}:/data
+    ports:
+      - "${REDIS_BIND_HOST:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lai_network
+
+
+networks:
+  lai_network:
+    external: true
