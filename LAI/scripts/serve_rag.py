@@ -667,6 +667,18 @@ async def lifespan(app: FastAPI):
     else:
         print("[startup]   analyzer LLM not configured (ANALYZER_LLM_API_URL unset) — V1 only", flush=True)
 
+    # Warm the LLM with a dummy completion so the first user request doesn't
+    # eat a 20-30s cold path (kernel autotune + first-batch JIT).
+    try:
+        t0 = time.time()
+        llm_generate(
+            [{"role": "user", "content": "Hallo"}],
+            max_new_tokens=8,
+        )
+        print(f"[startup]   LLM warmup: {time.time()-t0:.1f}s", flush=True)
+    except Exception as e:
+        print(f"[startup]   LLM warmup failed (non-fatal): {e}", flush=True)
+
     print("[startup] READY", flush=True)
     yield
 
