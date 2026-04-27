@@ -468,12 +468,20 @@ def _extract_docling_tables(doc) -> list[dict]:
 # Clause segmentation + analysis
 # ---------------------------------------------------------------------------
 
-def segment_clauses(contract_text: str, max_chars: int = 12000) -> list[dict]:
+def segment_clauses(contract_text: str, max_chars: int = 8000) -> list[dict]:
     """Use the LLM to split contract text into clauses. For very long
-    contracts, segment in windows and concatenate."""
+    contracts, segment in windows and concatenate.
+
+    Window sizing is paired with the per-window output budget below.
+    Rough heuristic for German legal text: ~3 chars/token in, and the
+    JSON-segmented output (clauses + verbatim text) tends to be ~1.2x
+    the input. So 8000 chars ≈ 2700 input tokens → ~3300 output tokens
+    needed. We allocate 6000 as a comfortable headroom — a single
+    truncated window silently drops every clause in it (parse fails),
+    which is what produced the dropped-second-window bug on the Enercon
+    Wartungsvertrag run."""
     clauses: list[dict] = []
     text = contract_text
-    # Window if too long (rough char limit ~ Qwen 7B context budget)
     if len(text) <= max_chars:
         windows = [text]
     else:
@@ -495,7 +503,7 @@ def segment_clauses(contract_text: str, max_chars: int = 12000) -> list[dict]:
             {"role": "system", "content": CLAUSE_SEGMENT_SYSTEM},
             {"role": "user",   "content": win},
         ]
-        out, _, _ = llm_generate(msgs, max_new_tokens=2000)
+        out, _, _ = llm_generate(msgs, max_new_tokens=6000)
         parsed = parse_json_lenient(out)
         if isinstance(parsed, list):
             for c in parsed:
