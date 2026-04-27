@@ -1,0 +1,40 @@
+# LAI master compose — brings up the runtime essentials in one command.
+#
+# The actual service definitions still live in per-component files under
+# Docker/ so each service stays independently start/stop/log-able for
+# tinkering. This file is a thin `include:` wrapper.
+#
+# Quick reference:
+#   docker compose up -d            # bring everything up
+#   docker compose ps               # status
+#   docker compose logs -f analyzer # tail one service
+#   docker compose down             # tear down
+#
+# Or, to bring up just one service in isolation (the per-component files
+# remain authoritative):
+#   docker compose -f Docker/llm-analyzer/docker-compose.yml up -d
+#
+# Bring up the FastAPI backend (serve_rag.py) + Vite UI separately via
+# scripts/start.sh — they run on the host (no container) so editing code
+# and reloading is fast.
+
+name: lai
+
+include:
+  # Analyzer LLM (Qwen3.6-27B with thinking mode) — port 8005
+  - ../Docker/llm-analyzer/docker-compose.yml
+  # Embedding service (Qwen3-Embedding-8B) — port 8003
+  - ../Docker/embedding/docker-compose.yml
+  # Pipeline DB (pgvector) — port 5434
+  - ../Docker/database/pgvector/docker-compose.yml
+  # Redis — port 6380 (used by Celery / future caching)
+  - ../Docker/database/redis/docker-compose.yml
+
+# Reranker is intentionally NOT included here:
+#   - serve_rag.py loads Qwen3-Reranker-8B in-process (lifespan startup);
+#     no out-of-process service is needed for the current /query path.
+#   - Docker/reranker/docker-compose.yml ships an old MiniLM cross-encoder
+#     and would clash on :8004 with a separate `lai-test-reranker` setup
+#     that some hosts already run.
+# To bring up the standalone reranker for testing, run it on its own:
+#     docker compose -f Docker/reranker/docker-compose.yml up -d
