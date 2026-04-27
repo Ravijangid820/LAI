@@ -247,6 +247,10 @@ def llm_generate(messages: list[dict], max_new_tokens: int = 400) -> tuple[str, 
             "messages": msgs,
             "max_tokens": max_new_tokens,
             "temperature": 0.0,
+            # Conversational path — thinking mode off so /query stays fast.
+            # The analyzer V2 path uses its own client (lai.analyzer.llm_client)
+            # which enables thinking explicitly per call.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         r = httpx.post(url, json=body, timeout=600.0)
         r.raise_for_status()
