@@ -1,16 +1,26 @@
 # Security Posture
 
-> Status: V1 hardening — loopback-only services + SSH tunnel for remote access. No HTTPS, no auth yet. Suitable for solo development / a single trusted developer accessing over SSH. Not suitable for multi-user or public deployment.
+> Status: VPN-trusted mode is the practical default. The code is secure-by-default (loopback-only) but each deployment chooses its bind address via env vars based on its trust model. No HTTPS, no auth yet — those are the next steps when going beyond a single trusted operator on a private VPN.
 
-## What's exposed
+## Three trust models, one codebase
 
-| Service | Port | Bind |
+The same code supports three deployment shapes via env vars; pick the one that matches your network:
+
+| Mode | When to pick | How |
 |---|---|---|
-| `serve_rag.py` (FastAPI) | 18000 | `127.0.0.1` |
-| Vite dev server | 5173 | `127.0.0.1` (default — start with `npm run dev`) |
-| Analyzer LLM (`lai_analyzer_llm`) | 8005 | `127.0.0.1` |
+| **A. Loopback + SSH tunnel** | Most secure. Single dev with SSH access; no shared VPN. | Code default — start `serve_rag` with no env override; do `ssh -L 5173:localhost:5173 -L 18000:localhost:18000 user@server` from your laptop. |
+| **B. VPN-trusted LAN** | Solo dev or small team behind a corporate/private VPN (FortiClient, WireGuard, etc.). The VPN is the auth gate. | `LAI_BIND_HOST=0.0.0.0 ANALYZER_BIND_HOST=0.0.0.0 npm run dev -- --host 0.0.0.0`. Browse `http://<server-lan-ip>:5173/`. |
+| **C. Public / shared host** | Multi-user or unreachable-by-VPN. | Not yet supported — see "Known gaps" below; needs reverse proxy + TLS + auth. |
 
-Nothing reachable from the LAN/VPN by default. Anyone wanting to hit these services has to log in to the host first.
+## What's exposed (default code config)
+
+| Service | Port | Default bind | Override env var |
+|---|---|---|---|
+| `serve_rag.py` (FastAPI) | 18000 | `127.0.0.1` | `LAI_BIND_HOST` |
+| Vite dev server | 5173 | `127.0.0.1` (default — start with `npm run dev`) | pass `--host 0.0.0.0` if needed |
+| Analyzer LLM (`lai_analyzer_llm`) | 8005 | `127.0.0.1` | `ANALYZER_BIND_HOST` |
+
+Default code config = nothing reachable from the LAN/VPN. Override per-deployment to fit your trust model (above).
 
 ## Accessing from a remote machine — SSH tunnel
 
@@ -39,17 +49,27 @@ autossh -M 0 -N \
 
 `autossh` re-establishes the tunnel automatically when the underlying SSH session dies.
 
-## Overriding the bind address
+## VPN-trusted mode (current default at this site)
 
-If you need to expose temporarily on a fully trusted local network (e.g. for a demo to a colleague on the same LAN) and have decided the data is OK to share:
+Used when access is gated by a VPN like FortiClient — anyone past the VPN can reach the services directly, no SSH tunnel needed.
 
 ```bash
+# serve_rag
 LAI_BIND_HOST=0.0.0.0 .venv/bin/python scripts/serve_rag.py --port 18000
+
+# analyzer LLM container
 ANALYZER_BIND_HOST=0.0.0.0 docker compose -f Docker/llm-analyzer/docker-compose.yml up -d
-npm --prefix web_ui/LAI run dev -- --host 0.0.0.0
+
+# UI
+cd web_ui/LAI && npm run dev -- --host 0.0.0.0
 ```
 
-**Don't do this on an untrusted network.** Anyone who can reach the IP will be able to read every uploaded contract and run unbounded LLM queries.
+UI .env points at the server's LAN IP:
+```
+VITE_BACKEND_URL=http://<server-lan-ip>:18000
+```
+
+**Trust assumption:** the VPN access list is the auth boundary. Whoever your VPN admin lets in, can read every uploaded contract and run any query. If your VPN has many users, you should layer auth on top (see "Known gaps").
 
 ## Known gaps (not addressed in this iteration)
 
