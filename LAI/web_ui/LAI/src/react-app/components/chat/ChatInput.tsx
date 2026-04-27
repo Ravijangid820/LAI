@@ -5,6 +5,7 @@ import { cn } from "@/react-app/lib/utils";
 import type { ChatAttachment } from "./ChatMessage";
 import { ManuscriptIcon } from "@/react-app/components/icons";
 import { useSpeechRecognition } from "@/react-app/hooks/useSpeechRecognition";
+import { randomId } from "@/react-app/utils/uuid";
 
 interface ChatInputProps {
   onSend: (message: string, attachments: ChatAttachment[]) => void;
@@ -78,7 +79,7 @@ export function ChatInput({
     const files = e.currentTarget.files;
     if (!files) return;
     const newAttachments: ChatAttachment[] = Array.from(files).map((file) => ({
-      id: crypto.randomUUID(),
+      id: randomId(),
       name: file.name,
       size: file.size,
       type: file.type,
@@ -107,7 +108,7 @@ export function ChatInput({
     const files = e.dataTransfer.files;
     if (!files) return;
     const newAttachments: ChatAttachment[] = Array.from(files).map((file) => ({
-      id: crypto.randomUUID(),
+      id: randomId(),
       name: file.name,
       size: file.size,
       type: file.type,

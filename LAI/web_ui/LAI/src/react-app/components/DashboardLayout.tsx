@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useLocation, Outlet, useNavigate } from "react-router";
 import { Logo } from "@/react-app/components/Logo";
 import { useAuth } from "@/react-app/contexts/AuthContext";
+import { randomId } from "@/react-app/utils/uuid";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -93,7 +94,7 @@ export default function DashboardLayout() {
   // ── FIX 3: New Chat — creates a real conversation and sets it active ──────
   const handleNewChat = () => {
     const newConversation: Conversation = {
-      id: crypto.randomUUID(),
+      id: randomId(),
       title: "New Chat",
       preview: "Start a new conversation...",
       timestamp: new Date(),

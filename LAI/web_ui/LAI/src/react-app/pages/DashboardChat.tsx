@@ -19,6 +19,7 @@ import { TypingIndicator } from "@/react-app/components/chat/TypingIndicator";
 import { Button } from "@/react-app/components/ui/button";
 import type { Conversation } from "@/react-app/components/DashboardLayout";
 import { queryRAG, uploadDocument, analyzeContract } from "@/react-app/lib/ragApi";
+import { randomId } from "@/react-app/utils/uuid";
 
 const suggestedPrompts = [
   {
@@ -104,7 +105,7 @@ export default function DashboardChatPage() {
     attachments: ChatAttachment[],
   ) => {
     const userMessage: ChatMessageData = {
-      id: crypto.randomUUID(),
+      id: randomId(),
       role: "user",
       content,
       attachments,
@@ -141,7 +142,7 @@ export default function DashboardChatPage() {
             // The CTA is surfaced as a regular message so the user knows
             // the option exists; clicking it triggers /analyze-contract.
             const uploadMessage: ChatMessageData = {
-              id: crypto.randomUUID(),
+              id: randomId(),
               role: "assistant",
               content:
                 `📄 **Document uploaded:** ${uploadResult.filename}\n` +
@@ -201,7 +202,7 @@ export default function DashboardChatPage() {
           lines.push("✅ No issues flagged in any clause.");
         }
         const aiMessage: ChatMessageData = {
-          id: crypto.randomUUID(),
+          id: randomId(),
           role: "assistant",
           content: lines.join("\n"),
           timestamp: new Date(),
@@ -221,7 +222,7 @@ export default function DashboardChatPage() {
           : "";
 
         const aiMessage: ChatMessageData = {
-          id: crypto.randomUUID(),
+          id: randomId(),
           role: "assistant",
           content: result.answer + modeBadge,
           timestamp: new Date(),
@@ -233,7 +234,7 @@ export default function DashboardChatPage() {
       setIsUploading(false);
       // Show the error as an assistant message so it's visible in chat
       const errorMessage: ChatMessageData = {
-        id: crypto.randomUUID(),
+        id: randomId(),
         role: "assistant",
         content: `⚠️ **Error:** ${err instanceof Error ? err.message : "Could not reach the backend. Make sure the API server is running on the SSH server."}`,
         timestamp: new Date(),
