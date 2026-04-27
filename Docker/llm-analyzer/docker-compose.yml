@@ -29,7 +29,9 @@ services:
     volumes:
       - /data/projects/lai/LAI/.runtime-cache/hf:/root/.cache/huggingface
     ports:
-      - "${ANALYZER_PORT:-8005}:8000"
+      # Loopback-only — only the host's serve_rag.py needs to reach this LLM.
+      # Override with ANALYZER_BIND_HOST=0.0.0.0 if you put auth in front.
+      - "${ANALYZER_BIND_HOST:-127.0.0.1}:${ANALYZER_PORT:-8005}:8000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

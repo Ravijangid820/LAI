@@ -1104,7 +1104,11 @@ def delete_session_endpoint(session_id: str):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--host", default="0.0.0.0")
+    # Default to loopback only — uploaded contracts and chat history are
+    # sensitive. Bind via SSH tunnel ("ssh -L 18000:localhost:18000") for
+    # remote access, or override with LAI_BIND_HOST if you need to expose
+    # to a trusted local network and have separate auth in front.
+    p.add_argument("--host", default=os.environ.get("LAI_BIND_HOST", "127.0.0.1"))
     p.add_argument("--port", type=int, default=18000)
     args = p.parse_args()
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
