@@ -118,14 +118,20 @@ export default function DashboardChatPage() {
     try {
       let currentSessionId = sessionId;
 
-      // Upload PDF attachments first
-      const pdfAttachments = attachments.filter(
-        (a) => a.file && a.file.name.toLowerCase().endsWith(".pdf")
+      // Upload all document attachments — backend Docling accepts
+      // PDF, DOCX/DOC, XLSX/XLS, TXT, CSV, MD. Match the same set the
+      // ChatInput file picker offers; if Docling can't parse a specific
+      // file the backend will return an error which is surfaced in chat.
+      const SUPPORTED_DOC_EXTS = [".pdf", ".doc", ".docx", ".xlsx", ".xls", ".txt", ".csv", ".md"];
+      const docAttachments = attachments.filter(
+        (a) => a.file && SUPPORTED_DOC_EXTS.some(
+          (ext) => a.file!.name.toLowerCase().endsWith(ext)
+        )
       );
 
-      if (pdfAttachments.length > 0) {
+      if (docAttachments.length > 0) {
         setIsUploading(true);
-        for (const attachment of pdfAttachments) {
+        for (const attachment of docAttachments) {
           if (attachment.file) {
             const uploadResult = await uploadDocument(attachment.file, currentSessionId);
             currentSessionId = uploadResult.session_id;
