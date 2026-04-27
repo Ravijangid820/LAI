@@ -920,6 +920,7 @@ def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
         cfg=cfg,
         clauses_input=clauses_raw,
         docling_tables=sess.get("tables") or [],
+        n_pages=sess.get("n_pages") or 0,
     )
 
     # Project V2 result onto the existing AnalyzeResp shape — UI keeps working.
@@ -932,6 +933,25 @@ def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
             citations=[],  # V2 carries legal_basis on each Issue instead
         ))
     missing = [_v1_issue_to_out(i.model_dump()) for i in result.missing_required_clauses]
+
+    # Surface extraction-quality warning at the top of missing-clauses so
+    # reviewers see it before the (possibly noisy) per-clause list. A real
+    # high-severity flag — bad extraction is genuinely high-impact for the
+    # downstream interpretation, even though no individual clause is broken.
+    if result.extraction_quality and result.extraction_quality.confidence == "low":
+        missing.insert(0, IssueOut(
+            severity="high",
+            type="Extraktionsqualität",
+            description=(
+                "⚠️ Niedrige Extraktionsqualität — die folgenden 'Fehlt'-Befunde "
+                "sind möglicherweise falsch positiv. " + result.extraction_quality.reason
+            ),
+            recommendation=(
+                "PDF-Extraktion prüfen (z.B. besseren OCR-Pass oder Original-Quelle nutzen), "
+                "bevor fehlende Klauseln als tatsächlich fehlend behandelt werden."
+            ),
+            reason=None,
+        ))
 
     # Persist the full V2 result on the session for richer UI consumption later
     sess["clauses"] = [c.model_dump() for c in clauses_out]

@@ -77,6 +77,7 @@ class Issue(BaseModel):
     rationale: str = Field(description="Why this disposition; required so judgment is auditable")
     suggested_redline: Optional[str] = None
     legal_basis: list[str] = Field(default_factory=list, description="§/Art references where applicable")
+    low_confidence: bool = Field(default=False, description="True when extraction quality may have caused this finding (e.g. missing-clause from a poorly-OCR'd PDF)")
 
 
 class Clause(BaseModel):
@@ -105,6 +106,20 @@ class ContractMetadata(BaseModel):
     jurisdiction: Optional[str] = None
 
 
+class ExtractionQuality(BaseModel):
+    """How much the analyzer trusts the input it received.
+
+    For signed/scanned PDFs, OCR can drop large portions of the body silently.
+    When that happens, missing-clause findings are over-confident — we
+    surface this so reviewers can recognize the noise.
+    """
+    confidence: Literal["high", "medium", "low"]
+    chars_per_page: float
+    total_chars: int
+    n_pages: int
+    reason: str
+
+
 class ContractAnalysis(BaseModel):
     metadata: ContractMetadata
     contract_type: ContractType
@@ -114,6 +129,7 @@ class ContractAnalysis(BaseModel):
     clauses: list[Clause] = Field(default_factory=list)
     cross_clause_findings: list[CrossClauseFinding] = Field(default_factory=list)
     missing_required_clauses: list[Issue] = Field(default_factory=list)
+    extraction_quality: Optional[ExtractionQuality] = None
     degraded: bool = False
     model: str
     thinking_tokens: int = 0

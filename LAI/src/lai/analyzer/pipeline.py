@@ -25,9 +25,115 @@ from lai.analyzer.schema import (
     ContractMetadata,
     ContractType,
     CrossClauseFinding,
+    ExtractionQuality,
     Issue,
     Parcel,
 )
+
+
+# Empirical thresholds (German legal text typically runs ~2000-3500 chars/page
+# under decent extraction). Below 1800 the body is usually fragmentary; below
+# 1200 we've often only captured the cover/signature pages.
+_EXTRACTION_LOW_CHARS_PER_PAGE = 1800.0
+_EXTRACTION_VERY_LOW_CHARS_PER_PAGE = 1200.0
+
+
+def assess_extraction_quality(
+    text: str,
+    n_pages: int,
+) -> ExtractionQuality:
+    total_chars = len(text or "")
+    pages = max(int(n_pages or 0), 0)
+    chars_per_page = (total_chars / pages) if pages else float(total_chars)
+
+    if pages == 0:
+        # Plain-text upload (.txt/.md) — no page metric. Treat short
+        # documents as lower confidence; otherwise high.
+        if total_chars < 5000:
+            return ExtractionQuality(
+                confidence="low",
+                chars_per_page=chars_per_page,
+                total_chars=total_chars,
+                n_pages=0,
+                reason=f"Eingabetext sehr kurz ({total_chars} Zeichen, keine Seitenangabe).",
+            )
+        return ExtractionQuality(
+            confidence="high",
+            chars_per_page=chars_per_page,
+            total_chars=total_chars,
+            n_pages=0,
+            reason="Plain-text-Eingabe ohne Seitenangabe.",
+        )
+
+    if chars_per_page < _EXTRACTION_VERY_LOW_CHARS_PER_PAGE:
+        return ExtractionQuality(
+            confidence="low",
+            chars_per_page=chars_per_page,
+            total_chars=total_chars,
+            n_pages=pages,
+            reason=(
+                f"Nur {chars_per_page:.0f} Zeichen pro Seite extrahiert "
+                f"({total_chars:,} Zeichen / {pages} Seiten). "
+                "Vermutlich gescanntes/signiertes PDF mit unvollständiger OCR — "
+                "Fehlende-Klauseln-Befunde können falsch positiv sein."
+            ),
+        )
+    if chars_per_page < _EXTRACTION_LOW_CHARS_PER_PAGE:
+        return ExtractionQuality(
+            confidence="low",
+            chars_per_page=chars_per_page,
+            total_chars=total_chars,
+            n_pages=pages,
+            reason=(
+                f"Niedrige Textdichte: {chars_per_page:.0f} Zeichen pro Seite "
+                f"({total_chars:,} / {pages}). Teile des Vertragstextes wurden "
+                "möglicherweise nicht extrahiert."
+            ),
+        )
+    if chars_per_page < 2500:
+        return ExtractionQuality(
+            confidence="medium",
+            chars_per_page=chars_per_page,
+            total_chars=total_chars,
+            n_pages=pages,
+            reason=(
+                f"Mittlere Textdichte: {chars_per_page:.0f} Zeichen pro Seite. "
+                "Extraktion plausibel, einzelne Abschnitte könnten fehlen."
+            ),
+        )
+    return ExtractionQuality(
+        confidence="high",
+        chars_per_page=chars_per_page,
+        total_chars=total_chars,
+        n_pages=pages,
+        reason=(
+            f"Gute Textdichte: {chars_per_page:.0f} Zeichen pro Seite "
+            f"({total_chars:,} / {pages})."
+        ),
+    )
+
+
+def _mark_low_confidence(issues: list[Issue]) -> list[Issue]:
+    """Mark missing-clause findings as low-confidence and downgrade severity
+    by 1 (capped at 2 = 'unklar formuliert'). Reason: when extraction is
+    poor, these are over-reports of absent text rather than absent terms."""
+    out: list[Issue] = []
+    for i in issues:
+        new_sev = max(2, int(i.severity) - 1)
+        out.append(i.model_copy(update={
+            "severity": new_sev,
+            "low_confidence": True,
+            "description": (
+                "[Niedrige Extraktionsqualität — Klausel könnte vorhanden sein, "
+                "aber nicht erkannt] " + i.description
+            ),
+            "rectify_or_ignore": "negotiate",
+            "rationale": (
+                "Erst PDF-Extraktion prüfen, bevor diese Klausel als fehlend behandelt wird. "
+                + i.rationale
+            ),
+        }))
+    return out
 
 
 # Rough char→token conversion for German legal text (memory: ~3 chars/token)
@@ -274,6 +380,7 @@ def analyze(
     cfg: AnalyzerLLMConfig,
     clauses_input: list[dict],
     docling_tables: Optional[list[dict]] = None,
+    n_pages: int = 0,
 ) -> ContractAnalysis:
     """Run the V2 pipeline.
 
@@ -282,10 +389,16 @@ def analyze(
         cfg: analyzer LLM config (Qwen3.6-27B endpoint).
         clauses_input: list of {"id", "title", "text"} from upstream segmentation.
         docling_tables: optional list of {"title"|"caption", "rows"} dicts.
+        n_pages: number of pages in the source PDF. Used to compute
+            extraction quality; missing-clause findings are marked
+            low-confidence when chars/page is below the legal-text threshold.
 
     Returns: ContractAnalysis (Pydantic).
     """
     t0 = time.time()
+
+    # 0) Extraction quality — gate downstream confidence on this.
+    extraction_quality = assess_extraction_quality(contract_text, n_pages)
 
     # 1) Classify
     contract_type = classify(cfg, contract_text)
@@ -331,6 +444,11 @@ def analyze(
 
     elapsed = time.time() - t0  # noqa: F841 — caller may also time
 
+    # When extraction is low-confidence, the "missing clauses" list is
+    # mostly over-reports of unseen text. Downgrade severity and tag.
+    if extraction_quality.confidence == "low":
+        missing = _mark_low_confidence(missing)
+
     return ContractAnalysis(
         metadata=metadata,
         contract_type=contract_type,
@@ -340,6 +458,7 @@ def analyze(
         clauses=clauses_out,
         cross_clause_findings=cross_findings,
         missing_required_clauses=missing,
+        extraction_quality=extraction_quality,
         degraded=False,
         model=cfg.model,
         thinking_tokens=0,
