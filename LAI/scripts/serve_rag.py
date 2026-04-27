@@ -389,8 +389,31 @@ def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int, list[di
 
     global _DOCLING_CONVERTER
     if _DOCLING_CONVERTER is None:
-        from docling.document_converter import DocumentConverter
-        _DOCLING_CONVERTER = DocumentConverter()
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import (
+            PdfPipelineOptions, TesseractCliOcrOptions,
+        )
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+
+        # Default RapidOCR struggles on signed/scanned German contracts —
+        # umlauts and word boundaries get lost (e.g. "Reußenköge" became
+        # "ReuBenkoge", entire sections dropped). Tesseract with the
+        # German training data is significantly better at this. Falls
+        # back to default (RapidOCR) if Tesseract isn't installed.
+        try:
+            pipeline_options = PdfPipelineOptions(
+                do_ocr=True,
+                ocr_options=TesseractCliOcrOptions(lang=["deu", "eng"]),
+            )
+            _DOCLING_CONVERTER = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+                }
+            )
+            print("[docling] Using Tesseract (deu+eng) for OCR.", flush=True)
+        except Exception as e:
+            print(f"[docling] Tesseract setup failed ({e}) — falling back to default OCR", flush=True)
+            _DOCLING_CONVERTER = DocumentConverter()
 
     suffix_for_tmp = suffix or ".pdf"
     with tempfile.NamedTemporaryFile(suffix=suffix_for_tmp, delete=False) as tmp:
