@@ -374,6 +374,11 @@ def _whole_contract_pass(
 # Entry point
 # ---------------------------------------------------------------------------
 
+ProgressCallback = Optional[
+    "object"  # placeholder; real type Callable[[dict], None] below
+]
+
+
 def analyze(
     contract_text: str,
     *,
@@ -381,6 +386,7 @@ def analyze(
     clauses_input: list[dict],
     docling_tables: Optional[list[dict]] = None,
     n_pages: int = 0,
+    on_progress=None,  # Callable[[dict], None] — invoked at each major step
 ) -> ContractAnalysis:
     """Run the V2 pipeline.
 
@@ -392,38 +398,89 @@ def analyze(
         n_pages: number of pages in the source PDF. Used to compute
             extraction quality; missing-clause findings are marked
             low-confidence when chars/page is below the legal-text threshold.
+        on_progress: optional callback receiving a dict with keys
+            ``step`` (str), ``current`` (int), ``total`` (int),
+            ``elapsed_s`` (float), ``percent`` (0.0-1.0). Called at each
+            major step. Used by the API layer to surface live progress.
 
     Returns: ContractAnalysis (Pydantic).
     """
     t0 = time.time()
+    n_clauses_total = sum(1 for c in clauses_input if str(c.get("text", "")).strip())
+
+    def _emit(step: str, current: int = 0, total: int = 0, percent: float = 0.0) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress({
+                "step": step,
+                "current": current,
+                "total": total,
+                "elapsed_s": time.time() - t0,
+                "percent": max(0.0, min(1.0, percent)),
+            })
+        except Exception:
+            # Progress is observability only — never let a callback bug
+            # take down the analysis.
+            pass
+
+    # Rough percent budget — tuned to reality (per-clause thinking pass
+    # dominates, ~70% of total wall time on a 10-clause contract):
+    #   classify        → 1%
+    #   compress        → 3%
+    #   reconcile/parc  → 6% (parcel NER hits the LLM per candidate)
+    #   per-clause      → 70% (split evenly across n_clauses_total)
+    #   whole-contract  → 20%
+    PCT_CLASSIFY_DONE = 0.01
+    PCT_COMPRESS_DONE = 0.04
+    PCT_RECON_DONE    = 0.06
+    PCT_PARCELS_DONE  = 0.10
+    PCT_CLAUSES_BASE  = 0.10
+    PCT_CLAUSES_END   = 0.80
+    PCT_WHOLE_DONE    = 1.00
+
+    _emit("starting", total=n_clauses_total)
 
     # 0) Extraction quality — gate downstream confidence on this.
     extraction_quality = assess_extraction_quality(contract_text, n_pages)
 
     # 1) Classify
+    _emit("classifying", percent=0.0)
     contract_type = classify(cfg, contract_text)
+    _emit("classify_done", percent=PCT_CLASSIFY_DONE)
 
     # 2) Compress for whole-contract pass if needed
+    _emit("preparing_context", percent=PCT_CLASSIFY_DONE)
     compressed_for_summary = _maybe_compress(cfg, contract_text)
     contract_summary = compressed_for_summary[:4000]
+    _emit("preparing_context_done", percent=PCT_COMPRESS_DONE)
 
     # 3) Reconcile tables (deterministic, no LLM)
     fin_tables, recon_findings = reconcile_all(docling_tables or [])
     recon_dicts = [f.model_dump() for f in recon_findings]
+    _emit("tables_reconciled", current=len(fin_tables), percent=PCT_RECON_DONE)
 
     # 4) Cadastral NER
+    _emit("extracting_parcels", percent=PCT_RECON_DONE)
     parcels: list[Parcel] = cadastral_ner.extract_parcels(
         contract_text, _build_ner_llm_call(cfg),
     )
+    _emit("parcels_done", current=len(parcels), percent=PCT_PARCELS_DONE)
 
-    # 5) Per-clause deep analysis
+    # 5) Per-clause deep analysis (the bulk of the work)
     clauses_out: list[Clause] = []
-    for c in clauses_input:
+    for idx, c in enumerate(clauses_input, start=1):
         cid = str(c.get("id", len(clauses_out) + 1))
         title = str(c.get("title", ""))[:200]
         text = str(c.get("text", ""))
         if not text.strip():
             continue
+        progress_share = (
+            PCT_CLAUSES_BASE
+            + (PCT_CLAUSES_END - PCT_CLAUSES_BASE)
+              * ((idx - 1) / max(n_clauses_total, 1))
+        )
+        _emit("analyzing_clause", current=idx, total=n_clauses_total, percent=progress_share)
         try:
             clauses_out.append(_analyze_one_clause(
                 cfg, cid, title, text, contract_type, contract_summary,
@@ -434,7 +491,10 @@ def analyze(
                 summary=f"[Analyse fehlgeschlagen: {e}]", issues=[],
             ))
 
+    _emit("clauses_done", current=n_clauses_total, total=n_clauses_total, percent=PCT_CLAUSES_END)
+
     # 6) Whole-contract pass
+    _emit("whole_contract", percent=PCT_CLAUSES_END)
     metadata, cross_findings, missing = _whole_contract_pass(
         cfg, contract_type,
         metadata_hint={"first_chars": contract_text[:1000]},
@@ -448,6 +508,8 @@ def analyze(
     # mostly over-reports of unseen text. Downgrade severity and tag.
     if extraction_quality.confidence == "low":
         missing = _mark_low_confidence(missing)
+
+    _emit("done", current=n_clauses_total, total=n_clauses_total, percent=PCT_WHOLE_DONE)
 
     return ContractAnalysis(
         metadata=metadata,

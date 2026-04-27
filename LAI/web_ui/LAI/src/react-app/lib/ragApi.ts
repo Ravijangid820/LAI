@@ -200,6 +200,31 @@ export async function deleteSession(sessionId: string): Promise<boolean> {
   }
 }
 
+// ── Live analyze progress ─────────────────────────────────────────────────
+
+export interface AnalyzeProgress {
+  status: "idle" | "running" | "done" | "error";
+  step?: string;       // e.g. "analyzing_clause", "whole_contract", "done"
+  current?: number;
+  total?: number;
+  elapsed_s?: number;
+  percent?: number;    // 0.0 .. 1.0
+  error?: string;
+  session_id?: string;
+}
+
+export async function getAnalyzeProgress(sessionId: string): Promise<AnalyzeProgress> {
+  try {
+    const res = await fetch(
+      `${BACKEND_URL}/analyze-contract/progress?session_id=${encodeURIComponent(sessionId)}`,
+    );
+    if (!res.ok) return { status: "idle" };
+    return await res.json();
+  } catch {
+    return { status: "idle" };
+  }
+}
+
 export async function renameSession(sessionId: string, title: string): Promise<boolean> {
   try {
     const res = await fetch(`${BACKEND_URL}/sessions/${sessionId}`, {

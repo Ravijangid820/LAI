@@ -71,6 +71,11 @@ STATE: dict = {
     # Analyzer V2 — separate vLLM endpoint, Qwen3.6-27B with thinking mode
     "analyzer_cfg": None,
     "analyzer_version_default": "1",  # "1" | "2"
+    # Per-session live progress for /analyze-contract V2. Keyed by
+    # session_id; the analyzer pipeline updates this via its on_progress
+    # callback while the long-running synchronous request executes, and
+    # the UI polls /analyze-contract/progress in parallel.
+    "analyzer_progress": {},
     # Sessions live in SQLite via lai.persistence — see init in lifespan().
     # Process-memory cache here intentionally removed; refresh-safe across
     # both UI reloads and serve_rag restarts.
@@ -1014,18 +1019,51 @@ def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
         raise HTTPException(404, "session_id not found")
     cfg = STATE["analyzer_cfg"]
     t0 = time.time()
+    sid = req.session_id
 
-    # Reuse fast-path clause segmentation — V2 reasons over the segmentation
-    # result rather than re-segmenting. Cheaper and consistent across versions.
-    clauses_raw = segment_clauses(sess["contract_text"])
+    # Initialize progress so the UI can poll immediately. Subsequent
+    # callbacks from the pipeline overwrite this.
+    STATE["analyzer_progress"][sid] = {
+        "status": "running",
+        "step": "segmenting",
+        "current": 0,
+        "total": 0,
+        "elapsed_s": 0.0,
+        "percent": 0.0,
+        "started_at": t0,
+    }
 
-    result = analyzer_pipeline.analyze(
-        contract_text=sess["contract_text"],
-        cfg=cfg,
-        clauses_input=clauses_raw,
-        docling_tables=sess.get("tables") or [],
-        n_pages=sess.get("n_pages") or 0,
-    )
+    def _on_progress(event: dict) -> None:
+        # Pipeline callback — write the latest event to the shared dict.
+        STATE["analyzer_progress"][sid] = {
+            "status": "running" if event.get("step") != "done" else "running",
+            **event,
+            "started_at": t0,
+        }
+
+    try:
+        # Reuse fast-path clause segmentation — V2 reasons over the segmentation
+        # result rather than re-segmenting. Cheaper and consistent across versions.
+        clauses_raw = segment_clauses(sess["contract_text"])
+
+        result = analyzer_pipeline.analyze(
+            contract_text=sess["contract_text"],
+            cfg=cfg,
+            clauses_input=clauses_raw,
+            docling_tables=sess.get("tables") or [],
+            n_pages=sess.get("n_pages") or 0,
+            on_progress=_on_progress,
+        )
+    except Exception as e:
+        STATE["analyzer_progress"][sid] = {
+            "status": "error",
+            "step": "error",
+            "error": str(e)[:500],
+            "elapsed_s": time.time() - t0,
+            "percent": 0.0,
+            "started_at": t0,
+        }
+        raise
 
     # Project V2 result onto the existing AnalyzeResp shape — UI keeps working.
     clauses_out: list[ClauseOut] = []
@@ -1065,6 +1103,17 @@ def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
     )
     persistence.save_session(req.session_id, sess)
 
+    # Mark progress as complete so any final UI poll sees a clean done state.
+    STATE["analyzer_progress"][sid] = {
+        "status": "done",
+        "step": "done",
+        "current": len(clauses_out),
+        "total": len(clauses_out),
+        "elapsed_s": round(time.time() - t0, 1),
+        "percent": 1.0,
+        "started_at": t0,
+    }
+
     return AnalyzeResp(
         session_id=req.session_id,
         filename=sess["filename"],
@@ -1087,6 +1136,19 @@ def analyze_contract(req: AnalyzeReq):
     requested = (req.version or STATE["analyzer_version_default"]).strip()
     use_v2 = requested == "2" and STATE["analyzer_cfg"] is not None
     return _analyze_v2(req) if use_v2 else _analyze_v1(req)
+
+
+@app.get("/analyze-contract/progress")
+def analyze_contract_progress(session_id: str):
+    """Live progress for an in-flight V2 analysis. Returns the latest
+    pipeline event (step, current clause / total clauses, percent
+    complete, elapsed seconds). Idempotent — UI polls this every few
+    seconds while the long-running /analyze-contract POST is open.
+    Returns ``status: "idle"`` when no analysis has run for this session."""
+    progress = STATE["analyzer_progress"].get(session_id)
+    if not progress:
+        return {"status": "idle", "session_id": session_id}
+    return {"session_id": session_id, **progress}
 
 
 @app.get("/analyze-contract/full")

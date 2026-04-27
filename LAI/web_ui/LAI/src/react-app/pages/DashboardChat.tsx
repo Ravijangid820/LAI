@@ -18,7 +18,14 @@ import { ChatInput } from "@/react-app/components/chat/ChatInput";
 import { TypingIndicator } from "@/react-app/components/chat/TypingIndicator";
 import { Button } from "@/react-app/components/ui/button";
 import type { Conversation } from "@/react-app/components/DashboardLayout";
-import { queryRAG, uploadDocument, analyzeContract, getSession } from "@/react-app/lib/ragApi";
+import {
+  queryRAG,
+  uploadDocument,
+  analyzeContract,
+  getSession,
+  getAnalyzeProgress,
+  type AnalyzeProgress,
+} from "@/react-app/lib/ragApi";
 import { randomId } from "@/react-app/utils/uuid";
 
 // localStorage key for the active session id. One per active conversation
@@ -241,7 +248,77 @@ export default function DashboardChatPage() {
          trimmed.startsWith("/analyze"));
 
       if (isAnalyzeCmd) {
-        const a = await analyzeContract(currentSessionId);
+        // Live progress message — updated in place every few seconds
+        // while the long /analyze-contract POST is open.
+        const progressMsgId = randomId();
+        const progressMsg: ChatMessageData = {
+          id: progressMsgId,
+          role: "assistant",
+          content: "🔄 **Analyse läuft…** Vorbereitung",
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, progressMsg]);
+
+        const renderProgress = (p: AnalyzeProgress): string => {
+          if (p.status === "error") {
+            return `❌ **Analyse fehlgeschlagen** — ${p.error ?? "unbekannter Fehler"}`;
+          }
+          const elapsed = Math.max(0, Math.round(p.elapsed_s ?? 0));
+          const elapsedStr = elapsed >= 60 ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s` : `${elapsed}s`;
+          const pct = Math.round((p.percent ?? 0) * 100);
+          let label = "Vorbereitung";
+          if (p.step === "starting") label = "Starte Analyse";
+          else if (p.step === "classifying") label = "Vertragstyp wird erkannt";
+          else if (p.step === "classify_done") label = "Vertragstyp erkannt";
+          else if (p.step === "preparing_context" || p.step === "preparing_context_done")
+            label = "Kontext wird vorbereitet";
+          else if (p.step === "tables_reconciled") label = "Tabellen abgeglichen";
+          else if (p.step === "extracting_parcels") label = "Flurstücke werden extrahiert";
+          else if (p.step === "parcels_done")
+            label = `Flurstücke extrahiert (${p.current ?? 0})`;
+          else if (p.step === "analyzing_clause")
+            label = `Klausel ${p.current}/${p.total} wird analysiert`;
+          else if (p.step === "clauses_done") label = "Klausel-Analyse abgeschlossen";
+          else if (p.step === "whole_contract") label = "Gesamtvertrag wird geprüft";
+          else if (p.step === "done") label = "Fertig";
+          // Rough ETA — simple linear extrapolation, only meaningful when
+          // we have non-zero progress.
+          let etaStr = "";
+          if (pct > 5 && pct < 100 && elapsed > 0) {
+            const totalEst = elapsed / Math.max(p.percent ?? 0.001, 0.01);
+            const remaining = Math.max(0, Math.round(totalEst - elapsed));
+            etaStr = remaining >= 60
+              ? ` · ~${Math.ceil(remaining / 60)} min verbleibend`
+              : ` · ~${remaining}s verbleibend`;
+          }
+          return `🔄 **${label}** — ${pct}% · ${elapsedStr} elapsed${etaStr}`;
+        };
+
+        // Start polling. Stops when analyzeContract resolves below.
+        // currentSessionId is guaranteed non-null here (isAnalyzeCmd
+        // guards on it), but the TS narrowing doesn't survive into a
+        // separate boolean variable — assert non-null explicitly.
+        const sidForAnalyze: string = currentSessionId!;
+        let pollDone = false;
+        const pollInterval = window.setInterval(async () => {
+          if (pollDone) return;
+          const p = await getAnalyzeProgress(sidForAnalyze);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === progressMsgId ? { ...m, content: renderProgress(p) } : m,
+            ),
+          );
+        }, 3000);
+
+        let a;
+        try {
+          a = await analyzeContract(sidForAnalyze);
+        } finally {
+          pollDone = true;
+          window.clearInterval(pollInterval);
+        }
+
+        // Replace the progress placeholder with the final result.
         const lines: string[] = [];
         lines.push(`**Contract analysis** — ${a.filename}`);
         lines.push(`Detected ${a.n_clauses} clauses (analysis took ${a.elapsed_s}s)`);
@@ -273,13 +350,16 @@ export default function DashboardChatPage() {
         } else {
           lines.push("✅ No issues flagged in any clause.");
         }
-        const aiMessage: ChatMessageData = {
-          id: randomId(),
-          role: "assistant",
-          content: lines.join("\n"),
-          timestamp: new Date(),
-        };
-        setMessages((prev) => [...prev, aiMessage]);
+        // Replace the progress placeholder we inserted earlier with the
+        // final analysis text — keeping the same id so React updates in
+        // place rather than appending a new bubble.
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === progressMsgId
+              ? { ...m, content: lines.join("\n"), timestamp: new Date() }
+              : m,
+          ),
+        );
       } else {
         // Normal /query path
         const result = await queryRAG(content, currentSessionId);
