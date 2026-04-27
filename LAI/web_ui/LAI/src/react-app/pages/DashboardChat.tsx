@@ -121,13 +121,18 @@ export default function DashboardChatPage() {
 
     let cancelled = false;
     (async () => {
-      const detail = await getSession(stored);
+      const result = await getSession(stored);
       if (cancelled) return;
-      if (!detail) {
-        // Stale id — server doesn't have it any more (e.g. DB wiped).
-        try { window.localStorage.removeItem(sessionKey(activeConversationId)); } catch {}
+      if (!result.ok) {
+        // Only treat a TRUE 404 as a stale id worth clearing. Network
+        // errors (e.g. serve_rag mid-restart) keep the id so we can
+        // rehydrate on a later mount.
+        if (result.reason === "not-found") {
+          try { window.localStorage.removeItem(sessionKey(activeConversationId)); } catch {}
+        }
         return;
       }
+      const detail = result.session;
       setSessionId(detail.session_id);
       const replayed: ChatMessageData[] = detail.messages.map((m) => ({
         id: randomId(),
@@ -141,13 +146,15 @@ export default function DashboardChatPage() {
     return () => { cancelled = true; };
   }, [activeConversationId]);
 
-  // Persist sessionId to localStorage every time it changes so refresh-survival
-  // works regardless of which code path created it (upload or first /query).
+  // Persist sessionId to localStorage when we have one. Don't auto-clear
+  // on null — the rehydration effect above is the only place that should
+  // remove a stored id, and only on confirmed 404. Otherwise an initial
+  // null state on mount would wipe the value before rehydration can read it.
   useEffect(() => {
+    if (!sessionId) return;
     try {
       const k = sessionKey(activeConversationId);
-      if (sessionId) window.localStorage.setItem(k, sessionId);
-      else window.localStorage.removeItem(k);
+      window.localStorage.setItem(k, sessionId);
     } catch {
       // localStorage unavailable (private mode etc.) — ignore, just lose persistence
     }

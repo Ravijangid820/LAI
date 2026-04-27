@@ -160,14 +160,21 @@ export interface SessionSummary {
   n_messages: number;
 }
 
-export async function getSession(sessionId: string): Promise<SessionDetail | null> {
+// Distinguished result so the caller can tell "session is truly gone (404)"
+// from "couldn't reach the backend right now" — only the former should
+// invalidate cached state in the UI.
+export type SessionFetchResult =
+  | { ok: true; session: SessionDetail }
+  | { ok: false; reason: "not-found" | "unreachable" };
+
+export async function getSession(sessionId: string): Promise<SessionFetchResult> {
   try {
     const res = await fetch(`${BACKEND_URL}/sessions/${sessionId}`);
-    if (res.status === 404) return null;
-    if (!res.ok) throw new Error(`Session fetch failed: ${res.status}`);
-    return res.json();
+    if (res.status === 404) return { ok: false, reason: "not-found" };
+    if (!res.ok) return { ok: false, reason: "unreachable" };
+    return { ok: true, session: await res.json() };
   } catch {
-    return null;
+    return { ok: false, reason: "unreachable" };
   }
 }
 
