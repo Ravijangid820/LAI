@@ -21,10 +21,22 @@ done
 
 if [ "$KEEP_HOST" = "0" ]; then
     echo "[stop] stopping host processes..."
-    pkill -f "scripts/serve_rag.py --port 18000" 2>/dev/null && echo "[stop]   serve_rag.py killed" || echo "[stop]   serve_rag.py not running"
-    # Match LAI vite specifically — don't kill unrelated vite servers on the box
-    ps -ef | awk '$0 ~ /web_ui\/LAI.*vite/ && $0 !~ /awk/ {print $2}' | xargs -r kill 2>/dev/null \
-        && echo "[stop]   Vite killed" || echo "[stop]   Vite not running"
+    # Resolve PIDs by exec-name + argv (avoids matching bash wrappers
+    # whose argv string contains the same path as the real process).
+    SERVE_RAG_PID=$(ps -eo pid=,comm=,args= \
+        | awk '$2 ~ /^python/ && /scripts\/serve_rag\.py/ && /--port 18000/ {print $1}')
+    VITE_PID=$(ps -eo pid=,comm=,args= \
+        | awk '$2 == "node" && /web_ui\/LAI\/.*\.bin\/vite/ {print $1}')
+    if [ -n "$SERVE_RAG_PID" ]; then
+        kill $SERVE_RAG_PID 2>/dev/null && echo "[stop]   serve_rag.py killed (PID $SERVE_RAG_PID)"
+    else
+        echo "[stop]   serve_rag.py not running"
+    fi
+    if [ -n "$VITE_PID" ]; then
+        kill $VITE_PID 2>/dev/null && echo "[stop]   Vite killed (PID $VITE_PID)"
+    else
+        echo "[stop]   Vite not running"
+    fi
 fi
 
 if [ "$KEEP_DOCKER" = "0" ]; then

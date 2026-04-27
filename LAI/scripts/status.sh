@@ -42,15 +42,21 @@ check "embedding /health     " "http://localhost:8003/health"
 check "Vite UI               " "http://localhost:5173/"
 
 # ── host processes ────────────────────────────────────────────────────────
+# Filter on the actual executable name (comm), not argv — bash wrappers
+# embed the full command in their argv and would otherwise be a false hit.
 echo
 echo "Host processes:"
-if pgrep -af "scripts/serve_rag.py --port 18000" >/dev/null; then
-    ok "serve_rag.py — PID $(pgrep -f "scripts/serve_rag.py --port 18000" | head -1)"
+SERVE_RAG_PID=$(ps -eo pid=,comm=,args= \
+    | awk '$2 ~ /^python/ && /scripts\/serve_rag\.py/ && /--port 18000/ {print $1; exit}')
+if [ -n "$SERVE_RAG_PID" ]; then
+    ok "serve_rag.py — PID $SERVE_RAG_PID"
 else
     fail "serve_rag.py — not running"
 fi
-if pgrep -af "web_ui/LAI.*vite" >/dev/null; then
-    ok "Vite — PID $(pgrep -af "web_ui/LAI.*vite" | head -1 | awk '{print $1}')"
+VITE_PID=$(ps -eo pid=,comm=,args= \
+    | awk '$2 == "node" && /web_ui\/LAI\/.*\.bin\/vite/ {print $1; exit}')
+if [ -n "$VITE_PID" ]; then
+    ok "Vite — PID $VITE_PID"
 else
     fail "Vite — not running"
 fi

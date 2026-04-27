@@ -41,9 +41,20 @@ echo "[start] bringing up Docker services (analyzer, embedding, reranker, pgvect
 cd "$LAI_DIR"
 ANALYZER_BIND_HOST="$ANALYZER_BIND_HOST" docker compose up -d
 
+# Helpers — filter on executable name (comm) so bash wrappers' argv
+# don't get matched as if they were the actual processes.
+serve_rag_pid() {
+    ps -eo pid=,comm=,args= \
+        | awk '$2 ~ /^python/ && /scripts\/serve_rag\.py/ && /--port 18000/ {print $1; exit}'
+}
+vite_pid() {
+    ps -eo pid=,comm=,args= \
+        | awk '$2 == "node" && /web_ui\/LAI\/.*\.bin\/vite/ {print $1; exit}'
+}
+
 # ── host process: serve_rag.py ──────────────────────────────────────────
-if pgrep -af "scripts/serve_rag.py --port 18000" >/dev/null; then
-    echo "[start] serve_rag already running — leaving it"
+if [ -n "$(serve_rag_pid)" ]; then
+    echo "[start] serve_rag already running (PID $(serve_rag_pid)) — leaving it"
 else
     echo "[start] launching serve_rag.py on :18000 (logs → $LOG_DIR/serve_rag.log)"
     cd "$LAI_DIR"
@@ -53,8 +64,8 @@ else
 fi
 
 # ── host process: Vite UI ───────────────────────────────────────────────
-if pgrep -af "web_ui/LAI.*vite" >/dev/null; then
-    echo "[start] Vite already running — leaving it"
+if [ -n "$(vite_pid)" ]; then
+    echo "[start] Vite already running (PID $(vite_pid)) — leaving it"
 else
     if [ "$VPN_MODE" = "1" ]; then
         VITE_HOST_FLAG="--host 0.0.0.0"
