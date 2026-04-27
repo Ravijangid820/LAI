@@ -18,8 +18,16 @@ import { ChatInput } from "@/react-app/components/chat/ChatInput";
 import { TypingIndicator } from "@/react-app/components/chat/TypingIndicator";
 import { Button } from "@/react-app/components/ui/button";
 import type { Conversation } from "@/react-app/components/DashboardLayout";
-import { queryRAG, uploadDocument, analyzeContract } from "@/react-app/lib/ragApi";
+import { queryRAG, uploadDocument, analyzeContract, getSession } from "@/react-app/lib/ragApi";
 import { randomId } from "@/react-app/utils/uuid";
+
+// localStorage key for the active session id. One per active conversation
+// (we scope by activeConversationId so users with multiple chats keep
+// their uploaded contract isolated per chat).
+const SESSION_KEY_PREFIX = "lai.session.";
+function sessionKey(convId: string | undefined | null): string {
+  return SESSION_KEY_PREFIX + (convId || "default");
+}
 
 const suggestedPrompts = [
   {
@@ -92,11 +100,58 @@ export default function DashboardChatPage() {
     return () => clearTimeout(timer);
   }, [messages.length, isTyping, forceScrollToBottom]);
 
+  // ── Session rehydration ───────────────────────────────────────────────
+  // On conversation change (or first mount), look up a previously-saved
+  // session_id in localStorage. If one exists, fetch its persisted
+  // messages from the backend and replay them into the UI so the user's
+  // chat history survives page refreshes and serve_rag restarts.
   useEffect(() => {
     setMessages([]);
     setShowScrollBtn(false);
     setSessionId(null);
+
+    const stored = (() => {
+      try {
+        return window.localStorage.getItem(sessionKey(activeConversationId));
+      } catch {
+        return null;
+      }
+    })();
+    if (!stored) return;
+
+    let cancelled = false;
+    (async () => {
+      const detail = await getSession(stored);
+      if (cancelled) return;
+      if (!detail) {
+        // Stale id — server doesn't have it any more (e.g. DB wiped).
+        try { window.localStorage.removeItem(sessionKey(activeConversationId)); } catch {}
+        return;
+      }
+      setSessionId(detail.session_id);
+      const replayed: ChatMessageData[] = detail.messages.map((m) => ({
+        id: randomId(),
+        role: m.role,
+        content: m.content,
+        timestamp: new Date((m.created_at || 0) * 1000),
+      }));
+      setMessages(replayed);
+    })();
+
+    return () => { cancelled = true; };
   }, [activeConversationId]);
+
+  // Persist sessionId to localStorage every time it changes so refresh-survival
+  // works regardless of which code path created it (upload or first /query).
+  useEffect(() => {
+    try {
+      const k = sessionKey(activeConversationId);
+      if (sessionId) window.localStorage.setItem(k, sessionId);
+      else window.localStorage.removeItem(k);
+    } catch {
+      // localStorage unavailable (private mode etc.) — ignore, just lose persistence
+    }
+  }, [sessionId, activeConversationId]);
 
   // ── Send message ──────────────────────────────────────────────────────────
   // CHANGED: replaced mock timeout + mockResponses with real queryRAG() call

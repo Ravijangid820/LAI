@@ -128,3 +128,65 @@ export async function checkHealth(): Promise<boolean> {
     return false;
   }
 }
+
+
+// ── Session rehydration (persistence across UI refreshes) ────────────────
+
+export interface PersistedMessage {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  mode: string | null;
+  created_at: number;
+}
+
+export interface SessionDetail {
+  session_id: string;
+  filename: string | null;
+  n_pages: number;
+  uploaded_at: number | null;
+  has_analysis: boolean;
+  analyzer_version: string | null;
+  messages: PersistedMessage[];
+}
+
+export interface SessionSummary {
+  id: string;
+  filename: string | null;
+  n_pages: number;
+  uploaded_at: number;
+  updated_at: number;
+  has_analysis: boolean;
+  n_messages: number;
+}
+
+export async function getSession(sessionId: string): Promise<SessionDetail | null> {
+  try {
+    const res = await fetch(`${BACKEND_URL}/sessions/${sessionId}`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`Session fetch failed: ${res.status}`);
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function listSessions(limit = 50): Promise<SessionSummary[]> {
+  try {
+    const res = await fetch(`${BACKEND_URL}/sessions?limit=${limit}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.sessions || [];
+  } catch {
+    return [];
+  }
+}
+
+export async function deleteSession(sessionId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${BACKEND_URL}/sessions/${sessionId}`, { method: "DELETE" });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}

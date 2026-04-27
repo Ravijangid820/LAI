@@ -58,6 +58,7 @@ from rag_eval import (  # type: ignore[import-not-found]
 )
 from lai.analyzer import pipeline as analyzer_pipeline  # noqa: E402
 from lai.analyzer import llm_client as analyzer_llm     # noqa: E402
+from lai import persistence                              # noqa: E402
 
 STATE: dict = {
     "corpus": None, "conn": None, "parent_text": None,
@@ -70,7 +71,9 @@ STATE: dict = {
     # Analyzer V2 — separate vLLM endpoint, Qwen3.6-27B with thinking mode
     "analyzer_cfg": None,
     "analyzer_version_default": "1",  # "1" | "2"
-    "sessions": {},  # session_id -> {"contract_text": str, "filename": str, "clauses": [...], "analysis": {...}}
+    # Sessions live in SQLite via lai.persistence — see init in lifespan().
+    # Process-memory cache here intentionally removed; refresh-safe across
+    # both UI reloads and serve_rag restarts.
 }
 
 
@@ -345,10 +348,10 @@ def session_uses_contract(session_id: str | None, question: str) -> bool:
     'Vertrag', 'Klausel', 'Pacht', 'Rückbau' etc., or directly references it,
     we should pull the contract text into the prompt context.
     """
-    if not session_id or session_id not in STATE["sessions"]:
+    if not session_id:
         return False
-    sess = STATE["sessions"][session_id]
-    if not sess.get("contract_text"):
+    sess = persistence.load_session(session_id)
+    if not sess or not sess.get("contract_text"):
         return False
     q = question.lower()
     contract_keywords = ("vertrag", "klausel", "pacht", "rückbau", "kündigung",
@@ -629,6 +632,13 @@ class AnalyzeResp(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Persistence — open/create the sessions DB before anything else so
+    # endpoints can rely on it from request 1.
+    db_path = LAI_DIR / "processed" / "sessions.db"
+    uploads_dir = LAI_DIR / "processed" / "uploads"
+    persistence.init(db_path, uploads_dir)
+    print(f"[startup]   persistence: db={db_path}  uploads={uploads_dir}", flush=True)
+
     print("[startup] loading embeddings...", flush=True)
     t0 = time.time()
     conn = sqlite3.connect(str(DB), check_same_thread=False)
@@ -724,7 +734,7 @@ def health():
         "loaded": llm_ready,
         "llm_backend": "remote" if STATE["llm_api_url"] else "local",
         "llm_model": STATE["llm_model_name"],
-        "n_sessions": len(STATE["sessions"]),
+        "n_sessions": persistence.count_sessions(),
     }
 
 
@@ -810,7 +820,9 @@ def query(req: QueryReq):
     # Decide mode label + build prompt
     contract_text = ""
     if use_contract:
-        contract_text = STATE["sessions"][sid]["contract_text"][:8000]
+        contract_sess = persistence.load_session(sid)
+        if contract_sess and contract_sess.get("contract_text"):
+            contract_text = contract_sess["contract_text"][:8000]
 
     if use_rag and use_contract:
         mode = "rag+contract"
@@ -832,6 +844,18 @@ def query(req: QueryReq):
     )
     timings.generate_s = round(time.time() - t0, 3)
     timings.total_s = round(time.time() - t_total0, 3)
+
+    # Persist chat messages so the UI can rehydrate the thread on refresh.
+    # We only persist when there's a session bound to a real upload — bare
+    # chat (no upload) doesn't currently produce a session row, so we'd be
+    # writing orphaned messages otherwise. Best-effort; never fail the
+    # request because of a write hiccup.
+    if persistence.session_exists(sid):
+        try:
+            persistence.add_message(sid, "user", req.question, mode=mode)
+            persistence.add_message(sid, "assistant", answer, mode=mode)
+        except Exception as e:
+            print(f"[warn] failed to persist messages for {sid}: {e}", flush=True)
 
     return QueryResp(
         answer=answer, chunks=chunks_out, timings=timings,
@@ -855,7 +879,10 @@ async def upload(file: UploadFile = File(...), session_id: str | None = Form(Non
     except Exception as e:
         raise HTTPException(422, f"Could not parse document: {e}")
 
-    STATE["sessions"][sid] = {
+    # Keep the original file on disk for audit / re-OCR / later re-render
+    upload_ext = persistence.save_upload(sid, contents, fname)
+
+    persistence.save_session(sid, {
         "filename": fname,
         "contract_text": md,
         "n_pages": num_pages,
@@ -863,7 +890,8 @@ async def upload(file: UploadFile = File(...), session_id: str | None = Form(Non
         "uploaded_at": time.time(),
         "clauses": None,     # filled by /analyze-contract
         "analysis": None,
-    }
+        "upload_ext": upload_ext,
+    })
     return UploadResp(
         session_id=sid, filename=fname, pages=num_pages,
         chunks=md.count("\n\n") + 1,  # rough paragraph count
@@ -891,7 +919,9 @@ def _v1_issue_to_out(i: dict) -> IssueOut:
 
 
 def _analyze_v1(req: AnalyzeReq) -> AnalyzeResp:
-    sess = STATE["sessions"][req.session_id]
+    sess = persistence.load_session(req.session_id)
+    if sess is None:
+        raise HTTPException(404, "session_id not found")
     t0 = time.time()
     text = sess["contract_text"]
 
@@ -918,6 +948,7 @@ def _analyze_v1(req: AnalyzeReq) -> AnalyzeResp:
         "n_clauses": len(clauses_out),
         "missing_required_clauses": [m.model_dump() for m in missing],
     }
+    persistence.save_session(req.session_id, sess)
     return AnalyzeResp(
         session_id=req.session_id,
         filename=sess["filename"],
@@ -930,7 +961,9 @@ def _analyze_v1(req: AnalyzeReq) -> AnalyzeResp:
 
 
 def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
-    sess = STATE["sessions"][req.session_id]
+    sess = persistence.load_session(req.session_id)
+    if sess is None:
+        raise HTTPException(404, "session_id not found")
     cfg = STATE["analyzer_cfg"]
     t0 = time.time()
 
@@ -979,6 +1012,10 @@ def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
     # Persist the full V2 result on the session for richer UI consumption later
     sess["clauses"] = [c.model_dump() for c in clauses_out]
     sess["analysis"] = result.model_dump()
+    sess["extraction_quality"] = (
+        result.extraction_quality.model_dump() if result.extraction_quality else None
+    )
+    persistence.save_session(req.session_id, sess)
 
     return AnalyzeResp(
         session_id=req.session_id,
@@ -993,7 +1030,7 @@ def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
 
 @app.post("/analyze-contract", response_model=AnalyzeResp)
 def analyze_contract(req: AnalyzeReq):
-    sess = STATE["sessions"].get(req.session_id)
+    sess = persistence.load_session(req.session_id)
     if not sess:
         raise HTTPException(404, "session_id not found — upload a document first")
     if not sess.get("contract_text"):
@@ -1008,13 +1045,57 @@ def analyze_contract(req: AnalyzeReq):
 def analyze_contract_full(session_id: str):
     """Return the full V2 ContractAnalysis for a session (parcels, tables,
     cross-clause findings — fields the legacy AnalyzeResp doesn't carry)."""
-    sess = STATE["sessions"].get(session_id)
+    sess = persistence.load_session(session_id)
     if not sess:
         raise HTTPException(404, "session_id not found")
     analysis = sess.get("analysis")
     if not analysis or analysis.get("analyzer_version") != "2.0":
         raise HTTPException(409, "no V2 analysis on this session — call /analyze-contract with version='2' first")
     return analysis
+
+
+# ---------------------------------------------------------------------------
+# Session listing + rehydration endpoints (UI persistence across refresh)
+# ---------------------------------------------------------------------------
+
+@app.get("/sessions")
+def list_sessions(limit: int = 50):
+    """Recent sessions for a sidebar — light payload, no contract_text."""
+    return {"sessions": persistence.list_sessions(limit=limit)}
+
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str):
+    """Full session payload for UI rehydration after a refresh.
+    Returns the contract metadata + last analysis + message history."""
+    sess = persistence.load_session(session_id)
+    if not sess:
+        raise HTTPException(404, "session_id not found")
+    messages = persistence.list_messages(session_id)
+    return {
+        "session_id": session_id,
+        "filename": sess.get("filename"),
+        "n_pages": sess.get("n_pages") or 0,
+        "uploaded_at": sess.get("uploaded_at"),
+        "has_analysis": sess.get("analysis") is not None,
+        "analyzer_version": (sess.get("analysis") or {}).get("analyzer_version"),
+        "messages": messages,
+    }
+
+
+@app.get("/sessions/{session_id}/messages")
+def get_session_messages(session_id: str):
+    if not persistence.session_exists(session_id):
+        raise HTTPException(404, "session_id not found")
+    return {"messages": persistence.list_messages(session_id)}
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session_endpoint(session_id: str):
+    if not persistence.session_exists(session_id):
+        raise HTTPException(404, "session_id not found")
+    persistence.delete_session(session_id)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
