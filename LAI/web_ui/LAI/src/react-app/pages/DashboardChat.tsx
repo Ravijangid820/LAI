@@ -360,6 +360,13 @@ export default function DashboardChatPage() {
               : m,
           ),
         );
+      } else if (content.trim().length === 0 && docAttachments.length > 0) {
+        // Upload-only — user attached a file with no question. The
+        // "Document uploaded" confirmation we showed above is the
+        // entire response; firing /query with empty content would
+        // just produce a spurious greeting. Skip.
+      } else if (content.trim().length === 0) {
+        // Empty submit, no attachment either — nothing to do.
       } else {
         // Normal /query path
         const result = await queryRAG(content, currentSessionId);
