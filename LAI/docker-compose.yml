@@ -72,6 +72,11 @@ services:
               capabilities: [gpu]
 
   # ── Embedding service (Qwen3-Embedding-8B) ───────────────────────────
+  # On GPU 1 by default — GPU 0 is dominated by the analyzer (Qwen3.6-27B)
+  # at 0.75 mem-util, leaving only ~25 GB free which is too tight for an
+  # 8B embedding model. GPU 1 has plenty of headroom alongside serve_rag's
+  # in-process reranker (~16 GB). Override with EMBEDDING_CUDA_DEVICE=0 if
+  # the analyzer is stopped or running on a different GPU.
   embedding:
     image: vllm/vllm-openai:latest
     container_name: lai_embedding
@@ -85,6 +90,11 @@ services:
       --gpu-memory-utilization ${EMBEDDING_GPU_MEM:-0.45}
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
+      # Use the local model snapshot — avoids the unauthenticated-HF-Hub
+      # warning + download rate limits. The model is already in
+      # .runtime-cache/hf via volume mount below.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     volumes:
       - ./.runtime-cache/hf:/root/.cache/huggingface
     ports:
@@ -102,7 +112,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['${EMBEDDING_CUDA_DEVICE:-0}']
+              device_ids: ['${EMBEDDING_CUDA_DEVICE:-1}']
               capabilities: [gpu]
 
   # ── PostgreSQL + pgvector ────────────────────────────────────────────
