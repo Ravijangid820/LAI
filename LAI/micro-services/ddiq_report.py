@@ -105,7 +105,10 @@ CREATE TABLE IF NOT EXISTS ddiq_documents (
     full_text TEXT, chunk_count INT DEFAULT 0, session_id TEXT);
 CREATE TABLE IF NOT EXISTS ddiq_doc_chunks (
     id SERIAL PRIMARY KEY, doc_id UUID REFERENCES ddiq_documents(id) ON DELETE CASCADE,
-    chunk_idx INT NOT NULL, text TEXT NOT NULL, embedding vector(1024), UNIQUE(doc_id, chunk_idx));
+    chunk_idx INT NOT NULL, text TEXT NOT NULL, embedding vector(4096), UNIQUE(doc_id, chunk_idx));
+    -- Qwen3-Embedding-8B returns 4096-dim vectors. If you swap to a different
+    -- embedding model (1024-dim sentence-transformers / 1536-dim ada / etc.),
+    -- update this column and drop ddiq_doc_chunks first.
 CREATE TABLE IF NOT EXISTS ddiq_reports (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), created_at TIMESTAMPTZ DEFAULT NOW(),
     project_name TEXT, document_ids UUID[], preset TEXT, report_data JSONB NOT NULL);
@@ -223,16 +226,48 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[di
         start += chunk_size - overlap
     return chunks
 
+# Embedding service shape:
+#   - The current LAI runtime exposes vLLM's OpenAI-compatible API at
+#     /v1/embeddings (POST {model, input: [...]} → {data: [{embedding}, ...]})
+#   - Older HuggingFace TEI servers used /embed with {inputs: ...}
+# We try OpenAI-shape first; on 404 fall back to TEI-shape so this code
+# works regardless of which embedding server the host is running.
+def _embed_via_openai(texts: list[str], timeout: int = 120) -> list[list[float]]:
+    resp = requests.post(
+        f"{EMBEDDING_URL}/v1/embeddings",
+        json={"model": "Qwen/Qwen3-Embedding-8B", "input": texts},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return [item["embedding"] for item in resp.json().get("data", [])]
+
+
+def _embed_via_tei(texts: list[str], timeout: int = 120) -> list[list[float]]:
+    resp = requests.post(
+        f"{EMBEDDING_URL}/embed",
+        json={"inputs": texts},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def embed_texts(texts: list[str], batch_size: int = 8) -> list[list[float]]:
-    all_emb = []
+    all_emb: list[list[float]] = []
     for i in range(0, len(texts), batch_size):
-        resp = requests.post(f"{EMBEDDING_URL}/embed", json={"inputs": texts[i:i+batch_size]}, timeout=120)
-        resp.raise_for_status(); all_emb.extend(resp.json())
+        batch = texts[i:i + batch_size]
+        try:
+            all_emb.extend(_embed_via_openai(batch))
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                all_emb.extend(_embed_via_tei(batch))
+            else:
+                raise
     return all_emb
 
+
 def embed_single(text: str) -> list[float]:
-    resp = requests.post(f"{EMBEDDING_URL}/embed", json={"inputs": text}, timeout=30)
-    resp.raise_for_status(); return resp.json()[0]
+    return embed_texts([text])[0]
 
 def search_doc_chunks(doc_ids, query_embedding, top_k=15):
     if not doc_ids: return []

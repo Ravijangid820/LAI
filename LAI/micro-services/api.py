@@ -160,29 +160,46 @@ class UploadResponse(BaseModel):
 # ─────────────────────────────────────────────
 # Pipeline functions
 # ─────────────────────────────────────────────
-def embed_query(text: str) -> list:
+# Embedding service: try vLLM's OpenAI-compatible /v1/embeddings first
+# (current LAI runtime), fall back to HuggingFace TEI's /embed if the
+# server speaks that older shape instead.
+def _embed_via_openai(texts: list[str], timeout: int = 120) -> list[list[float]]:
     resp = requests.post(
-        f"{EMBEDDING_URL}/embed",
-        json={"inputs": text},
-        timeout=30,
+        f"{EMBEDDING_URL}/v1/embeddings",
+        json={"model": "Qwen/Qwen3-Embedding-8B", "input": texts},
+        timeout=timeout,
     )
     resp.raise_for_status()
-    return resp.json()[0]
+    return [item["embedding"] for item in resp.json().get("data", [])]
+
+
+def _embed_via_tei(texts: list[str], timeout: int = 120) -> list[list[float]]:
+    resp = requests.post(
+        f"{EMBEDDING_URL}/embed",
+        json={"inputs": texts},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def embed_texts(texts: list[str], batch_size: int = 8) -> list[list]:
     """Embed multiple texts in batches to avoid payload size limits."""
-    all_embeddings = []
+    all_embeddings: list[list[float]] = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        resp = requests.post(
-            f"{EMBEDDING_URL}/embed",
-            json={"inputs": batch},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        all_embeddings.extend(resp.json())
+        try:
+            all_embeddings.extend(_embed_via_openai(batch, timeout=120))
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                all_embeddings.extend(_embed_via_tei(batch, timeout=120))
+            else:
+                raise
     return all_embeddings
+
+
+def embed_query(text: str) -> list:
+    return embed_texts([text])[0]
 
 
 def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
