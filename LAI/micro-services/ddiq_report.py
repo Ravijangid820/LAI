@@ -98,6 +98,11 @@ BUNDESLAND_KEYWORDS = {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SCHEMA_SQL = """
+-- pgvector is required for ddiq_doc_chunks.embedding (4096-dim Qwen3 vectors).
+-- Idempotent: no-op when the extension is already enabled. The whole
+-- SCHEMA_SQL runs in one transaction, so without this every CREATE TABLE
+-- below fails when the DB is fresh.
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS ddiq_documents (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), filename TEXT NOT NULL,
     size_bytes BIGINT DEFAULT 0, upload_date TIMESTAMPTZ DEFAULT NOW(),
