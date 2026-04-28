@@ -32,6 +32,7 @@ _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] i
     "https://lai-beta.vercel.app",
     "https://lai-pied.vercel.app",
     "https://lai-ashen.vercel.app",
+    "http://192.168.178.82:5173",
 ]
 # Only allow localhost in development
 if os.getenv("ENVIRONMENT", "development") == "development":

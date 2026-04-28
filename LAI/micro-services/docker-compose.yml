@@ -57,7 +57,7 @@ services:
       - DB_PASSWORD=${DB_PASSWORD:?Set DB_PASSWORD in .env}
       # Application config
       - ENVIRONMENT=${ENVIRONMENT:-production}
-      - CORS_ORIGINS=${CORS_ORIGINS:-https://lai-beta.vercel.app,https://lai-pied.vercel.app,https://lai-ashen.vercel.app}
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://lai-beta.vercel.app,https://lai-pied.vercel.app,https://lai-ashen.vercel.app,http://192.168.178.82:5173,}
     dns:
       - 8.8.8.8
       - 8.8.4.4
