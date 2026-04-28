@@ -111,7 +111,22 @@ CREATE TABLE IF NOT EXISTS ddiq_doc_chunks (
     -- update this column and drop ddiq_doc_chunks first.
 CREATE TABLE IF NOT EXISTS ddiq_reports (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), created_at TIMESTAMPTZ DEFAULT NOW(),
-    project_name TEXT, document_ids UUID[], preset TEXT, report_data JSONB NOT NULL);
+    project_name TEXT, document_ids UUID[], preset TEXT,
+    report_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- Status fields for the async job pattern. NULL/legacy rows count as "done".
+    status TEXT DEFAULT 'done',          -- queued | running | done | failed
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    progress_step TEXT,                  -- short label for UI ("classifying", etc.)
+    progress_percent DOUBLE PRECISION DEFAULT 0.0,
+    error TEXT);
+-- Forward-compat: add the columns if the table already exists.
+ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'done';
+ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
+ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS progress_step TEXT;
+ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS progress_percent DOUBLE PRECISION DEFAULT 0.0;
+ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS error TEXT;
 CREATE TABLE IF NOT EXISTS ddiq_geocode_cache (
     address TEXT PRIMARY KEY, lat DOUBLE PRECISION NOT NULL,
     lng DOUBLE PRECISION NOT NULL, cached_at TIMESTAMPTZ DEFAULT NOW());
@@ -151,6 +166,80 @@ def init_db():
         logger.info("DDiQ tables initialized")
     except Exception as e:
         logger.warning(f"DDiQ DB init skipped: {e}")
+
+
+# ─── Connection pool ───────────────────────────────────────────────────────
+# Every endpoint used to call psycopg2.connect() directly, paying the TCP +
+# auth handshake cost (~5-50ms) per request. /report/generate opened ~20+
+# connections in a single call. A single shared ThreadedConnectionPool
+# eliminates the cost; a thin _PooledConn wrapper makes existing call sites
+# (`conn.close()`) return the connection to the pool instead of really
+# closing it, so we don't have to refactor every endpoint.
+
+from psycopg2.pool import ThreadedConnectionPool
+
+_pg_pool: Optional[ThreadedConnectionPool] = None
+
+
+class _PooledConn:
+    """Proxy a psycopg2 connection from the pool. ``close()`` returns it
+    to the pool; everything else delegates to the underlying connection
+    so existing code continues to work."""
+    def __init__(self, conn, pool: ThreadedConnectionPool):
+        self.__dict__["_conn"] = conn
+        self.__dict__["_pool"] = pool
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value):
+        # Mirror writes onto the underlying connection.
+        setattr(self._conn, name, value)
+
+    def close(self):
+        if self._conn is None or self._pool is None:
+            return
+        try:
+            # If the txn is in a bad state, return aborted so the pool can
+            # reset/discard the connection cleanly.
+            if not self._conn.closed:
+                self._pool.putconn(self._conn)
+        finally:
+            self.__dict__["_conn"] = None
+            self.__dict__["_pool"] = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # Mirror psycopg2 connection-as-context-manager semantics: commit
+        # on clean exit, rollback on exception, then return to pool.
+        try:
+            if exc is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self.close()
+
+
+def init_pool() -> None:
+    global _pg_pool
+    if _pg_pool is not None:
+        return
+    _pg_pool = ThreadedConnectionPool(
+        minconn=int(os.getenv("DB_POOL_MIN", "2")),
+        maxconn=int(os.getenv("DB_POOL_MAX", "20")),
+        **DB_CONFIG,
+    )
+    logger.info(f"DDiQ DB pool: {_pg_pool.minconn}/{_pg_pool.maxconn} connections")
+
+
+def close_pool() -> None:
+    global _pg_pool
+    if _pg_pool is not None:
+        _pg_pool.closeall()
+        _pg_pool = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -201,7 +290,15 @@ class GenerateReportResponse(BaseModel):
 # CORE HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def get_conn(): return psycopg2.connect(**DB_CONFIG)
+def get_conn():
+    """Return a connection from the pool (lazy-init the pool on first use).
+
+    Call ``conn.close()`` as before — that returns it to the pool, not
+    actually closes it. Use ``with get_conn() as conn:`` to also pick up
+    auto-commit-on-success / rollback-on-exception."""
+    if _pg_pool is None:
+        init_pool()
+    return _PooledConn(_pg_pool.getconn(), _pg_pool)
 
 def clean_value(val, fallback: str = "Not specified in documents") -> str:
     s = str(val).strip()
@@ -846,7 +943,7 @@ def generate_findings(doc_ids, sections):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/documents", response_model=DocumentListResponse)
-async def list_documents():
+def list_documents():
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT id, filename, size_bytes, upload_date, status, category FROM ddiq_documents ORDER BY upload_date DESC")
     rows = cur.fetchall(); cur.close(); conn.close()
@@ -856,9 +953,11 @@ async def list_documents():
         status=r["status"], category=r["category"]) for r in rows], total=len(rows))
 
 @router.post("/documents/upload", response_model=UploadDocResponse)
-async def upload_document(file: UploadFile = File(...), category: str = Form("Uncategorized"), session_id: Optional[str] = Form(None)):
+def upload_document(file: UploadFile = File(...), category: str = Form("Uncategorized"), session_id: Optional[str] = Form(None)):
+    # Sync handler — runs in FastAPI's threadpool. Use file.file.read()
+    # (the underlying SpooledTemporaryFile) instead of `await file.read()`.
     if not file.filename.lower().endswith(".pdf"): raise HTTPException(400, "Only PDF")
-    fb = await file.read()
+    fb = file.file.read()
     if len(fb) > MAX_FILE_SIZE: raise HTTPException(400, "Too large")
     full_text, pages = extract_pdf_text(fb)
     if not full_text.strip(): raise HTTPException(400, "No text extracted")
@@ -875,11 +974,129 @@ async def upload_document(file: UploadFile = File(...), category: str = Form("Un
     return UploadDocResponse(id=did, filename=file.filename, pages=pages, chunks=len(chunks), status="analyzed",
         message=f"{file.filename}: {pages} pages, {len(chunks)} chunks")
 
-@router.post("/report/generate", response_model=GenerateReportResponse)
-async def generate_report(req: GenerateReportRequest):
-    if not req.document_ids: raise HTTPException(400, "No documents selected")
+# ─── Background-task worker for /report/generate/async ────────────────────
+# /report/generate is synchronous — fine for direct API use, but the
+# 30-60 minute report blocks a request the whole time. Browsers and
+# proxies time out long before that. The async path lets callers POST,
+# get a {report_id, status:"queued"} immediately, and poll
+# /report/{id}/status (or /report/{id}) for completion.
+
+from concurrent.futures import ThreadPoolExecutor
+
+_report_executor = ThreadPoolExecutor(
+    max_workers=int(os.getenv("REPORT_WORKERS", "2")),
+    thread_name_prefix="ddiq-report",
+)
+
+
+def _update_report_progress(report_id: str, step: Optional[str] = None,
+                            percent: Optional[float] = None,
+                            status: Optional[str] = None,
+                            error: Optional[str] = None) -> None:
+    """Patch a row in ddiq_reports without touching report_data. Best-effort."""
+    sets, params = [], []
+    if step is not None:    sets.append("progress_step = %s");    params.append(step)
+    if percent is not None: sets.append("progress_percent = %s"); params.append(percent)
+    if status is not None:  sets.append("status = %s");           params.append(status)
+    if error is not None:   sets.append("error = %s");            params.append(error)
+    if not sets:
+        return
+    if status == "running" and "started_at" not in [s.split(" =")[0] for s in sets]:
+        sets.append("started_at = COALESCE(started_at, NOW())")
+    if status in ("done", "failed"):
+        sets.append("finished_at = NOW()")
+    params.append(report_id)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE ddiq_reports SET {', '.join(sets)} WHERE id = %s",
+                    params,
+                )
+    except Exception as e:
+        logger.warning(f"progress update failed for {report_id}: {e}")
+
+
+def _run_report_generation_job(rid: str, req: "GenerateReportRequest") -> None:
+    """Runs the same pipeline as the sync /report/generate, but writes
+    progress + final report into the existing ddiq_reports row instead
+    of returning. Errors are recorded in ``status='failed'`` + ``error``."""
+    try:
+        _update_report_progress(rid, status="running", step="starting", percent=0.0)
+        report, _T = _generate_report_core(rid, req, progress=lambda step, pct: _update_report_progress(rid, step=step, percent=pct))
+        _update_report_progress(rid, status="done", step="done", percent=1.0)
+    except HTTPException as e:
+        _update_report_progress(rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}")
+    except Exception as e:
+        logger.exception(f"report {rid} failed")
+        _update_report_progress(rid, status="failed", error=str(e)[:500])
+
+
+@router.post("/report/generate/async")
+def generate_report_async(req: GenerateReportRequest):
+    """Non-blocking variant of /report/generate. Returns
+    {report_id, status} immediately and runs the pipeline in a
+    background thread. Poll /report/{id}/status (or /report/{id}) for
+    progress and the final result."""
+    if not req.document_ids:
+        raise HTTPException(400, "No documents selected")
+
+    # Pre-create the row so the caller has a real report_id to poll.
+    rid = str(uuid.uuid4())
+    pname = req.project_name or "Wind Energy Project"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ddiq_reports (id, project_name, document_ids, preset,
+                                              report_data, status, started_at, progress_step, progress_percent)
+                   VALUES (%s, %s, %s::uuid[], %s, '{}'::jsonb, 'queued', NULL, 'queued', 0.0)""",
+                (rid, pname, req.document_ids, req.preset),
+            )
+
+    _report_executor.submit(_run_report_generation_job, rid, req)
+    return {
+        "report_id": rid,
+        "status": "queued",
+        "poll_url": f"/ddiq/report/{rid}/status",
+    }
+
+
+@router.get("/report/{report_id}/status")
+def get_report_status(report_id: str):
+    """Poll endpoint for the async report-generation flow. Cheap — only
+    reads the row's status fields, not the full payload."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id, status, progress_step, progress_percent, started_at,
+                          finished_at, error, project_name
+                   FROM ddiq_reports WHERE id = %s""",
+                (report_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Report not found")
+    return {
+        "report_id": str(row["id"]),
+        "status": row["status"] or "done",
+        "step": row["progress_step"],
+        "percent": float(row["progress_percent"] or 0.0),
+        "started_at": row["started_at"].isoformat() if row["started_at"] else None,
+        "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
+        "error": row["error"],
+        "project_name": row["project_name"],
+    }
+
+
+def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None) -> "tuple[DDiQReportData, dict]":
+    """Inner pipeline used by both the sync handler and the async worker.
+    ``progress(step, percent)`` is invoked at each major step when given."""
+    if progress is None:
+        progress = lambda step, pct: None  # noqa: E731
+
     t0 = time.time(); T = {}
 
+    progress("gathering", 0.01)
     t = time.time()
     full_text = get_all_text_for_docs(req.document_ids)
     if not full_text.strip(): raise HTTPException(404, "No text")
@@ -895,21 +1112,28 @@ async def generate_report(req: GenerateReportRequest):
     T["meta_s"] = round(time.time()-t, 2)
     pname = req.project_name or meta.get("projectName", "Wind Energy Project")
     pfor = req.prepared_for or meta.get("preparedFor", "Client")
+    progress("metadata", 0.05)
 
     t = time.time()
+    progress("sections", 0.07)
     sections = [analyze_section(req.document_ids, s) for s in ["overview","land","permits","economics"]]
     T["sections_s"] = round(time.time()-t, 2)
+    progress("sections_done", 0.55)  # sections is the bulk (~80% of wall time)
 
     t = time.time()
+    progress("geocoding", 0.55)
     pc = geocode_project_location(sections)
     ploc = get_section_value(sections, "overview", "Location")
     logger.info(f"Center: {pc}, Location: {ploc}")
     T["geocode_s"] = round(time.time()-t, 2)
 
+    progress("wea_extraction", 0.58)
     t = time.time(); weas = extract_wea_statuses(req.document_ids, full_text, sections, pc); T["wea_s"] = round(time.time()-t, 2)
+    progress("infrastructure", 0.70)
     t = time.time(); infra = extract_infrastructure(req.document_ids, sections, pc); T["infra_s"] = round(time.time()-t, 2)
 
     # ── 13-Step Cadastral Pipeline ────────────────────────────────────────
+    progress("cadastral", 0.78)
     t = time.time()
     pipeline = CadastralPipeline(
         alkis_query_fn=alkis_query_parcels,
@@ -990,43 +1214,69 @@ async def generate_report(req: GenerateReportRequest):
         geojson=pipeline_result.geojson if pipeline_result.geojson else None,
     )
 
-    rid = str(uuid.uuid4()); conn = get_conn(); cur = conn.cursor()
-    cur.execute("INSERT INTO ddiq_reports (id,project_name,document_ids,preset,report_data) VALUES (%s,%s,%s::uuid[],%s,%s)",
-        (rid, pname, req.document_ids, req.preset, json.dumps(report.dict())))
+    # UPSERT into ddiq_reports — sync path inserts a fresh row, async path
+    # updates the row that /report/generate/async pre-created.
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ddiq_reports (id, project_name, document_ids, preset, report_data)
+                   VALUES (%s, %s, %s::uuid[], %s, %s)
+                   ON CONFLICT (id) DO UPDATE SET
+                       project_name = EXCLUDED.project_name,
+                       document_ids = EXCLUDED.document_ids,
+                       preset = EXCLUDED.preset,
+                       report_data = EXCLUDED.report_data""",
+                (rid, pname, req.document_ids, req.preset, json.dumps(report.dict())),
+            )
 
-    # Persist project area first (parent of contracts and parcels)
-    if pa and pa.polygon:
-        cur.execute("""INSERT INTO ddiq_project_areas (name, polygon, centroid_lat, centroid_lng, area_km2, source, report_id)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-            (pa.name, json.dumps(pa.polygon), pa.centroid_lat, pa.centroid_lng, pa.area_km2, pa.source, rid))
+            # Persist project area first (parent of contracts and parcels)
+            if pa and pa.polygon:
+                cur.execute(
+                    """INSERT INTO ddiq_project_areas (name, polygon, centroid_lat, centroid_lng, area_km2, source, report_id)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (pa.name, json.dumps(pa.polygon), pa.centroid_lat, pa.centroid_lng, pa.area_km2, pa.source, rid))
 
-    # Persist contracts (must come before classified_parcels since matched_contract_id references them)
-    for contract in pipeline_result.contracts:
-        cur.execute("""INSERT INTO ddiq_contracts (id, contract_ref, contract_type, contracting_entity, raw_text_excerpt, report_id)
-            VALUES (%s,%s,%s,%s,%s,%s)""",
-            (contract.contract_id, contract.contract_ref, contract.contract_type,
-             contract.contracting_entity, contract.text_excerpt[:500], rid))
-        for pref in contract.referenced_parcels:
-            cur.execute("INSERT INTO ddiq_contract_parcels (contract_id, parcel_identifier) VALUES (%s,%s)",
-                (contract.contract_id, pref))
+            # Persist contracts (parent of classified_parcels via matched_contract_id)
+            for contract in pipeline_result.contracts:
+                cur.execute(
+                    """INSERT INTO ddiq_contracts (id, contract_ref, contract_type, contracting_entity, raw_text_excerpt, report_id)
+                       VALUES (%s,%s,%s,%s,%s,%s)""",
+                    (contract.contract_id, contract.contract_ref, contract.contract_type,
+                     contract.contracting_entity, contract.text_excerpt[:500], rid))
+                for pref in contract.referenced_parcels:
+                    cur.execute(
+                        "INSERT INTO ddiq_contract_parcels (contract_id, parcel_identifier) VALUES (%s,%s)",
+                        (contract.contract_id, pref))
 
-    # Persist classified parcels last
-    for cp in pipeline_result.classified_parcels:
-        cur.execute("""INSERT INTO ddiq_classified_parcels
-            (report_id, parcel_number, gemarkung, flur, normalized_id, polygon, polygon_source,
-             classification, color, confidence, matched_contract_id, classification_reason, area_ha, owner, linked_wea)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (rid, cp.parcel_number, cp.gemarkung, cp.flur, cp.normalized_id,
-             json.dumps(cp.polygon), cp.polygon_source, cp.classification.value,
-             cp.color, cp.confidence, cp.matched_contract_id, cp.classification_reason,
-             cp.area_ha, cp.owner, cp.linked_wea))
+            # Persist classified parcels last
+            for cp in pipeline_result.classified_parcels:
+                cur.execute(
+                    """INSERT INTO ddiq_classified_parcels
+                       (report_id, parcel_number, gemarkung, flur, normalized_id, polygon, polygon_source,
+                        classification, color, confidence, matched_contract_id, classification_reason, area_ha, owner, linked_wea)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (rid, cp.parcel_number, cp.gemarkung, cp.flur, cp.normalized_id,
+                     json.dumps(cp.polygon), cp.polygon_source, cp.classification.value,
+                     cp.color, cp.confidence, cp.matched_contract_id, cp.classification_reason,
+                     cp.area_ha, cp.owner, cp.linked_wea))
 
-    conn.commit(); cur.close(); conn.close()
     T["total_s"] = round(time.time()-t0, 2)
+    return report, T
+
+
+@router.post("/report/generate", response_model=GenerateReportResponse)
+def generate_report(req: GenerateReportRequest):
+    """Synchronous report generation — kept for back-compat. Blocks the
+    request for the entire pipeline runtime (~30-60 min). Prefer
+    /report/generate/async + /report/{id}/status for any UI-driven flow."""
+    if not req.document_ids:
+        raise HTTPException(400, "No documents selected")
+    rid = str(uuid.uuid4())
+    report, T = _generate_report_core(rid, req)
     return GenerateReportResponse(report_id=rid, report=report, timings=T)
 
 @router.get("/report/{report_id}")
-async def get_report(report_id: str):
+def get_report(report_id: str):
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM ddiq_reports WHERE id = %s", (report_id,))
     row = cur.fetchone(); cur.close(); conn.close()
@@ -1036,7 +1286,7 @@ async def get_report(report_id: str):
 
 
 @router.get("/report/{report_id}/geojson")
-async def get_report_geojson(report_id: str):
+def get_report_geojson(report_id: str):
     """Return GeoJSON FeatureCollection for GIS import (QGIS, ArcGIS, MapBox, etc.)."""
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT report_data FROM ddiq_reports WHERE id = %s", (report_id,))
@@ -1096,7 +1346,7 @@ async def get_report_geojson(report_id: str):
 
 
 @router.get("/report/{report_id}/validate")
-async def validate_report(report_id: str):
+def validate_report(report_id: str):
     """Run validation checks on a generated report (Step 13)."""
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT report_data FROM ddiq_reports WHERE id = %s", (report_id,))
@@ -1129,7 +1379,7 @@ class ProjectAreaResponse(BaseModel):
 
 
 @router.post("/project-area", response_model=ProjectAreaResponse)
-async def create_project_area(req: ProjectAreaRequest):
+def create_project_area(req: ProjectAreaRequest):
     """Define a project area polygon (Step 1 of Output Map)."""
     if len(req.polygon) < 3:
         raise HTTPException(400, "Polygon must have at least 3 points")
@@ -1182,4 +1432,11 @@ async def get_map_tiles():
     }
 
 @router.on_event("startup")
-async def startup(): init_db()
+async def startup():
+    init_pool()
+    init_db()
+
+
+@router.on_event("shutdown")
+async def shutdown():
+    close_pool()

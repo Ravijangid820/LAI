@@ -384,17 +384,22 @@ async def health():
 
 
 @app.post("/upload", response_model=UploadResponse)
-async def upload_document(
+def upload_document(
     file: UploadFile = File(...),
     session_id: Optional[str] = None,
 ):
-    """Upload a PDF document for analysis."""
+    """Upload a PDF document for analysis.
+
+    Sync handler — FastAPI dispatches to a threadpool. The underlying
+    SpooledTemporaryFile (`file.file`) is readable synchronously, so we
+    don't need `await file.read()` (which only works in an async def).
+    """
     # Validate file type
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     # Read file
-    file_bytes = await file.read()
+    file_bytes = file.file.read()
 
     # Check file size
     if len(file_bytes) > MAX_FILE_SIZE:
@@ -443,7 +448,7 @@ async def upload_document(
 
 
 @app.post("/query", response_model=QueryResponse)
-async def query(req: QueryRequest):
+def query(req: QueryRequest):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
