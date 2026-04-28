@@ -178,15 +178,22 @@ are concentrated.
 ## End-to-end RAG Service + Web UI
 
 `scripts/serve_rag.py` exposes the full retrieval+generation pipeline
-behind a FastAPI endpoint that matches the `web_ui/LAI/src/react-app/lib/ragApi.ts`
-contract:
+behind a FastAPI endpoint that matches the contract consumed by the
+**LAI-UI** frontend.
+
+The frontend lives in its own repo as of v1.0.0:
+
+* **Frontend repo:** https://github.com/Ravijangid820/LAI-UI
+* **Local clone convention:** `/data/projects/lai/lai-ui/` (sibling to
+  this `LAI/` directory; gitignored from this repo)
 
 ```bash
 # Backend (loads 127 GB embeddings + reranker + Qwen2.5-7B-Instruct, ~5-30 min cold start)
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/serve_rag.py --port 18000
 
-# Frontend (React + Vite + Hono, default port 5173)
-cd web_ui/LAI && npm install && npm run dev
+# Frontend (separate repo)
+git clone git@github.com:Ravijangid820/LAI-UI.git ../lai-ui
+cd ../lai-ui && npm install && npm run dev   # Vite default port 5173
 ```
 
 Endpoints:

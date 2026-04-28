@@ -103,11 +103,10 @@ LAI/processed/backups/
 # Runtime logs (tmux/background scripts write here)
 LAI/logs/tmp/
 
-# Web UI dependencies + local env
-LAI/web_ui/**/node_modules/
-LAI/web_ui/**/.env
-LAI/web_ui/**/dist/
-LAI/web_ui/**/.wrangler/
+# The web UI lives in its own repo as of v1.0.0 — see LAI/README.md.
+# A clone of it commonly sits at /data/projects/lai/lai-ui/ for local dev,
+# but is its own git repo and must not show up as untracked here.
+lai-ui/
 
 # Micro-services local env (DB credentials, CORS origins, etc.)
 LAI/micro-services/.env
