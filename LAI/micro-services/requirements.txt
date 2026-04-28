@@ -1,0 +1,24 @@
+# ── Core API ──
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+# Required by FastAPI for multipart/form-data parsing (UploadFile / Form).
+python-multipart>=0.0.9
+
+# ── Database ──
+psycopg2-binary>=2.9.9
+
+# ── HTTP Client ──
+requests>=2.31.0
+
+# ── PDF Processing ──
+PyMuPDF>=1.23.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# ── ML / Embeddings ──
+numpy>=1.24.0
+
+# ── Spatial Operations (NEW — cadastral pipeline) ──
+shapely>=2.0.0
