@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
-import os, re, json, time, uuid, logging, math
+import os, re, json, time, uuid, logging, math, hashlib
 import requests
 import psycopg2
 import psycopg2.extras
@@ -119,7 +119,11 @@ CREATE TABLE IF NOT EXISTS ddiq_reports (
     finished_at TIMESTAMPTZ,
     progress_step TEXT,                  -- short label for UI ("classifying", etc.)
     progress_percent DOUBLE PRECISION DEFAULT 0.0,
-    error TEXT);
+    error TEXT,
+    -- Stable hash of (sorted doc_ids, preset, project_name) — lets us dedup
+    -- repeat requests and return the cached/in-flight report instead of
+    -- recomputing the 30-60 min pipeline.
+    request_fingerprint TEXT);
 -- Forward-compat: add the columns if the table already exists.
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'done';
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
@@ -127,6 +131,9 @@ ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS progress_step TEXT;
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS progress_percent DOUBLE PRECISION DEFAULT 0.0;
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS error TEXT;
+ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;
+CREATE INDEX IF NOT EXISTS ddiq_reports_fingerprint_idx
+    ON ddiq_reports(request_fingerprint) WHERE request_fingerprint IS NOT NULL;
 CREATE TABLE IF NOT EXISTS ddiq_geocode_cache (
     address TEXT PRIMARY KEY, lat DOUBLE PRECISION NOT NULL,
     lng DOUBLE PRECISION NOT NULL, cached_at TIMESTAMPTZ DEFAULT NOW());
@@ -974,6 +981,46 @@ def upload_document(file: UploadFile = File(...), category: str = Form("Uncatego
     return UploadDocResponse(id=did, filename=file.filename, pages=pages, chunks=len(chunks), status="analyzed",
         message=f"{file.filename}: {pages} pages, {len(chunks)} chunks")
 
+# ─── Request dedup ────────────────────────────────────────────────────────
+# A 30-60 min pipeline run is too expensive to repeat for the same input.
+# We fingerprint (sorted doc_ids, preset, project_name) and look up
+# ddiq_reports.request_fingerprint before queuing or running anything.
+# - status='done'  → return the cached row, no work done.
+# - status in ('queued','running') and recent → return that row's id so the
+#   caller polls the in-flight job instead of starting a duplicate.
+
+_INFLIGHT_TTL = "2 hours"  # reuse window for queued/running rows
+
+
+def _compute_fingerprint(doc_ids, preset, project_name) -> str:
+    parts = [
+        ",".join(sorted(doc_ids or [])),
+        (preset or "").strip().lower(),
+        (project_name or "").strip().lower(),
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def _find_existing_report(fp: str) -> Optional[dict]:
+    """Most recent reusable row for this fingerprint, or None."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""SELECT id, status, created_at, started_at
+                    FROM ddiq_reports
+                    WHERE request_fingerprint = %s
+                      AND (
+                        status = 'done'
+                        OR (status IN ('queued','running')
+                            AND COALESCE(started_at, created_at) > NOW() - INTERVAL '{_INFLIGHT_TTL}')
+                      )
+                    ORDER BY created_at DESC
+                    LIMIT 1""",
+                (fp,),
+            )
+            return cur.fetchone()
+
+
 # ─── Background-task worker for /report/generate/async ────────────────────
 # /report/generate is synchronous — fine for direct API use, but the
 # 30-60 minute report blocks a request the whole time. Browsers and
@@ -1041,6 +1088,16 @@ def generate_report_async(req: GenerateReportRequest):
     if not req.document_ids:
         raise HTTPException(400, "No documents selected")
 
+    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name)
+    existing = _find_existing_report(fp)
+    if existing:
+        return {
+            "report_id": str(existing["id"]),
+            "status": existing["status"],
+            "poll_url": f"/ddiq/report/{existing['id']}/status",
+            "cached": True,
+        }
+
     # Pre-create the row so the caller has a real report_id to poll.
     rid = str(uuid.uuid4())
     pname = req.project_name or "Wind Energy Project"
@@ -1048,9 +1105,10 @@ def generate_report_async(req: GenerateReportRequest):
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO ddiq_reports (id, project_name, document_ids, preset,
-                                              report_data, status, started_at, progress_step, progress_percent)
-                   VALUES (%s, %s, %s::uuid[], %s, '{}'::jsonb, 'queued', NULL, 'queued', 0.0)""",
-                (rid, pname, req.document_ids, req.preset),
+                                              report_data, status, started_at, progress_step, progress_percent,
+                                              request_fingerprint)
+                   VALUES (%s, %s, %s::uuid[], %s, '{}'::jsonb, 'queued', NULL, 'queued', 0.0, %s)""",
+                (rid, pname, req.document_ids, req.preset, fp),
             )
 
     _report_executor.submit(_run_report_generation_job, rid, req)
@@ -1058,6 +1116,7 @@ def generate_report_async(req: GenerateReportRequest):
         "report_id": rid,
         "status": "queued",
         "poll_url": f"/ddiq/report/{rid}/status",
+        "cached": False,
     }
 
 
@@ -1271,8 +1330,29 @@ def generate_report(req: GenerateReportRequest):
     /report/generate/async + /report/{id}/status for any UI-driven flow."""
     if not req.document_ids:
         raise HTTPException(400, "No documents selected")
+
+    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name)
+    existing = _find_existing_report(fp)
+    if existing and existing["status"] == "done":
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT report_data FROM ddiq_reports WHERE id = %s", (existing["id"],))
+                row = cur.fetchone()
+        if row and row["report_data"]:
+            return GenerateReportResponse(
+                report_id=str(existing["id"]),
+                report=DDiQReportData(**row["report_data"]),
+                timings={"cached": True},
+            )
+
     rid = str(uuid.uuid4())
     report, T = _generate_report_core(rid, req)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ddiq_reports SET request_fingerprint = %s WHERE id = %s",
+                (fp, rid),
+            )
     return GenerateReportResponse(report_id=rid, report=report, timings=T)
 
 @router.get("/report/{report_id}")
@@ -1431,10 +1511,36 @@ async def get_map_tiles():
         ],
     }
 
+def reap_orphans() -> None:
+    """Mark queued/running reports as failed at startup. After a backend
+    restart the in-process ThreadPoolExecutor tasks are gone, so any row
+    left in those states is dead weight — without this the UI would
+    poll forever. Safe with a single uvicorn worker (our deployment);
+    with multiple workers this would race against siblings still
+    booting and should move into a leader-election or external job
+    runner."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE ddiq_reports
+                       SET status = 'failed',
+                           error = 'orphaned: backend restarted mid-job',
+                           finished_at = NOW()
+                       WHERE status IN ('queued','running')"""
+                )
+                n = cur.rowcount
+        if n:
+            logger.warning(f"reaped {n} orphaned report(s) from previous run")
+    except Exception as e:
+        logger.warning(f"orphan reap failed: {e}")
+
+
 @router.on_event("startup")
 async def startup():
     init_pool()
     init_db()
+    reap_orphans()
 
 
 @router.on_event("shutdown")
