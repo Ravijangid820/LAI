@@ -26,7 +26,7 @@ if [ "$KEEP_HOST" = "0" ]; then
     SERVE_RAG_PID=$(ps -eo pid=,comm=,args= \
         | awk '$2 ~ /^python/ && /scripts\/serve_rag\.py/ && /--port 18000/ {print $1}')
     VITE_PID=$(ps -eo pid=,comm=,args= \
-        | awk '$2 == "node" && /web_ui\/LAI\/.*\.bin\/vite/ {print $1}')
+        | awk '$2 == "node" && /lai-ui\/.*\.bin\/vite/ {print $1}')
     if [ -n "$SERVE_RAG_PID" ]; then
         kill $SERVE_RAG_PID 2>/dev/null && echo "[stop]   serve_rag.py killed (PID $SERVE_RAG_PID)"
     else

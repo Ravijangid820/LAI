@@ -16,6 +16,10 @@ set -euo pipefail
 
 # ── paths ────────────────────────────────────────────────────────────────
 LAI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Frontend lives in its own repo (LAI-UI) as of v1.0.0. By convention
+# it's cloned next to LAI/ at /data/projects/lai/lai-ui/. Override
+# LAI_UI_DIR if you keep it elsewhere.
+LAI_UI_DIR="${LAI_UI_DIR:-$(cd "$LAI_DIR/.." && pwd)/lai-ui}"
 LOG_DIR="$LAI_DIR/logs/tmp"
 mkdir -p "$LOG_DIR"
 
@@ -49,7 +53,7 @@ serve_rag_pid() {
 }
 vite_pid() {
     ps -eo pid=,comm=,args= \
-        | awk '$2 == "node" && /web_ui\/LAI\/.*\.bin\/vite/ {print $1; exit}'
+        | awk '$2 == "node" && /lai-ui\/.*\.bin\/vite/ {print $1; exit}'
 }
 
 # ── host process: serve_rag.py ──────────────────────────────────────────
@@ -72,8 +76,19 @@ else
     else
         VITE_HOST_FLAG=""
     fi
+    if [ ! -d "$LAI_UI_DIR" ]; then
+        echo "[start] ERROR: lai-ui not found at $LAI_UI_DIR"
+        echo "[start]   clone it next to LAI:  git clone git@github.com:Ravijangid820/LAI-UI.git $LAI_UI_DIR"
+        echo "[start]   or set LAI_UI_DIR=/path/to/lai-ui"
+        exit 1
+    fi
+    if [ ! -d "$LAI_UI_DIR/node_modules" ]; then
+        echo "[start] installing lai-ui npm dependencies (one-time)..."
+        (cd "$LAI_UI_DIR" && npm install) > "$LOG_DIR/npm-install.log" 2>&1 \
+            || { echo "[start] npm install failed — see $LOG_DIR/npm-install.log"; exit 1; }
+    fi
     echo "[start] launching Vite UI on :5173 (logs → $LOG_DIR/vite.log)"
-    cd "$LAI_DIR/web_ui/LAI"
+    cd "$LAI_UI_DIR"
     nohup npm run dev -- $VITE_HOST_FLAG \
         > "$LOG_DIR/vite.log" 2>&1 &
     echo "[start]   PID $!"
