@@ -358,13 +358,29 @@ def alkis_query_parcels(lat: float, lng: float, bundesland: str, radius_m: float
         "BBOX": f"{lat-buf},{lng-buf},{lat+buf},{lng+buf},EPSG:4326",
         "COUNT": "10", "OUTPUTFORMAT": "application/json"}
 
+    parcels: list[dict] = []
+    headers = {"User-Agent": NOMINATIM_UA}
     try:
         logger.info(f"ALKIS WFS: {config['label']} at {lat:.5f},{lng:.5f}")
-        resp = requests.get(config["url"], params=params, timeout=20, headers={"User-Agent": NOMINATIM_UA})
-        resp.raise_for_status()
-        data = resp.json()
-        features = data.get("features", [])
-        parcels = [p for p in (_parse_alkis_feature(f) for f in features) if p]
+        # Try JSON first
+        resp = requests.get(config["url"], params=params, timeout=20, headers=headers)
+        # Several state WFS (e.g. NRW INSPIRE-CP) return 400 when asked for JSON
+        # because they only speak GML. Fall back without OUTPUTFORMAT.
+        if resp.status_code == 400 or "application/json" not in (resp.headers.get("content-type") or "").lower():
+            logger.info(f"ALKIS WFS: JSON not accepted ({resp.status_code}), retrying with GML")
+            params_gml = {k: v for k, v in params.items() if k != "OUTPUTFORMAT"}
+            resp = requests.get(config["url"], params=params_gml, timeout=20, headers=headers)
+            resp.raise_for_status()
+            parcels = _parse_alkis_xml(resp.text, lat, lng)
+        else:
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+                features = data.get("features", [])
+                parcels = [p for p in (_parse_alkis_feature(f) for f in features) if p]
+            except json.JSONDecodeError:
+                logger.info("ALKIS returned non-JSON despite header; trying XML parser")
+                parcels = _parse_alkis_xml(resp.text, lat, lng)
         logger.info(f"ALKIS WFS → {len(parcels)} parcels")
 
         # Cache
@@ -376,12 +392,8 @@ def alkis_query_parcels(lat: float, lng: float, bundesland: str, radius_m: float
         except Exception: pass
 
         return parcels
-    except json.JSONDecodeError:
-        logger.info("ALKIS returned non-JSON, trying XML")
-        try: return _parse_alkis_xml(resp.text, lat, lng)
-        except Exception: pass
     except Exception as e:
-        logger.warning(f"ALKIS WFS failed: {e}")
+        logger.warning(f"ALKIS WFS failed for {bundesland}: {e}")
     return []
 
 
@@ -433,20 +445,103 @@ def _parse_alkis_feature(feature: dict) -> Optional[dict]:
 
 
 def _parse_alkis_xml(xml_text, lat, lng):
-    """Fallback XML/GML parser for WFS that don't support JSON."""
+    """Parse INSPIRE Cadastral Parcels GML/XML responses.
+
+    Many state WFS (NRW, Bayern, Hessen, ...) only return GML — not JSON.
+    Schema (INSPIRE CP v4.0):
+
+        <wfs:FeatureCollection>
+          <wfs:member>
+            <cp:CadastralParcel>
+              <cp:areaValue uom="m2">…</cp:areaValue>
+              <cp:label>…</cp:label>
+              <cp:nationalCadastralReference>…</cp:nationalCadastralReference>
+              <cp:geometry>
+                <gml:Polygon srsName="…4326">
+                  <gml:exterior><gml:LinearRing>
+                    <gml:posList>lat lng lat lng …</gml:posList>
+                  </gml:LinearRing></gml:exterior>
+                  …optional gml:interior…
+                </gml:Polygon>
+              </cp:geometry>
+              <cp:referencePoint><gml:Point><gml:pos>lat lng</gml:pos></gml:Point></cp:referencePoint>
+            </cp:CadastralParcel>
+          </wfs:member>
+        </wfs:FeatureCollection>
+
+    For EPSG:4326 INSPIRE specifies lat-lng axis order, which matches what
+    we use everywhere in the UI ([lat,lng] for Leaflet). For projected SRS
+    we'd need pyproj — out of scope here; we request 4326 to avoid that.
+
+    Falls back to a synthetic polygon around (lat, lng) only if the parser
+    finds a CadastralParcel element with no geometry — better than dropping
+    the parcel silently.
+    """
     import xml.etree.ElementTree as ET
-    parcels = []
+    parcels: list[dict] = []
     try:
         root = ET.fromstring(xml_text)
-        for elem in root.iter():
-            if "label" in elem.tag.lower() or "CadastralParcel" in elem.tag:
-                label = ""
-                for child in elem.iter():
-                    if child.tag.endswith("label") and child.text: label = child.text.strip()
-                if label:
-                    parcels.append({"parcelNumber": label, "gemarkung": "", "flur": 0,
-                        "polygon": make_parcel_polygon(lat, lng), "area_m2": 0, "source": "ALKIS XML"})
-    except Exception as e: logger.warning(f"ALKIS XML parse: {e}")
+    except Exception as e:
+        logger.warning(f"ALKIS XML parse: {e}")
+        return parcels
+
+    NS_GML = "{http://www.opengis.net/gml/3.2}"
+    NS_CP = "{http://inspire.ec.europa.eu/schemas/cp/4.0}"
+
+    def _local(tag: str) -> str:
+        # strip namespace for tolerant matching
+        return tag.split("}", 1)[-1] if "}" in tag else tag
+
+    def _text_of_child(parent, local_name: str) -> Optional[str]:
+        for c in parent:
+            if _local(c.tag) == local_name and (c.text or "").strip():
+                return c.text.strip()
+        return None
+
+    def _parse_pos_list(text: str) -> list[list[float]]:
+        nums = [float(x) for x in (text or "").split() if x]
+        # Pairs of (lat, lng)
+        return [[nums[i], nums[i + 1]] for i in range(0, len(nums) - 1, 2)]
+
+    # Walk all CadastralParcel elements regardless of namespace prefix
+    for parcel_el in root.iter():
+        if _local(parcel_el.tag) != "CadastralParcel":
+            continue
+
+        label = _text_of_child(parcel_el, "label") or ""
+        ncr = _text_of_child(parcel_el, "nationalCadastralReference") or ""
+        area_text = _text_of_child(parcel_el, "areaValue")
+        try:
+            area_m2 = float(area_text) if area_text else 0.0
+        except ValueError:
+            area_m2 = 0.0
+
+        # Find first gml:posList descendant for the exterior ring
+        polygon: list[list[float]] = []
+        for posList in parcel_el.iter(NS_GML + "posList"):
+            polygon = _parse_pos_list(posList.text or "")
+            if polygon:
+                break
+        # If no polygon, fall back to a small synthetic ring at the query point
+        if not polygon:
+            polygon = make_parcel_polygon(lat, lng)
+
+        # Parcel number — prefer cp:label, otherwise tail of nationalCadastralReference
+        pnum = label
+        if not pnum and ncr:
+            tail = re.sub(r"_+$", "", ncr).split("-")[-1]
+            pnum = re.sub(r"^0+", "", tail) or tail
+
+        parcels.append({
+            "parcelNumber": pnum,
+            "gemarkung": "",
+            "flur": 0,
+            "polygon": polygon,
+            "area_m2": area_m2,
+            "source": "ALKIS WFS (GML)",
+            "nationalCadastralReference": ncr,
+        })
+
     return parcels
 
 
