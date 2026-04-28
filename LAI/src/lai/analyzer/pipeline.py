@@ -17,7 +17,7 @@ from lai.analyzer import cadastral_ner
 from lai.analyzer import llm_client
 from lai.analyzer import prompts
 from lai.analyzer.llm_client import AnalyzerLLMConfig
-from lai.analyzer.playbooks import PLAYBOOKS, severity_for_topic
+from lai.analyzer.playbooks import PLAYBOOKS, severity_for_topic, topic_covered
 from lai.analyzer.reconciler import reconcile_all
 from lai.analyzer.schema import (
     Clause,
@@ -343,13 +343,18 @@ def _whole_contract_pass(
             continue
 
     # Belt-and-suspenders: deterministic playbook check supplements the LLM.
-    seen_topics_lower = {c.type.lower() for c in clauses if c.type}
-    seen_topics_lower |= {
+    # Uses topic_covered() so common synonyms count (e.g. clause type
+    # "Laufzeit und Verlängerung" covers the playbook topic "Vertragsdauer";
+    # "Haftungsbeschränkung" covers "Haftungsbegrenzung").
+    seen_clause_types = {c.type.lower() for c in clauses if c.type}
+    # Also include any titles the LLM already flagged as missing — no need
+    # to double-flag those.
+    seen_clause_types |= {
         m.title.replace("Fehlend:", "").strip().lower() for m in missing_from_llm
     }
     deterministic: list[Issue] = []
     for topic, reason in PLAYBOOKS.get(contract_type, []):
-        if topic.lower() not in seen_topics_lower and not any(topic.lower() in s for s in seen_topics_lower):
+        if not topic_covered(topic, seen_clause_types):
             deterministic.append(Issue(
                 severity=severity_for_topic(topic),  # type: ignore[arg-type]
                 title=f"Fehlend: {topic}",

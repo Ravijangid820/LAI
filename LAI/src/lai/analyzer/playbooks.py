@@ -135,3 +135,73 @@ def all_topics(types: Iterable[ContractType] = ()) -> set[str]:
         for topic, _ in PLAYBOOKS.get(t, []):
             out.add(topic)
     return out
+
+
+# ── Topic synonym map for the playbook coverage check ─────────────────────
+# When deciding whether a required topic is "covered" by the segmented
+# clauses, we previously did a literal substring match: required topic
+# string vs. each clause's type string. That misses the way the analyzer
+# (and German legal practice) labels things — e.g. clause type
+# "Laufzeit und Verlängerung" is the Vertragsdauer of the contract;
+# clause type "Haftungsbeschränkung" is the Haftungsbegrenzung. Without
+# a synonym map both got flagged as missing.
+#
+# Each entry maps a playbook topic → list of lowercase patterns. If ANY
+# pattern is a substring of any clause type seen in the contract, the
+# topic counts as covered. Patterns default to ``[topic.lower()]`` for
+# topics not listed here.
+TOPIC_SYNONYMS: dict[str, list[str]] = {
+    "Vertragsdauer":           ["vertragsdauer", "laufzeit", "vertragslaufzeit",
+                                "beginn und ende", "vertragsverhältnis"],
+    "Verlängerungsoption":     ["verlängerung", "verlängerungsoption", "renewal"],
+    "Pacht/Vergütung":         ["pacht", "vergütung", "entgelt", "miete"],
+    "Vergütung":               ["vergütung", "entgelt", "honorar", "preis"],
+    "Vergütungsformel":        ["vergütungsformel", "preisformel", "marktprämie", "vergütung"],
+    "Kündigungsrechte":        ["kündigung"],
+    "Haftung":                 ["haftung"],
+    "Haftungsbegrenzung":      ["haftungsbegrenzung", "haftungsbeschränkung",
+                                "haftungsausschluss", "haftung"],
+    "Versicherung":            ["versicherung", "haftpflicht"],
+    "Verfügbarkeitsgarantie":  ["verfügbarkeit", "availability"],
+    "Reaktionszeiten":         ["reaktionszeit", "sla", "service level"],
+    "Pönale/Bonus-Malus":      ["pönale", "bonus", "malus", "vertragsstrafe"],
+    "Force Majeure":           ["force majeure", "höhere gewalt"],
+    "Rückbauverpflichtung":    ["rückbau", "demontage", "wiederherstellung"],
+    "Standsicherheitsnachweis":["standsicherheit"],
+    "Wegerecht/Zufahrt":       ["wegerecht", "zufahrt", "zugang"],
+    "Übertragung/Sukzession":  ["übertragung", "sukzession", "abtretung"],
+    "Vorkaufsrecht":           ["vorkaufsrecht"],
+    "Genehmigungsrisiko":      ["genehmigung", "bimschg"],
+    "Untervermietung/Überlassung": ["untervermiet", "überlassung"],
+    "Grunddienstbarkeit":      ["dienstbarkeit", "grunddienstbarkeit"],
+    "Nutzungsumfang":          ["nutzungsumfang", "gegenstand", "nutzung"],
+    "Leistungsumfang":         ["leistungsumfang", "umfang", "instandhaltung", "wartungsumfang"],
+    "Ersatzteilversorgung":    ["ersatzteil"],
+    "Anschlusspunkt":          ["anschlusspunkt", "netzanschluss", "netzverknüpfung"],
+    "Einspeiseleistung":       ["einspeise"],
+    "EEG-Vergütung / Marktprämie": ["eeg", "marktprämie"],
+    "Mess- und Abrechnungsmodalitäten": ["abrechnung", "messung", "messkonzept"],
+    "Curtailment / Einspeisemanagement": ["curtailment", "einspeisemanagement", "einsman"],
+    "Bilanzkreismanagement":   ["bilanzkreis"],
+    "Abnahmeverpflichtung":    ["abnahme", "take-or-pay"],
+    "Marktprämie":             ["marktprämie"],
+    "Lieferprofil":            ["lieferprofil", "baseload", "as-produced", "as-forecasted"],
+    "Herkunftsnachweise":      ["herkunftsnachweis", "guarantees of origin", "goo"],
+    "Change of Law":           ["change of law", "gesetzliche änderung"],
+    "Kaufgegenstand":          ["kaufgegenstand"],
+    "Kaufpreis":               ["kaufpreis"],
+    "Garantien":               ["garantie", "zusicherung", "warranties"],
+    "Closing-Bedingungen":     ["closing", "conditions precedent", "vollzugsvoraussetzung"],
+    "Übergangsstichtag":       ["übergangsstichtag", "übergabestichtag", "stichtag",
+                                "gefahrenübergang"],
+    "Vertraulichkeit":         ["vertraulichkeit", "geheimhaltung", "nda"],
+}
+
+
+def topic_covered(topic: str, seen_clause_types: Iterable[str]) -> bool:
+    """True iff any synonym for ``topic`` is a substring of any clause
+    type seen in the contract. Falls back to a direct substring search
+    on ``topic.lower()`` for topics not in ``TOPIC_SYNONYMS``."""
+    patterns = TOPIC_SYNONYMS.get(topic) or [topic.lower()]
+    seen = list(seen_clause_types)
+    return any(pat in s for pat in patterns for s in seen)
