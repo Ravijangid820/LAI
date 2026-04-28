@@ -271,6 +271,17 @@ class AusgabeblattSection(BaseModel):
 class WEAStatus(BaseModel):
     name: str; ampel: str; owner: str; parcel: str; contract: str; lat: float; lng: float; address: str
     clearance_radius_m: float = 1000.0
+    # Technical attributes (P1 #7) — pulled from Erläuterungsbericht / BImSchG
+    # permit. Hub height drives the 10H clearance for Bayern/Hessen.
+    hub_height_m: Optional[float] = None
+    rotor_diameter_m: Optional[float] = None
+    rated_power_kw: Optional[float] = None
+    manufacturer: Optional[str] = None
+    model: Optional[str] = None
+    # Status code per BImSchG procedure: errichtet | genehmigt | geplant | abgenommen
+    status_code: Optional[str] = None
+    permit_ref: Optional[str] = None      # Aktenzeichen of the BImSchG Bescheid
+    warranty_end: Optional[str] = None    # ISO date or free text
 class InfraPoint(BaseModel):
     name: str; type: str; lat: float; lng: float
 class CadastralParcel(BaseModel):
@@ -280,8 +291,78 @@ class CadastralParcel(BaseModel):
     polygonSource: str = "estimated"  # "alkis_wfs", "document", "estimated"
     confidence: float = 0.0
     normalizedId: str = ""
+
+# ─── Evidence + quantification (P0 #1, #4) ──────────────────────────────────
+# Every Finding/TimelineEntry/Grundbuch/Rückbau check carries Evidence so a
+# lawyer can verify the LLM's claim by jumping to the right page of the
+# right document. Without this, output is unverifiable.
+class Evidence(BaseModel):
+    doc_id: Optional[str] = None
+    doc_filename: Optional[str] = None
+    page: Optional[int] = None        # currently no per-page chunking — left None
+    excerpt: str = ""                 # short snippet (≤300 chars) from the chunk
+    clause: Optional[str] = None      # e.g. "§4 Abs. 1 BImSchG", "Pachtvertrag §7"
+
+class Quantification(BaseModel):
+    """Materiality scorecard on a finding. Lawyer DD ranks by impact, not text."""
+    mw_affected: Optional[float] = None
+    eur_impact_estimate: Optional[float] = None
+    days_until_deadline: Optional[int] = None
+    rationale: Optional[str] = None   # how the LLM arrived at these numbers
+
 class Finding(BaseModel):
-    domain: str; severity: str; text: str
+    domain: str
+    severity: str
+    text: str
+    # P0 additions
+    evidence: list[Evidence] = []
+    quantification: Optional[Quantification] = None
+    legal_basis: Optional[str] = None        # "§4 BImSchG" / "§35 Abs. 1 Nr. 5 BauGB" / "§44 BNatSchG"
+    recommended_action: Optional[str] = None
+    # section | cross_document | deadline | grundbuch | rueckbau | regulatory
+    kind: str = "section"
+
+# ─── Timeline (P0 #2) ───────────────────────────────────────────────────────
+class TimelineEntry(BaseModel):
+    """Date-bound milestone or deadline pulled from the documents.
+    Surfaces 'permit valid until 2027-06-30, renewal 6 months prior' style
+    findings that pure-RAG Q&A misses."""
+    kind: str  # permit_expiry | lease_term_end | renewal_deadline | warranty_end | bond_validity | construction_milestone | objection_window | other
+    date: str  # ISO YYYY-MM-DD when known, free-text fallback otherwise
+    description: str
+    legal_basis: Optional[str] = None       # e.g. "§70 VwGO Widerspruchsfrist"
+    evidence: list[Evidence] = []
+    days_from_now: Optional[int] = None
+    urgency: Optional[str] = None           # expired | urgent | soon | future
+
+# ─── Grundbuch consistency (P1 #6) ──────────────────────────────────────────
+class GrundbuchCheck(BaseModel):
+    """Per-parcel: does Pachtvertrag-lessor match the registered Eigentümer?
+    What encumbrances (Belastungen) are on the title? Without this, a parcel
+    can show 'secured' even if the contract is signed by someone with no
+    legal title."""
+    parcel_id: str                          # normalized: gemarkung:flur:parcel_number
+    registered_owner: Optional[str] = None
+    lessor_name: Optional[str] = None
+    owner_match: Optional[bool] = None      # None when undeterminable from documents
+    match_confidence: float = 0.0
+    encumbrances: list[str] = []            # "Wegerecht zugunsten Gemeinde", "§24 BauGB Vorkaufsrecht", "Hypothek 250k €"
+    evidence: list[Evidence] = []
+    note: Optional[str] = None
+
+# ─── Rückbaubürgschaft (P1 #9) ──────────────────────────────────────────────
+class RueckbauBond(BaseModel):
+    """§35 Abs. 5 BauGB requires a decommissioning bond. Recurring DD red flag.
+    Pulled out of the BImSchG-Bescheid Auflagen or a separate Bürgschaftsurkunde."""
+    amount_eur: Optional[float] = None
+    provider: Optional[str] = None          # bank, insurer, parent guarantor
+    beneficiary: Optional[str] = None       # usually the Standortgemeinde
+    valid_until: Optional[str] = None       # ISO date
+    instrument_type: Optional[str] = None   # "Bürgschaft" | "Hinterlegung" | "Konzernbürgschaft"
+    sufficient: Optional[bool] = None       # vs. expected Rückbaukosten (LLM's read)
+    evidence: list[Evidence] = []
+    note: Optional[str] = None
+
 class DDiQReportData(BaseModel):
     projectName: str; preparedBy: str; preparedFor: str; date: str; projectCenter: dict
     sections: list[AusgabeblattSection]; weaStatuses: list[WEAStatus]
@@ -291,6 +372,12 @@ class DDiQReportData(BaseModel):
     clearanceZones: Optional[list[dict]] = None  # WEA clearance zone circles
     validation: Optional[dict] = None            # Validation report
     geojson: Optional[dict] = None               # GeoJSON FeatureCollection
+    # P0/P1 additions
+    timeline: list[TimelineEntry] = []
+    crossDocFindings: list[Finding] = []         # inter-document inconsistencies
+    grundbuchChecks: list[GrundbuchCheck] = []
+    rueckbauBond: Optional[RueckbauBond] = None
+    documentMap: list[dict] = []                 # [{"id": uuid, "filename": str}] for evidence rendering
 class GenerateReportRequest(BaseModel):
     document_ids: list[str]; preset: str = "full"
     project_name: Optional[str] = None; prepared_for: Optional[str] = None
@@ -427,6 +514,41 @@ def rag_context(doc_ids, question, top_k=5):
     if not chunks: return "(No relevant content found)"
     reranked = rerank(question, chunks, top_k=top_k)
     return "\n\n".join([f"[Doc: {c.get('filename','?')}]\n{c['text'][:800]}" for c in reranked])
+
+
+def rag_context_with_meta(doc_ids, question, top_k=5):
+    """Same retrieval as rag_context, but also returns the chunk metadata
+    so callers can attach Evidence pointers ({doc_id, doc_filename,
+    excerpt}) to whatever facts the LLM extracts. Format mirrors
+    rag_context with a [#1], [#2]... numbering so the LLM can cite
+    chunks back by index, which we then resolve to Evidence."""
+    emb = embed_single(question); chunks = search_doc_chunks(doc_ids, emb, top_k=20)
+    if not chunks: return "(No relevant content found)", []
+    reranked = rerank(question, chunks, top_k=top_k)
+    parts = []
+    for i, c in enumerate(reranked, 1):
+        parts.append(f"[#{i} | Doc: {c.get('filename','?')}]\n{c['text'][:800]}")
+    return "\n\n".join(parts), reranked
+
+
+def evidence_from_chunks(reranked, indices):
+    """Resolve LLM-cited chunk indices (1-based) to Evidence records.
+    Tolerates strings ('1','#1','chunk_1') and out-of-range silently."""
+    out = []
+    if not reranked: return out
+    for idx in indices or []:
+        try:
+            n = int(re.sub(r"[^0-9]", "", str(idx)))
+        except Exception:
+            continue
+        if 1 <= n <= len(reranked):
+            c = reranked[n-1]
+            out.append(Evidence(
+                doc_id=str(c.get("doc_id")) if c.get("doc_id") else None,
+                doc_filename=c.get("filename"),
+                excerpt=(c.get("text", "") or "")[:300],
+            ))
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -740,47 +862,498 @@ def extract_parcel_refs(text):
 # SECTION ANALYSIS + WEA + INFRA + PARCELS + FINDINGS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-EXTRACTION_SYSTEM = """You are a legal due diligence analyst for German wind energy projects.
-Extract structured data from contract documents. ALWAYS respond with valid JSON only.
-No markdown, no explanations. If not in documents, use null for optional fields."""
+EXTRACTION_SYSTEM = """You are a senior German legal due-diligence analyst for wind-energy
+projects. Read the supplied document context and answer like a Berufsanwalt working
+on an acquisition red-flag report.
 
+Rules:
+- ALWAYS return valid JSON only. No markdown, no preamble, no trailing text.
+- Cite specific German statutes when relevant: BImSchG (§§4,6,10,15,52), BauGB (§35
+  privileged use, §35 Abs. 5 Rückbau), BNatSchG (§44 Zugriffsverbote, §45 Ausnahme),
+  UVPG, EEG (Marktwert, Marktprämie §20, Direktvermarktung §35a), TA Lärm,
+  22./32. BImSchV, AVV Kennzeichnung, VwGO §70 (Widerspruchsfrist), §550 BGB Schriftform.
+- For every fact-bearing answer, identify the supporting context chunks by their
+  [#N] index from the supplied context and return them in the "evidence_chunks" array.
+  Empty array if you have no source. Never fabricate citations.
+- Use null for unknown optional fields. Don't guess monetary amounts or dates.
+- Distinguish formal status (BImSchG §6 erteilt) from construction status (errichtet)
+  from operational status (in Betrieb genommen) — these are different things."""
+
+
+# SECTION_QUESTIONS — each entry is {label, question, anchor (statutory hook)}.
+# The anchor keeps the question grounded in a specific German legal framework so
+# the LLM doesn't drift into generic Q&A. Questions deliberately ask for facts a
+# real DD lawyer would scribble in the margin.
 SECTION_QUESTIONS = {
-    "overview": [("Project Name","What is the project name or wind farm name?"),("Location","What is the project location (district, state, municipality)?"),("Project Status","What is the current project status?"),("Project Type","Is this greenfield, repowering, or expansion?"),("Number of WEA","How many wind turbines (WEA) are planned or installed?"),("Type & Capacity","What is the turbine model and capacity per unit?"),("Total Capacity","What is the total installed capacity? Answer with unit MW."),("Project Company","What is the project company (Projektgesellschaft)?"),("Investors","Who are the investors or shareholders?"),("Grid Connection","What is the grid connection point and cable route length?"),("Wind Priority Zone","Is the project in a designated wind priority zone?")],
-    "land": [("Usage Contracts","How many site usage contracts are signed vs. total needed?"),("Land Registry","Are easements registered in the land registry?"),("Buffer Zone Security","Are buffer/setback zones contractually secured?"),("Cable Route","Is the cable route easement secured?"),("Access Roads","Are access road agreements in place?"),("Contract Error Rate","Are there contracts with defects?"),("Contracts Reviewed","How many contracts reviewed? Answer as 'X contracts'."),("Contracting Entity","Is the contracting entity consistent across all contracts?")],
-    "permits": [("BImSchG Permit","Status of BImSchG permit application?"),("Environmental Impact","Has UVP/EIA been conducted?"),("Species Protection","Are there species protection requirements?"),("Noise & Shadow","Do noise/shadow assessments meet requirements?"),("Authority Consultations","Have all authority consultations been completed?"),("Recurring Inspections","What recurring inspections exist?")],
-    "economics": [("Feed-in Tariff","What EEG tariff or auction award applies?"),("PPA","Is there a PPA? With whom and at what price?"),("Profitability","What is the project IRR?"),("Financing","What is the financing structure?"),("Securities","What securities are in place?"),("Operations","Who is the O&M operator?"),("Maintenance","What is the maintenance contract scope?"),("Insurance","What insurance coverage is in place?"),("Open Liability","Are there open or contingent liabilities?")],
+    "overview": [
+        {"label": "Project Name", "anchor": "Genehmigungsbescheid / Pachtvertrag",
+         "question": "What is the project name (Windpark-Bezeichnung) as it appears on the Genehmigungsbescheid title or Pachtvertrag preamble?"},
+        {"label": "Location", "anchor": "Lageplan / Erläuterungsbericht",
+         "question": "Project site: Bundesland, Landkreis, Gemeinde, Gemarkung. Cite the Lageplan or Erläuterungsbericht."},
+        {"label": "Project Status", "anchor": "BImSchG §§4, 6, 10, 15",
+         "question": "Current status under BImSchG: §10 Antrag eingereicht / Auslegung / §6 erteilt (bestandskräftig?) / §15 Inbetriebnahme angezeigt? Distinguish formal permit status from construction status."},
+        {"label": "Project Type", "anchor": "EEG bestehende-Anlage rules",
+         "question": "Greenfield, repowering (per §6 EEG bestehende-Anlage rules), or expansion? If repowering, are old turbines fully decommissioned?"},
+        {"label": "Number of WEA", "anchor": "BImSchG-Bescheid",
+         "question": "Total Windenergieanlagen, broken down by status (errichtet + genehmigt + geplant). State count for each class."},
+        {"label": "Type & Capacity", "anchor": "Erläuterungsbericht",
+         "question": "Per turbine: manufacturer, type designation, rated power kW, hub height m, rotor diameter m. Cite the Erläuterungsbericht."},
+        {"label": "Total Capacity", "anchor": "BImSchG-Bescheid",
+         "question": "Total installed/planned MW. State the numerator if some WEA are still in Genehmigung-erteilt status (not yet built)."},
+        {"label": "Project Company", "anchor": "Gesellschaftsvertrag / HRB",
+         "question": "Projektgesellschaft (Pächterin / Antragstellerin). Rechtsform (GmbH & Co. KG, etc.) and HR-Nummer if cited."},
+        {"label": "Investors", "anchor": "Gesellschaftsvertrag / Gesellschafterliste",
+         "question": "Gesellschafter / Kommanditisten / Investorenkreis from the Gesellschaftsvertrag or share register."},
+        {"label": "Grid Connection", "anchor": "Netzanschlussvertrag / Einspeisezusage",
+         "question": "Netzverknüpfungspunkt, Netzbetreiber, vereinbarte Anschlussleistung MW, geplantes Inbetriebnahmedatum. Reference the Netzanschlussvertrag / Einspeisezusage."},
+        {"label": "Wind Priority Zone", "anchor": "BauGB §35 Abs. 1 Nr. 5 / Regionalplan",
+         "question": "Designation per Regionalplan / Flächennutzungsplan (Vorrang-/Vorbehaltsgebiet Windenergie). Privileged use under §35 Abs. 1 Nr. 5 BauGB? Any concentrating-effect plan under §35 Abs. 3 Satz 3 BauGB?"},
+    ],
+    "land": [
+        {"label": "Site Control Coverage", "anchor": "Pachtvertrag / Nutzungsvertrag",
+         "question": "Which Flurstücke are secured by Pachtvertrag, Nutzungsvertrag, or registered Dienstbarkeit? Quote the percentage of project-area parcels covered. Flag missing parcels by Flurstücksnummer."},
+        {"label": "Lessor vs Owner", "anchor": "BGB §873 / Grundbuch",
+         "question": "Are all Pachtverträge signed by the registered Eigentümer per Grundbuch? Flag any case where Verpächter ≠ Eigentümer or where the signing party lacks Vertretungsmacht (Prokura, Vollmacht)."},
+        {"label": "Term & Extension", "anchor": "Pachtvertrag Laufzeit",
+         "question": "Pachtdauer (typically 25–30 yr) plus Verlängerungsoptionen. Compare to expected operational life and EEG-award duration. Flag any mismatch."},
+        {"label": "Land Registry Encumbrances", "anchor": "Grundbuch Abt. II/III",
+         "question": "Bestehende Eintragungen im Grundbuch Abt. II (Lasten) and Abt. III (Hypotheken/Grundschulden): Wegerecht, Leitungsrecht, Vorkaufsrecht §24 BauGB, Hypothek, Reallast. Quote Grundbuch references where given."},
+        {"label": "Cable & Access Easements", "anchor": "BGB §§1090ff Dienstbarkeit",
+         "question": "Are easements for Kabeltrasse and Zuwegung secured by registered Dienstbarkeit? List affected Wegeparzellen and confirm Eintragung im Grundbuch."},
+        {"label": "Setback / 10H Compliance", "anchor": "BauGB §35 / 10H-Regelung BayBO Art. 82",
+         "question": "Are Abstandsflächen and (for Bayern/Hessen) the 10H-Mindestabstand zu Wohnbebauung satisfied? State the actual distance to the nearest Wohnhaus and the regulatory minimum."},
+        {"label": "Reinstatement / Rückbau", "anchor": "BauGB §35 Abs. 5",
+         "question": "Rückbauverpflichtung at end of lease per §35 Abs. 5 BauGB: Bürgschaftshöhe, Bürge (Bank, Konzern), Laufzeit. Sufficient vs. expected Rückbaukosten?"},
+        {"label": "Lease Defects", "anchor": "BGB §550 Schriftform / §10 Abs. 1 BauGB",
+         "question": "Inhaltliche oder formelle Mängel in den Pachtverträgen (Schriftform §550 BGB, Vertretungsmacht, Übertragbarkeit auf Rechtsnachfolger, Anpassungsklauseln)."},
+    ],
+    "permits": [
+        {"label": "BImSchG Permit Status", "anchor": "BImSchG §§4, 6, 10",
+         "question": "Status nach §4 i.V.m. §6 BImSchG: Aktenzeichen, Ausfertigungsdatum, Bestandskraft (§70 VwGO Widerspruchsfrist abgelaufen?). Welche Auflagen und Nebenbestimmungen sind kritisch?"},
+        {"label": "BauGB Privileged Use", "anchor": "BauGB §35 Abs. 1 Nr. 5 / §35 Abs. 3 Satz 3",
+         "question": "Außenbereichsprivileg nach §35 Abs. 1 Nr. 5 BauGB. Konkurrenz mit konzentrierender Planung im Regionalplan (§35 Abs. 3 Satz 3 BauGB)? Konflikt mit Flächennutzungs- oder Bebauungsplan?"},
+        {"label": "UVP / Environmental Impact", "anchor": "UVPG §§7-9",
+         "question": "UVP-Vorprüfung (§7 UVPG) oder UVP-Pflicht (§§9-13 UVPG)? Wann wurde der UVP-Bericht erstellt? Welche Umweltauswirkungen wurden festgestellt und welche Ausgleichs-/Vermeidungsmaßnahmen verlangt?"},
+        {"label": "Species Protection", "anchor": "BNatSchG §§44, 45",
+         "question": "Artenschutzrechtliche Prüfung (§44 BNatSchG): Verbotstatbestände (Tötung/Verletzung, Störung, Zerstörung von Fortpflanzungs-/Ruhestätten) erfüllt? Ausnahmegenehmigung (§45 Abs. 7 BNatSchG) erforderlich? Welche Schutzmaßnahmen (Abschaltzeiten Rotmilan, Mäusebussard, Fledermaus)?"},
+        {"label": "Noise & Shadow", "anchor": "TA Lärm / 22./32. BImSchV",
+         "question": "TA Lärm Tag-/Nacht-Immissionsrichtwerte am nächstgelegenen IO eingehalten? Schattenwurfprognose nach 22./32. BImSchV (max. 30 min/Tag, 30 h/Jahr)? Abschaltautomatik vorgesehen?"},
+        {"label": "Aviation / Lighting", "anchor": "AVV Kennzeichnung / EEG §9 BNK",
+         "question": "Tageskennzeichnung und Nachtkennzeichnung nach AVV Kennzeichnung. Bedarfsgesteuerte Nachtkennzeichnung (BNK) gemäß §9 EEG aktiv? DFS-/Wehrbereich-Stellungnahme positiv?"},
+        {"label": "Authority Consultations", "anchor": "VwVfG §§28, 30 / TÖB-Beteiligung",
+         "question": "Beteiligung Träger öffentlicher Belange (Naturschutzbehörde, Landwirtschaftskammer, Forstbehörde, Wasserbehörde, ggf. DFS und Wehrbereich) abgeschlossen? Liegen positive Stellungnahmen vor?"},
+        {"label": "Recurring Inspections", "anchor": "DIBt-Richtlinie / BImSchV",
+         "question": "Wiederkehrende Prüfungen: jährliche WEA-Inspektion (DIBt-Richtlinie), Sicherheitsüberprüfung Turm (10-Jahres-Rhythmus), Schallpegel-Nachprüfung. Termine und Verantwortlichkeiten?"},
+    ],
+    "economics": [
+        {"label": "EEG Subsidy Regime", "anchor": "EEG §22 Ausschreibung / §23a Marktwert",
+         "question": "EEG-Förderregime: Ausschreibungszuschlag (Gebotstermin, anzulegender Wert ct/kWh)? Marktwert-Korrektur Wind an Land (§23a EEG)? Inbetriebnahme-Frist (regelmäßig 30 Mt nach Zuschlag) eingehalten oder Pönale?"},
+        {"label": "Direktvermarktung", "anchor": "EEG §§20, 35a",
+         "question": "Direktvermarktungsvertrag: Marktprämie nach §20 EEG, Direktvermarkter, Vertragslaufzeit, Fernsteuerbarkeit (§35a EEG)? Volumen- und Profilrisiko?"},
+        {"label": "PPA / Off-Take", "anchor": "Stromabnahmevertrag",
+         "question": "Stromabnahmevertrag: Abnehmer-Bonität, Kontraktlaufzeit, Pricing-Mechanismus (Festpreis / Floor / Cap), Volumenrisiko, Curtailment-Pass-Through, Change-of-Control-Klausel?"},
+        {"label": "Financing", "anchor": "Senior debt / Equity",
+         "question": "Finanzierungsstruktur: Senior Debt (Kreditgeber, Tranchen, DSCR-Covenants, Tilgungsprofil), Equity-Anteil, Nachrangkapital. Sponsor-Recourse oder non-recourse?"},
+        {"label": "Securities", "anchor": "BGB Grundschuld / Forderungsabtretung",
+         "question": "Besicherung: Grundschuld auf Pachtflächen, Forderungsabtretung Stromerlöse, Kontoverpfändung, Step-in-Rechte aus Direct Agreements? Bondworthiness der Sicherheiten?"},
+        {"label": "O&M Service Level", "anchor": "Wartungsvertrag",
+         "question": "Wartungsvertrag (Vollwartung / Basiswartung): Verfügbarkeitsgarantie (Marktstandard 97–98%), Pönalen bei Unterschreitung, Reaktionszeiten, Restlaufzeit?"},
+        {"label": "Manufacturer Warranty", "anchor": "Werkvertrag §§631ff BGB",
+         "question": "Hersteller-Gewährleistung: Anspruchsdauer, Ausschlüsse (höhere Gewalt, Wartungsverstöße), Haftungs-Cap, End-of-Warranty-Inspection-Termin?"},
+        {"label": "Insurance Coverage", "anchor": "Allgefahren / BU / Haftpflicht",
+         "question": "Versicherungsumfang: Allgefahrenversicherung (Sach), Maschinenbruch, Betriebsunterbrechung BI 12-18 Mt, Haftpflicht (Mindestdeckung 5 Mio €), D&O. Versicherer-Bonität und Selbstbehalte?"},
+        {"label": "Tax Structure", "anchor": "GewStG §29 / UStG §15a",
+         "question": "Gewerbesteuerzerlegung (§29 GewStG): 90% Standortgemeinde / 10% Sitzgemeinde-Anteil korrekt aufgeteilt? §15a UStG-Berichtigungsrisiko bei Vorsteuerabzug auf WEA-Investition?"},
+        {"label": "Open Liabilities", "anchor": "VwGO §§70, 74 Widerspruch/Klage",
+         "question": "Eventualverbindlichkeiten: laufende Widerspruchsverfahren §70 VwGO, Anfechtungsklagen §74 VwGO, behördliche Anhörungen, Schadenersatzklagen Anwohner, vorvertragliche Rücktrittsrechte?"},
+    ],
 }
 
 
 def analyze_section(doc_ids, section_id):
+    """Run the section's questions through evidence-aware RAG. Each row
+    carries the chunks the LLM cited so the frontend can show 'click to
+    see source'. Falls back gracefully if a question has no hit."""
     questions = SECTION_QUESTIONS.get(section_id, [])
-    title_map = {"overview": "Project Overview", "land": "Land Security & Ownership", "permits": "Permits & Regulatory Conditions", "economics": "Economics & Operations"}
+    title_map = {"overview": "Project Overview", "land": "Land Security & Ownership",
+                 "permits": "Permits & Regulatory Conditions", "economics": "Economics & Operations"}
     rows = []
-    for label, question in questions:
-        context = rag_context(doc_ids, question, top_k=5)
-        prompt = f"""Answer this due diligence question based on documents.\n\nContext:\n{context}\n\nQuestion: {question}\n\nRespond JSON: {{"value":"answer as string","ampel":"green"/"yellow"/"red"/null,"note":"risk note or null"}}\nIMPORTANT: value MUST be a string, never a bare number. E.g. "10 contracts" not 10."""
+    for q in questions:
+        # Backwards-compatible: tuples like ("label","question") still work.
+        if isinstance(q, tuple):
+            label, question = q[0], q[1]; anchor = None
+        else:
+            label, question, anchor = q.get("label"), q.get("question"), q.get("anchor")
+        ctx, reranked = rag_context_with_meta(doc_ids, question, top_k=5)
+        anchor_hint = f"\nLegal anchor: {anchor}" if anchor else ""
+        prompt = (
+            f"""Answer this DD question based ONLY on the supplied context. Cite the
+chunk numbers ([#1], [#2]...) you used in evidence_chunks.
+
+Context:
+{ctx}
+
+Question: {question}{anchor_hint}
+
+Respond JSON: {{"value":"answer as string","ampel":"green"/"yellow"/"red"/null,"note":"short risk note or null","evidence_chunks":[1,3]}}
+IMPORTANT: value MUST be a string, never a bare number ("10 contracts" not 10).
+Set ampel=red for material gaps/non-compliance, yellow for risks worth flagging,
+green for verified-compliant, null when not enough information.""")
         try:
             result = llm_json(EXTRACTION_SYSTEM, prompt)
             val = clean_value(result.get("value"), "Information not found in documents")
             note_raw = result.get("note"); note = clean_value(note_raw, "") if note_raw else None
             if note == "": note = None
-            rows.append(AusgabeblattRow(label=label, value=val, ampel=result.get("ampel") if result.get("ampel") in ("green","yellow","red") else None, note=note))
+            row = AusgabeblattRow(
+                label=label, value=val,
+                ampel=result.get("ampel") if result.get("ampel") in ("green","yellow","red") else None,
+                note=note,
+            )
+            # Stash evidence onto the row via a dynamic attr; AusgabeblattRow
+            # doesn't have a field for it but findings/timeline that re-derive
+            # from these rows pull evidence from a parallel structure below.
+            row.__dict__["_evidence"] = evidence_from_chunks(reranked, result.get("evidence_chunks", []))
+            row.__dict__["_anchor"] = anchor
+            rows.append(row)
         except Exception as e:
             logger.error(f"Section {section_id}/{label}: {e}")
             rows.append(AusgabeblattRow(label=label, value="Could not extract", ampel="red", note=f"Error: {str(e)[:80]}"))
     return AusgabeblattSection(id=section_id, title=title_map.get(section_id, section_id.title()), rows=rows)
 
 
+# ─── P0 #2: Timeline / deadline extraction ──────────────────────────────────
+def extract_timeline(doc_ids, full_text):
+    """Pull every date-bound milestone out of the documents and tag it.
+    A real DD report ranks issues by their proximity to a deadline; without
+    this pass the pipeline is date-blind and misses things like
+    'BImSchG-Genehmigung gilt bis 2027-06-30, Verlängerungsantrag 6 Mt vorher'."""
+    ctx, reranked = rag_context_with_meta(
+        doc_ids,
+        "Frist Ablauf Bestandskraft Inbetriebnahme Genehmigung gültig bis Verlängerung Pachtdauer Bürgschaft Laufzeit",
+        top_k=8,
+    )
+    prompt = f"""Extract every date or deadline relevant to the wind-park DD.
+
+Context:
+{ctx}
+
+Return JSON array. Each entry:
+{{"kind":"permit_expiry|lease_term_end|renewal_deadline|warranty_end|bond_validity|construction_milestone|objection_window|other",
+  "date":"YYYY-MM-DD or free text if month/year only",
+  "description":"what this date governs (e.g. 'BImSchG permit Aktenzeichen 12-345 expires')",
+  "legal_basis":"statute if applicable, e.g. 'VwGO §70 Widerspruchsfrist'",
+  "evidence_chunks":[1,2]}}
+
+Look specifically for:
+- BImSchG permit Ausfertigungsdatum + Bestandskraft (3 Mt nach Zustellung per §70 VwGO)
+- Pachtvertrag-Laufzeit-Ende and Verlängerungsoptionen-Frist
+- Bürgschaft (Rückbaubürgschaft) Ablaufdatum
+- EEG-Zuschlag-Inbetriebnahmefrist (regelmäßig 30 Mt nach Gebotstermin)
+- Hersteller-Gewährleistung Ende
+- Netzanschluss vereinbartes Inbetriebnahmedatum
+- DIBt/§52 BImSchG wiederkehrende Prüfungstermine
+Return [] if nothing date-bound is in the documents. Never invent a date."""
+    try:
+        result = llm_json(EXTRACTION_SYSTEM, prompt)
+        if isinstance(result, dict):
+            result = result.get("timeline", result.get("data", []))
+        if not isinstance(result, list):
+            return []
+        from datetime import datetime, date
+        today = date.today()
+        out: list[TimelineEntry] = []
+        for r in result:
+            ds = str(r.get("date", "")).strip()
+            if not ds:
+                continue
+            days = None
+            urgency = None
+            try:
+                d = datetime.strptime(ds[:10], "%Y-%m-%d").date()
+                days = (d - today).days
+                urgency = (
+                    "expired" if days < 0 else
+                    "urgent" if days <= 30 else
+                    "soon" if days <= 180 else
+                    "future"
+                )
+            except Exception:
+                pass
+            ev = evidence_from_chunks(reranked, r.get("evidence_chunks", []))
+            out.append(TimelineEntry(
+                kind=str(r.get("kind", "other")),
+                date=ds,
+                description=str(r.get("description", "")),
+                legal_basis=r.get("legal_basis"),
+                evidence=ev,
+                days_from_now=days,
+                urgency=urgency,
+            ))
+        return sorted(out, key=lambda t: (t.days_from_now if t.days_from_now is not None else 99999))
+    except Exception as e:
+        logger.error(f"Timeline extraction: {e}")
+        return []
+
+
+# ─── P0 #3: Cross-document consistency check ────────────────────────────────
+def check_cross_doc_consistency(sections, weas, parcels, total_capacity_mw=None):
+    """Detect contradictions BETWEEN the analysed documents — the classic
+    DD red flag that pure-RAG Q&A misses because each question runs in
+    isolation. Examples: BImSchG permit count ≠ lease parcel count, lease
+    term shorter than EEG-award duration, lessor names inconsistent."""
+    facts = {
+        "sections": [{"section": s.title, "label": r.label, "value": r.value, "ampel": r.ampel}
+                     for s in sections for r in s.rows],
+        "wea_count": len(weas),
+        "wea_status_codes": [w.status_code for w in weas if w.status_code],
+        "parcel_count": len(parcels),
+        "parcel_secured": sum(1 for p in parcels if p.status == "secured"),
+        "parcel_not_secured": sum(1 for p in parcels if p.status == "not_secured"),
+        "total_capacity_mw": total_capacity_mw,
+    }
+    prompt = f"""You are doing the cross-document consistency check on a wind-park DD.
+Scan these extracted facts for contradictions, missing-document red flags, or
+inconsistencies that a Berufsanwalt would immediately challenge.
+
+Facts:
+{json.dumps(facts, ensure_ascii=False, indent=2)}
+
+Look for:
+- Turbine count differs across BImSchG-Bescheid / Pachtvertrag / EEG-Zuschlag
+- Total MW from sections doesn't match (#turbines × rated power)
+- Pachtdauer < expected operational life (typically 25 yr)
+- Lessor / Verpächter names inconsistent across leases
+- Project Company in Pachtvertrag ≠ Antragstellerin im BImSchG-Antrag
+- Number of secured parcels < number of WEA (each WEA needs Standort + Zuwegung)
+- BImSchG permit erteilt but no Pachtvertrag for one or more parcels
+- EEG-Zuschlag erteilt but Inbetriebnahme-Frist conflicts with construction status
+- Cited capacity in Erläuterungsbericht ≠ EEG-Zuschlag MW
+- Missing core document type: BImSchG-Bescheid / Pachtvertrag / Netzanschluss / Rückbaubürgschaft
+
+Return JSON array. Each entry:
+{{"text":"clear factual statement of the inconsistency",
+  "severity":"red|yellow",
+  "domain":"Land|Permits|Economics|Regulatory|General",
+  "legal_basis":"if applicable",
+  "recommended_action":"what to do about it",
+  "quantification":{{"mw_affected":..,"eur_impact_estimate":..,"days_until_deadline":..,"rationale":".."}}}}
+
+Return [] if no inconsistencies found. Never fabricate — only flag what the
+facts clearly contradict."""
+    try:
+        result = llm_json(EXTRACTION_SYSTEM, prompt)
+        if isinstance(result, dict):
+            result = result.get("inconsistencies", result.get("findings", result.get("data", [])))
+        if not isinstance(result, list):
+            return []
+        out: list[Finding] = []
+        for r in result:
+            text = str(r.get("text", "")).strip()
+            if not text:
+                continue
+            q_raw = r.get("quantification") or {}
+            quant = None
+            if isinstance(q_raw, dict) and any(q_raw.get(k) is not None for k in ("mw_affected","eur_impact_estimate","days_until_deadline")):
+                quant = Quantification(
+                    mw_affected=q_raw.get("mw_affected"),
+                    eur_impact_estimate=q_raw.get("eur_impact_estimate"),
+                    days_until_deadline=q_raw.get("days_until_deadline"),
+                    rationale=q_raw.get("rationale"),
+                )
+            out.append(Finding(
+                domain=str(r.get("domain", "General")),
+                severity=r.get("severity") if r.get("severity") in ("red", "yellow", "green") else "yellow",
+                text=text,
+                legal_basis=r.get("legal_basis"),
+                recommended_action=r.get("recommended_action"),
+                quantification=quant,
+                kind="cross_document",
+            ))
+        return out
+    except Exception as e:
+        logger.error(f"Cross-doc consistency: {e}")
+        return []
+
+
+# ─── P1 #9: Rückbaubürgschaft extraction ────────────────────────────────────
+def extract_rueckbau_bond(doc_ids):
+    """§35 Abs. 5 BauGB requires the operator to post a decommissioning bond.
+    Recurring DD red flag — without verifying it, the project can be blocked
+    at financial close. Pull amount, provider, beneficiary, validity from
+    the Auflagen of the BImSchG-Bescheid or a separate Bürgschaftsurkunde."""
+    ctx, reranked = rag_context_with_meta(
+        doc_ids,
+        "Rückbau Bürgschaft Sicherheitsleistung Hinterlegung Konzernbürgschaft §35 BauGB Abriss Beseitigung",
+        top_k=6,
+    )
+    prompt = f"""Extract the Rückbaubürgschaft (decommissioning bond) facts.
+
+Context:
+{ctx}
+
+Return JSON object:
+{{"amount_eur": <number or null>,
+  "provider": "<bank/insurer/parent or null>",
+  "beneficiary": "<usually Standortgemeinde>",
+  "valid_until": "YYYY-MM-DD or null",
+  "instrument_type": "Bürgschaft|Hinterlegung|Konzernbürgschaft|null",
+  "sufficient": <true/false/null — your read on whether the amount covers
+   expected Rückbaukosten (typical 80-150k €/MW)>,
+  "note": "one-sentence assessment",
+  "evidence_chunks":[1,3]}}
+
+If no Rückbau bond is mentioned, return null fields with note='not found in documents'.
+Never fabricate amounts."""
+    try:
+        result = llm_json(EXTRACTION_SYSTEM, prompt)
+        if not isinstance(result, dict):
+            return None
+        if all(result.get(k) is None for k in ("amount_eur", "provider", "valid_until", "instrument_type")):
+            # Nothing real extracted; surface a placeholder so the lawyer
+            # knows the absence is intentional, not a UI bug.
+            return RueckbauBond(note=str(result.get("note", "Rückbaubürgschaft not found in supplied documents.")))
+        return RueckbauBond(
+            amount_eur=result.get("amount_eur"),
+            provider=result.get("provider"),
+            beneficiary=result.get("beneficiary"),
+            valid_until=result.get("valid_until"),
+            instrument_type=result.get("instrument_type"),
+            sufficient=result.get("sufficient"),
+            note=result.get("note"),
+            evidence=evidence_from_chunks(reranked, result.get("evidence_chunks", [])),
+        )
+    except Exception as e:
+        logger.error(f"Rückbaubürgschaft extraction: {e}")
+        return None
+
+
+# ─── P1 #6: Grundbuch lessor-vs-owner check ─────────────────────────────────
+def check_grundbuch_match(doc_ids, parcels):
+    """Compare Pachtvertrag-lessor against the registered Eigentümer per
+    Grundbuch. A parcel can show 'secured' under contract logic even if
+    the lessor has no legal title — this is the next layer of validation."""
+    if not parcels:
+        return []
+    # Sample a manageable subset of secured parcels — Grundbuch lookup
+    # is the most expensive LLM pass per parcel. Lawyer-grade DD would
+    # check every one externally, but we surface the LLM's read on what's
+    # actually extractable from the supplied PDFs.
+    target = [p for p in parcels if p.status == "secured" and p.normalizedId][:25]
+    if not target:
+        return []
+    ctx, reranked = rag_context_with_meta(
+        doc_ids,
+        "Grundbuch Eigentümer Eintragung Belastung Wegerecht Vorkaufsrecht Hypothek Reallast Pächter Verpächter",
+        top_k=10,
+    )
+    parcel_list = [{"parcel_id": p.normalizedId, "owner_per_alkis": p.owner,
+                    "lessor_or_contract_ref": p.contractRef or "unknown"} for p in target]
+    prompt = f"""For each parcel in the list, judge whether the registered Grundbuch-
+Eigentümer matches the Verpächter named in the Pachtvertrag, and list any
+encumbrances (Belastungen) you can find in the documents.
+
+Context:
+{ctx}
+
+Parcels:
+{json.dumps(parcel_list, ensure_ascii=False)}
+
+Return JSON array. Each entry:
+{{"parcel_id":"...",
+  "registered_owner":"Eigentümer per Grundbuch or null",
+  "lessor_name":"Verpächter per Pachtvertrag or null",
+  "owner_match":<true/false/null — null if undeterminable>,
+  "match_confidence":<0.0..1.0>,
+  "encumbrances":["Wegerecht zugunsten Gemeinde X","§24 BauGB Vorkaufsrecht",...],
+  "note":"short explanation",
+  "evidence_chunks":[1,4]}}
+
+Only return parcels that appear in the supplied list. owner_match=null is fine
+if the documents don't show enough — don't guess. encumbrances=[] is fine when
+nothing is registered."""
+    try:
+        result = llm_json(EXTRACTION_SYSTEM, prompt)
+        if isinstance(result, dict):
+            result = result.get("checks", result.get("data", []))
+        if not isinstance(result, list):
+            return []
+        out: list[GrundbuchCheck] = []
+        for r in result:
+            pid = str(r.get("parcel_id", "")).strip()
+            if not pid:
+                continue
+            try:
+                conf = float(r.get("match_confidence", 0.0))
+            except Exception:
+                conf = 0.0
+            out.append(GrundbuchCheck(
+                parcel_id=pid,
+                registered_owner=r.get("registered_owner"),
+                lessor_name=r.get("lessor_name"),
+                owner_match=r.get("owner_match"),
+                match_confidence=conf,
+                encumbrances=[str(x) for x in (r.get("encumbrances") or []) if x],
+                note=r.get("note"),
+                evidence=evidence_from_chunks(reranked, r.get("evidence_chunks", [])),
+            ))
+        return out
+    except Exception as e:
+        logger.error(f"Grundbuch check: {e}")
+        return []
+
+
 def extract_wea_statuses(doc_ids, full_text, sections, project_center=None):
-    context = rag_context(doc_ids, "wind turbines WEA owners parcels contract status locations")
-    prompt = f"""Extract ALL wind turbines (WEA/WKA) from documents.\n\nContext:\n{context}\n\nText:\n{full_text[:6000]}\n\nReturn JSON array:\n[{{"name":"WEA Hude 1","owner":"name or Unknown","parcel":"ref or empty","contract":"ref or Not specified","address":"municipality, state","ampel":"green/yellow/red"}}]\nIMPORTANT: If "7 WEA in Hude" create "WEA Hude 1"-"WEA Hude 7". Use "yellow" for pre-check docs where status is unknown."""
+    """Extract WEA per-turbine attributes including the technical fields a
+    DD lawyer needs: hub height (drives 10H clearance for Bayern/Hessen),
+    rotor diameter, rated power, manufacturer, model, status code, BImSchG
+    permit reference, warranty end date."""
+    context = rag_context(
+        doc_ids,
+        "Windenergieanlage WEA Hersteller Typ Nabenhöhe Rotordurchmesser Nennleistung "
+        "Aktenzeichen Genehmigung errichtet geplant Standort Flurstück Gewährleistung",
+    )
+    prompt = f"""Extract ALL wind turbines (WEA/WKA) from the documents.
+
+Context:
+{context}
+
+Text (first 6000 chars):
+{full_text[:6000]}
+
+Return JSON array of turbines. Each turbine:
+{{"name":"WEA Hude 1",
+  "owner":"name or Unknown",
+  "parcel":"Flurstücksnummer or empty",
+  "contract":"Pachtvertrag-Ref or 'Not specified'",
+  "address":"municipality, state",
+  "ampel":"green|yellow|red",
+  "hub_height_m":<number or null — Nabenhöhe in metres>,
+  "rotor_diameter_m":<number or null — Rotordurchmesser in metres>,
+  "rated_power_kw":<number or null — Nennleistung in kW>,
+  "manufacturer":"Vestas|Enercon|Nordex|Siemens Gamesa|GE|null",
+  "model":"E-138 EP3|V126|N163|... (Typenbezeichnung) or null",
+  "status_code":"errichtet|genehmigt|geplant|abgenommen|null",
+  "permit_ref":"BImSchG-Aktenzeichen or null",
+  "warranty_end":"YYYY-MM-DD or null"}}
+
+Rules:
+- Status: errichtet=physically built, genehmigt=permit issued not yet built,
+  geplant=planned only, abgenommen=accepted into operation. Be honest about
+  ambiguity — set null rather than guessing.
+- If "7 WEA in Hude" create WEA Hude 1 through WEA Hude 7 with shared attrs.
+- Hub height matters: 10H rule means a 200m turbine in Bayern needs 2km clearance.
+  Pull this from the Erläuterungsbericht / Genehmigungsbescheid wherever possible.
+- Use "yellow" ampel for pre-check docs where status is unknown."""
 
     weas_raw = []
     try:
         result = llm_json(EXTRACTION_SYSTEM, prompt)
-        if isinstance(result, dict): weas_raw = result.get("turbines", result.get("wea", result.get("data", [])))
-        elif isinstance(result, list): weas_raw = result
-    except Exception as e: logger.error(f"WEA extraction: {e}")
+        if isinstance(result, dict):
+            weas_raw = result.get("turbines", result.get("wea", result.get("data", [])))
+        elif isinstance(result, list):
+            weas_raw = result
+    except Exception as e:
+        logger.error(f"WEA extraction: {e}")
 
     if not weas_raw:
         wea_count = parse_wea_count(get_section_value(sections, "overview", "Number of WEA"))
@@ -790,20 +1363,41 @@ def extract_wea_statuses(doc_ids, full_text, sections, project_center=None):
         if wea_count > 0:
             short = re.sub(r"(?i)windpark|windenergie|wind\s*farm|projekt", "", pname).strip().split()[0] if pname else "WEA"
             for i in range(1, wea_count+1):
-                weas_raw.append({"name": f"WEA {short} {i}", "owner": company or "See contracts", "parcel": "", "contract": "See contract review", "address": loc, "ampel": "yellow"})
+                weas_raw.append({"name": f"WEA {short} {i}", "owner": company or "See contracts",
+                                 "parcel": "", "contract": "See contract review",
+                                 "address": loc, "ampel": "yellow"})
+
+    def _num(v):
+        try: return float(v) if v not in (None, "") else None
+        except Exception: return None
 
     statuses = []
     for idx, w in enumerate(weas_raw):
         addr = str(w.get("address", ""))
         coords = geocode_address(addr) if addr else None
         if not coords and project_center: coords = project_center
-        statuses.append(WEAStatus(name=str(w.get("name", f"WEA {idx+1}")),
+        sc = w.get("status_code")
+        if sc not in ("errichtet", "genehmigt", "geplant", "abgenommen"):
+            sc = None
+        statuses.append(WEAStatus(
+            name=str(w.get("name", f"WEA {idx+1}")),
             ampel=w.get("ampel","yellow") if w.get("ampel") in ("green","yellow","red") else "yellow",
-            owner=clean_value(w.get("owner"),"Unknown"), parcel=clean_value(w.get("parcel"),""),
-            contract=clean_value(w.get("contract"),"Not specified"),
-            lat=coords[0] if coords else 0.0, lng=coords[1] if coords else 0.0, address=addr))
+            owner=clean_value(w.get("owner"), "Unknown"),
+            parcel=clean_value(w.get("parcel"), ""),
+            contract=clean_value(w.get("contract"), "Not specified"),
+            lat=coords[0] if coords else 0.0, lng=coords[1] if coords else 0.0,
+            address=addr,
+            hub_height_m=_num(w.get("hub_height_m")),
+            rotor_diameter_m=_num(w.get("rotor_diameter_m")),
+            rated_power_kw=_num(w.get("rated_power_kw")),
+            manufacturer=w.get("manufacturer") or None,
+            model=w.get("model") or None,
+            status_code=sc,
+            permit_ref=w.get("permit_ref") or None,
+            warranty_end=w.get("warranty_end") or None,
+        ))
 
-    # Scatter duplicate coordinates
+    # Scatter duplicate coordinates so the map doesn't stack pins.
     if statuses:
         cg = {}
         for i, s in enumerate(statuses): cg.setdefault(f"{s.lat:.6f},{s.lng:.6f}", []).append(i)
@@ -812,11 +1406,11 @@ def extract_wea_statuses(doc_ids, full_text, sections, project_center=None):
                 clat, clng = statuses[indices[0]].lat, statuses[indices[0]].lng
                 for j, idx in enumerate(indices):
                     angle = (2*math.pi*j)/len(indices); s = statuses[idx]
-                    statuses[idx] = WEAStatus(name=s.name, ampel=s.ampel, owner=s.owner, parcel=s.parcel,
-                        contract=s.contract, address=s.address,
-                        lat=clat+0.003*math.cos(angle), lng=clng+0.003*math.sin(angle))
+                    s2 = s.copy(update={"lat": clat+0.003*math.cos(angle),
+                                         "lng": clng+0.003*math.sin(angle)})
+                    statuses[idx] = s2
 
-    # Deduplicate names
+    # Deduplicate names per address group.
     nc = {}
     for s in statuses: nc[s.name] = nc.get(s.name, 0) + 1
     if any(c > 1 for c in nc.values()):
@@ -826,8 +1420,7 @@ def extract_wea_statuses(doc_ids, full_text, sections, project_center=None):
             short = addr.split(",")[0].strip().split()[-1] if addr else "Park"
             for j, idx in enumerate(indices):
                 s = statuses[idx]
-                statuses[idx] = WEAStatus(name=f"WEA {short} {j+1}", ampel=s.ampel, owner=s.owner,
-                    parcel=s.parcel, contract=s.contract, lat=s.lat, lng=s.lng, address=s.address)
+                statuses[idx] = s.copy(update={"name": f"WEA {short} {j+1}"})
     return statuses
 
 
@@ -934,20 +1527,106 @@ def build_parcels(doc_ids, full_text, wea_statuses, project_center=None, locatio
     return parcels
 
 
-def generate_findings(doc_ids, sections):
-    issues = [f"[{sec.title}] {row.label}: {row.value}" + (f" — {row.note}" if row.note else "")
-        for sec in sections for row in sec.rows if row.ampel in ("red","yellow")]
-    if not issues: return [Finding(domain="General", severity="green", text="No critical issues identified.")]
-    prompt = f"""Generate action items.\n\nIssues:\n{chr(10).join(f'- {i}' for i in issues)}\n\nReturn JSON: [{{"domain":"Land Security/Permits/Economics/General","severity":"red/yellow/green","text":"recommendation"}}]"""
+def generate_findings(doc_ids, sections, total_capacity_mw: Optional[float] = None):
+    """Build evidence-aware Findings with statutory citations and materiality
+    quantification. Each finding carries: legal_basis, recommended_action,
+    quantification (mw_affected, eur_impact, days_until_deadline) and
+    Evidence pointers back to the cited chunks in `sections`. A lawyer can
+    click through to the source PDF instead of taking the LLM at its word."""
+    flagged = []
+    for sec in sections:
+        for row in sec.rows:
+            if row.ampel not in ("red", "yellow"):
+                continue
+            ev = row.__dict__.get("_evidence") or []
+            anchor = row.__dict__.get("_anchor")
+            flagged.append({
+                "section": sec.title, "label": row.label, "value": row.value,
+                "ampel": row.ampel, "note": row.note, "anchor": anchor,
+                "evidence": [e.dict() if hasattr(e, "dict") else e for e in ev],
+            })
+
+    if not flagged:
+        return [Finding(domain="General", severity="green",
+                        text="No material issues identified across the analysed sections.",
+                        kind="section")]
+
+    # Build the LLM prompt as JSON — easier for the model to ground each
+    # finding back to a specific flagged row + its anchor + its evidence.
+    capacity_hint = f"\nProject total capacity (for MW-affected sizing): {total_capacity_mw} MW" if total_capacity_mw else ""
+    prompt = f"""You are drafting the FINDINGS chapter of a wind-park red-flag DD report.
+For each material issue, produce one Finding with:
+- domain: "Land" | "Permits" | "Economics" | "Regulatory" | "General"
+- severity: "red" (deal-blocker) | "yellow" (open issue, manageable) | "green" (resolved)
+- text: 1-2 sentence factual statement of the issue.
+- legal_basis: cite the specific German statute (e.g. "BImSchG §6", "BauGB §35 Abs. 5",
+  "BNatSchG §44", "VwGO §70") if known. null otherwise.
+- recommended_action: concrete next step a lawyer would take (e.g. "Obtain certified
+  Grundbuch extract for parcel 12/4 and verify lessor identity", "Renew Bürgschaft
+  with bank guarantee letter before 2027-06-30").
+- quantification: object with mw_affected (number, null if unknown), eur_impact_estimate
+  (number in EUR, null if unknown), days_until_deadline (integer, null if no
+  date-bound deadline), rationale (one short sentence justifying the numbers).
+- evidence_indices: array of integers — pick the index (1-based) of items from
+  the issues list below that this finding references. The Evidence chunks are
+  attached upstream; you only return indices.{capacity_hint}
+
+Issues to draw from (1-indexed):
+{json.dumps([{{"i": i+1, **f} for i, f in enumerate(flagged)}], ensure_ascii=False)}
+
+Return JSON array. Use null for any field you cannot determine. Prioritise issues
+that block financial close (title, BImSchG bestandskräftig, EEG award, Rückbaubond)
+over cosmetic ones."""
     try:
         result = llm_json(EXTRACTION_SYSTEM, prompt)
-        if isinstance(result, dict): result = result.get("findings", [])
-        if isinstance(result, list):
-            return [Finding(domain=str(f.get("domain","General")),
-                severity=f.get("severity","yellow") if f.get("severity") in ("green","yellow","red") else "yellow",
-                text=str(f.get("text",""))) for f in result if f.get("text")]
-    except Exception as e: logger.error(f"Findings: {e}")
-    return [Finding(domain="General", severity="yellow", text="Manual review required.")]
+        if isinstance(result, dict):
+            result = result.get("findings", result.get("data", []))
+        if not isinstance(result, list):
+            return [Finding(domain="General", severity="yellow",
+                            text="Findings extraction returned an unexpected shape — manual review required.",
+                            kind="section")]
+        out: list[Finding] = []
+        for f in result:
+            text = str(f.get("text", "")).strip()
+            if not text:
+                continue
+            sev = f.get("severity") if f.get("severity") in ("green", "yellow", "red") else "yellow"
+            # Roll up Evidence from the source rows the LLM pointed at.
+            ev: list[Evidence] = []
+            for idx in f.get("evidence_indices", []) or []:
+                try:
+                    n = int(idx)
+                except Exception:
+                    continue
+                if 1 <= n <= len(flagged):
+                    src_ev = flagged[n-1].get("evidence") or []
+                    for e in src_ev:
+                        if isinstance(e, dict):
+                            ev.append(Evidence(**{k: v for k, v in e.items() if k in Evidence.__fields__}))
+            q_raw = f.get("quantification") or {}
+            quant = None
+            if isinstance(q_raw, dict) and any(q_raw.get(k) is not None for k in ("mw_affected","eur_impact_estimate","days_until_deadline")):
+                quant = Quantification(
+                    mw_affected=q_raw.get("mw_affected"),
+                    eur_impact_estimate=q_raw.get("eur_impact_estimate"),
+                    days_until_deadline=q_raw.get("days_until_deadline"),
+                    rationale=q_raw.get("rationale"),
+                )
+            out.append(Finding(
+                domain=str(f.get("domain", "General")),
+                severity=sev, text=text,
+                evidence=ev,
+                quantification=quant,
+                legal_basis=f.get("legal_basis"),
+                recommended_action=f.get("recommended_action"),
+                kind="section",
+            ))
+        return out or [Finding(domain="General", severity="yellow",
+                               text="No findings produced — manual review required.", kind="section")]
+    except Exception as e:
+        logger.error(f"Findings: {e}")
+    return [Finding(domain="General", severity="yellow",
+                    text="Manual review required (findings extraction failed).", kind="section")]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1167,8 +1846,10 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     T["gather_s"] = round(time.time()-t, 2)
 
     conn = get_conn(); cur = conn.cursor()
-    cur.execute(f"SELECT filename FROM ddiq_documents WHERE id::text IN ({','.join(['%s']*len(req.document_ids))})", tuple(req.document_ids))
-    doc_names = [r[0] for r in cur.fetchall()]; cur.close(); conn.close()
+    cur.execute(f"SELECT id, filename FROM ddiq_documents WHERE id::text IN ({','.join(['%s']*len(req.document_ids))})", tuple(req.document_ids))
+    _doc_rows = cur.fetchall(); cur.close(); conn.close()
+    doc_names = [r[1] for r in _doc_rows]
+    document_map = [{"id": str(r[0]), "filename": r[1]} for r in _doc_rows]
 
     t = time.time()
     try: meta = llm_json(EXTRACTION_SYSTEM, f"""Extract metadata.\n\n{rag_context(req.document_ids,'project name company location',3)}\n\nReturn: {{"projectName":"name","preparedFor":"company"}}""")
@@ -1245,7 +1926,92 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
         t = time.time(); legacy_parcels = build_parcels(req.document_ids, full_text, weas, pc, ploc); T["parcels_legacy_s"] = round(time.time()-t, 2)
         parcels = legacy_parcels
 
-    t = time.time(); findings = generate_findings(req.document_ids, sections); T["findings_s"] = round(time.time()-t, 2)
+    # Parse total capacity from the overview section to feed materiality
+    # quantification (mw_affected sizing) and cross-doc consistency.
+    total_mw = None
+    try:
+        cap_str = get_section_value(sections, "overview", "Total Capacity")
+        m = re.search(r"([\d,.]+)\s*MW", cap_str or "", re.IGNORECASE)
+        if m:
+            total_mw = float(m.group(1).replace(",", "."))
+    except Exception:
+        pass
+
+    progress("findings", 0.85)
+    t = time.time()
+    findings = generate_findings(req.document_ids, sections, total_capacity_mw=total_mw)
+    T["findings_s"] = round(time.time()-t, 2)
+
+    # P0 #2: Timeline / deadline pass
+    progress("timeline", 0.88)
+    t = time.time()
+    timeline = extract_timeline(req.document_ids, full_text)
+    T["timeline_s"] = round(time.time()-t, 2)
+
+    # P0 #3: Cross-document consistency check
+    progress("cross_doc", 0.91)
+    t = time.time()
+    cross_doc_findings = check_cross_doc_consistency(sections, weas, parcels, total_capacity_mw=total_mw)
+    T["cross_doc_s"] = round(time.time()-t, 2)
+
+    # P1 #9: Rückbaubürgschaft extraction
+    progress("rueckbau", 0.93)
+    t = time.time()
+    rueckbau = extract_rueckbau_bond(req.document_ids)
+    T["rueckbau_s"] = round(time.time()-t, 2)
+
+    # P1 #6: Grundbuch lessor-vs-owner check on secured parcels
+    progress("grundbuch", 0.95)
+    t = time.time()
+    grundbuch_checks = check_grundbuch_match(req.document_ids, parcels)
+    T["grundbuch_s"] = round(time.time()-t, 2)
+
+    # Promote material timeline events (urgent / expired) into Findings so
+    # the lawyer's findings list reflects deadline pressure, not just
+    # section issues.
+    deadline_findings: list[Finding] = []
+    for te in timeline:
+        if te.urgency in ("expired", "urgent"):
+            sev = "red" if te.urgency == "expired" else "yellow"
+            deadline_findings.append(Finding(
+                domain="Regulatory" if "permit" in te.kind or "objection" in te.kind else "General",
+                severity=sev, kind="deadline",
+                text=f"{te.kind.replace('_',' ').title()}: {te.description} (date: {te.date}).",
+                legal_basis=te.legal_basis,
+                evidence=te.evidence,
+                quantification=Quantification(days_until_deadline=te.days_from_now,
+                    rationale=f"Urgency='{te.urgency}'") if te.days_from_now is not None else None,
+                recommended_action=("File renewal / Verlängerungsantrag immediately."
+                                    if te.urgency == "urgent" else
+                                    "Already past — investigate compliance gap and remediation path."),
+            ))
+
+    # Promote Rückbaubürgschaft gaps into findings
+    if rueckbau and (rueckbau.amount_eur is None or rueckbau.sufficient is False):
+        sev = "red" if rueckbau.amount_eur is None else "yellow"
+        deadline_findings.append(Finding(
+            domain="Regulatory", severity=sev, kind="rueckbau",
+            text=("No Rückbaubürgschaft found in supplied documents — required under §35 Abs. 5 BauGB."
+                  if rueckbau.amount_eur is None else
+                  f"Rückbaubürgschaft amount ({rueckbau.amount_eur:.0f} EUR) appears insufficient vs. expected Rückbaukosten."),
+            legal_basis="BauGB §35 Abs. 5",
+            evidence=rueckbau.evidence,
+            recommended_action="Obtain certified Bürgschaftsurkunde (bank or parent guarantee) before financial close.",
+        ))
+
+    # Promote Grundbuch mismatches into findings
+    for gc in grundbuch_checks:
+        if gc.owner_match is False and gc.match_confidence >= 0.5:
+            deadline_findings.append(Finding(
+                domain="Land", severity="red", kind="grundbuch",
+                text=f"Lessor on parcel {gc.parcel_id} ({gc.lessor_name or 'unknown'}) does not match registered Grundbuch owner ({gc.registered_owner or 'unknown'}).",
+                legal_basis="BGB §873 / Grundbuchordnung",
+                evidence=gc.evidence,
+                recommended_action="Obtain certified Grundbuchauszug and verify Vertretungsmacht of the signing party before closing.",
+            ))
+
+    # Combine all findings; section findings stay first, then derived.
+    all_findings = list(findings) + deadline_findings
 
     lats = [w.lat for w in weas if w.lat != 0]; lngs = [w.lng for w in weas if w.lng != 0]
     center = {"lat": sum(lats)/len(lats) if lats else (pc[0] if pc else 53.0),
@@ -1253,10 +2019,12 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
 
     from datetime import datetime
 
-    # Prepare clearance zones for report
+    # Prepare clearance zones for report — include the radius source so the
+    # frontend can show '10H rule (BayBO Art. 82)' next to the circle.
     clearance_data = [
         {"wea_name": z.wea_name, "center_lat": z.center_lat, "center_lng": z.center_lng,
-         "radius_m": z.radius_m, "polygon": z.polygon}
+         "radius_m": z.radius_m, "polygon": z.polygon,
+         "radius_source": z.__dict__.get("_radius_source")}
         for z in pipeline_result.clearance_zones
     ] if pipeline_result.clearance_zones else None
 
@@ -1270,12 +2038,17 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
 
     report = DDiQReportData(projectName=pname, preparedBy="LAI Due Diligence System", preparedFor=pfor,
         date=datetime.now().strftime("%d %B %Y"), projectCenter=center, sections=sections,
-        weaStatuses=weas, infrastructure=infra, parcels=parcels, findings=findings,
+        weaStatuses=weas, infrastructure=infra, parcels=parcels, findings=all_findings,
         analyzedDocuments=doc_names,
         projectArea=project_area_data,
         clearanceZones=clearance_data,
         validation=pipeline_result.validation.dict() if pipeline_result.validation else None,
         geojson=pipeline_result.geojson if pipeline_result.geojson else None,
+        timeline=timeline,
+        crossDocFindings=cross_doc_findings,
+        grundbuchChecks=grundbuch_checks,
+        rueckbauBond=rueckbau,
+        documentMap=document_map,
     )
 
     # UPSERT into ddiq_reports — sync path inserts a fresh row, async path

@@ -465,6 +465,9 @@ def extract_contract_refs(text: str) -> list[dict]:
 # CLEARANCE ZONES
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Default fallback radii used when neither hub-height nor 10H apply.
+# These are coarse Bundesland defaults — only meaningful when the LLM
+# couldn't extract a hub height for the WEA.
 CLEARANCE_DEFAULTS = {
     "bayern": 2000,
     "nordrhein-westfalen": 1000,
@@ -484,15 +487,60 @@ CLEARANCE_DEFAULTS = {
     "berlin": 500,
 }
 
+# Bundesländer where the 10H rule (10× total height to the nearest residential
+# building) is the binding minimum distance to Wohnbebauung. Bayern (BayBO Art. 82)
+# is the canonical case; Hessen has a soft 10H equivalent under §249 Abs. 6 BauGB
+# in some districts. Other states use absolute setbacks per Regional/Landesplanung
+# (no fixed federal rule).
+TEN_H_BUNDESLAENDER = {"bayern", "hessen"}
+
+
+def clearance_radius_for_wea(wea, bundesland: str = "") -> tuple[float, str]:
+    """Return (radius_m, source) for a WEA's clearance zone.
+
+    Picks the binding radius by priority:
+      1. 10H × (hub_height + ½·rotor) for Bayern/Hessen if hub data is present
+      2. CLEARANCE_DEFAULTS[bundesland] otherwise
+      3. 1000m flat fallback
+
+    The lawyer-relevant case is #1 — without it a 200m turbine in Bayern
+    would show 2000m clearance regardless of actual height, which can
+    misrepresent compliance with BayBO Art. 82."""
+    hub = getattr(wea, "hub_height_m", None)
+    rotor = getattr(wea, "rotor_diameter_m", None)
+    bl = (bundesland or "").lower()
+
+    if hub and bl in TEN_H_BUNDESLAENDER:
+        # Total-height per BayBO Art. 82 = Nabenhöhe + Rotorradius. If rotor
+        # is unknown fall back to hub-only — still tighter than the flat
+        # 2000m default and at least directionally correct.
+        total_h = float(hub) + (float(rotor) / 2.0 if rotor else 0.0)
+        radius = max(10.0 * total_h, 500.0)  # 500m floor for tiny test data
+        return (round(radius, 1), f"10H rule (BayBO Art. 82) · hub {hub}m + rotor/2 {round((rotor or 0)/2,1)}m")
+
+    if bl in CLEARANCE_DEFAULTS:
+        return (float(CLEARANCE_DEFAULTS[bl]), f"Bundesland default ({bl})")
+
+    return (1000.0, "fallback (no Bundesland match)")
+
 
 def build_clearance_zones(wea_statuses: list, bundesland: str = "") -> list[ClearanceZone]:
-    """Build clearance zone circles for each WEA."""
-    radius = CLEARANCE_DEFAULTS.get(bundesland, 1000)
+    """Build clearance zone circles for each WEA. Each zone uses the binding
+    radius for that turbine — hub-height-aware 10H for Bayern/Hessen,
+    Bundesland default otherwise. The radius rationale is propagated so
+    the frontend can display 'why this circle is this big'."""
     zones = []
     for wea in wea_statuses:
         if wea.lat == 0 and wea.lng == 0:
             continue
+        radius, source = clearance_radius_for_wea(wea, bundesland)
         circle = make_circle_polygon(wea.lat, wea.lng, radius)
+        # Annotate the WEA itself so generate_findings/UI can show the
+        # binding rule per turbine.
+        try:
+            wea.clearance_radius_m = radius
+        except Exception:
+            pass
         zones.append(ClearanceZone(
             wea_name=wea.name,
             center_lat=wea.lat,
@@ -500,6 +548,11 @@ def build_clearance_zones(wea_statuses: list, bundesland: str = "") -> list[Clea
             radius_m=radius,
             polygon=circle,
         ))
+        # Stash on the zone object for downstream display via dict access.
+        try:
+            zones[-1].__dict__["_radius_source"] = source
+        except Exception:
+            pass
     return zones
 
 
