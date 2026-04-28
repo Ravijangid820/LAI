@@ -200,6 +200,29 @@ export async function deleteSession(sessionId: string): Promise<boolean> {
   }
 }
 
+// Append a message bubble to a session so refresh-replay sees it.
+// Used for UI-rendered bubbles (upload confirmation, analyze output)
+// that the backend doesn't auto-persist via /query.
+export async function appendMessage(
+  sessionId: string,
+  role: "user" | "assistant",
+  content: string,
+  mode?: string,
+): Promise<boolean> {
+  if (!content.trim()) return false;
+  try {
+    const res = await fetch(`${BACKEND_URL}/sessions/${sessionId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role, content, mode: mode ?? null }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+
 // ── Live analyze progress ─────────────────────────────────────────────────
 
 export interface AnalyzeProgress {

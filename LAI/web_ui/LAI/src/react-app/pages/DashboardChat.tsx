@@ -24,6 +24,7 @@ import {
   analyzeContract,
   getSession,
   getAnalyzeProgress,
+  appendMessage,
   type AnalyzeProgress,
 } from "@/react-app/lib/ragApi";
 import { randomId } from "@/react-app/utils/uuid";
@@ -238,18 +239,28 @@ export default function DashboardChatPage() {
             // Show upload success message with an "Analyze contract" CTA.
             // The CTA is surfaced as a regular message so the user knows
             // the option exists; clicking it triggers /analyze-contract.
+            const uploadAssistantText =
+              `📄 **Document uploaded:** ${uploadResult.filename}\n` +
+              `- Pages: ${uploadResult.pages}\n` +
+              `- Chunks: ${uploadResult.chunks}\n\n` +
+              `You can ask questions about this document, or type **"analyze contract"** ` +
+              `for a clause-by-clause review (issues, missing clauses, citations).`;
             const uploadMessage: ChatMessageData = {
               id: randomId(),
               role: "assistant",
-              content:
-                `📄 **Document uploaded:** ${uploadResult.filename}\n` +
-                `- Pages: ${uploadResult.pages}\n` +
-                `- Chunks: ${uploadResult.chunks}\n\n` +
-                `You can ask questions about this document, or type **"analyze contract"** ` +
-                `for a clause-by-clause review (issues, missing clauses, citations).`,
+              content: uploadAssistantText,
               timestamp: new Date(),
             };
             setMessages((prev) => [...prev, uploadMessage]);
+
+            // Persist both the user-side action and the assistant
+            // confirmation so refresh-replay shows the same bubbles.
+            // Best-effort; failure here doesn't break the UX.
+            const userBubbleText = `📎 ${uploadResult.filename}`;
+            await Promise.allSettled([
+              appendMessage(currentSessionId, "user", userBubbleText, "upload"),
+              appendMessage(currentSessionId, "assistant", uploadAssistantText, "upload"),
+            ]);
           }
         }
         setIsUploading(false);
@@ -371,13 +382,21 @@ export default function DashboardChatPage() {
         // Replace the progress placeholder we inserted earlier with the
         // final analysis text — keeping the same id so React updates in
         // place rather than appending a new bubble.
+        const analysisText = lines.join("\n");
         setMessages((prev) =>
           prev.map((m) =>
             m.id === progressMsgId
-              ? { ...m, content: lines.join("\n"), timestamp: new Date() }
+              ? { ...m, content: analysisText, timestamp: new Date() }
               : m,
           ),
         );
+        // Persist both sides — user's "analyze contract" trigger and the
+        // rendered analysis output. Without this the analysis vanishes
+        // on refresh.
+        await Promise.allSettled([
+          appendMessage(sidForAnalyze, "user", content || "analyze contract", "analyze"),
+          appendMessage(sidForAnalyze, "assistant", analysisText, "analyze"),
+        ]);
       } else if (content.trim().length === 0 && docAttachments.length > 0) {
         // Upload-only — user attached a file with no question. The
         // "Document uploaded" confirmation we showed above is the

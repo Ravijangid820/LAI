@@ -1200,6 +1200,30 @@ def get_session_messages(session_id: str):
     return {"messages": persistence.list_messages(session_id)}
 
 
+class AppendMessageReq(BaseModel):
+    role: str   # "user" | "assistant"
+    content: str
+    mode: Optional[str] = None  # free-form: "chat" | "rag" | "upload" | "analyze" | ...
+
+
+@app.post("/sessions/{session_id}/messages")
+def append_session_message(session_id: str, req: AppendMessageReq):
+    """Append an assistant- or user-side message to an existing session
+    so refresh-replay sees every bubble the UI showed. Used for bubbles
+    the backend doesn't generate itself — upload confirmation,
+    rendered /analyze-contract output, etc.
+
+    /query already self-persists; the UI shouldn't double-save those."""
+    if not persistence.session_exists(session_id):
+        raise HTTPException(404, "session_id not found")
+    if req.role not in ("user", "assistant"):
+        raise HTTPException(400, "role must be 'user' or 'assistant'")
+    if not req.content.strip():
+        raise HTTPException(400, "content required")
+    msg_id = persistence.add_message(session_id, req.role, req.content, mode=req.mode)
+    return {"ok": True, "id": msg_id}
+
+
 @app.delete("/sessions/{session_id}")
 def delete_session_endpoint(session_id: str):
     if not persistence.session_exists(session_id):
