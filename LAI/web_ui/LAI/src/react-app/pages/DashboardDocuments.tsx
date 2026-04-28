@@ -1,4 +1,6 @@
-import { useState, useRef } from "react";
+"use client";
+
+import { useState, useEffect, useRef } from "react";
 import {
   Card,
   CardContent,
@@ -7,6 +9,7 @@ import {
 } from "@/react-app/components/ui/card";
 import { Button } from "@/react-app/components/ui/button";
 import { Input } from "@/react-app/components/ui/input";
+import { Progress } from "@/react-app/components/ui/progress";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -26,73 +29,43 @@ import {
   StorageIcon,
   LensIcon,
   ArchiveIcon,
+  SandglassIcon,
 } from "@/react-app/components/icons";
-
-interface Document {
-  id: string;
-  name: string;
-  size: number;
-  uploadDate: string;
-  type: string;
-  status: "analyzed" | "pending" | "archived";
-  category: string;
-}
+import { fetchDocuments, uploadDDiQDocument } from "@/react-app/lib/ddiqApi";
+import type { DocumentItem } from "@/react-app/lib/ddiqDemoData";
 
 export default function DashboardDocumentsPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [documents, setDocuments] = useState<Document[]>([
-    {
-      id: "1",
-      name: "permit_application_2024.pdf",
-      size: 2.4,
-      uploadDate: "2024-02-18",
-      type: "PDF",
-      status: "analyzed",
-      category: "Permits",
-    },
-    {
-      id: "2",
-      name: "land_lease_agreement.docx",
-      size: 1.1,
-      uploadDate: "2024-02-15",
-      type: "Word",
-      status: "analyzed",
-      category: "Legal",
-    },
-    {
-      id: "3",
-      name: "environmental_impact_report.pdf",
-      size: 5.8,
-      uploadDate: "2024-02-14",
-      type: "PDF",
-      status: "analyzed",
-      category: "Environmental",
-    },
-    {
-      id: "4",
-      name: "technical_specifications.xlsx",
-      size: 0.8,
-      uploadDate: "2024-02-10",
-      type: "Excel",
-      status: "pending",
-      category: "Technical",
-    },
-    {
-      id: "5",
-      name: "grid_connection_procedure.pdf",
-      size: 3.2,
-      uploadDate: "2024-02-08",
-      type: "PDF",
-      status: "archived",
-      category: "Grid",
-    },
-  ]);
-
+  // ── State ──
+  const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState("");
   const [filterStatus, setFilterStatus] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
 
+  // Upload state
+  const [uploading, setUploading] = useState(false);
+  const [uploadFileName, setUploadFileName] = useState("");
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
+  // ── Load documents from backend ──
+  const loadDocuments = async () => {
+    try {
+      const res = await fetchDocuments();
+      setDocuments(res.documents);
+    } catch (err) {
+      console.error("Failed to load documents:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadDocuments();
+  }, []);
+
+  // ── Filtering ──
   const filteredDocuments = documents.filter((doc) => {
     const matchesSearch =
       doc.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -101,6 +74,7 @@ export default function DashboardDocumentsPage() {
     return matchesSearch && matchesStatus;
   });
 
+  // ── Drag & Drop ──
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -114,43 +88,125 @@ export default function DashboardDocumentsPage() {
     if (e.dataTransfer.files?.length) processFiles(e.dataTransfer.files);
   };
 
-  const deleteDocument = (id: string) =>
-    setDocuments(documents.filter((d) => d.id !== id));
-  const downloadDocument = (name: string) => console.log(`Downloading ${name}`);
-  const archiveDocument = (id: string) =>
-    setDocuments(
-      documents.map((d) => (d.id === id ? { ...d, status: "archived" } : d)),
-    );
+  // ── File Upload via API ──
+  const processFiles = async (files: FileList) => {
+    for (const file of Array.from(files)) {
+      if (!file.name.toLowerCase().endsWith(".pdf")) {
+        setUploadError(
+          `"${file.name}" skipped — only PDF files are supported for analysis`,
+        );
+        continue;
+      }
+
+      setUploading(true);
+      setUploadFileName(file.name);
+      setUploadError(null);
+
+      try {
+        // Determine category from filename
+        const nameLower = file.name.toLowerCase();
+        let category = "Uncategorized";
+        if (
+          nameLower.includes("vertrag") ||
+          nameLower.includes("contract") ||
+          nameLower.includes("lease")
+        )
+          category = "Legal";
+        else if (
+          nameLower.includes("permit") ||
+          nameLower.includes("genehmigung") ||
+          nameLower.includes("bimsch")
+        )
+          category = "Permits";
+        else if (
+          nameLower.includes("umwelt") ||
+          nameLower.includes("environment") ||
+          nameLower.includes("uva") ||
+          nameLower.includes("eia")
+        )
+          category = "Environmental";
+        else if (nameLower.includes("techni") || nameLower.includes("spec"))
+          category = "Technical";
+        else if (nameLower.includes("grid") || nameLower.includes("netz"))
+          category = "Grid";
+        else if (
+          nameLower.includes("financ") ||
+          nameLower.includes("finanz") ||
+          nameLower.includes("bank")
+        )
+          category = "Financial";
+
+        await uploadDDiQDocument(file, category);
+
+        // Refresh document list after upload
+        await loadDocuments();
+      } catch (err) {
+        setUploadError(
+          err instanceof Error ? err.message : `Upload failed for ${file.name}`,
+        );
+      } finally {
+        setUploading(false);
+        setUploadFileName("");
+      }
+    }
+  };
 
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.currentTarget.files?.length) processFiles(e.currentTarget.files);
     e.currentTarget.value = "";
   };
 
-  const processFiles = (files: FileList) => {
-    Array.from(files).forEach((file) => {
-      const newDoc: Document = {
-        id: Date.now().toString() + Math.random(),
-        name: file.name,
-        size: file.size / (1024 * 1024),
-        uploadDate: new Date().toISOString().split("T")[0],
-        type: file.type.split("/")[1]?.toUpperCase() || "File",
-        status: "pending",
-        category: "Uncategorized",
-      };
-      setDocuments((prev) => [newDoc, ...prev]);
-    });
-  };
-
   const triggerFileInput = () => fileInputRef.current?.click();
 
+  // ── Actions (local for now — can add backend endpoints later) ──
+  const deleteDocument = (id: string) => {
+    // TODO: call DELETE /ddiq/documents/{id} when endpoint exists
+    setDocuments(documents.filter((d) => d.id !== id));
+  };
+
+  const archiveDocument = (id: string) => {
+    // TODO: call PATCH /ddiq/documents/{id}/archive when endpoint exists
+    setDocuments(
+      documents.map((d) =>
+        d.id === id ? { ...d, status: "archived" as const } : d,
+      ),
+    );
+  };
+
+  const downloadDocument = (name: string) => {
+    console.log(`Download: ${name}`);
+    // TODO: call GET /ddiq/documents/{id}/download when endpoint exists
+  };
+
+  // ── UI Config ──
   const statusColor = {
-    analyzed: "text-emerald-600 bg-emerald-500/10 dark:text-emerald-500 dark:bg-emerald-500/20",
-    pending: "text-amber-600 bg-amber-500/10 dark:text-amber-500 dark:bg-amber-500/20",
-    archived: "text-slate-500 bg-slate-500/10 dark:text-slate-400 dark:bg-slate-500/20",
+    analyzed:
+      "text-emerald-600 bg-emerald-500/10 dark:text-emerald-500 dark:bg-emerald-500/20",
+    pending:
+      "text-amber-600 bg-amber-500/10 dark:text-amber-500 dark:bg-amber-500/20",
+    archived:
+      "text-slate-500 bg-slate-500/10 dark:text-slate-400 dark:bg-slate-500/20",
   };
 
   const totalSize = documents.reduce((sum, doc) => sum + doc.size, 0);
+
+  // ── Loading State ──
+  if (loading) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold">Documents</h1>
+          <p className="text-muted-foreground">
+            Manage and organize your project documents
+          </p>
+        </div>
+        <div className="flex items-center justify-center py-16">
+          <SandglassIcon className="w-6 h-6 text-muted-foreground animate-pulse mr-3" />
+          <span className="text-muted-foreground">Loading documents...</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -162,7 +218,11 @@ export default function DashboardDocumentsPage() {
             Manage and organize your project documents
           </p>
         </div>
-        <Button className="shadow-sm" onClick={triggerFileInput}>
+        <Button
+          className="shadow-sm"
+          onClick={triggerFileInput}
+          disabled={uploading}
+        >
           <PlusIcon className="w-4 h-4 mr-2" />
           Upload Document
         </Button>
@@ -183,7 +243,6 @@ export default function DashboardDocumentsPage() {
             </div>
           </CardContent>
         </Card>
-
         <Card className="bg-card/50 backdrop-blur border-border/50">
           <CardContent className="p-5">
             <div className="flex items-start justify-between">
@@ -199,7 +258,6 @@ export default function DashboardDocumentsPage() {
             </div>
           </CardContent>
         </Card>
-
         <Card className="bg-card/50 backdrop-blur border-border/50">
           <CardContent className="p-5">
             <div className="flex items-start justify-between">
@@ -219,44 +277,82 @@ export default function DashboardDocumentsPage() {
 
       {/* Upload Zone */}
       <Card
-        className={`bg-card/50 backdrop-blur border-border/50 border-2 border-dashed transition-colors cursor-pointer hover:border-slate-400 dark:hover:border-slate-600 ${dragActive ? "border-slate-500 bg-slate-500/5" : ""
-          }`}
+        className={`bg-card/50 backdrop-blur border-border/50 border-2 border-dashed transition-colors cursor-pointer hover:border-slate-400 dark:hover:border-slate-600 ${dragActive ? "border-slate-500 bg-slate-500/5" : ""} ${uploading ? "pointer-events-none opacity-60" : ""}`}
         onDragEnter={handleDrag}
         onDragLeave={handleDrag}
         onDragOver={handleDrag}
         onDrop={handleDrop}
-        onClick={triggerFileInput}
+        onClick={uploading ? undefined : triggerFileInput}
       >
         <CardContent className="p-8">
           <div className="flex flex-col items-center justify-center gap-4">
-            <div className="p-4 rounded-md bg-slate-100 dark:bg-slate-800">
-              <UploadIcon className="w-8 h-8 text-slate-600 dark:text-slate-400" />
-            </div>
-            <div className="text-center">
-              <p className="font-semibold text-foreground">Drag and drop files here</p>
-              <p className="text-sm text-muted-foreground mt-1">
-                or click to select documents (PDF, Word, Excel, CSV, TXT)
-              </p>
-            </div>
-            <Button
-              variant="outline"
-              className="mt-2 text-sm shadow-sm"
-              onClick={(e) => {
-                e.stopPropagation();
-                triggerFileInput();
-              }}
-            >
-              Select Files
-            </Button>
+            {uploading ? (
+              <>
+                <div className="p-4 rounded-md bg-primary/10">
+                  <SandglassIcon className="w-8 h-8 text-primary animate-pulse" />
+                </div>
+                <div className="text-center">
+                  <p className="font-semibold text-foreground">
+                    Uploading & analyzing...
+                  </p>
+                  <p className="text-sm text-muted-foreground mt-1">
+                    {uploadFileName}
+                  </p>
+                </div>
+                <Progress value={65} className="h-2 w-48" />
+              </>
+            ) : (
+              <>
+                <div className="p-4 rounded-md bg-slate-100 dark:bg-slate-800">
+                  <UploadIcon className="w-8 h-8 text-slate-600 dark:text-slate-400" />
+                </div>
+                <div className="text-center">
+                  <p className="font-semibold text-foreground">
+                    Drag and drop PDF files here
+                  </p>
+                  <p className="text-sm text-muted-foreground mt-1">
+                    or click to select documents — PDFs will be extracted,
+                    chunked, and embedded for analysis
+                  </p>
+                </div>
+                <Button
+                  variant="outline"
+                  className="mt-2 text-sm shadow-sm"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    triggerFileInput();
+                  }}
+                >
+                  Select Files
+                </Button>
+              </>
+            )}
           </div>
         </CardContent>
       </Card>
+
+      {/* Upload Error */}
+      {uploadError && (
+        <div className="rounded-lg border border-rose-500/40 bg-rose-500/5 p-3 flex items-center justify-between">
+          <p className="text-sm text-rose-600 dark:text-rose-400">
+            {uploadError}
+          </p>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-xs"
+            onClick={() => setUploadError(null)}
+          >
+            Dismiss
+          </Button>
+        </div>
+      )}
 
       <input
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".pdf,.docx,.doc,.xlsx,.xls,.csv,.txt"
+        accept=".pdf"
         onChange={handleFileInputChange}
         style={{ display: "none" }}
       />
@@ -308,7 +404,16 @@ export default function DashboardDocumentsPage() {
           {filteredDocuments.length === 0 ? (
             <div className="text-center py-8">
               <ManuscriptIcon className="w-12 h-12 text-muted-foreground mx-auto mb-3 opacity-50" />
-              <p className="text-muted-foreground">No documents found</p>
+              <p className="text-muted-foreground">
+                {documents.length === 0
+                  ? "No documents uploaded yet"
+                  : "No documents match your search"}
+              </p>
+              {documents.length === 0 && (
+                <p className="text-xs text-muted-foreground mt-1">
+                  Upload a PDF above to get started
+                </p>
+              )}
             </div>
           ) : (
             <div className="space-y-2">

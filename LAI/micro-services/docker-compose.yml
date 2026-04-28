@@ -1,0 +1,75 @@
+# LAI Backend Service — Production RAG + Cadastral Pipeline
+# =========================================================
+# Path: /data/projects/lai/LAI/micro-services
+#
+# Backend-only compose. Connects to LAI runtime services
+# (analyzer-llm, embedding, postgres, redis) via the
+# external `lai_network` defined by the LAI runtime compose.
+#
+# Prerequisites:
+#   - LAI runtime stack running (analyzer-llm, embedding, postgres, redis)
+#   - `lai_network` external network created (the runtime stack creates it)
+#   - .env file with DB_PASSWORD set (copy from .env.example)
+#
+# Setup:
+#   1. Bring up the LAI runtime stack first
+#   2. cp .env.example .env  &&  edit DB_PASSWORD
+#   3. docker compose up -d --build
+#
+# Verify:
+#   curl http://localhost:8000/health
+#   curl http://localhost:8000/ddiq/config/map-tiles
+#
+# Stop:
+#   docker compose down
+#
+# NOTE on reranker: the LAI runtime compose does NOT run a
+# standalone reranker container — reranking lives in-process
+# inside serve_rag.py on the host. Since api.py / ddiq_report.py
+# still call RERANKER_URL via HTTP, point it at the host
+# (host.docker.internal). The extra_hosts entry below resolves
+# it to the host gateway on Linux.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lai-backend
+    restart: unless-stopped
+    ports:
+      # Host port 18001 (next to serve_rag's 18000); 8000 is held on this
+      # box by a sibling tenant. Override with BACKEND_PORT env var.
+      - "${BACKEND_BIND_HOST:-127.0.0.1}:${BACKEND_PORT:-18001}:8000"
+    environment:
+      # LLM — Qwen3.6-27B analyzer from LAI runtime stack
+      - LLM_URL=http://lai_analyzer_llm:8000/v1
+      - LLM_MODEL=${LLM_MODEL:-qwen3.6-27b}
+      # Embedding — Qwen3-Embedding-8B from LAI runtime stack
+      - EMBEDDING_URL=http://lai_embedding:8000
+      # Reranker — host-side serve_rag.py (adjust port to match)
+      - RERANKER_URL=${RERANKER_URL:-http://host.docker.internal:8004}
+      # Database — pgvector from LAI runtime stack (internal port 5432)
+      - DB_HOST=lai_postgres_main
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-lai_db}
+      - DB_USER=${DB_USER:-lai_user}
+      - DB_PASSWORD=${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      # Application config
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://lai-beta.vercel.app,https://lai-pied.vercel.app,https://lai-ashen.vercel.app}
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    extra_hosts:
+      # ALKIS WFS endpoints (DNS workaround)
+      - "www.opengeodata.lgln.niedersachsen.de:104.20.47.7"
+      - "www.wfs.nrw.de:93.184.133.217"
+      # Reach host-side services (e.g., the in-process reranker in serve_rag.py)
+      - "host.docker.internal:host-gateway"
+    networks:
+      - lai_network
+
+networks:
+  lai_network:
+    external: true

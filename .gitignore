@@ -109,6 +109,9 @@ LAI/web_ui/**/.env
 LAI/web_ui/**/dist/
 LAI/web_ui/**/.wrangler/
 
+# Micro-services local env (DB credentials, CORS origins, etc.)
+LAI/micro-services/.env
+
 # Top-level scripts folder (personal scripts, not project code)
 /scripts/
 

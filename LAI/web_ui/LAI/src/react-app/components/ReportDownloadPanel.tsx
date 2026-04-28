@@ -26,7 +26,6 @@ import {
 import { Input } from "@/react-app/components/ui/input";
 
 import {
-  DEMO_REPORT,
   PRESETS,
   FORMAT_OPTIONS,
   SECTION_META,
@@ -40,6 +39,8 @@ import {
   type ReportPreset,
   type ExportFormat,
 } from "@/react-app/lib/ddiqDemoData";
+
+import { generateReport } from "@/react-app/lib/ddiqApi";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UI HELPERS
@@ -95,8 +96,6 @@ const AmpelBadge = ({ status }: { status: Ampel }) => {
   );
 };
 
-// ── Ausgabeblatt Table ──────────────────────────────────────────────────────
-
 const AusgabeblattTable = ({ section }: { section: AusgabeblattSection }) => (
   <div className="rounded-lg border border-border/60 overflow-hidden">
     <div className="bg-slate-50 dark:bg-slate-800/60 px-4 py-2.5 border-b border-border/40">
@@ -124,8 +123,6 @@ const AusgabeblattTable = ({ section }: { section: AusgabeblattSection }) => (
     </div>
   </div>
 );
-
-// ── Status Map (traffic-light cards) ────────────────────────────────────────
 
 const StatusMap = ({ statuses }: { statuses: WEAStatus[] }) => {
   const c = {
@@ -184,8 +181,6 @@ const StatusMap = ({ statuses }: { statuses: WEAStatus[] }) => {
   );
 };
 
-// ── Findings ────────────────────────────────────────────────────────────────
-
 const FindingsTable = ({
   findings,
 }: {
@@ -211,8 +206,6 @@ const FindingsTable = ({
   </div>
 );
 
-// ── Cadastral Parcel Table (preview) ────────────────────────────────────────
-
 const CadastralTable = ({ parcels }: { parcels: CadastralParcel[] }) => {
   const totalArea = parcels.reduce((s, p) => s + p.area, 0);
   const securedArea = parcels
@@ -223,7 +216,6 @@ const CadastralTable = ({ parcels }: { parcels: CadastralParcel[] }) => {
         p.status === "easement",
     )
     .reduce((s, p) => s + p.area, 0);
-
   return (
     <div className="rounded-lg border border-border/60 overflow-hidden">
       <div className="bg-slate-50 dark:bg-slate-800/60 px-4 py-2.5 border-b border-border/40 flex items-center justify-between">
@@ -297,8 +289,7 @@ const CadastralTable = ({ parcels }: { parcels: CadastralParcel[] }) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// LOCATION MAP — Uses ProjectLocationMap (react-leaflet) for preview,
-//                static SVG for downloaded exports
+// LOCATION MAP
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import ProjectLocationMap from "@/react-app/components/ProjectLocationMap";
@@ -326,7 +317,7 @@ const PARCEL_STATUS_COLORS: Record<
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// REPORT GENERATORS
+// REPORT GENERATORS (unchanged — work on any DDiQReportData)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function generateHTML(d: DDiQReportData, a: string[]): string {
@@ -378,7 +369,6 @@ function generateHTML(d: DDiQReportData, a: string[]): string {
       `</tbody></table>`
     : "";
 
-  // ── Cadastral Parcels table for export ──
   const PC: Record<string, { stroke: string; label: string }> = {
     secured: { stroke: "#059669", label: "Secured" },
     negotiation: { stroke: "#d97706", label: "Negotiation" },
@@ -414,27 +404,27 @@ function generateHTML(d: DDiQReportData, a: string[]): string {
         `</tbody></table>`
       : "";
 
-  // ── Location Map: full interactive Leaflet with Turbines/Parcels toggle ──
+  // ── Location Map with Turbines/Parcels toggle ──
   const hasLocMap = a.includes("locationmap");
   const hasCadast = a.includes("cadastralmap") && d.parcels.length > 0;
   const leafletHead = hasLocMap
-    ? `<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>` +
-      `<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>`
+    ? `<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>`
     : "";
+
   const locH = hasLocMap
     ? (() => {
         const center = {
           lat:
-            d.weaStatuses.reduce((s, w) => s + w.lat, 0) / d.weaStatuses.length,
+            d.weaStatuses.reduce((s, w) => s + w.lat, 0) /
+            (d.weaStatuses.length || 1),
           lng:
-            d.weaStatuses.reduce((s, w) => s + w.lng, 0) / d.weaStatuses.length,
+            d.weaStatuses.reduce((s, w) => s + w.lng, 0) /
+            (d.weaStatuses.length || 1),
         };
         const cableStart = d.infrastructure.find(
           (p) => p.type === "cable_start",
         );
         const cableEnd = d.infrastructure.find((p) => p.type === "cable_end");
-
-        // Parcel colors for JS
         const PCS: Record<string, string> = {
           secured: "#059669",
           negotiation: "#d97706",
@@ -450,13 +440,11 @@ function generateHTML(d: DDiQReportData, a: string[]): string {
           easement: "Cable Easement",
         };
 
-        // Toggle button HTML (only if parcels exist)
         const toggleHTML = hasCadast
-          ? `
-      <div id="ddiq-toggle" style="display:flex;gap:0;background:#f1f5f9;border-radius:6px;padding:2px;border:1px solid #e2e8f0;margin-bottom:12px;width:fit-content;">
-        <button id="btn-turbines" onclick="switchView('turbines')" style="font:600 12px/1 system-ui;padding:7px 16px;border-radius:4px;border:none;cursor:pointer;background:#fff;color:#0f172a;box-shadow:0 1px 3px rgba(0,0,0,.08);transition:all .15s;">Turbines</button>
-        <button id="btn-parcels" onclick="switchView('parcels')" style="font:600 12px/1 system-ui;padding:7px 16px;border-radius:4px;border:none;cursor:pointer;background:transparent;color:#64748b;transition:all .15s;">Parcels</button>
-      </div>`
+          ? `<div id="ddiq-toggle" style="display:flex;gap:0;background:#f1f5f9;border-radius:6px;padding:2px;border:1px solid #e2e8f0;margin-bottom:12px;width:fit-content;">
+      <button id="btn-turbines" onclick="switchView('turbines')" style="font:600 12px/1 system-ui;padding:7px 16px;border-radius:4px;border:none;cursor:pointer;background:#fff;color:#0f172a;box-shadow:0 1px 3px rgba(0,0,0,.08);transition:all .15s;">Turbines</button>
+      <button id="btn-parcels" onclick="switchView('parcels')" style="font:600 12px/1 system-ui;padding:7px 16px;border-radius:4px;border:none;cursor:pointer;background:transparent;color:#64748b;transition:all .15s;">Parcels</button>
+    </div>`
           : "";
 
         return (
@@ -471,12 +459,8 @@ function generateHTML(d: DDiQReportData, a: string[]): string {
   var topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { attribution: '© OpenTopoMap', maxZoom: 17 });
   street.addTo(map);
   L.control.layers({ 'Street': street, 'Satellite': satellite, 'Topographic': topo }, {}, { position: 'topright' }).addTo(map);
-
-  // ── Shared: Cable + Infrastructure ──
   var sharedGroup = L.layerGroup().addTo(map);
-
-  ${cableStart && cableEnd ? `L.polyline([[${cableStart.lat},${cableStart.lng}],[${cableEnd.lat},${cableEnd.lng}]], { color: '#6366f1', weight: 2.5, dashArray: '10 6', opacity: 0.7 }).addTo(sharedGroup).bindPopup('<b>Cable Route</b><br><span style="color:#64748b;">4.2 km → Substation Tostedt</span>');` : ""}
-
+  ${cableStart && cableEnd ? `L.polyline([[${cableStart.lat},${cableStart.lng}],[${cableEnd.lat},${cableEnd.lng}]], { color: '#6366f1', weight: 2.5, dashArray: '10 6', opacity: 0.7 }).addTo(sharedGroup);` : ""}
   ${d.infrastructure
     .filter((p) => p.type !== "cable_start")
     .map((p) => {
@@ -491,171 +475,76 @@ function generateHTML(d: DDiQReportData, a: string[]): string {
         p.type === "substation" || p.type === "cable_end"
           ? "#6366f1"
           : "#64748b";
-      return `L.marker([${p.lat},${p.lng}], { icon: L.divIcon({ className:'', iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-14],
-      html:'<div style="width:26px;height:26px;background:${bg}15;border:1.5px solid ${bg};border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:12px;">${emoji}</div>'
-    })}).addTo(sharedGroup).bindPopup('<b>${p.name}</b><br><span style="color:#94a3b8;font-size:11px;">${p.lat.toFixed(5)}°N, ${p.lng.toFixed(5)}°E</span>');`;
+      return `L.marker([${p.lat},${p.lng}], { icon: L.divIcon({ className:'', iconSize:[26,26], iconAnchor:[13,13], popupAnchor:[0,-14], html:'<div style="width:26px;height:26px;background:${bg}15;border:1.5px solid ${bg};border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:12px;">${emoji}</div>' })}).addTo(sharedGroup).bindPopup('<b>${p.name}</b>');`;
     })
     .join("\n  ")}
-
-  // ── Turbines Layer ──
   var turbineGroup = L.layerGroup().addTo(map);
-
   ${d.weaStatuses
     .map((w) => {
       const c = AMPEL_HEX[w.ampel];
-      return `(function(){
-    var ic = L.divIcon({ className:'', iconSize:[30,30], iconAnchor:[15,15], popupAnchor:[0,-17],
-      html:'<div style="width:30px;height:30px;"><div style="position:absolute;inset:0;background:${c};border:2.5px solid #fff;border-radius:50%;box-shadow:0 2px 8px ${c}55;display:flex;align-items:center;justify-content:center;"><span style="color:#fff;font-size:11px;font-weight:800;font-family:system-ui;">${w.name.replace("WEA ", "")}</span></div></div>'
-    });
-    L.marker([${w.lat},${w.lng}], { icon: ic }).addTo(turbineGroup)
-      .bindPopup('<div style="font:12px/1.6 system-ui;min-width:200px;padding:10px 12px;">'
-        + '<div style="display:flex;align-items:center;gap:6px;padding-bottom:6px;margin-bottom:6px;border-bottom:1px solid #f1f5f9;">'
-        + '<span style="width:9px;height:9px;border-radius:50%;background:${c};border:1.5px solid #fff;box-shadow:0 0 0 1px ${c}40;"></span>'
-        + '<strong style="font-size:13px;">${w.name}</strong>'
-        + '<span style="font-size:9px;font-weight:700;padding:1px 7px;border-radius:4px;background:${c}10;color:${c};margin-left:auto;">${AMPEL_LABEL[w.ampel]}</span></div>'
-        + '<div style="font-size:11px;color:#475569;">'
-        + '<div><b style="color:#1e293b;">Owner</b> ${w.owner}</div>'
-        + '<div><b style="color:#1e293b;">Parcel</b> ${w.parcel}</div>'
-        + '<div><b style="color:#1e293b;">Address</b> ${w.address}</div>'
-        + '<div><b style="color:#1e293b;">Contract</b> ${w.contract}</div></div>'
-        + '<div style="font-size:10px;color:#94a3b8;margin-top:5px;padding-top:5px;border-top:1px solid #f1f5f9;">${w.lat.toFixed(5)}°N, ${w.lng.toFixed(5)}°E</div></div>')
-      .bindTooltip('${w.name}', { direction:'top', offset:[0,-17], permanent:true,
-        className:'plm-wea-tt' });
-  })();`;
+      return `(function(){ var ic = L.divIcon({ className:'', iconSize:[30,30], iconAnchor:[15,15], popupAnchor:[0,-17], html:'<div style="width:30px;height:30px;"><div style="position:absolute;inset:0;background:${c};border:2.5px solid #fff;border-radius:50%;box-shadow:0 2px 8px ${c}55;display:flex;align-items:center;justify-content:center;"><span style="color:#fff;font-size:11px;font-weight:800;font-family:system-ui;">${w.name.replace("WEA ", "")}</span></div></div>' });
+    L.marker([${w.lat},${w.lng}], { icon: ic }).addTo(turbineGroup).bindPopup('<div style="font:12px/1.6 system-ui;min-width:200px;padding:10px 12px;"><strong style="font-size:13px;">${w.name}</strong> <span style="font-size:9px;font-weight:700;padding:1px 7px;border-radius:4px;background:${c}10;color:${c};">${AMPEL_LABEL[w.ampel]}</span><div style="font-size:11px;color:#475569;margin-top:6px;"><div><b>Owner</b> ${w.owner}</div><div><b>Parcel</b> ${w.parcel}</div><div><b>Address</b> ${w.address}</div><div><b>Contract</b> ${w.contract}</div></div></div>').bindTooltip('${w.name}', { direction:'top', offset:[0,-17], permanent:true, className:'plm-wea-tt' }); })();`;
     })
     .join("\n  ")}
-
   ${
     hasCadast
-      ? `
-  // ── Parcels Layer ──
-  var parcelGroup = L.layerGroup();
-
+      ? `var parcelGroup = L.layerGroup();
   ${d.parcels
     .map((p) => {
       const c = PCS[p.status] || "#64748b";
       const lb = PCL[p.status] || p.status;
-      const isEasement = p.status === "easement";
-      // Find top-left corner for label
+      const isE = p.status === "easement";
       const tlIdx = p.polygon.reduce(
-        (bi, pt, i, arr) =>
+        (bi: number, pt: number[], i: number, arr: number[][]) =>
           pt[0] > arr[bi][0] || (pt[0] === arr[bi][0] && pt[1] < arr[bi][1])
             ? i
             : bi,
         0,
       );
       const tl = p.polygon[tlIdx];
-      return `(function(){
-    L.polygon([${p.polygon.map((pt) => `[${pt[0]},${pt[1]}]`).join(",")}], {
-      fillColor:'${c}', fillOpacity:0.2, color:'${c}', weight:${isEasement ? 1.5 : 2.5},
-      ${isEasement ? "dashArray:'6 4'," : ""} opacity:0.9
-    }).addTo(parcelGroup).bindPopup(
-      '<div style="font:12px/1.6 system-ui;min-width:200px;padding:10px 12px;">'
-      + '<div style="display:flex;align-items:center;gap:6px;padding-bottom:6px;margin-bottom:6px;border-bottom:1px solid #f1f5f9;">'
-      + '<span style="width:9px;height:9px;border-radius:50%;background:${c};border:1.5px solid #fff;box-shadow:0 0 0 1px ${c}40;"></span>'
-      + '<strong style="font-size:13px;">Flst. ${p.parcelNumber}</strong>'
-      + '<span style="font-size:9px;font-weight:700;padding:1px 7px;border-radius:4px;background:${c}10;color:${c};margin-left:auto;">${lb}</span></div>'
-      + '<div style="font-size:11px;color:#475569;">'
-      + '<div><b style="color:#1e293b;">Gemarkung</b> ${p.gemarkung}, Flur ${p.flur}</div>'
-      + '<div><b style="color:#1e293b;">Owner</b> ${p.owner}</div>'
-      + '<div><b style="color:#1e293b;">Area</b> ${p.area} ha</div>'
-      ${p.linkedWEA ? `+ '<div><b style="color:#1e293b;">Turbine</b> ${p.linkedWEA}</div>'` : ""}
-      ${p.contractRef ? `+ '<div><b style="color:#1e293b;">Contract</b> ${p.contractRef}</div>'` : ""}
-      ${p.notes ? `+ '<div style="font-size:10px;color:#94a3b8;margin-top:5px;padding-top:5px;border-top:1px solid #f1f5f9;font-style:italic;">${p.notes}</div>'` : ""}
-      + '</div></div>'
-    );
-    // Corner label
-    L.marker([${tl[0]},${tl[1]}], { interactive:false, icon: L.divIcon({ className:'', iconSize:[0,0], iconAnchor:[-4,14],
-      html:'<div style="font:800 11px/1 system-ui;color:${c};white-space:nowrap;pointer-events:none;text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 6px #fff,0 0 6px #fff,1px 1px 2px rgba(0,0,0,.15);">${p.parcelNumber}</div>'
-    })}).addTo(parcelGroup);
-  })();`;
+      return `(function(){ L.polygon([${p.polygon.map((pt) => `[${pt[0]},${pt[1]}]`).join(",")}], { fillColor:'${c}', fillOpacity:0.2, color:'${c}', weight:${isE ? 1.5 : 2.5}, ${isE ? "dashArray:'6 4'," : ""} opacity:0.9 }).addTo(parcelGroup).bindPopup('<div style="font:12px/1.6 system-ui;min-width:200px;padding:10px 12px;"><strong>Flst. ${p.parcelNumber}</strong> <span style="font-size:9px;font-weight:700;padding:1px 7px;border-radius:4px;background:${c}10;color:${c};">${lb}</span><div style="font-size:11px;color:#475569;margin-top:6px;"><div><b>Gemarkung</b> ${p.gemarkung}, Flur ${p.flur}</div><div><b>Owner</b> ${p.owner}</div><div><b>Area</b> ${p.area} ha</div>${p.linkedWEA ? `<div><b>Turbine</b> ${p.linkedWEA}</div>` : ""}${p.contractRef ? `<div><b>Contract</b> ${p.contractRef}</div>` : ""}</div></div>');
+    L.marker([${tl[0]},${tl[1]}], { interactive:false, icon: L.divIcon({ className:'', iconSize:[0,0], iconAnchor:[-4,14], html:'<div style="font:800 11px/1 system-ui;color:${c};white-space:nowrap;pointer-events:none;text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 6px #fff,0 0 6px #fff,1px 1px 2px rgba(0,0,0,.15);">${p.parcelNumber}</div>' })}).addTo(parcelGroup); })();`;
     })
     .join("\n  ")}
-
-  // Small WEA dots in parcel view
   ${d.weaStatuses
     .map((w) => {
       const c = AMPEL_HEX[w.ampel];
-      return `L.marker([${w.lat},${w.lng}], { icon: L.divIcon({ className:'', iconSize:[12,12], iconAnchor:[6,6],
-    html:'<div style="width:12px;height:12px;background:${c};border:1.5px solid #fff;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,.25);opacity:.8;"></div>'
-  })}).addTo(parcelGroup).bindTooltip('${w.name}', { direction:'top', offset:[0,-8] });`;
+      return `L.marker([${w.lat},${w.lng}], { icon: L.divIcon({ className:'', iconSize:[12,12], iconAnchor:[6,6], html:'<div style="width:12px;height:12px;background:${c};border:1.5px solid #fff;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,.25);opacity:.8;"></div>' })}).addTo(parcelGroup).bindTooltip('${w.name}', { direction:'top', offset:[0,-8] });`;
     })
     .join("\n  ")}
   `
       : ""
   }
-
-  // ── Legend ──
-  var legendCtrl = L.control({ position: 'bottomright' });
   var currentLegend = null;
   function buildLegend(mode) {
     if (currentLegend) map.removeControl(currentLegend);
     currentLegend = L.control({ position: 'bottomright' });
-    currentLegend.onAdd = function() {
-      var d = L.DomUtil.create('div');
+    currentLegend.onAdd = function() { var d = L.DomUtil.create('div');
       var dot = function(c) { return '<span style="width:8px;height:8px;border-radius:50%;background:'+c+';flex-shrink:0;"></span>'; };
       var sw = function(c,ds) { return '<span style="width:16px;height:8px;border-radius:2px;border:1.5px '+(ds?'dashed':'solid')+' '+c+';background:'+c+'20;flex-shrink:0;"></span>'; };
       var row = function(i,t) { return '<div style="display:flex;align-items:center;gap:7px;padding:1px 0;">'+i+'<span>'+t+'</span></div>'; };
       var b = '';
-      if (mode === 'turbines') {
-        b += '<div style="font-weight:600;font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px;">Turbine Status</div>';
-        b += row(dot('#059669'), 'Secured (${d.weaStatuses.filter((w) => w.ampel === "green").length})');
-        b += row(dot('#d97706'), 'Negotiation (${d.weaStatuses.filter((w) => w.ampel === "yellow").length})');
-        b += row(dot('#dc2626'), 'Open (${d.weaStatuses.filter((w) => w.ampel === "red").length})');
-      } else {
-        b += '<div style="font-weight:600;font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px;">Land Status</div>';
-        b += row(sw('#059669'), 'Secured');
-        b += row(sw('#d97706'), 'In Negotiation');
-        b += row(sw('#dc2626'), 'Not Secured');
-        b += row(sw('#3b82f6'), 'Buffer Zone');
-        b += row(sw('#8b5cf6',true), 'Cable Easement');
-      }
-      b += '<div style="height:1px;background:#e2e8f0;margin:4px 0;"></div>';
-      b += row('<span style="width:16px;height:0;border-top:2px dashed #6366f1;flex-shrink:0;"></span>', 'Cable Route');
-      d.innerHTML = '<div style="background:rgba(255,255,255,.96);backdrop-filter:blur(8px);padding:9px 12px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.08);border:1px solid #e2e8f0;font:10px/1.6 system-ui;color:#475569;">'+b+'</div>';
-      return d;
-    };
-    currentLegend.addTo(map);
-  }
+      if (mode === 'turbines') { b += row(dot('#059669'),'Secured (${d.weaStatuses.filter((w) => w.ampel === "green").length})'); b += row(dot('#d97706'),'Negotiation (${d.weaStatuses.filter((w) => w.ampel === "yellow").length})'); b += row(dot('#dc2626'),'Open (${d.weaStatuses.filter((w) => w.ampel === "red").length})'); }
+      else { b += row(sw('#059669'),'Secured'); b += row(sw('#d97706'),'In Negotiation'); b += row(sw('#dc2626'),'Not Secured'); b += row(sw('#3b82f6'),'Buffer Zone'); b += row(sw('#8b5cf6',true),'Cable Easement'); }
+      b += '<div style="height:1px;background:#e2e8f0;margin:4px 0;"></div>'; b += row('<span style="width:16px;height:0;border-top:2px dashed #6366f1;flex-shrink:0;"></span>','Cable Route');
+      d.innerHTML = '<div style="background:rgba(255,255,255,.96);backdrop-filter:blur(8px);padding:9px 12px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.08);border:1px solid #e2e8f0;font:10px/1.6 system-ui;color:#475569;">'+b+'</div>'; return d; };
+    currentLegend.addTo(map); }
   buildLegend('turbines');
-
-  // ── Toggle Logic ──
   ${
     hasCadast
-      ? `
-  window.switchView = function(mode) {
-    var btnT = document.getElementById('btn-turbines');
-    var btnP = document.getElementById('btn-parcels');
-    if (mode === 'turbines') {
-      map.removeLayer(parcelGroup);
-      turbineGroup.addTo(map);
-      btnT.style.background = '#fff'; btnT.style.color = '#0f172a'; btnT.style.boxShadow = '0 1px 3px rgba(0,0,0,.08)';
-      btnP.style.background = 'transparent'; btnP.style.color = '#64748b'; btnP.style.boxShadow = 'none';
-    } else {
-      map.removeLayer(turbineGroup);
-      parcelGroup.addTo(map);
-      btnP.style.background = '#fff'; btnP.style.color = '#0f172a'; btnP.style.boxShadow = '0 1px 3px rgba(0,0,0,.08)';
-      btnT.style.background = 'transparent'; btnT.style.color = '#64748b'; btnT.style.boxShadow = 'none';
-    }
-    buildLegend(mode);
-  };
-  `
+      ? `window.switchView = function(mode) { var btnT=document.getElementById('btn-turbines'), btnP=document.getElementById('btn-parcels');
+    if(mode==='turbines'){map.removeLayer(parcelGroup);turbineGroup.addTo(map);btnT.style.background='#fff';btnT.style.color='#0f172a';btnT.style.boxShadow='0 1px 3px rgba(0,0,0,.08)';btnP.style.background='transparent';btnP.style.color='#64748b';btnP.style.boxShadow='none';}
+    else{map.removeLayer(turbineGroup);parcelGroup.addTo(map);btnP.style.background='#fff';btnP.style.color='#0f172a';btnP.style.boxShadow='0 1px 3px rgba(0,0,0,.08)';btnT.style.background='transparent';btnT.style.color='#64748b';btnT.style.boxShadow='none';}
+    buildLegend(mode); };`
       : ""
   }
-
-  // Fit bounds
   var bounds = L.latLngBounds([${d.weaStatuses.map((w) => `[${w.lat},${w.lng}]`).join(",")}]);
-  map.fitBounds(bounds.pad(0.15));
-
-  // WEA tooltip style
-  var style = document.createElement('style');
-  style.textContent = '.plm-wea-tt{background:none!important;border:none!important;box-shadow:none!important;font:700 9.5px/1 system-ui;color:#0f172a;padding:0!important;text-shadow:0 0 4px #fff,0 0 4px #fff,0 0 8px #fff}.plm-wea-tt::before{display:none}';
+  if(bounds.isValid()) map.fitBounds(bounds.pad(0.15));
+  var style = document.createElement('style'); style.textContent = '.plm-wea-tt{background:none!important;border:none!important;box-shadow:none!important;font:700 9.5px/1 system-ui;color:#0f172a;padding:0!important;text-shadow:0 0 4px #fff,0 0 4px #fff,0 0 8px #fff}.plm-wea-tt::before{display:none}';
   document.head.appendChild(style);
 })();
 <\/script>` +
-          // WEA coordinates table
-          `<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:12px;">` +
-          `<thead><tr style="background:#f8fafc;"><th style="text-align:left;padding:6px 10px;border:1px solid #e2e8f0;">WEA</th><th style="text-align:left;padding:6px 10px;border:1px solid #e2e8f0;">Lat</th><th style="text-align:left;padding:6px 10px;border:1px solid #e2e8f0;">Lng</th><th style="text-align:left;padding:6px 10px;border:1px solid #e2e8f0;">Address</th><th style="text-align:left;padding:6px 10px;border:1px solid #e2e8f0;">Status</th></tr></thead>` +
+          `<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:12px;"><thead><tr style="background:#f8fafc;"><th style="text-align:left;padding:6px 10px;border:1px solid #e2e8f0;">WEA</th><th style="text-align:left;padding:6px 10px;border:1px solid #e2e8f0;">Lat</th><th style="text-align:left;padding:6px 10px;border:1px solid #e2e8f0;">Lng</th><th style="text-align:left;padding:6px 10px;border:1px solid #e2e8f0;">Address</th><th style="text-align:left;padding:6px 10px;border:1px solid #e2e8f0;">Status</th></tr></thead>` +
           `<tbody>${d.weaStatuses.map((w) => `<tr><td style="padding:6px 10px;border:1px solid #e2e8f0;font-weight:600;">${w.name}</td><td style="padding:6px 10px;border:1px solid #e2e8f0;">${w.lat.toFixed(4)}</td><td style="padding:6px 10px;border:1px solid #e2e8f0;">${w.lng.toFixed(4)}</td><td style="padding:6px 10px;border:1px solid #e2e8f0;">${w.address}</td><td style="padding:6px 10px;border:1px solid #e2e8f0;"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${ac(w.ampel)};margin-right:4px;vertical-align:middle;"></span>${al(w.ampel)}</td></tr>`).join("")}</tbody></table>`
         );
       })()
@@ -905,7 +794,6 @@ export default function ReportDownloadPanel({
   documents: rawDocs,
   className,
 }: Props) {
-  // Guard: if caller passes undefined/null explicitly, default param won't catch it
   const documents = rawDocs ?? [];
   const analyzedDocs = useMemo(
     () => documents.filter((d) => d.status === "analyzed"),
@@ -926,6 +814,11 @@ export default function ReportDownloadPanel({
   ]);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportDone, setExportDone] = useState(false);
+
+  // ── Report generation state (replaces DEMO_REPORT) ──
+  const [reportData, setReportData] = useState<DDiQReportData | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [generateError, setGenerateError] = useState<string | null>(null);
 
   const selectedDocs = useMemo(
     () => documents.filter((d) => selectedDocIds.has(d.id)),
@@ -987,14 +880,33 @@ export default function ReportDownloadPanel({
     setSelectedPreset(p);
     setActiveSections([...p.sections]);
   };
+
   const resetToStart = () => {
     setStep("select-docs");
     setExportDone(false);
+    setReportData(null);
+    setGenerateError(null);
   };
-  const getReportData = (): DDiQReportData => ({
-    ...DEMO_REPORT,
-    analyzedDocuments: selectedDocs.map((d) => d.name),
-  });
+
+  // ── Generate report via backend API ──
+  const handleGenerateAndPreview = async () => {
+    setGenerating(true);
+    setGenerateError(null);
+    try {
+      const res = await generateReport({
+        document_ids: [...selectedDocIds],
+        preset: selectedPreset.id,
+      });
+      setReportData(res.report);
+      setStep("preview");
+    } catch (err) {
+      setGenerateError(
+        err instanceof Error ? err.message : "Report generation failed",
+      );
+    } finally {
+      setGenerating(false);
+    }
+  };
 
   const doExport = () => {
     setStep("exporting");
@@ -1012,11 +924,15 @@ export default function ReportDownloadPanel({
   };
 
   const handleDownloadAll = () => {
-    const rd = getReportData();
-    selectedFormats.forEach((f) => downloadFormat(f, rd, activeSections));
+    if (!reportData) return;
+    selectedFormats.forEach((f) =>
+      downloadFormat(f, reportData, activeSections),
+    );
   };
-  const handleDownloadOne = (fmt: ExportFormat) =>
-    downloadFormat(fmt, getReportData(), activeSections);
+  const handleDownloadOne = (fmt: ExportFormat) => {
+    if (!reportData) return;
+    downloadFormat(fmt, reportData, activeSections);
+  };
 
   // ═══════════ STEP 1: SELECT DOCUMENTS ═══════════════════════════════════
 
@@ -1128,7 +1044,6 @@ export default function ReportDownloadPanel({
                 onChange={(e) => setDocSearch(e.target.value)}
               />
             </div>
-
             {analyzedDocs.length === 0 ? (
               <div className="text-center py-8">
                 <ManuscriptIcon className="w-10 h-10 text-muted-foreground mx-auto mb-3 opacity-40" />
@@ -1191,7 +1106,6 @@ export default function ReportDownloadPanel({
                 })}
               </div>
             )}
-
             {documents.filter((d) => d.status !== "analyzed").length > 0 && (
               <>
                 <Separator className="my-4" />
@@ -1415,17 +1329,45 @@ export default function ReportDownloadPanel({
           </CardContent>
         </Card>
 
+        {/* Error display */}
+        {generateError && (
+          <div className="rounded-lg border border-rose-500/40 bg-rose-500/5 p-4">
+            <p className="text-sm text-rose-600 dark:text-rose-400 font-medium">
+              Report generation failed
+            </p>
+            <p className="text-xs text-rose-500 mt-1">{generateError}</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-3 text-xs"
+              onClick={() => setGenerateError(null)}
+            >
+              Dismiss
+            </Button>
+          </div>
+        )}
+
         <div className="flex justify-between">
-          <Button variant="outline" onClick={() => setStep("select-docs")}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              setStep("select-docs");
+              setReportData(null);
+            }}
+          >
             Back
           </Button>
           <Button
-            onClick={() => setStep("preview")}
-            disabled={activeSections.length === 0}
+            onClick={handleGenerateAndPreview}
+            disabled={activeSections.length === 0 || generating}
             className="shadow-sm"
           >
-            <LensIcon className="w-4 h-4 mr-2" />
-            Preview Report
+            {generating ? (
+              <SandglassIcon className="w-4 h-4 mr-2 animate-pulse" />
+            ) : (
+              <LensIcon className="w-4 h-4 mr-2" />
+            )}
+            {generating ? "Generating Report..." : "Preview Report"}
           </Button>
         </div>
       </div>
@@ -1433,8 +1375,8 @@ export default function ReportDownloadPanel({
 
   // ═══════════ STEP 3: PREVIEW ════════════════════════════════════════════
 
-  if (step === "preview") {
-    const rd = getReportData();
+  if (step === "preview" && reportData) {
+    const rd = reportData;
     const visSec = rd.sections.filter((s) => activeSections.includes(s.id));
     return (
       <div className={cn("space-y-6", className)}>
@@ -1492,7 +1434,6 @@ export default function ReportDownloadPanel({
               <span>Date: {rd.date}</span>
             </div>
           </div>
-
           {rd.analyzedDocuments.length > 0 && (
             <div className="mb-6 p-3 rounded-lg bg-muted/30 border border-border/30">
               <h4 className="text-xs font-semibold text-muted-foreground mb-2">
@@ -1510,7 +1451,6 @@ export default function ReportDownloadPanel({
               </div>
             </div>
           )}
-
           <div className="space-y-6">
             {visSec.map((sec) => (
               <AusgabeblattTable key={sec.id} section={sec} />
@@ -1595,11 +1535,12 @@ export default function ReportDownloadPanel({
                     Report generated successfully
                   </h3>
                   <p className="text-sm text-muted-foreground mt-1">
-                    {DEMO_REPORT.projectName} — {selectedPreset.name}
+                    {reportData?.projectName || "Report"} —{" "}
+                    {selectedPreset.name}
                   </p>
                   <p className="text-xs text-muted-foreground mt-0.5">
                     {selectedDocIds.size} documents · {activeSections.length}{" "}
-                    sections · {DEMO_REPORT.findings.length} action items
+                    sections · {reportData?.findings.length || 0} action items
                   </p>
                 </div>
                 {selectedFormats.length > 1 && (
@@ -1633,7 +1574,10 @@ export default function ReportDownloadPanel({
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => setStep("configure")}
+                    onClick={() => {
+                      setReportData(null);
+                      setStep("configure");
+                    }}
                   >
                     Generate Another
                   </Button>

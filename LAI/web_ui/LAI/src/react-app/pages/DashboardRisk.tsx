@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useEffect, useMemo } from "react";
 import {
   Card,
   CardContent,
@@ -36,6 +36,8 @@ import {
   DownloadIcon,
 } from "@/react-app/components/icons";
 import ReportDownloadPanel from "@/react-app/components/ReportDownloadPanel";
+import { fetchDocuments } from "@/react-app/lib/ddiqApi";
+import type { DocumentItem } from "@/react-app/lib/ddiqDemoData";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -50,55 +52,6 @@ interface RiskArea {
   flaggedItems: number;
   lastUpdated: string;
 }
-
-// Documents — same data as DashboardDocumentsPage
-const DOCUMENTS = [
-  {
-    id: "1",
-    name: "permit_application_2024.pdf",
-    size: 2.4,
-    uploadDate: "2024-02-18",
-    type: "PDF",
-    status: "analyzed" as const,
-    category: "Permits",
-  },
-  {
-    id: "2",
-    name: "land_lease_agreement.docx",
-    size: 1.1,
-    uploadDate: "2024-02-15",
-    type: "Word",
-    status: "analyzed" as const,
-    category: "Legal",
-  },
-  {
-    id: "3",
-    name: "environmental_impact_report.pdf",
-    size: 5.8,
-    uploadDate: "2024-02-14",
-    type: "PDF",
-    status: "analyzed" as const,
-    category: "Environmental",
-  },
-  {
-    id: "4",
-    name: "technical_specifications.xlsx",
-    size: 0.8,
-    uploadDate: "2024-02-10",
-    type: "Excel",
-    status: "pending" as const,
-    category: "Technical",
-  },
-  {
-    id: "5",
-    name: "grid_connection_procedure.pdf",
-    size: 3.2,
-    uploadDate: "2024-02-08",
-    type: "PDF",
-    status: "archived" as const,
-    category: "Grid",
-  },
-];
 
 const riskCfg = {
   low: {
@@ -130,8 +83,7 @@ const riskCfg = {
   },
 };
 
-// ─── Demo Data ──────────────────────────────────────────────────────────────
-// Same documents as DashboardDocumentsPage — later replace with shared state/context
+// ─── Risk Data (static — later can come from report analysis) ───────────────
 
 const RISKS: RiskArea[] = [
   {
@@ -209,6 +161,17 @@ export default function DashboardRiskPage() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<string | null>(null);
 
+  // ── Documents from backend ──
+  const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [docsLoading, setDocsLoading] = useState(true);
+
+  useEffect(() => {
+    fetchDocuments()
+      .then((res) => setDocuments(res.documents))
+      .catch((err) => console.error("Failed to load documents:", err))
+      .finally(() => setDocsLoading(false));
+  }, []);
+
   const filtered = useMemo(
     () =>
       RISKS.filter((r) => {
@@ -226,7 +189,7 @@ export default function DashboardRiskPage() {
     high: RISKS.filter((r) => r.riskLevel === "high").length,
   };
   const avg = Math.round(RISKS.reduce((s, r) => s + r.score, 0) / RISKS.length);
-  const analyzedCount = DOCUMENTS.filter((d) => d.status === "analyzed").length;
+  const analyzedCount = documents.filter((d) => d.status === "analyzed").length;
 
   return (
     <div className="space-y-6">
@@ -254,7 +217,6 @@ export default function DashboardRiskPage() {
           </TabsTrigger>
         </TabsList>
 
-        {/* Risk Assessment Tab */}
         <TabsContent value="assessment" className="space-y-6 mt-6">
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <Card className="bg-card/50 backdrop-blur border-border/50">
@@ -491,9 +453,17 @@ export default function DashboardRiskPage() {
           </Card>
         </TabsContent>
 
-        {/* DDiQ Reports Tab — passes documents as props */}
         <TabsContent value="reports" className="mt-6">
-          <ReportDownloadPanel documents={DOCUMENTS} />
+          {docsLoading ? (
+            <div className="flex items-center justify-center py-16">
+              <SandglassIcon className="w-6 h-6 text-muted-foreground animate-pulse mr-3" />
+              <span className="text-muted-foreground">
+                Loading documents...
+              </span>
+            </div>
+          ) : (
+            <ReportDownloadPanel documents={documents} />
+          )}
         </TabsContent>
       </Tabs>
     </div>
