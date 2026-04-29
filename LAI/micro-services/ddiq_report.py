@@ -365,9 +365,16 @@ class RueckbauBond(BaseModel):
 
 class DDiQReportData(BaseModel):
     projectName: str; preparedBy: str; preparedFor: str; date: str; projectCenter: dict
-    sections: list[AusgabeblattSection]; weaStatuses: list[WEAStatus]
-    infrastructure: list[InfraPoint]; parcels: list[CadastralParcel]
-    findings: list[Finding]; analyzedDocuments: list[str]
+    # Defaults to empty so we can construct the report at the start of the
+    # pipeline and fill fields in as each phase completes — supports
+    # incremental persistence, so a mid-pipeline crash still leaves a
+    # usable report instead of an empty placeholder row.
+    sections: list[AusgabeblattSection] = []
+    weaStatuses: list[WEAStatus] = []
+    infrastructure: list[InfraPoint] = []
+    parcels: list[CadastralParcel] = []
+    findings: list[Finding] = []
+    analyzedDocuments: list[str] = []
     projectArea: Optional[dict] = None          # Project area polygon data
     clearanceZones: Optional[list[dict]] = None  # WEA clearance zone circles
     validation: Optional[dict] = None            # Validation report
@@ -1754,6 +1761,37 @@ def _update_report_progress(report_id: str, step: Optional[str] = None,
         logger.warning(f"progress update failed for {report_id}: {e}")
 
 
+def _persist_report_jsonb(rid: str, project_name: str, doc_ids: list, preset: str,
+                          report: "DDiQReportData") -> None:
+    """Best-effort UPSERT of just the report_data JSONB. Used as a checkpoint
+    after each major pipeline phase — if a later phase crashes, the row
+    still has the partial report from the last successful checkpoint
+    instead of the empty '{}' placeholder.
+
+    Cheap (one round-trip per phase) and idempotent: re-running the same
+    pipeline overwrites the row in place. Auxiliary table writes
+    (ddiq_contracts, ddiq_classified_parcels, ddiq_project_areas) are
+    deliberately NOT done here — those are write-once-at-end to avoid
+    duplicate rows from re-running."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO ddiq_reports (id, project_name, document_ids, preset, report_data)
+                       VALUES (%s, %s, %s::uuid[], %s, %s)
+                       ON CONFLICT (id) DO UPDATE SET
+                           project_name = EXCLUDED.project_name,
+                           document_ids = EXCLUDED.document_ids,
+                           preset = EXCLUDED.preset,
+                           report_data = EXCLUDED.report_data""",
+                    (rid, project_name, doc_ids, preset, json.dumps(report.dict())),
+                )
+    except Exception as e:
+        # Checkpoint failure shouldn't kill the pipeline — the next checkpoint
+        # (or the final UPSERT) will catch up.
+        logger.warning(f"checkpoint persist for {rid} failed: {e}")
+
+
 def _run_report_generation_job(rid: str, req: "GenerateReportRequest") -> None:
     """Runs the same pipeline as the sync /report/generate, but writes
     progress + final report into the existing ddiq_reports row instead
@@ -1865,11 +1903,29 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     pfor = req.prepared_for or meta.get("preparedFor", "Client")
     progress("metadata", 0.05)
 
+    # ── Build the report object up-front and persist it incrementally as
+    # each phase completes. If the pipeline crashes mid-run, the row in
+    # ddiq_reports.report_data still has the partial state from the last
+    # successful checkpoint instead of the empty '{}' placeholder. The
+    # final checkpoint at the end of this function is byte-identical to
+    # what a single end-of-pipeline UPSERT would have written.
+    from datetime import datetime
+    report = DDiQReportData(
+        projectName=pname, preparedBy="LAI Due Diligence System", preparedFor=pfor,
+        date=datetime.now().strftime("%d %B %Y"),
+        projectCenter={"lat": 53.0, "lng": 9.0},  # placeholder — overwritten after geocoding
+        analyzedDocuments=doc_names,
+        documentMap=document_map,
+    )
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+
     t = time.time()
     progress("sections", 0.07)
     sections = [analyze_section(req.document_ids, s) for s in ["overview","land","permits","economics"]]
     T["sections_s"] = round(time.time()-t, 2)
     progress("sections_done", 0.55)  # sections is the bulk (~80% of wall time)
+    report.sections = sections
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
 
     t = time.time()
     progress("geocoding", 0.55)
@@ -1880,8 +1936,13 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
 
     progress("wea_extraction", 0.58)
     t = time.time(); weas = extract_wea_statuses(req.document_ids, full_text, sections, pc); T["wea_s"] = round(time.time()-t, 2)
+    report.weaStatuses = weas
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+
     progress("infrastructure", 0.70)
     t = time.time(); infra = extract_infrastructure(req.document_ids, sections, pc); T["infra_s"] = round(time.time()-t, 2)
+    report.infrastructure = infra
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
 
     # ── 13-Step Cadastral Pipeline ────────────────────────────────────────
     progress("cadastral", 0.78)
@@ -1932,6 +1993,33 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
         t = time.time(); legacy_parcels = build_parcels(req.document_ids, full_text, weas, pc, ploc); T["parcels_legacy_s"] = round(time.time()-t, 2)
         parcels = legacy_parcels
 
+    # Stash cadastral artifacts on the report so the checkpoint right after
+    # this phase is materially complete (parcels + project area + clearance
+    # zones + validation + geojson) — even if findings/timeline/etc fail
+    # later, the lawyer still gets a usable map from this checkpoint.
+    lats0 = [w.lat for w in weas if w.lat != 0]; lngs0 = [w.lng for w in weas if w.lng != 0]
+    center0 = {"lat": sum(lats0)/len(lats0) if lats0 else (pc[0] if pc else 53.0),
+               "lng": sum(lngs0)/len(lngs0) if lngs0 else (pc[1] if pc else 9.0)}
+    clearance_data0 = [
+        {"wea_name": z.wea_name, "center_lat": z.center_lat, "center_lng": z.center_lng,
+         "radius_m": z.radius_m, "polygon": z.polygon,
+         "radius_source": z.__dict__.get("_radius_source")}
+        for z in pipeline_result.clearance_zones
+    ] if pipeline_result.clearance_zones else None
+    pa0 = pipeline_result.project_area
+    project_area_data0 = {
+        "name": pa0.name, "polygon": pa0.polygon,
+        "centroid_lat": pa0.centroid_lat, "centroid_lng": pa0.centroid_lng,
+        "area_km2": pa0.area_km2, "source": pa0.source,
+    } if pa0 and pa0.polygon else None
+    report.projectCenter = center0
+    report.parcels = parcels
+    report.projectArea = project_area_data0
+    report.clearanceZones = clearance_data0
+    report.validation = pipeline_result.validation.dict() if pipeline_result.validation else None
+    report.geojson = pipeline_result.geojson if pipeline_result.geojson else None
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+
     # Parse total capacity from the overview section to feed materiality
     # quantification (mw_affected sizing) and cross-doc consistency.
     total_mw = None
@@ -1947,30 +2035,40 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     t = time.time()
     findings = generate_findings(req.document_ids, sections, total_capacity_mw=total_mw)
     T["findings_s"] = round(time.time()-t, 2)
+    report.findings = findings  # may be augmented with deadline/rueckbau/grundbuch findings later
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
 
     # P0 #2: Timeline / deadline pass
     progress("timeline", 0.88)
     t = time.time()
     timeline = extract_timeline(req.document_ids, full_text)
     T["timeline_s"] = round(time.time()-t, 2)
+    report.timeline = timeline
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
 
     # P0 #3: Cross-document consistency check
     progress("cross_doc", 0.91)
     t = time.time()
     cross_doc_findings = check_cross_doc_consistency(sections, weas, parcels, total_capacity_mw=total_mw)
     T["cross_doc_s"] = round(time.time()-t, 2)
+    report.crossDocFindings = cross_doc_findings
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
 
     # P1 #9: Rückbaubürgschaft extraction
     progress("rueckbau", 0.93)
     t = time.time()
     rueckbau = extract_rueckbau_bond(req.document_ids)
     T["rueckbau_s"] = round(time.time()-t, 2)
+    report.rueckbauBond = rueckbau
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
 
     # P1 #6: Grundbuch lessor-vs-owner check on secured parcels
     progress("grundbuch", 0.95)
     t = time.time()
     grundbuch_checks = check_grundbuch_match(req.document_ids, parcels)
     T["grundbuch_s"] = round(time.time()-t, 2)
+    report.grundbuchChecks = grundbuch_checks
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
 
     # Promote material timeline events (urgent / expired) into Findings so
     # the lawyer's findings list reflects deadline pressure, not just
@@ -2018,60 +2116,19 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
 
     # Combine all findings; section findings stay first, then derived.
     all_findings = list(findings) + deadline_findings
+    report.findings = all_findings
+    # Final report_data checkpoint — byte-identical to what the
+    # original single end-of-pipeline UPSERT wrote.
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
 
-    lats = [w.lat for w in weas if w.lat != 0]; lngs = [w.lng for w in weas if w.lng != 0]
-    center = {"lat": sum(lats)/len(lats) if lats else (pc[0] if pc else 53.0),
-              "lng": sum(lngs)/len(lngs) if lngs else (pc[1] if pc else 9.0)}
-
-    from datetime import datetime
-
-    # Prepare clearance zones for report — include the radius source so the
-    # frontend can show '10H rule (BayBO Art. 82)' next to the circle.
-    clearance_data = [
-        {"wea_name": z.wea_name, "center_lat": z.center_lat, "center_lng": z.center_lng,
-         "radius_m": z.radius_m, "polygon": z.polygon,
-         "radius_source": z.__dict__.get("_radius_source")}
-        for z in pipeline_result.clearance_zones
-    ] if pipeline_result.clearance_zones else None
-
-    # Prepare project area for report
+    # Auxiliary-table writes (ddiq_project_areas / ddiq_contracts /
+    # ddiq_classified_parcels). These are write-once-at-end because they
+    # have no ON CONFLICT handling — running them twice would create
+    # duplicates. The report_data JSONB above already has a copy of all
+    # this data; the relational tables are for query performance only.
     pa = pipeline_result.project_area
-    project_area_data = {
-        "name": pa.name, "polygon": pa.polygon,
-        "centroid_lat": pa.centroid_lat, "centroid_lng": pa.centroid_lng,
-        "area_km2": pa.area_km2, "source": pa.source,
-    } if pa and pa.polygon else None
-
-    report = DDiQReportData(projectName=pname, preparedBy="LAI Due Diligence System", preparedFor=pfor,
-        date=datetime.now().strftime("%d %B %Y"), projectCenter=center, sections=sections,
-        weaStatuses=weas, infrastructure=infra, parcels=parcels, findings=all_findings,
-        analyzedDocuments=doc_names,
-        projectArea=project_area_data,
-        clearanceZones=clearance_data,
-        validation=pipeline_result.validation.dict() if pipeline_result.validation else None,
-        geojson=pipeline_result.geojson if pipeline_result.geojson else None,
-        timeline=timeline,
-        crossDocFindings=cross_doc_findings,
-        grundbuchChecks=grundbuch_checks,
-        rueckbauBond=rueckbau,
-        documentMap=document_map,
-    )
-
-    # UPSERT into ddiq_reports — sync path inserts a fresh row, async path
-    # updates the row that /report/generate/async pre-created.
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO ddiq_reports (id, project_name, document_ids, preset, report_data)
-                   VALUES (%s, %s, %s::uuid[], %s, %s)
-                   ON CONFLICT (id) DO UPDATE SET
-                       project_name = EXCLUDED.project_name,
-                       document_ids = EXCLUDED.document_ids,
-                       preset = EXCLUDED.preset,
-                       report_data = EXCLUDED.report_data""",
-                (rid, pname, req.document_ids, req.preset, json.dumps(report.dict())),
-            )
-
             # Persist project area first (parent of contracts and parcels)
             if pa and pa.polygon:
                 cur.execute(
