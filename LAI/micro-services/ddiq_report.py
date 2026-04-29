@@ -1905,8 +1905,11 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     try: meta = llm_json(EXTRACTION_SYSTEM, f"""Extract metadata.\n\n{rag_context(req.document_ids,'project name company location',3)}\n\nReturn: {{"projectName":"name","preparedFor":"company"}}""")
     except Exception: meta = {}
     T["meta_s"] = round(time.time()-t, 2)
-    pname = req.project_name or meta.get("projectName", "Wind Energy Project")
-    pfor = req.prepared_for or meta.get("preparedFor", "Client")
+    # Triple fallback: explicit request → LLM-extracted metadata → hard default.
+    # The middle term can be None when the LLM returns {"projectName": null}, so
+    # we can't rely on dict.get's default arg here.
+    pname = req.project_name or meta.get("projectName") or "Wind Energy Project"
+    pfor = req.prepared_for or meta.get("preparedFor") or "Client"
     progress("metadata", 0.05)
 
     # ── Build the report object up-front and persist it incrementally as
