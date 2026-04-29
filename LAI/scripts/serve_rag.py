@@ -179,18 +179,55 @@ WIND_LEASE_PLAYBOOK = [
 ]
 
 
-def build_rag_messages(question: str, sources: list[str]) -> list[dict]:
+# Conversational memory: how much prior history to inject into the LLM prompt.
+# 16 messages = 8 turns of back-and-forth, enough for sticky preferences and
+# coreference ("tell me more about it") without blowing up the prompt budget.
+# Each message is also clipped to MAX_HIST_CHARS_PER_MSG so a runaway long
+# answer in turn 1 can't push out the rest of the conversation.
+HISTORY_MAX_MESSAGES = 16
+MAX_HIST_CHARS_PER_MSG = 4000
+
+
+def _load_history(session_id: str | None) -> list[dict]:
+    """Load prior user/assistant turns for a session in OpenAI chat format.
+    Returns [] for a brand-new session or any persistence failure — chat
+    must never break because the history layer hiccuped."""
+    if not session_id:
+        return []
+    try:
+        msgs = persistence.list_messages(session_id)
+    except Exception:
+        return []
+    # Keep only the most recent window. Filter to user/assistant (drop any
+    # mode-tag rows that aren't actual chat turns) and clip overlong messages.
+    out: list[dict] = []
+    for m in msgs[-HISTORY_MAX_MESSAGES:]:
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = (m.get("content") or "")
+        if len(content) > MAX_HIST_CHARS_PER_MSG:
+            content = content[:MAX_HIST_CHARS_PER_MSG] + "\n[...truncated]"
+        out.append({"role": role, "content": content})
+    return out
+
+
+def build_rag_messages(question: str, sources: list[str],
+                       history: list[dict] | None = None) -> list[dict]:
     src_block = "\n\n".join(f"[Quelle {i+1}]\n{s}" for i, s in enumerate(sources))
     user = f"Rechtstexte:\n{src_block}\n\nFrage: {question}"
     return [
         {"role": "system", "content": RAG_SYSTEM},
+        *(history or []),
         {"role": "user",   "content": user},
     ]
 
 
-def build_chat_messages(question: str) -> list[dict]:
+def build_chat_messages(question: str,
+                        history: list[dict] | None = None) -> list[dict]:
     return [
         {"role": "system", "content": CHAT_SYSTEM},
+        *(history or []),
         {"role": "user",   "content": question},
     ]
 
@@ -855,6 +892,13 @@ def query(req: QueryReq):
         if contract_sess and contract_sess.get("contract_text"):
             contract_text = contract_sess["contract_text"][:8000]
 
+    # Prior chat turns for the same session — gives the model conversational
+    # memory across requests. Without this, every turn is stateless and
+    # follow-ups like "tell me more about it" or "answer in English from now on"
+    # are silently dropped. Loaded BEFORE we inject the current question so
+    # the new turn isn't double-counted.
+    history = _load_history(sid)
+
     if use_rag and use_contract:
         mode = "rag+contract"
         # Make the upload's authority explicit so the model doesn't conflate
@@ -868,19 +912,20 @@ def query(req: QueryReq):
             "[Hintergrund-Quelle aus dem Korpus — nur für Kontext, NICHT der Vertrag des Nutzers]\n" + s
             for s in rag_sources
         ]
-        msgs = build_rag_messages(req.question, [contract_block] + bg_blocks)
+        msgs = build_rag_messages(req.question, [contract_block] + bg_blocks, history=history)
     elif use_rag:
         mode = "rag"
-        msgs = build_rag_messages(req.question, rag_sources)
+        msgs = build_rag_messages(req.question, rag_sources, history=history)
     elif use_contract:
         mode = "contract"
         msgs = build_rag_messages(
             req.question,
             ["[HOCHGELADENER VERTRAG]\n" + contract_text],
+            history=history,
         )
     else:
         mode = "chat"
-        msgs = build_chat_messages(req.question)
+        msgs = build_chat_messages(req.question, history=history)
 
     t0 = time.time()
     answer, prompt_tokens, completion_tokens = llm_generate(

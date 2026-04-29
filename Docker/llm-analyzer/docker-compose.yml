@@ -22,6 +22,7 @@ services:
       --trust-remote-code
       --gpu-memory-utilization ${ANALYZER_GPU_MEM_UTIL:-0.85}
       --reasoning-parser qwen3
+      --enable-prefix-caching
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
       HF_HUB_OFFLINE: "1"
