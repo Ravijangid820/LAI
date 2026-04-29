@@ -2205,6 +2205,48 @@ def generate_report(req: GenerateReportRequest):
             )
     return GenerateReportResponse(report_id=rid, report=report, timings=T)
 
+@router.get("/reports")
+def list_reports(limit: int = 50):
+    """Recent DDiQ reports for the Past Reports browser. Returns lightweight
+    summary rows (no full report_data) so the listing is cheap even with
+    hundreds of historical reports. Click-to-load fetches the full payload
+    via GET /report/{id}."""
+    if limit < 1: limit = 1
+    if limit > 200: limit = 200
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id, project_name, status, created_at, started_at, finished_at,
+                          progress_percent, error, preset,
+                          COALESCE(array_length(document_ids, 1), 0) AS doc_count,
+                          COALESCE(jsonb_array_length(report_data->'findings'), 0) AS finding_count
+                   FROM ddiq_reports
+                   ORDER BY created_at DESC NULLS LAST
+                   LIMIT %s""",
+                (limit,),
+            )
+            rows = cur.fetchall()
+    return {
+        "reports": [
+            {
+                "report_id": str(r["id"]),
+                "project_name": r["project_name"],
+                "status": r["status"] or "done",
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+                "progress_percent": float(r["progress_percent"] or 0.0),
+                "error": r["error"],
+                "doc_count": r["doc_count"] or 0,
+                "finding_count": r["finding_count"] or 0,
+                "preset": r["preset"],
+            }
+            for r in rows
+        ],
+        "total": len(rows),
+    }
+
+
 @router.get("/report/{report_id}")
 def get_report(report_id: str):
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
