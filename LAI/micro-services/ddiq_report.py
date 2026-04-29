@@ -1553,6 +1553,12 @@ def generate_findings(doc_ids, sections, total_capacity_mw: Optional[float] = No
 
     # Build the LLM prompt as JSON — easier for the model to ground each
     # finding back to a specific flagged row + its anchor + its evidence.
+    # Pre-serialise the issues list outside the f-string so dict literals
+    # don't collide with f-string brace escaping.
+    issues_json = json.dumps(
+        [{"i": i + 1, **f} for i, f in enumerate(flagged)],
+        ensure_ascii=False,
+    )
     capacity_hint = f"\nProject total capacity (for MW-affected sizing): {total_capacity_mw} MW" if total_capacity_mw else ""
     prompt = f"""You are drafting the FINDINGS chapter of a wind-park red-flag DD report.
 For each material issue, produce one Finding with:
@@ -1572,7 +1578,7 @@ For each material issue, produce one Finding with:
   attached upstream; you only return indices.{capacity_hint}
 
 Issues to draw from (1-indexed):
-{json.dumps([{{"i": i+1, **f} for i, f in enumerate(flagged)}], ensure_ascii=False)}
+{issues_json}
 
 Return JSON array. Use null for any field you cannot determine. Prioritise issues
 that block financial close (title, BImSchG bestandskräftig, EEG award, Rückbaubond)
