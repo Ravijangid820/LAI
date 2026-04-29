@@ -505,7 +505,13 @@ def llm_call(system, user, temperature=0.1, max_tokens=2048):
     resp = requests.post(f"{LLM_URL}/chat/completions", json={"model": LLM_MODEL,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "max_tokens": max_tokens, "temperature": temperature}, timeout=300)
-    resp.raise_for_status(); return resp.json()["choices"][0]["message"]["content"].strip()
+    resp.raise_for_status()
+    # vLLM occasionally returns content=null when the model emits a stop
+    # token immediately (empty completion). Guard with `or ""` so .strip()
+    # doesn't blow up — the caller's JSON parse will then fail cleanly
+    # and fall back to its own error path instead of crashing the pipeline.
+    content = resp.json()["choices"][0]["message"].get("content") or ""
+    return content.strip()
 
 def llm_json(system, user, temperature=0.0):
     raw = llm_call(system, user, temperature, max_tokens=4096)
