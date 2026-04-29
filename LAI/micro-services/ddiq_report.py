@@ -2257,6 +2257,30 @@ def get_report(report_id: str):
             "project_name": row["project_name"], "report": row["report_data"]}
 
 
+@router.delete("/report/{report_id}")
+def delete_report(report_id: str):
+    """Hard-delete a report and all its cadastral artifacts. Idempotent —
+    returns 404 if the id is unknown. The report_data JSONB has its own
+    copy of parcels/contracts/areas, but the relational rows in the
+    auxiliary tables (ddiq_classified_parcels, ddiq_contracts,
+    ddiq_project_areas) reference report_id without an FK CASCADE, so
+    we clean them up explicitly in one transaction.
+
+    ddiq_contract_parcels.contract_id has ON DELETE CASCADE on its FK to
+    ddiq_contracts(id), so deleting the contracts row automatically
+    drops its child contract_parcels rows."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM ddiq_reports WHERE id = %s", (report_id,))
+            if not cur.fetchone():
+                raise HTTPException(404, "Report not found")
+            cur.execute("DELETE FROM ddiq_classified_parcels WHERE report_id = %s", (report_id,))
+            cur.execute("DELETE FROM ddiq_contracts WHERE report_id = %s", (report_id,))
+            cur.execute("DELETE FROM ddiq_project_areas WHERE report_id = %s", (report_id,))
+            cur.execute("DELETE FROM ddiq_reports WHERE id = %s", (report_id,))
+    return {"deleted": True, "report_id": report_id}
+
+
 @router.get("/report/{report_id}/geojson")
 def get_report_geojson(report_id: str):
     """Return GeoJSON FeatureCollection for GIS import (QGIS, ArcGIS, MapBox, etc.)."""
