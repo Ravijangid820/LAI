@@ -176,6 +176,40 @@ uv run pytest -m "not slow"      # Skip slow tests
 
 ## API Endpoints
 
+> **Runtime today vs. planned v5.** What's actually running (and shipping in `MVP_DELIVERY.md`) is the two-service split below: `serve_rag` for the conversational legal assistant on `:18000` and `lai-backend` (the DDiQ microservice) for multi-doc due-diligence reports on `:18001`. The planned `src/lai/` domain-driven backend in the next subsection is the v5 design target — those endpoints (`/extraction/locations/...`, schema-per-user multi-tenancy) are not yet wired into the runtime.
+
+### Runtime: serve_rag (`:18000`) — conversational chat
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/query` | Ask a legal question (auto-routes RAG / chat / contract / rag+contract); injects last 16 user/assistant turns from sessions.db as conversation memory |
+| `POST` | `/upload` | Upload PDF/DOCX (OCR via Tesseract de+en, segment, embed, store) and bind to a session |
+| `GET`  | `/sessions` | List recent chat sessions for the sidebar (light payload, auto-derived titles) |
+| `GET`  | `/sessions/{id}` | Full session payload — metadata + last analysis + message history (for UI rehydration on refresh) |
+| `POST` | `/sessions/{id}/messages` | Append a user/assistant message |
+| `PATCH`| `/sessions/{id}` | Set a user-facing title (rename) |
+| `DELETE`| `/sessions/{id}` | Delete a session |
+| `GET`  | `/health` | Liveness |
+
+### Runtime: lai-backend / DDiQ microservice (`:18001`) — multi-doc due-diligence
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/ddiq/documents/upload` | Upload PDF (Tesseract OCR + 4096-dim Qwen3-Embedding-8B chunks → pgvector) |
+| `GET`  | `/ddiq/documents` | List uploaded DDiQ documents |
+| `POST` | `/ddiq/report/generate` | Sync report generation — kept for back-compat; blocks for the entire 30-90 min runtime |
+| `POST` | `/ddiq/report/generate/async` | **Preferred.** Returns `{report_id, status:"queued", cached?}` immediately; backend executor runs the pipeline. Request-fingerprint dedup (sorted doc_ids + preset + project_name) returns the cached row instantly when matched. |
+| `GET`  | `/ddiq/report/{id}/status` | Cheap status poll (status, step, percent, error) |
+| `GET`  | `/ddiq/report/{id}` | Full report payload (sections, WEAs, parcels, findings, timeline, crossDocFindings, grundbuchChecks, rueckbauBond, geojson) |
+| `GET`  | `/ddiq/report/{id}/geojson` | GeoJSON FeatureCollection for QGIS / ArcGIS / MapBox |
+| `GET`  | `/ddiq/reports?limit=N` | Lightweight summary list for the Past Reports browser (no full report_data) |
+| `DELETE`| `/ddiq/report/{id}` | Hard-delete a report and cascade through `ddiq_classified_parcels` / `ddiq_contracts` / `ddiq_project_areas` in one transaction |
+| `GET`  | `/ddiq/config/map-tiles` | Map tile layer config for the frontend Leaflet map |
+
+> **Auth status (Apr 30):** the frontend `AuthContext` is currently a demo that accepts any credentials; both backends do not validate JWTs and do not scope by user. Sessions / documents / reports are globally visible. Real auth + user scoping is on the to-do list before any shared deployment — see `MVP_DELIVERY.md` "Known gaps".
+
+### Planned v5 (`src/lai/` domain-driven backend, not yet runtime)
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/query` | Ask a legal question (full RAG pipeline) |

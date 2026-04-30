@@ -31,6 +31,17 @@ uv run python -m lai.api.main
 # API at http://localhost:8000, docs at http://localhost:8000/docs
 ```
 
+## Runtime services (what's actually shipping)
+
+The MVP runtime is a **two-service split** that runs alongside the data pipeline above:
+
+- **`serve_rag`** (host process, `:18000`) — the conversational legal assistant. Document upload + clause analyzer + RAG-grounded chat with conversational memory + vLLM prefix caching. Started via `bash scripts/start.sh`.
+- **`lai-backend`** (Docker container, `:18001`) — the DDiQ multi-document due-diligence microservice at [`micro-services/`](micro-services/). Async report generation with request-fingerprint dedup, incremental persistence, statutory-anchor section prompts, timeline / cross-doc / Grundbuch / Rückbau extraction passes, 10H rule. Brought up via `docker compose -f micro-services/docker-compose.yml up -d`.
+
+The frontend lives in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), cloned by convention to `/data/projects/lai/lai-ui/` (override via `LAI_UI_DIR`).
+
+See [`docs/MVP_DELIVERY.md`](docs/MVP_DELIVERY.md) for the full feature list and [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) for the API endpoint catalog.
+
 ## Data Processing Pipeline
 
 6-step pipeline for preparing the 672GB corpus for both RAG and fine-tuning:
