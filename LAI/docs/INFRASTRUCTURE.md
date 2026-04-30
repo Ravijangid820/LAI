@@ -40,17 +40,30 @@ docker network create lai_network
 
 ### Service Map
 
-| Service | Directory | Container Name | Port | GPU |
-|---------|-----------|----------------|------|-----|
-| PostgreSQL + pgvector | `Docker/database/pgvector/` | lai_postgres | 5433 | - |
-| MinIO | `Docker/database/minio/` | lai_minio | 9000, 9001 | - |
-| Redis | `Docker/database/redis/` | lai_redis | 6380 | - |
-| Embedding (BGE-M3) | `Docker/embedding/` | lai_embedding | 8003 | GPU 0 |
-| Reranker (MiniLM) | `Docker/reranker/` | lai_reranker | 8004 | GPU 0 |
-| LLM (Qwen2.5-7B) | `Docker/llm/` | lai_llm | 8001 | GPU 1 |
-| MLflow | `Docker/mlflow/` | lai_mlflow | 5000 | - |
-| Prometheus | `Docker/monitoring/` | lai_prometheus | 9090 | - |
-| Grafana | `Docker/monitoring/` | lai_grafana | 3001 | - |
+> **Runtime today (Apr 2026).** Models and ports below reflect what's actually running. The pipeline DB on `:5433` is from the v5-planning-target (used by `src/lai/` data pipeline); the runtime DB used by the DDiQ microservice is `lai_postgres_main` on `:5434`. The reranker and analyzer LLM have both been upgraded since this doc was first written; ML-services entries that just say "vLLM" or "Docker" were swapped for newer model checkpoints in place.
+
+| Service | Directory / source | Container | Port | GPU | Notes |
+|---|---|---|---|---|---|
+| Pipeline pgvector | `Docker/database/pgvector/` | `lai_postgres` | 5433 | – | Used by `lai.pipeline` (corpus chunks, classifications). |
+| **Runtime pgvector** | `Docker/database/pgvector-v2/` | `lai_postgres_main` | 5434 | – | **Used by the DDiQ microservice + chat — this is the live runtime DB.** |
+| MinIO | `Docker/database/minio/` | `lai_minio` | 9000, 9001 | – | Raw corpus + segments + report exports. |
+| Redis | `Docker/database/redis/` | `lai_redis` | 6380 | – | |
+| Embedding | `Docker/embedding/` | `lai_embedding` | 8003 | GPU 0 | **Qwen3-Embedding-8B** (4096 dims, halfvec). Replaced BGE-M3. |
+| Analyzer LLM | `Docker/llm-analyzer/` (or `Docker/llm/`) | `lai_analyzer_llm` | 8005 | GPU 0 | **Qwen3.6-27B with thinking-mode** + `--enable-prefix-caching`. Used by both serve_rag (`/query`) and DDiQ. |
+| Reranker | host-side (in-process) | – | – | (host) | **Qwen3-Reranker-8B** loaded into the `serve_rag.py` host process; the standalone `Docker/reranker/` container is legacy (still tracked in compose but not started by `start.sh`). |
+| Backend microservice (DDiQ) | `LAI/micro-services/` | `lai-backend` | 18001 | – | FastAPI; uses `lai_postgres_main`, talks HTTP to `lai_analyzer_llm` + `lai_embedding`, talks back to `serve_rag` for the in-process reranker. Async report flow + dedup + incremental persistence. |
+| MLflow | `Docker/mlflow/` | `lai_mlflow` | 5000 | – | |
+| Prometheus | `Docker/monitoring/` | `lai_prometheus` | 9090 | – | |
+| Grafana | `Docker/monitoring/` | `lai_grafana` | 3001 | – | |
+
+### Host processes (not Docker)
+
+Started via `bash scripts/start.sh` from the LAI repo root:
+
+| Process | Port | Notes |
+|---|---|---|
+| `serve_rag.py` | 18000 | Conversational chat backend — RAG pipeline + clause analyzer + 16-message conversation memory + in-process Qwen3-Reranker-8B. Default bind `127.0.0.1`; override with `LAI_BIND_HOST=0.0.0.0` for VPN-trusted LAN. |
+| Vite UI | 5173 | Frontend lives in its own repo at `/data/projects/lai/lai-ui/` (the [LAI-UI](https://github.com/Ravijangid820/LAI-UI) clone, sibling to `LAI/`). Override with `LAI_UI_DIR`. `start.sh` runs `npm install` on first launch. |
 
 ### Starting Services
 

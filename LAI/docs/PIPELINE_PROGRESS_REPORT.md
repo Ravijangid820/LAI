@@ -6,11 +6,51 @@
 
 ---
 
+## Update — 2026-04-30
+
+This report is a snapshot from late March; what's below describes the
+state at the time and is preserved as historical context. Pipeline
+progress as of April 30:
+
+- **Steps 1, 2, 3, 4, 6 complete.** Step 5 (synthetic Q&A generation)
+  was reported in-progress in March with a ~46h ETA; current run state
+  lives in `LAI/processed/pipeline_local.db` and the MinIO export.
+- **Embedding model upgraded.** The original report cites
+  Qwen3-Embedding-8B at **1024 dims**; the actual deployed model emits
+  **4096 dims**, stored as `halfvec(4096)` on Postgres because 4096
+  exceeds pgvector's HNSW index limit (search uses exact cosine).
+  Schema and Step 6 code updated accordingly (commit
+  `0f374f3 feat(pipeline): step 6 on Qwen3-Embedding-8B (halfvec 4096)`).
+- **Reranker upgraded.** The original "Cross-encoder via vLLM (MiniLM)"
+  was replaced with **Qwen3-Reranker-8B** (multilingual, in-process
+  inside `serve_rag.py`). The standalone Docker reranker container is
+  legacy and not started by `start.sh`.
+- **Analyzer LLM upgraded.** Step-3 classification numbers below were
+  produced on Qwen2.5-72B-Instruct-AWQ; the runtime analyzer LLM is now
+  **Qwen3.6-27B with thinking-mode** (lai_analyzer_llm container, port
+  8005). The 72B-AWQ checkpoint is still the pipeline-side workhorse
+  for synthetic data generation.
+- **Production fine-tune merged.** A LoRA fine-tune of Qwen2.5-7B on
+  Step-5 synthetic data produced
+  `/data/projects/lai/models/qwen25-7b-legal-merged`; this is the
+  default LLM for inference in `serve_rag.py`.
+- **Runtime services on top of the pipeline:** see
+  [`MVP_DELIVERY.md`](MVP_DELIVERY.md) for the conversational chat
+  (`serve_rag` on `:18000`) and DDiQ multi-doc due-diligence pipeline
+  (`lai-backend` microservice on `:18001`) that consume the corpus the
+  steps below produce.
+
+The original status-and-numbers below remain accurate **for the date
+they were taken (2026-03-23)**; treat them as a snapshot, not as live
+state.
+
+---
+
 ## Executive Summary
 
 The LAI data processing pipeline converts 672GB of raw German legal documents into a production-ready RAG (Retrieval-Augmented Generation) system and fine-tuning dataset. The pipeline has been designed, implemented, and partially executed across 6 steps, processing the highest-value data sources first.
 
-**Current status:** Steps 1-3 complete for Phase 1 data. Steps 4-6 pending LLM/embedding container availability.
+**Current status (as of 2026-03-23):** Steps 1-3 complete for Phase 1 data. Steps 4-6 pending LLM/embedding container availability.
 
 ---
 
