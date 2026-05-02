@@ -54,6 +54,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     analysis_json            TEXT,
     extraction_quality_json  TEXT,
     upload_ext               TEXT,
+    -- Pinned conversational context: stable user/project facts extracted
+    -- from the first few turns and refreshed periodically. Survives the
+    -- 32-msg rolling window so long sessions don't lose T1 facts like
+    -- "user is Anika at Nordlicht Wind, evaluating Lamstedt".
+    session_meta_json        TEXT,
     created_at               REAL NOT NULL,
     updated_at               REAL NOT NULL
 );
@@ -94,10 +99,12 @@ def init(db_path: Path, uploads_dir: Path) -> None:
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
 
-    # Forward-compat migration — older DBs predate the `title` column.
+    # Forward-compat migration — older DBs predate these columns.
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
     if "title" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+    if "session_meta_json" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN session_meta_json TEXT")
 
     _STATE["conn"] = conn
     _STATE["uploads_dir"] = uploads_dir
@@ -315,6 +322,31 @@ def list_messages(session_id: str) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def get_session_meta(session_id: str) -> Optional[dict]:
+    """Pinned conversational context (user name, project, key dates, ...)
+    extracted by the LLM and saved alongside the session. None when the
+    column is empty (brand-new session or extraction never ran)."""
+    row = _conn().execute(
+        "SELECT session_meta_json FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if not row or not row["session_meta_json"]:
+        return None
+    try:
+        return json.loads(row["session_meta_json"])
+    except json.JSONDecodeError:
+        return None
+
+
+def set_session_meta(session_id: str, meta: dict) -> None:
+    """Persist a refreshed metadata snapshot for the session."""
+    with _STATE["lock"]:
+        _conn().execute(
+            "UPDATE sessions SET session_meta_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(meta, ensure_ascii=False), time.time(), session_id),
+        )
 
 
 # ---------------------------------------------------------------------------

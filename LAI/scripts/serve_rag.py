@@ -180,12 +180,119 @@ WIND_LEASE_PLAYBOOK = [
 
 
 # Conversational memory: how much prior history to inject into the LLM prompt.
-# 16 messages = 8 turns of back-and-forth, enough for sticky preferences and
-# coreference ("tell me more about it") without blowing up the prompt budget.
-# Each message is also clipped to MAX_HIST_CHARS_PER_MSG so a runaway long
-# answer in turn 1 can't push out the rest of the conversation.
-HISTORY_MAX_MESSAGES = 16
-MAX_HIST_CHARS_PER_MSG = 4000
+# 32 messages = 16 turns of back-and-forth. Per-msg clip is 2000 chars so
+# worst-case footprint stays at ~21 k tokens (32 × 666 tok), the same ceiling
+# as the previous 16 × 1300-tok config — but typical chat messages are 100-500
+# chars so in real use 32 messages comfortably cover ~30 turns.
+#
+# For long-running sessions where T1 facts (user name, project, etc.) eventually
+# roll out of even this 32-msg window, see _maybe_refresh_session_metadata
+# below — it pins stable facts to the system prompt so they survive forever.
+HISTORY_MAX_MESSAGES = 32
+MAX_HIST_CHARS_PER_MSG = 2000
+
+
+# ── Pinned session metadata ────────────────────────────────────────────────
+# The 32-msg rolling window above is enough for ~16 turns of detailed history,
+# but stable facts stated very early in the conversation (the user's name,
+# their company, the project they're working on, the signing deadline) still
+# roll off in long sessions. This pinned metadata lives in the system prompt
+# instead of the rolling history, so it survives forever — extracted by the
+# LLM from the first few turns and refreshed every few user turns.
+
+# How often (in user turns since last refresh) to re-extract the metadata.
+# Smaller = facts get pinned faster; larger = fewer extra LLM calls. 3 user
+# turns means meta is fresh by ~turn 3-4 of a new chat.
+META_REFRESH_EVERY_N_USER_TURNS = 3
+
+# Cap on how many recent messages to feed the extraction LLM. Keeps the
+# extraction prompt cheap regardless of how long the conversation runs.
+META_EXTRACT_LOOKBACK = 20
+
+META_EXTRACT_SYSTEM = (
+    "You extract a short, stable profile of a user and their work context "
+    "from a chat transcript. Return ONLY valid JSON. Be conservative — only "
+    "include facts the user explicitly stated; never guess or invent."
+)
+
+
+def _format_session_meta_prefix(meta: Optional[dict]) -> str:
+    """Render the pinned session metadata as a system-prompt prefix block.
+    Returns '' when there's nothing useful to pin so we don't waste tokens
+    on an empty header."""
+    if not meta:
+        return ""
+    parts: list[str] = []
+    if meta.get("user_name"):     parts.append(f"- Name: {meta['user_name']}")
+    if meta.get("organisation"):  parts.append(f"- Organisation: {meta['organisation']}")
+    if meta.get("role"):          parts.append(f"- Role: {meta['role']}")
+    if meta.get("project"):       parts.append(f"- Project / matter: {meta['project']}")
+    for kd in (meta.get("key_dates") or []):
+        if isinstance(kd, dict) and kd.get("date"):
+            label = (kd.get("what") or "").strip()
+            parts.append(f"- Key date: {kd['date']}" + (f" — {label}" if label else ""))
+    for kf in (meta.get("key_facts") or [])[:5]:
+        if isinstance(kf, str) and kf.strip():
+            parts.append(f"- {kf.strip()}")
+    if not parts:
+        return ""
+    return (
+        "[Session context — stable facts about this user and conversation; "
+        "use these to address the user appropriately and apply continuity. "
+        "Do NOT contradict them.]\n"
+        + "\n".join(parts)
+        + "\n[/Session context]\n\n"
+    )
+
+
+def _maybe_refresh_session_metadata(session_id: str) -> None:
+    """Re-extract the pinned profile if it's missing or stale (≥N new user
+    turns since last extraction). Best-effort: any failure is logged and
+    swallowed — chat must never break because the meta layer hiccuped."""
+    if not session_id:
+        return
+    try:
+        msgs = persistence.list_messages(session_id)
+    except Exception:
+        return
+    user_turn_count = sum(1 for m in msgs if m.get("role") == "user")
+    if user_turn_count < 1:
+        return
+    existing = persistence.get_session_meta(session_id) or {}
+    last_n = int(existing.get("_refreshed_at_n_user_turns", 0))
+    if user_turn_count - last_n < META_REFRESH_EVERY_N_USER_TURNS and last_n > 0:
+        return  # not stale enough, skip
+
+    # Build the extraction context — last N messages, both roles, clipped.
+    recent = msgs[-META_EXTRACT_LOOKBACK:]
+    convo = "\n".join(
+        f"[{m.get('role')}] {(m.get('content') or '')[:600]}"
+        for m in recent if m.get("role") in ("user", "assistant")
+    )
+    prompt = (
+        "Read this conversation excerpt and identify the user's stable "
+        "context. Return ONLY a JSON object with these optional fields "
+        "(omit any field if not stated):\n"
+        '  "user_name"     – first name or full name\n'
+        '  "organisation"  – company / firm / employer\n'
+        '  "role"          – job title or function\n'
+        '  "project"       – the project, deal, or matter they are working on\n'
+        '  "key_dates"     – array of {"date": "YYYY-MM-DD or text", "what": "what this date is"}\n'
+        '  "key_facts"     – array of short factual statements (max 5)\n\n'
+        f"Conversation:\n{convo}\n\nJSON:"
+    )
+    try:
+        result = llm_json(META_EXTRACT_SYSTEM, prompt)
+        if not isinstance(result, dict):
+            return
+        # Whitelist the schema to keep the row small and predictable.
+        clean = {k: result.get(k) for k in
+                 ("user_name", "organisation", "role", "project", "key_dates", "key_facts")
+                 if result.get(k)}
+        clean["_refreshed_at_n_user_turns"] = user_turn_count
+        persistence.set_session_meta(session_id, clean)
+    except Exception as e:
+        print(f"[meta] session meta refresh for {session_id} failed: {e}", flush=True)
 
 
 def _load_history(session_id: str | None) -> list[dict]:
@@ -213,20 +320,22 @@ def _load_history(session_id: str | None) -> list[dict]:
 
 
 def build_rag_messages(question: str, sources: list[str],
-                       history: list[dict] | None = None) -> list[dict]:
+                       history: list[dict] | None = None,
+                       meta_prefix: str = "") -> list[dict]:
     src_block = "\n\n".join(f"[Quelle {i+1}]\n{s}" for i, s in enumerate(sources))
     user = f"Rechtstexte:\n{src_block}\n\nFrage: {question}"
     return [
-        {"role": "system", "content": RAG_SYSTEM},
+        {"role": "system", "content": meta_prefix + RAG_SYSTEM},
         *(history or []),
         {"role": "user",   "content": user},
     ]
 
 
 def build_chat_messages(question: str,
-                        history: list[dict] | None = None) -> list[dict]:
+                        history: list[dict] | None = None,
+                        meta_prefix: str = "") -> list[dict]:
     return [
-        {"role": "system", "content": CHAT_SYSTEM},
+        {"role": "system", "content": meta_prefix + CHAT_SYSTEM},
         *(history or []),
         {"role": "user",   "content": question},
     ]
@@ -899,6 +1008,13 @@ def query(req: QueryReq):
     # the new turn isn't double-counted.
     history = _load_history(sid)
 
+    # Pinned session metadata — stable facts (user name, project, deadlines)
+    # that survive even when their original turn rolls out of the 32-msg
+    # rolling window. Cheap when the session is short or when the previous
+    # extraction is still fresh; the refresh fires AFTER persisting the new
+    # turn (below) so the freshly stated facts make it into the next refresh.
+    meta_prefix = _format_session_meta_prefix(persistence.get_session_meta(sid))
+
     if use_rag and use_contract:
         mode = "rag+contract"
         # Make the upload's authority explicit so the model doesn't conflate
@@ -912,20 +1028,22 @@ def query(req: QueryReq):
             "[Hintergrund-Quelle aus dem Korpus — nur für Kontext, NICHT der Vertrag des Nutzers]\n" + s
             for s in rag_sources
         ]
-        msgs = build_rag_messages(req.question, [contract_block] + bg_blocks, history=history)
+        msgs = build_rag_messages(req.question, [contract_block] + bg_blocks,
+                                  history=history, meta_prefix=meta_prefix)
     elif use_rag:
         mode = "rag"
-        msgs = build_rag_messages(req.question, rag_sources, history=history)
+        msgs = build_rag_messages(req.question, rag_sources,
+                                  history=history, meta_prefix=meta_prefix)
     elif use_contract:
         mode = "contract"
         msgs = build_rag_messages(
             req.question,
             ["[HOCHGELADENER VERTRAG]\n" + contract_text],
-            history=history,
+            history=history, meta_prefix=meta_prefix,
         )
     else:
         mode = "chat"
-        msgs = build_chat_messages(req.question, history=history)
+        msgs = build_chat_messages(req.question, history=history, meta_prefix=meta_prefix)
 
     t0 = time.time()
     answer, prompt_tokens, completion_tokens = llm_generate(
@@ -954,6 +1072,13 @@ def query(req: QueryReq):
         persistence.add_message(sid, "assistant", answer, mode=mode)
     except Exception as e:
         print(f"[warn] failed to persist messages for {sid}: {e}", flush=True)
+
+    # After persisting the new turn, refresh the pinned session metadata if
+    # it's stale (every N user turns). This way the facts the user JUST
+    # stated are part of the extraction context, and the next /query call
+    # picks up the refreshed pin. Inline because it's a single LLM call;
+    # if it ever becomes hot enough to matter we can move it to a worker.
+    _maybe_refresh_session_metadata(sid)
 
     return QueryResp(
         answer=answer, chunks=chunks_out, timings=timings,
