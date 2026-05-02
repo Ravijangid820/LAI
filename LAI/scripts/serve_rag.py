@@ -836,37 +836,52 @@ async def lifespan(app: FastAPI):
     reranker = Reranker("Qwen/Qwen3-Reranker-8B")
     print(f"[startup]   reranker: {time.time()-t0:.1f}s", flush=True)
 
-    LLM_API_URL = os.environ.get("LLM_API_URL")
-    LLM_MODEL = os.environ.get(
-        "LLM_MODEL",
-        "/data/projects/lai/models/qwen25-7b-legal-merged",
-    )
+    # Default to the 27B analyzer container running locally — Qwen3.6-27B
+    # with thinking-mode is the only model approved for chat. The 7B legal
+    # fine-tune showed identity-tracking failures past ~15 turns of complex
+    # content (smoke test 2026-04-30) and is no longer used.
+    #
+    # To opt INTO loading a local model in-process you must set BOTH:
+    #   LLM_LOCAL_PATH=/path/to/checkpoint   (explicit, no default)
+    #   LLM_API_URL=                          (must be empty)
+    # Anything else uses the remote endpoint.
+    LLM_API_URL = os.environ.get("LLM_API_URL", "http://localhost:8005")
+    LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.6-27b")
+    LLM_LOCAL_PATH = os.environ.get("LLM_LOCAL_PATH")  # opt-in only, no default
 
-    if LLM_API_URL:
-        # Remote vLLM endpoint — verify it's reachable; no in-process load.
+    use_local = bool(LLM_LOCAL_PATH) and not LLM_API_URL
+    if use_local:
+        # Explicitly requested local-load path — verify the user actually
+        # meant it and warn loudly that this isn't the default.
+        t0 = time.time()
+        print(f"[startup]   LLM: loading LOCAL model from {LLM_LOCAL_PATH} "
+              "(opt-in via LLM_LOCAL_PATH; remote endpoint disabled)", flush=True)
+        tok = AutoTokenizer.from_pretrained(LLM_LOCAL_PATH, trust_remote_code=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        lm = AutoModelForCausalLM.from_pretrained(
+            LLM_LOCAL_PATH, torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True,
+        ).eval()
+        print(f"[startup]   LLM ready in {time.time()-t0:.1f}s", flush=True)
+        STATE.update(corpus=corpus, conn=conn, parent_text=parent_text,
+                     reranker=reranker, lm=lm, tok=tok,
+                     llm_api_url=None, llm_model_name=LLM_LOCAL_PATH)
+    else:
+        # Remote vLLM endpoint (default) — verify it's reachable; no in-process load.
         print(f"[startup]   LLM: remote endpoint {LLM_API_URL} (model={LLM_MODEL})", flush=True)
         try:
             r = httpx.get(f"{LLM_API_URL.rstrip('/')}/v1/models", timeout=5)
             if r.status_code != 200:
                 raise RuntimeError(f"LLM endpoint returned {r.status_code}")
         except Exception as e:
-            raise RuntimeError(f"LLM endpoint {LLM_API_URL} not reachable: {e}")
+            raise RuntimeError(
+                f"LLM endpoint {LLM_API_URL} not reachable: {e}\n"
+                "  → Start the analyzer container: cd Docker/llm-analyzer && docker compose up -d\n"
+                "  → Or override LLM_API_URL to point at a reachable endpoint."
+            )
         STATE.update(corpus=corpus, conn=conn, parent_text=parent_text,
                      reranker=reranker, lm=None, tok=None,
                      llm_api_url=LLM_API_URL, llm_model_name=LLM_MODEL)
-    else:
-        t0 = time.time()
-        print(f"[startup]   LLM: loading {LLM_MODEL}", flush=True)
-        tok = AutoTokenizer.from_pretrained(LLM_MODEL, trust_remote_code=True)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
-        lm = AutoModelForCausalLM.from_pretrained(
-            LLM_MODEL, torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True,
-        ).eval()
-        print(f"[startup]   LLM ready in {time.time()-t0:.1f}s", flush=True)
-        STATE.update(corpus=corpus, conn=conn, parent_text=parent_text,
-                     reranker=reranker, lm=lm, tok=tok,
-                     llm_api_url=None, llm_model_name=LLM_MODEL)
 
     # Analyzer V2 config — optional. If env not set, V2 is unavailable
     # and /analyze-contract falls back to V1 regardless of `version` flag.
