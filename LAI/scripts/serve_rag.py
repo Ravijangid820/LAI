@@ -282,7 +282,20 @@ def _maybe_refresh_session_metadata(session_id: str) -> None:
         f"Conversation:\n{convo}\n\nJSON:"
     )
     try:
-        result = llm_json(META_EXTRACT_SYSTEM, prompt)
+        # serve_rag has no llm_json wrapper (that lives in DDiQ-land); use
+        # llm_generate directly and strip ```json fences before json.loads.
+        msgs = [
+            {"role": "system", "content": META_EXTRACT_SYSTEM},
+            {"role": "user",   "content": prompt},
+        ]
+        raw, _, _ = llm_generate(msgs, max_new_tokens=400)
+        cleaned = re.sub(r"```json\s*", "", raw)
+        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+        # If the model wrapped the JSON in prose, find the first { and last }.
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start >= 0 and end > start:
+            cleaned = cleaned[start:end + 1]
+        result = json.loads(cleaned)
         if not isinstance(result, dict):
             return
         # Whitelist the schema to keep the row small and predictable.
