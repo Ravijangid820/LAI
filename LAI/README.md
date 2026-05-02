@@ -40,7 +40,7 @@ The MVP runtime is a **two-service split** that runs alongside the data pipeline
 
 The frontend lives in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), cloned by convention to `/data/projects/lai/lai-ui/` (override via `LAI_UI_DIR`).
 
-See [`docs/MVP_DELIVERY.md`](docs/MVP_DELIVERY.md) for the full feature list and [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) for the API endpoint catalog.
+See [`docs/MVP_DELIVERY.md`](docs/MVP_DELIVERY.md) for the full feature list, [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) for the API endpoint catalog, and [`TODO.md`](TODO.md) for what's next.
 
 ## Data Processing Pipeline
 
