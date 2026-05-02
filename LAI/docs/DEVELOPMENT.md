@@ -1,6 +1,6 @@
 # LAI - Development Guide
 
-> **What's runtime today.** The MVP runtime is a two-service split: the conversational chat (`scripts/serve_rag.py`, `:18000`) and the DDiQ due-diligence microservice (`micro-services/`, `:18001` Docker). The frontend is in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), conventionally cloned to `/data/projects/lai/lai-ui/`. The `src/lai/` domain-driven backend below is the v5 design target — its FastAPI app (`lai.api.main`) is not yet wired into the runtime that ships. See [`MVP_DELIVERY.md`](MVP_DELIVERY.md) and [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+> **What's runtime today.** The MVP runtime is a two-service split: the conversational chat (`scripts/serve_rag.py`, `:18000`) and the DDiQ due-diligence microservice (`micro-services/`, `:18001` Docker). The frontend is in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), conventionally cloned to `/data/projects/lai/LAI-UI/`. The `src/lai/` domain-driven backend below is the v5 design target — its FastAPI app (`lai.api.main`) is not yet wired into the runtime that ships. See [`MVP_DELIVERY.md`](MVP_DELIVERY.md) and [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
 
 ## Project Structure
 
@@ -31,7 +31,7 @@ LAI/
 └── pyproject.toml
 
 # Sibling clone (its own repo — not under LAI/)
-/data/projects/lai/lai-ui/        # Frontend (Vite + React) — github.com/Ravijangid820/LAI-UI
+/data/projects/lai/LAI-UI/        # Frontend (Vite + React) — github.com/Ravijangid820/LAI-UI
 ```
 
 Each domain package under `src/lai/` contains its own `routes.py` (API endpoints), business logic, and `repository.py` (database operations).

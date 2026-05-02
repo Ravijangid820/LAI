@@ -63,7 +63,7 @@ Started via `bash scripts/start.sh` from the LAI repo root:
 | Process | Port | Notes |
 |---|---|---|
 | `serve_rag.py` | 18000 | Conversational chat backend — RAG pipeline + clause analyzer + 16-message conversation memory + in-process Qwen3-Reranker-8B. Default bind `127.0.0.1`; override with `LAI_BIND_HOST=0.0.0.0` for VPN-trusted LAN. |
-| Vite UI | 5173 | Frontend lives in its own repo at `/data/projects/lai/lai-ui/` (the [LAI-UI](https://github.com/Ravijangid820/LAI-UI) clone, sibling to `LAI/`). Override with `LAI_UI_DIR`. `start.sh` runs `npm install` on first launch. |
+| Vite UI | 5173 | Frontend lives in its own repo at `/data/projects/lai/LAI-UI/` (the [LAI-UI](https://github.com/Ravijangid820/LAI-UI) clone, sibling to `LAI/`). Override with `LAI_UI_DIR`. `start.sh` runs `npm install` on first launch. |
 
 ### Starting Services
 

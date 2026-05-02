@@ -38,7 +38,7 @@ The MVP runtime is a **two-service split** that runs alongside the data pipeline
 - **`serve_rag`** (host process, `:18000`) — the conversational legal assistant. Document upload + clause analyzer + RAG-grounded chat with conversational memory + vLLM prefix caching. Started via `bash scripts/start.sh`.
 - **`lai-backend`** (Docker container, `:18001`) — the DDiQ multi-document due-diligence microservice at [`micro-services/`](micro-services/). Async report generation with request-fingerprint dedup, incremental persistence, statutory-anchor section prompts, timeline / cross-doc / Grundbuch / Rückbau extraction passes, 10H rule. Brought up via `docker compose -f micro-services/docker-compose.yml up -d`.
 
-The frontend lives in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), cloned by convention to `/data/projects/lai/lai-ui/` (override via `LAI_UI_DIR`).
+The frontend lives in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), cloned by convention to `/data/projects/lai/LAI-UI/` (override via `LAI_UI_DIR`).
 
 See [`docs/MVP_DELIVERY.md`](docs/MVP_DELIVERY.md) for the full feature list, [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) for the API endpoint catalog, and [`TODO.md`](TODO.md) for what's next.
 
@@ -195,7 +195,7 @@ behind a FastAPI endpoint that matches the contract consumed by the
 The frontend lives in its own repo as of v1.0.0:
 
 * **Frontend repo:** https://github.com/Ravijangid820/LAI-UI
-* **Local clone convention:** `/data/projects/lai/lai-ui/` (sibling to
+* **Local clone convention:** `/data/projects/lai/LAI-UI/` (sibling to
   this `LAI/` directory; gitignored from this repo)
 
 ```bash
@@ -203,8 +203,8 @@ The frontend lives in its own repo as of v1.0.0:
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/serve_rag.py --port 18000
 
 # Frontend (separate repo)
-git clone git@github.com:Ravijangid820/LAI-UI.git ../lai-ui
-cd ../lai-ui && npm install && npm run dev   # Vite default port 5173
+git clone git@github.com:Ravijangid820/LAI-UI.git ../LAI-UI
+cd ../LAI-UI && npm install && npm run dev   # Vite default port 5173
 ```
 
 Endpoints:

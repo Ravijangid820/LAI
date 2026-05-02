@@ -104,9 +104,9 @@ LAI/processed/backups/
 LAI/logs/tmp/
 
 # The web UI lives in its own repo as of v1.0.0 — see LAI/README.md.
-# A clone of it commonly sits at /data/projects/lai/lai-ui/ for local dev,
+# A clone of it commonly sits at /data/projects/lai/LAI-UI/ for local dev,
 # but is its own git repo and must not show up as untracked here.
-lai-ui/
+LAI-UI/
 
 # Micro-services local env (DB credentials, CORS origins, etc.)
 LAI/micro-services/.env

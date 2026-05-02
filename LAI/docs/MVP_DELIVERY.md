@@ -94,7 +94,7 @@ Significant work shipped after the initial MVP delivery. Two themes: **lawyer-gr
 
 ### Frontend layout & UX polish
 
-- **Frontend split** into its own repo: [LAI-UI](https://github.com/Ravijangid820/LAI-UI). The backend repo no longer ships UI code; the runtime scripts (`start.sh` / `stop.sh` / `status.sh`) point at a sibling clone at `/data/projects/lai/lai-ui/` (override via `LAI_UI_DIR`).
+- **Frontend split** into its own repo: [LAI-UI](https://github.com/Ravijangid820/LAI-UI). The backend repo no longer ships UI code; the runtime scripts (`start.sh` / `stop.sh` / `status.sh`) point at a sibling clone at `/data/projects/lai/LAI-UI/` (override via `LAI_UI_DIR`).
 - **Persistence across refreshes**: chat — `lai.activeConversation` mirrors active conversation id to localStorage so a refresh restores it (with stale-id cleanup after the next sidebar fetch). DDiQ — `lai.ddiq.activeReport` holds the in-flight report id + cached payload; refresh during a 30-90 min run resumes polling against the same report instead of starting over.
 - **Demo data removed.** The static "Risk Assessment" tab (6 hardcoded fake risk areas), `DEMO_PARCELS` (12 Tostedt fixtures with names like Hofmann/Meier/Kroeger), `DEMO_REPORT` (Windpark Nordheide / 49.6 MW), and `DEMO_DOCUMENTS` are gone. Risk Assessment now defaults to the DDiQ Reports tab.
 - **PDF download**: replaced the misleading HTML-as-PDF "download" with browser-native print-to-PDF via `window.print()` on a Blob URL. DOCX and XLSX format aliases removed (they were HTML-as-`.doc` and CSV-as-`.csv`).

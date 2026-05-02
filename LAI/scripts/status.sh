@@ -54,7 +54,7 @@ else
     fail "serve_rag.py — not running"
 fi
 VITE_PID=$(ps -eo pid=,comm=,args= \
-    | awk '$2 == "node" && /lai-ui\/.*\.bin\/vite/ {print $1; exit}')
+    | awk '$2 == "node" && /LAI-UI\/.*\.bin\/vite/ {print $1; exit}')
 if [ -n "$VITE_PID" ]; then
     ok "Vite — PID $VITE_PID"
 else
