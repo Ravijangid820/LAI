@@ -205,9 +205,14 @@ MAX_HIST_CHARS_PER_MSG = 2000
 # turns means meta is fresh by ~turn 3-4 of a new chat.
 META_REFRESH_EVERY_N_USER_TURNS = 3
 
-# Cap on how many recent messages to feed the extraction LLM. Keeps the
-# extraction prompt cheap regardless of how long the conversation runs.
-META_EXTRACT_LOOKBACK = 20
+# How many recent messages to feed the extraction LLM. Bumped from 20 to 60
+# (~30 turns of back-and-forth) because the previous cap was too tight: in a
+# 28-turn conversation, the establishing T1 facts (name, role) had already
+# rolled out of the lookback by the time the meta refresh fired, so the model
+# couldn't extract user_name even though it was clearly stated. Sticky-merge
+# below keeps any field once-extracted, so even this larger lookback can't
+# cause a previously-saved fact to vanish.
+META_EXTRACT_LOOKBACK = 60
 
 META_EXTRACT_SYSTEM = (
     "You extract a short, stable profile of a user and their work context "
@@ -283,7 +288,12 @@ def _maybe_refresh_session_metadata(session_id: str) -> None:
     )
     try:
         # serve_rag has no llm_json wrapper (that lives in DDiQ-land); use
-        # llm_generate directly and strip ```json fences before json.loads.
+        # llm_generate directly. Note: llm_generate already passes
+        # `chat_template_kwargs: {enable_thinking: False}` for /query calls,
+        # so this extraction runs without thinking-mode. A separate bench
+        # confirmed thinking=ON exhausts even 1500 tokens on this prompt and
+        # never emits the JSON; thinking=OFF returns valid JSON in 270 tokens
+        # at ~10s. 400 is generous headroom — typical output is ~270 tokens.
         msgs = [
             {"role": "system", "content": META_EXTRACT_SYSTEM},
             {"role": "user",   "content": prompt},
@@ -298,12 +308,20 @@ def _maybe_refresh_session_metadata(session_id: str) -> None:
         result = json.loads(cleaned)
         if not isinstance(result, dict):
             return
-        # Whitelist the schema to keep the row small and predictable.
-        clean = {k: result.get(k) for k in
-                 ("user_name", "organisation", "role", "project", "key_dates", "key_facts")
-                 if result.get(k)}
-        clean["_refreshed_at_n_user_turns"] = user_turn_count
-        persistence.set_session_meta(session_id, clean)
+
+        # Sticky-merge: each refresh STARTS from the previously-saved profile
+        # and overlays any newly-extracted fields. This way, when a stable
+        # fact like user_name was extracted at refresh #1 but the establishing
+        # turn has since rolled out of the META_EXTRACT_LOOKBACK window by
+        # refresh #5, the field doesn't get nuked from the saved row. Newly
+        # stated info still wins (overlays old), so corrections (e.g. "the
+        # signing date is actually September 30") still take effect.
+        merged: dict = {k: v for k, v in existing.items() if k != "_refreshed_at_n_user_turns"}
+        for k in ("user_name", "organisation", "role", "project", "key_dates", "key_facts"):
+            if result.get(k):
+                merged[k] = result[k]
+        merged["_refreshed_at_n_user_turns"] = user_turn_count
+        persistence.set_session_meta(session_id, merged)
     except Exception as e:
         print(f"[meta] session meta refresh for {session_id} failed: {e}", flush=True)
 
