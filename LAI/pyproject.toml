@@ -1,6 +1,6 @@
 [project]
 name = "lai"
-version = "5.0.0"
+version = "2.0.0"
 description = "German Legal AI Platform for Wind Energy Due Diligence"
 requires-python = ">=3.13"
 readme = "README.md"
