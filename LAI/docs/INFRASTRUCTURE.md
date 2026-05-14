@@ -62,8 +62,14 @@ Started via `bash scripts/ops/start.sh` from the LAI repo root:
 
 | Process | Port | Notes |
 |---|---|---|
-| `serve_rag.py` | 18000 | Conversational chat backend — RAG pipeline + clause analyzer + 16-message conversation memory + in-process Qwen3-Reranker-8B. Default bind `127.0.0.1`; override with `LAI_BIND_HOST=0.0.0.0` for VPN-trusted LAN. |
+| `lai.api.serve_rag` | 18000 | Conversational chat backend — RAG pipeline + clause analyzer + 16-message conversation memory + in-process Qwen3-Reranker-8B. Run as `python -m lai.api.serve_rag`. Default bind `127.0.0.1`; override with `LAI_BIND_HOST=0.0.0.0` for VPN-trusted LAN. |
 | Vite UI | 5173 | Frontend lives in its own repo at `/data/projects/lai/LAI-UI/` (the [LAI-UI](https://github.com/Ravijangid820/LAI-UI) clone, sibling to `LAI/`). Override with `LAI_UI_DIR`. `start.sh` runs `npm install` on first launch. |
+
+**Docker-free runtime.** `bash scripts/ops/start-host.sh` runs the entire
+stack as host processes — vLLM analyzer/embedding/reranker servers,
+`serve_rag`, the DDiQ backend, Vite, and a user-local PostgreSQL cluster —
+with no Docker daemon and no root. `stop-host.sh` / `status-host.sh` manage
+it. Use this when the Docker socket is unavailable.
 
 ### Starting Services
 
@@ -275,7 +281,7 @@ CUDA_DEVICE=1          # LLM GPU (embedding+reranker share GPU 0)
 
 ## Versioning Strategy
 
-- **Code:** Git tags (`v5.0.0`, `v5.1.0`) — no version directories
+- **Code:** Git tags on the `v1.x` lineage (`v1.0.0-pre-split`, `v2.0.0`, ...) — no version directories
 - **Experiments:** MLflow run IDs — every training run is logged with full config
 - **Models:** MLflow artifact store (MinIO) — checkpoints stored per run
 - **Data:** DVC (future) — version large datasets alongside git

@@ -1,5 +1,18 @@
 # LAI Project Restructuring - Production-Grade Directory & Project Structure
 
+> **Status (v2 restructure executed).** This document is the original proposal
+> for moving off the `LAIV1..LAIV4` layout. The core migration to a single
+> `LAI/` app with the `src/lai/` domain package is **done**, and the v2
+> restructure has since gone further: `src/lai/` is now an installable package
+> (`uv sync` / `pip install -e .`), `serve_rag` lives at `lai.api.serve_rag`,
+> the retrieval eval harness at `lai.search.eval`, `scripts/` is organized into
+> `ops/ eval/ db/ archive/`, and review ownership is declared in
+> `.github/CODEOWNERS`. For the **current** authoritative structure see
+> [`../../README.md`](../../README.md), [`../DEVELOPMENT.md`](../DEVELOPMENT.md),
+> [`../PROJECT_STATUS.md`](../PROJECT_STATUS.md), and
+> [`../../src/lai/README.md`](../../src/lai/README.md). The sections below are
+> retained as design rationale.
+
 ---
 
 ## The Problem With The Current Structure
@@ -484,10 +497,9 @@ Model weights live in `/data/models/`, mounted as Docker volumes. Never in the c
 Instead of copying the whole project for each version, use **git tags and feature flags**.
 
 ```
-# Version = git tag on the same codebase
-git tag v3.0.0  # What was LAIV3
-git tag v4.0.0  # What was LAIV4
-git tag v5.0.0  # Next release
+# Version = git tag on the same codebase (the v1.x lineage)
+git tag v1.0.0-pre-split  # snapshot before the LAIV* -> LAI/ migration
+git tag v2.0.0            # the v2 restructure (this document's outcome)
 
 # Breaking changes = branches, not directories
 git checkout -b feat/crag-loop        # Add CRAG
@@ -552,7 +564,7 @@ This means V5 is just: `enable_crag=True, enable_web_search_fallback=True` in th
 2. Delete orphaned directories (backend/, qdrant/, LAI/)
 3. Move VDRs to `/data/vdrs/`
 4. Consolidate all docs into `docs/`
-5. Tag the final state as `v5.0.0`
+5. Tag the final state as `v2.0.0`
 
 ---
 

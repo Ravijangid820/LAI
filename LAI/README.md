@@ -40,7 +40,9 @@ The MVP runtime is a **two-service split** that runs alongside the data pipeline
 
 The frontend lives in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), cloned by convention to `/data/projects/lai/LAI-UI/` (override via `LAI_UI_DIR`).
 
-See [`docs/MVP_DELIVERY.md`](docs/MVP_DELIVERY.md) for the full feature list, [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) for the API endpoint catalog, [`TODO.md`](TODO.md) for what's next, and [`ops/README.md`](ops/README.md) for copy-paste operational commands (resume long pipeline runs, smoke-test the chat / DDiQ, check pipeline progress).
+See [`docs/MVP_DELIVERY.md`](docs/MVP_DELIVERY.md) for the full feature list, [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) for the API endpoint catalog, [`TODO.md`](TODO.md) for what's next, and [`scripts/ops/README.md`](scripts/ops/README.md) for copy-paste operational commands (resume long pipeline runs, smoke-test the chat / DDiQ, check pipeline progress).
+
+For a Docker-free runtime (when the Docker daemon is unavailable, or you want everything as host processes), use `bash scripts/ops/start-host.sh` — it runs the vLLM servers, `serve_rag`, the DDiQ backend, Vite, and a user-local PostgreSQL cluster, all without root. See [`scripts/ops/README.md`](scripts/ops/README.md).
 
 ## Data Processing Pipeline
 
@@ -76,16 +78,16 @@ The pipeline can run without PostgreSQL/MinIO/Redis — only the LLM container i
 
 ```bash
 # One-shot resume (auto-starts vLLM container + Step 5)
-./scripts/resume_step5.sh
-./scripts/resume_step5.sh --status   # check progress
-./scripts/resume_step5.sh --stop     # stop Step 5 (keeps LLM up)
+./scripts/ops/resume_step5.sh
+./scripts/ops/resume_step5.sh --status   # check progress
+./scripts/ops/resume_step5.sh --stop     # stop Step 5 (keeps LLM up)
 
 # Or run any step in --local mode (reads MinIO bind-mount, writes SQLite)
 uv run python -m lai.pipeline.cli step2 --local
 uv run python -m lai.pipeline.cli step5 --local
 ```
 
-Portable database snapshots (built with `python scripts/export_to_sqlite.py all`):
+Portable database snapshots (built with `python scripts/db/export_to_sqlite.py all`):
 - `processed/db_export/pipeline.db` (1 GB) — chunks, training samples, classifications
 - `processed/db_export/app.db` (284 GB) — chunks with embeddings as binary BLOBs
 
@@ -132,7 +134,7 @@ Flags to know:
 > token accuracy 76% → 86%), but an audit of the teacher-generated training
 > data found **15.8% of cited §§ / clauses are fabricated** by the 72B teacher.
 > Fine-tuning is shelved until we regenerate data with a verification loop.
-> See `scripts/audit_training_data.py` and the *Known Issues* section of
+> See `scripts/archive/audit_training_data.py` and the *Known Issues* section of
 > [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
 
 ## Corpus Processing (Phase 2)
@@ -140,7 +142,7 @@ Flags to know:
 Beyond the 6-step generic pipeline, there are **format-specific processors**
 for corpora whose structure matters (court decisions have semantic sections
 — Tenor / Tatbestand / Gründe — that a generic char-chunker loses). These
-live in `scripts/temp/`:
+one-off processors are archived in `scripts/archive/temp/`:
 
 ```bash
 # Unified processor for German court decisions:
@@ -148,7 +150,7 @@ live in `scripts/temp/`:
 #   - openlegaldata (41K cases, 10 per page file)
 # Handles all 7 schema variants, 28 raw-type values, recovers ~57% of
 # missing court_level via court.name parsing. Deduplicates by ECLI/slug.
-python scripts/temp/process_court_decisions.py --source all
+python scripts/archive/temp/process_court_decisions.py --source all
 # → data/lai-segments/legal_data/{hf_cases,openlegaldata}/*.segments.jsonl
 # → Step-1-compatible; feeds into the existing Step 2 / Step 6.
 ```
@@ -176,13 +178,13 @@ Reproducible numbers — these match what the evaluation actually returns
 on the recovered DB. The earlier README claim of R@5=75% was on a
 different val sample / smaller corpus and didn't replicate.
 
-**Cleanup that mattered:** `scripts/dedup_phase1_rechunks.py` removes
+**Cleanup that mattered:** `scripts/archive/dedup_phase1_rechunks.py` removes
 the 134K parents (216K children, 216K embeddings) that Step 2 produced
 when it inadvertently re-chunked Phase 1 sources during the multilegalpile
 run. Pre-dedup eval was R@1=0.24 / R@5=0.45; post-dedup is R@1=0.32 /
 R@5=0.55 — a 10pt R@5 lift just from removing duplicates.
 
-Followup: `scripts/rag_audit_analysis.py` slices the failures by task,
+Followup: `scripts/eval/rag_audit_analysis.py` slices the failures by task,
 query specificity, and doc_type to show where the remaining R@5 misses
 are concentrated.
 
@@ -200,7 +202,7 @@ The frontend lives in its own repo as of v1.0.0:
 
 ```bash
 # Backend (loads 127 GB embeddings + reranker + Qwen2.5-7B-Instruct, ~5-30 min cold start)
-CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/serve_rag.py --port 18000
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m lai.api.serve_rag --port 18000
 
 # Frontend (separate repo)
 git clone git@github.com:Ravijangid820/LAI-UI.git ../LAI-UI
@@ -219,7 +221,7 @@ For end-to-end manual comparison of base vs fine-tuned model with RAG
 context:
 
 ```bash
-python scripts/rag_generate_test.py --n 5 --top-k 3 \
+python scripts/eval/rag_generate_test.py --n 5 --top-k 3 \
   --base Qwen/Qwen2.5-7B-Instruct \
   --ft   /data/projects/lai/models/qwen25-7b-legal-merged
 ```
@@ -232,13 +234,13 @@ through several LLMs side-by-side and writes a markdown report to
 
 ```bash
 # Small models that fit alongside the embedding container (lai_embedding ~44 GB on GPU)
-CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/multi_model_compare.py \
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/archive/multi_model_compare.py \
     --n 5 --top-k 3 \
     --models qwen25-ft qwen25-base gemma4 llama3
 
 # 27B models (need lai_embedding STOPPED first — ~54 GB needed in bf16)
 docker stop lai_embedding
-CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/multi_model_compare.py \
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/archive/multi_model_compare.py \
     --n 5 --top-k 3 --models qwen35 qwen36
 docker start lai_embedding   # restore service after eval
 ```
@@ -248,7 +250,7 @@ Registered model keys (full inventory in
 
 | Key | Path | Size | Notes |
 |---|---|---|---|
-| `qwen25-ft` | `/data/projects/lai/models/qwen25-7b-legal-merged` | 15 GB | Our LoRA fine-tune merged in (default in `serve_rag.py`) |
+| `qwen25-ft` | `/data/projects/lai/models/qwen25-7b-legal-merged` | 15 GB | Our LoRA fine-tune merged in (default in `lai.api.serve_rag`) |
 | `qwen25-base` | `Qwen/Qwen2.5-7B-Instruct` | 15 GB | Base, same architecture as our FT |
 | `qwen35` | `Qwen/Qwen3.5-27B` | 52 GB | Larger, newer Qwen |
 | `qwen36` | `Qwen/Qwen3.6-27B` | 52 GB | Larger, newer Qwen |
@@ -263,7 +265,7 @@ Before spending more GPU time on fine-tuning, run the citation-grounding
 audit:
 
 ```bash
-python scripts/audit_training_data.py
+python scripts/archive/audit_training_data.py
 ```
 
 It parses every `§`/`Art.`/`Klausel` reference in answers and checks
@@ -285,24 +287,29 @@ for the current run's config and lessons learned.
 
 ## Project Structure
 
+`src/lai/` is an installable package — `uv sync` (or `pip install -e .`)
+makes `from lai... import ...` work everywhere, with no `sys.path` hacks.
+Each subpackage is one **domain**; ownership is declared in
+[`.github/CODEOWNERS`](../.github/CODEOWNERS) and each package has its own
+`README.md`. See [`src/lai/README.md`](src/lai/README.md) for the package map.
+
 ```
-src/lai/                  Domain-driven Python packages
+src/lai/                  Installable domain-driven package (`lai`)
   core/                   Config, logging, exceptions, models
-  api/                    FastAPI app, middleware, RAG pipeline orchestrator
+  api/                    FastAPI app + serve_rag.py (the chat backend, :18000)
   auth/                   JWT authentication, user management
   documents/              Upload, parse, chunk, embed, store
-  search/                 Query analysis, hybrid search, reranking
+  search/                 Hybrid search, reranking + eval.py (retrieval eval harness)
   generation/             LLM client, prompts, CRAG, citation verification
   infra/                  Database pool, Redis cache, MinIO client
-  pipeline/               Data processing pipeline (6 steps)
-    convert.py            Step 1: Raw → normalized segments
-    chunk.py              Step 2: Segments → parent-child chunks
-    classify.py           Step 3: Domain classification via LLM
-    enrich.py             Step 4: Contextual retrieval prefix
-    generate.py           Step 5: Synthetic fine-tuning data
-    embed.py              Step 6: Embeddings → pgvector
-    cli.py                CLI entry points for all steps
-    utils/                Text cleaning, German sentence splitting
+  pipeline/               Data processing pipeline (6 steps; cli.py is the entry point)
+micro-services/           DDiQ due-diligence report service (:18001)
+scripts/
+  ops/                    Operational entry points — start/stop/status{,-host}.sh,
+                          resume_step5/6.sh (host-mode variants run Docker-free)
+  eval/                   Eval & benchmark harnesses (rag_*, vllm_compare, ...)
+  db/                     DB export / backup / restore utilities
+  archive/                Completed one-off migrations, audits, pilots
 training/                 Model fine-tuning (separate lifecycle)
 tests/                    Unit, integration, E2E tests
 docs/                     Documentation

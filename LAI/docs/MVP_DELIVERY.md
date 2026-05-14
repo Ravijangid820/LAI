@@ -102,7 +102,7 @@ Significant work shipped after the initial MVP delivery. Two themes: **lawyer-gr
 
 ### Conversational memory (chat side)
 
-- `_load_history(session_id)` in `serve_rag.py` loads the last 16 user/assistant turns from `sessions.db` (clipped to 4000 chars/msg), filters non-chat roles, returns OpenAI message format.
+- `_load_history(session_id)` in `lai.api.serve_rag` (`src/lai/api/serve_rag.py`) loads the last 16 user/assistant turns from `sessions.db` (clipped to 4000 chars/msg), filters non-chat roles, returns OpenAI message format.
 - Wired into all four query modes (`chat`, `rag`, `contract`, `rag+contract`) so coreference ("tell me more about it") and sticky preferences ("from now on reply in English") work.
 - **vLLM `--enable-prefix-caching`** on the analyzer container: turn N reuses turn N-1's KV cache for the shared conversation prefix. Big speedup on multi-turn chats.
 

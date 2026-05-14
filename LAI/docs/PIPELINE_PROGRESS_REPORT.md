@@ -23,8 +23,8 @@ progress as of April 30:
   `0f374f3 feat(pipeline): step 6 on Qwen3-Embedding-8B (halfvec 4096)`).
 - **Reranker upgraded.** The original "Cross-encoder via vLLM (MiniLM)"
   was replaced with **Qwen3-Reranker-8B** (multilingual, in-process
-  inside `serve_rag.py`). The standalone Docker reranker container is
-  legacy and not started by `start.sh`.
+  inside `lai.api.serve_rag`). The standalone Docker reranker container is
+  legacy and not started by `scripts/ops/start.sh`.
 - **Analyzer LLM upgraded.** Step-3 classification numbers below were
   produced on Qwen2.5-72B-Instruct-AWQ; the runtime analyzer LLM is now
   **Qwen3.6-27B with thinking-mode** (lai_analyzer_llm container, port
@@ -33,7 +33,7 @@ progress as of April 30:
 - **Production fine-tune merged.** A LoRA fine-tune of Qwen2.5-7B on
   Step-5 synthetic data produced
   `/data/projects/lai/models/qwen25-7b-legal-merged`; this is the
-  default LLM for inference in `serve_rag.py`.
+  default LLM for inference in `lai.api.serve_rag`.
 - **Runtime services on top of the pipeline:** see
   [`MVP_DELIVERY.md`](MVP_DELIVERY.md) for the conversational chat
   (`serve_rag` on `:18000`) and DDiQ multi-doc due-diligence pipeline

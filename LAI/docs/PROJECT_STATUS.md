@@ -75,28 +75,37 @@ User Query
 
 ## Project Structure
 
+As of the **v2 restructure**, `src/lai/` is an installable package (`uv sync`
+/ `pip install -e .`) — `from lai... import ...` works everywhere, no
+`sys.path` hacks. `scripts/` is organized by purpose, and each `src/lai/`
+subpackage has its own `README.md` (see [`src/lai/README.md`](../src/lai/README.md)).
+
 ```
 /data/projects/lai/
 ├── LAI/                              # Application code
-│   ├── src/lai/                      # Python packages (domain-driven)
+│   ├── src/lai/                      # Installable domain-driven package (`lai`)
 │   │   ├── core/                     # Config, logging, exceptions, models, constants
-│   │   ├── api/                      # FastAPI app, middleware, RAG pipeline orchestrator
+│   │   ├── api/                      # FastAPI app shell + serve_rag.py (chat backend, :18000)
 │   │   ├── auth/                     # JWT auth, user CRUD, routes
 │   │   ├── documents/                # Upload, parse, chunk, embed, store
 │   │   ├── extraction/               # Location/geo extraction from legal docs (LLM-based)
-│   │   ├── search/                   # Query analysis, hybrid search, reranking
+│   │   ├── search/                   # Hybrid search, reranking + eval.py (retrieval eval harness)
 │   │   ├── generation/               # LLM client, prompts, CRAG, citation verification
 │   │   ├── infra/                    # Database pool, Redis cache, MinIO client
 │   │   └── pipeline/                 # Data processing pipeline (Steps 1-6)
+│   ├── micro-services/               # DDiQ due-diligence report service (lai-backend, :18001)
+│   ├── scripts/
+│   │   ├── ops/                      # Entry points — start/stop/status{,-host}.sh, resume_step5/6.sh
+│   │   ├── eval/                     # Eval & benchmark harnesses (rag_*, vllm_compare, ...)
+│   │   ├── db/                       # DB export / backup / restore utilities
+│   │   └── archive/                  # Completed one-off migrations, audits, pilots
 │   ├── training/                     # Model fine-tuning (separate lifecycle)
 │   ├── tests/                        # Unit, integration, E2E
-│   ├── logs/pipeline/                # Auto-generated logs per step
-│   │   ├── step1/                   #   step1_<source>_<timestamp>.log
-│   │   ├── step2/                   #   step2_<timestamp>.log
-│   │   └── ...
+│   ├── logs/                         # Auto-generated logs (pipeline/ per step, host/ per service)
 │   ├── docs/                         # Documentation
 │   └── pyproject.toml
 │
+├── .github/CODEOWNERS                # Per-domain review ownership
 └── Docker/                           # Containerized services (one dir per service)
     ├── database/
     │   ├── pgvector/                 # PostgreSQL + pgvector (port 5434)
@@ -121,13 +130,18 @@ Packages are organized by **business domain** (documents, search, generation, au
 
 ## Team Ownership
 
-| Package | Owner | What You Touch |
+Authoritative ownership is declared in [`.github/CODEOWNERS`](../../.github/CODEOWNERS)
+(replace the placeholder `@lai/*` handles with real team slugs). Summary:
+
+| Area | Owner | What You Touch |
 |---------|-------|---------------|
-| `lai.documents` | Dev A | Document upload, parsing (Docling), chunking, embedding, storage |
-| `lai.search` | Dev B | Query analysis, hybrid SQL search, reranker integration |
-| `lai.generation` | Dev C | LLM client, prompt templates, CRAG loop, citation verification |
-| `lai.auth` | Dev D | JWT tokens, user management, per-user schema creation |
-| `lai.core` / `lai.infra` / `lai.api` | Shared | Config, DB pool, Redis, MinIO, pipeline orchestrator |
+| `lai.pipeline` | data-pipeline | The 6-step corpus build; `python -m lai.pipeline.cli` |
+| `lai.search` | retrieval | Hybrid search, reranking, query analysis, `lai.search.eval` |
+| `lai.analyzer` | contract-analyzer | Qwen3.6-27B contract analyzer — playbooks, prompts, schema |
+| `lai.documents` / `lai.extraction` | ingestion | Document upload, parsing, chunking, geo-extraction |
+| `lai.generation` | generation | LLM client, prompt templates, CRAG loop, citation verification |
+| `lai.api` / `lai.auth` / `lai.core` / `lai.infra` | platform | App shell, serve_rag, JWT, config, DB/Redis/MinIO clients, `scripts/ops/` |
+| `micro-services/` | ddiq | DDiQ due-diligence report service |
 
 ---
 
@@ -158,10 +172,15 @@ cd /data/projects/lai/Docker/llm && docker compose up -d
 
 ```bash
 cd /data/projects/lai/LAI
-uv sync
-uv run python -m lai.api.main
-# API at http://localhost:8000
-# Docs at http://localhost:8000/docs
+uv sync                       # installs deps + the `lai` package (editable)
+
+# Runtime today — the two-service split (chat + DDiQ):
+bash scripts/ops/start.sh                 # Docker services + serve_rag + Vite
+#   or, Docker-free (host processes, no root):
+bash scripts/ops/start-host.sh
+
+# Planned-v2 unified FastAPI app (not yet the shipping runtime):
+uv run python -m lai.api.main             # API at http://localhost:8000
 ```
 
 ### 3. Run tests
@@ -176,7 +195,7 @@ uv run pytest -m "not slow"      # Skip slow tests
 
 ## API Endpoints
 
-> **Runtime today vs. planned v5.** What's actually running (and shipping in `MVP_DELIVERY.md`) is the two-service split below: `serve_rag` for the conversational legal assistant on `:18000` and `lai-backend` (the DDiQ microservice) for multi-doc due-diligence reports on `:18001`. The planned `src/lai/` domain-driven backend in the next subsection is the v5 design target — those endpoints (`/extraction/locations/...`, schema-per-user multi-tenancy) are not yet wired into the runtime.
+> **Runtime today vs. planned v2 app.** What's actually running (and shipping in `MVP_DELIVERY.md`) is the two-service split below: `serve_rag` (now `lai.api.serve_rag`) for the conversational legal assistant on `:18000` and `lai-backend` (the DDiQ microservice) for multi-doc due-diligence reports on `:18001`. The unified `lai.api.main` FastAPI app in the next subsection is the design target — those endpoints (`/extraction/locations/...`, schema-per-user multi-tenancy) are not yet wired into the runtime.
 
 ### Runtime: serve_rag (`:18000`) — conversational chat
 
@@ -208,7 +227,7 @@ uv run pytest -m "not slow"      # Skip slow tests
 
 > **Auth status (Apr 30):** the frontend `AuthContext` is currently a demo that accepts any credentials; both backends do not validate JWTs and do not scope by user. Sessions / documents / reports are globally visible. Real auth + user scoping is on the to-do list before any shared deployment — see `MVP_DELIVERY.md` "Known gaps".
 
-### Planned v5 (`src/lai/` domain-driven backend, not yet runtime)
+### Planned: unified `lai.api.main` app (`src/lai/` domain-driven backend, not yet runtime)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -277,10 +296,10 @@ cd /data/projects/lai/Docker/mlflow && docker compose up -d
 
 ## Versioning
 
-- **Code versions:** Git tags (`v5.0.0`, `v5.1.0`) — no version directories
+- **Code versions:** Git tags on the `v1.x` lineage (`v1.0.0-pre-split`, `v2.0.0`, ...) — no version directories. `pyproject.toml` `version` tracks the same scheme.
 - **Model versions:** MLflow run IDs — every training run is logged
 - **Feature flags:** Config toggles (`crag.enabled`, etc.) control what's active
-- **Rollback:** `git checkout v5.0.0` for code, MLflow artifact download for models
+- **Rollback:** `git checkout v2.0.0` for code, MLflow artifact download for models
 
 ---
 
@@ -326,7 +345,7 @@ immissionsschutzrecht, energierecht, baurecht, umweltrecht, vertragsrecht, gesel
 
 ---
 
-## What's Done (v5.0.0)
+## What's Done (v2.0.0)
 
 - [x] Domain-driven package architecture
 - [x] Full RAG pipeline (8 steps + CRAG loop)
@@ -366,7 +385,7 @@ immissionsschutzrecht, energierecht, baurecht, umweltrecht, vertragsrecht, gesel
 - [x] Step 5 fine-tuning data generation in progress (8 concurrent, ~46h ETA)
 - [x] Location/geo extraction module (`lai.extraction`) — LLM-based extraction of geocodable addresses, Flurstücke, coordinates from legal documents
 - [x] Extraction API endpoints (single, batch, summary)
-- [x] Test script for extraction (`scripts/test_extraction.py`)
+- [x] Extraction smoke-tested (the ad-hoc `scripts/test_extraction.py` was removed in the v2 restructure — superseded by the `lai.extraction` package + `scripts/eval/smoke_test_analyzer.py`)
 
 ---
 
@@ -401,7 +420,7 @@ Original size estimates were off; the corpora are much bigger than docs said:
 
 | Source | Actual size | Cases | Step 1 | Step 2 | Step 6 | Notes |
 |--------|---|---|:-:|:-:|:-:|---|
-| **hf_cases** | 13 GB | **251,038** | ✅ done (2026-04-23) | pending | pending | Custom processor: `scripts/temp/process_court_decisions.py` |
+| **hf_cases** | 13 GB | **251,038** | ✅ done (2026-04-23) | pending | pending | Custom processor: `scripts/archive/temp/process_court_decisions.py` |
 | **openlegaldata** | 1.5 GB | **41,740** | ✅ done (2026-04-23) | pending | pending | Same processor; 0.2% overlap with hf_cases, dedupe by ECLI/slug |
 | **Library** | 5.4 GB | 2,326 PDFs | pending | pending | pending | Use existing Step 1 Docling path |
 
@@ -433,7 +452,7 @@ from Step 5. Best checkpoint: **checkpoint-23000, eval_loss 0.553,
 token_accuracy 85.6%** (from 0.977 / 76% at step 1000). Merged adapter
 at `/data/projects/lai/models/qwen25-7b-legal-lora-v2-merged` (14.2 GB).
 
-**Why shelved**: a quality audit (`scripts/audit_training_data.py`)
+**Why shelved**: a quality audit (`scripts/archive/audit_training_data.py`)
 revealed **15.8% of legal citations in training answers are fabricated**
 by the 72B teacher. `rag_qa` (our core task) has an 18.8% citation
 fabrication rate. End-to-end RAG testing confirmed the FT model still
@@ -557,8 +576,8 @@ Ordered by leverage:
 | Issue | Impact | Status |
 |-------|--------|--------|
 | Phase 1 Steps 1-6 complete; fine-tune complete | Baseline RAG works | Shelved fine-tune, focusing on RAG quality |
-| **15.8% of training citations are fabricated** | FT model hallucinates §§/clauses | Captured in `scripts/audit_training_data.py`; regenerate with verification loop before retraining |
-| GPU contention with shared users | Training/eval may OOM | `./scripts/resume_step5.sh --status` to diagnose; resume cleanly via SQLite checkpoint |
+| **15.8% of training citations are fabricated** | FT model hallucinates §§/clauses | Captured in `scripts/archive/audit_training_data.py`; regenerate with verification loop before retraining |
+| GPU contention with shared users | Training/eval may OOM | `./scripts/ops/resume_step5.sh --status` to diagnose; resume cleanly via SQLite checkpoint |
 | No HNSW index on embeddings | 4096 dims > halfvec HNSW limit of 4000 | Use exact cosine search with metadata pre-filters |
 | `openlegaldata_api_dump/` has 4,174 legacy pre-V5 segment files | Will be picked up by Step 2 alongside our 84 new batches — may create noise | Inspect before Step 2; either delete or verify schema match |
 | Phase 2 chunk+embed pending | 290K court decisions processed but not yet in DB | Steps 2 + 6 next |
@@ -576,9 +595,9 @@ The pipeline can run with **only the LLM container** (no PostgreSQL, no MinIO, n
 
 ### Resume the running pipeline (one command)
 ```bash
-./scripts/resume_step5.sh           # starts vLLM container + Step 5
-./scripts/resume_step5.sh --status  # show progress
-./scripts/resume_step5.sh --stop    # stop Step 5 (keeps LLM up)
+./scripts/ops/resume_step5.sh           # starts vLLM container + Step 5
+./scripts/ops/resume_step5.sh --status  # show progress
+./scripts/ops/resume_step5.sh --stop    # stop Step 5 (keeps LLM up)
 ```
 
 The script auto-detects whichever container is publishing port 8005
@@ -609,7 +628,7 @@ embedding = list(struct.unpack('1024f', blob))  # 1024-dim vector
 
 Regenerate exports anytime PostgreSQL is up:
 ```bash
-python scripts/export_to_sqlite.py all
+python scripts/db/export_to_sqlite.py all
 ```
 
 ---
@@ -621,21 +640,23 @@ python scripts/export_to_sqlite.py all
 | App config | [src/lai/core/config.py](../src/lai/core/config.py) |
 | Data pipeline | [src/lai/pipeline/](../src/lai/pipeline/) — Steps 1-6 |
 | Location extraction | [src/lai/extraction/](../src/lai/extraction/) — LLM-based geo extraction |
-| Extraction test script | [scripts/test_extraction.py](../scripts/test_extraction.py) |
+| Chat backend (serve_rag) | [src/lai/api/serve_rag.py](../src/lai/api/serve_rag.py) — `python -m lai.api.serve_rag` |
+| Retrieval eval harness | [src/lai/search/eval.py](../src/lai/search/eval.py) — `python -m lai.search.eval` |
+| Per-domain ownership | [.github/CODEOWNERS](../../.github/CODEOWNERS) + per-package `README.md` under `src/lai/` |
 | Pipeline progress report | [PIPELINE_PROGRESS_REPORT.md](PIPELINE_PROGRESS_REPORT.md) |
 | Pipeline CLI | `python -m lai.pipeline.cli step1 --help` |
 | Local mode (no PostgreSQL) | `python -m lai.pipeline.cli step2 --local` — see [local_storage.py](../src/lai/pipeline/local_storage.py) |
-| Resume Step 5 (one-shot) | `./scripts/resume_step5.sh` — auto-starts vLLM container + Step 5 |
-| SQLite export of all DB data | `python scripts/export_to_sqlite.py all` — creates portable `.db` files |
+| Resume Step 5 (one-shot) | `./scripts/ops/resume_step5.sh` — auto-starts vLLM container + Step 5 |
+| SQLite export of all DB data | `python scripts/db/export_to_sqlite.py all` — creates portable `.db` files |
 | SQLite exports (location) | `LAI/processed/db_export/pipeline.db` (1GB) and `app.db` (284GB) |
 | Export training data to JSONL | `python -m training.fine_tuning.scripts.export_training_data` |
 | Run LoRA fine-tune | `python -m training.fine_tuning.scripts.run_lora --epochs 2` (see script for all flags) |
 | Training outputs | `training/fine_tuning/output/qwen25-7b-legal-lora/` (adapter + best checkpoint) |
-| **Process court decisions** | `python scripts/temp/process_court_decisions.py --source all` (handles hf_cases + openlegaldata, writes Step-1-compatible segments) |
+| **Process court decisions** | `python scripts/archive/temp/process_court_decisions.py --source all` (handles hf_cases + openlegaldata, writes Step-1-compatible segments) |
 | **Training-data quality audit** | `python scripts/archive/audit_training_data.py` (citations verified against parent chunks; found 15.8% fabrication rate) |
 | **Retrieval eval harness** | `python -m lai.search.eval --mode hybrid_rerank --n 500` (6 modes; writes results to `scripts/eval/rag_eval_results/`) |
 | **Retrieval failure analysis** | `python scripts/eval/rag_audit_analysis.py <results.json>` (breaks down recall by task, specificity, doc_type) |
-| **End-to-end RAG test** | `python scripts/rag_generate_test.py --n 5` (retrieve + generate with base + FT, side-by-side) |
+| **End-to-end RAG test** | `python scripts/eval/rag_generate_test.py --n 5` (retrieve + generate with base + FT, side-by-side) |
 | **Raw corpus layout** | `LAI/data/lai-raw/` (671 GB source docs) + `LAI/data/lai-segments/` (1.7 GB Step-1 output) — moved from `minio-backup/` 2026-04-23 |
 | RAG pipeline | [src/lai/api/pipeline.py](../src/lai/api/pipeline.py) |
 | Hybrid search SQL | [src/lai/search/hybrid_search.py](../src/lai/search/hybrid_search.py) |

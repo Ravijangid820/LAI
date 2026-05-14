@@ -1,4 +1,4 @@
-# LAI v5 - Architecture Overview
+# LAI v2 - Architecture Overview
 
 ## What LAI Does
 
@@ -39,15 +39,23 @@ LAI is a German legal AI platform for wind energy due diligence. It answers lega
 
 ## Packages (Domain-Driven)
 
-| Package | Domain Owner | Purpose | Key Files |
+`src/lai/` is an installable package (`uv sync` / `pip install -e .`). Each
+subpackage is one domain with its own `README.md`; review ownership is in
+[`.github/CODEOWNERS`](../../../.github/CODEOWNERS) (owner column below uses
+its team scheme).
+
+| Package | Owner | Purpose | Key Files |
 |---------|-------------|---------|-----------|
-| `lai.core` | Shared | Config, models, logging, utils, exceptions, constants | config.py, models.py, logging.py, constants.py, utils.py, exceptions.py |
-| `lai.documents` | Dev A | Document ingestion: parsing, chunking, embedding, CRUD | chunker.py, embedder.py, parser.py, repository.py, routes.py |
-| `lai.search` | Dev B | Search: query analysis, hybrid search, reranking | hybrid_search.py, query_analyzer.py, reranker.py, repository.py, routes.py |
-| `lai.generation` | Dev C | LLM: prompt building, CRAG grading, citation verification | llm_client.py, prompt_builder.py, citation_verifier.py, crag.py |
-| `lai.auth` | Dev D | Auth: JWT, users, sessions, per-user schema creation | jwt.py, repository.py, routes.py |
-| `lai.infra` | Shared | Infrastructure clients: DB pool, MinIO, Redis | database.py, minio.py, redis.py |
-| `lai.api` | Shared | FastAPI app shell, middleware, RAG pipeline orchestrator | main.py, middleware.py, pipeline.py |
+| `lai.core` | platform | Config, models, logging, utils, exceptions, constants | config.py, models.py, logging.py, constants.py, utils.py, exceptions.py |
+| `lai.infra` | platform | Infrastructure clients: DB pool, MinIO, Redis | database.py, minio.py, redis.py |
+| `lai.api` | platform | FastAPI app shell + `serve_rag.py` (the :18000 chat backend) | main.py, serve_rag.py, pipeline.py |
+| `lai.auth` | platform | Auth: JWT, users, sessions, per-user schema creation | jwt.py, repository.py, routes.py |
+| `lai.documents` | ingestion | Document ingestion: parsing, chunking, embedding, CRUD | chunker.py, embedder.py, parser.py, repository.py, routes.py |
+| `lai.extraction` | ingestion | Location/geo extraction from legal docs | location.py, models.py, repository.py, routes.py |
+| `lai.search` | retrieval | Hybrid search, reranking, query analysis + `eval.py` (retrieval eval) | hybrid_search.py, query_analyzer.py, reranker.py, eval.py, repository.py, routes.py |
+| `lai.generation` | generation | LLM: prompt building, CRAG grading, citation verification | llm_client.py, prompt_builder.py, citation_verifier.py, crag.py |
+| `lai.analyzer` | contract-analyzer | Qwen3.6-27B contract analyzer — playbooks, prompts, schema | pipeline.py, playbooks.py, prompts.py, schema.py, reconciler.py |
+| `lai.pipeline` | data-pipeline | The 6-step corpus build (`python -m lai.pipeline.cli`) | cli.py, convert.py, chunk.py, classify.py, enrich.py, generate.py, embed.py |
 
 ## RAG Pipeline (8 steps + CRAG loop)
 

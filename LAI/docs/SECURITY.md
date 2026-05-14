@@ -55,7 +55,7 @@ Used when access is gated by a VPN like FortiClient — anyone past the VPN can 
 
 ```bash
 # serve_rag
-LAI_BIND_HOST=0.0.0.0 .venv/bin/python scripts/serve_rag.py --port 18000
+LAI_BIND_HOST=0.0.0.0 .venv/bin/python -m lai.api.serve_rag --port 18000
 
 # analyzer LLM container
 ANALYZER_BIND_HOST=0.0.0.0 docker compose -f Docker/llm-analyzer/docker-compose.yml up -d

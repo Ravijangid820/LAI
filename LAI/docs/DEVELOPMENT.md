@@ -1,23 +1,27 @@
 # LAI - Development Guide
 
-> **What's runtime today.** The MVP runtime is a two-service split: the conversational chat (`lai.api.serve_rag`, `:18000`) and the DDiQ due-diligence microservice (`micro-services/`, `:18001` Docker). The frontend is in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), conventionally cloned to `/data/projects/lai/LAI-UI/`. The `src/lai/` domain-driven backend below is the v5 design target — its FastAPI app (`lai.api.main`) is not yet wired into the runtime that ships. See [`MVP_DELIVERY.md`](MVP_DELIVERY.md) and [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+> **What's runtime today.** The MVP runtime is a two-service split: the conversational chat (`lai.api.serve_rag`, `:18000`) and the DDiQ due-diligence microservice (`micro-services/`, `:18001` Docker). The frontend is in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), conventionally cloned to `/data/projects/lai/LAI-UI/`. As of the v2 restructure, `src/lai/` is an installable package (`uv sync` / `pip install -e .`) and `serve_rag` lives in it at `lai.api.serve_rag`; the unified FastAPI app shell (`lai.api.main`) is still the design target and not yet the shipping entry point. See [`MVP_DELIVERY.md`](MVP_DELIVERY.md) and [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
 
 ## Project Structure
 
+`src/lai/` is an installable package — `uv sync` (or `pip install -e .`)
+makes `from lai... import ...` work everywhere, with no `sys.path` hacks.
+Each subpackage is one **domain** with its own `README.md`; ownership is in
+[`.github/CODEOWNERS`](../../.github/CODEOWNERS). See
+[`src/lai/README.md`](../src/lai/README.md) for the full package map.
+
 ```
 LAI/
-├── src/lai/                      # Planned-v5 Python package (domain-driven)
+├── src/lai/                      # Installable domain-driven package (`lai`)
 │   ├── core/                     # Config, constants, models, logging, utils, exceptions
-│   ├── api/                      # FastAPI app, middleware, RAG pipeline orchestrator
+│   ├── api/                      # FastAPI app shell + serve_rag.py (chat backend, :18000)
 │   ├── auth/                     # JWT auth, user CRUD, routes
 │   ├── documents/                # Chunking, embedding, parsing, document CRUD, routes
-│   ├── search/                   # Query analysis, hybrid search, reranking, routes
+│   ├── search/                   # Hybrid search, reranking, routes + eval.py (retrieval eval)
 │   ├── generation/               # LLM client, prompts, CRAG grading, citation verification
 │   ├── infra/                    # Database pool, Redis cache, MinIO client
-│   └── pipeline/                 # Data processing pipeline (6 steps, CLI) — runtime today
+│   └── pipeline/                 # Data processing pipeline (6 steps, CLI)
 │
-├── scripts/
-│   └── serve_rag.py              # Runtime conversational chat backend (:18000)
 ├── micro-services/               # Runtime DDiQ microservice (lai-backend, :18001)
 │   ├── api.py                    # FastAPI app with the /ddiq/* routes
 │   ├── ddiq_report.py            # Pipeline + extraction passes (Evidence, Timeline, Grundbuch, Rückbau, ...)
@@ -25,10 +29,17 @@ LAI/
 │   ├── docker-compose.yml        # Container definition
 │   └── Dockerfile
 │
+├── scripts/
+│   ├── ops/                      # Entry points — start/stop/status{,-host}.sh, resume_step5/6.sh
+│   ├── eval/                     # Eval & benchmark harnesses (rag_*, vllm_compare, ...)
+│   ├── db/                       # DB export / backup / restore utilities
+│   └── archive/                  # Completed one-off migrations, audits, pilots
+│
 ├── training/                     # Model training (separate lifecycle)
 ├── tests/                        # Test suites (unit, integration, e2e)
 ├── docs/                         # Documentation
-└── pyproject.toml
+├── pyproject.toml
+└── .github/CODEOWNERS            # Per-domain review ownership
 
 # Sibling clone (its own repo — not under LAI/)
 /data/projects/lai/LAI-UI/        # Frontend (Vite + React) — github.com/Ravijangid820/LAI-UI
@@ -138,7 +149,8 @@ All steps log extensively to aid debugging. Logs include step timing, batch prog
 
 ## Versioning
 
-- Versions are git tags, not directories: `git tag v5.0.0`
+- Versions are git tags, not directories: `git tag v2.0.0` (the `v1.x` lineage —
+  see `pyproject.toml` `version` and the existing `v1.0.0-pre-split` tag)
 - Feature flags in config control what's active: `crag.enabled = true`
 - Model versions tracked in MLflow (http://localhost:5000)
 

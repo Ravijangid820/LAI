@@ -235,7 +235,7 @@ We need a real benchmark or this whole thing is vibes. Plan:
   - Latency p50/p95
 - **Baseline:** current V1 analyzer on the same set.
 
-Eval harness lives at `LAI/scripts/eval_analyzer.py` and reuses the pattern from `multi_model_compare.md`.
+Eval harness lives at `LAI/scripts/eval/eval_analyzer.py` and reuses the pattern from `multi_model_compare.md`.
 
 ## 12. Rollout plan
 
@@ -265,7 +265,7 @@ Resolved in this revision so implementation is unblocked. Revisit only if eval r
 | `LAI/src/lai/analyzer/` | New package: `playbooks/`, `prompts/`, `reconciler.py`, `cadastral_ner.py`, `schema.py` |
 | `Docker/llm-analyzer.docker-compose.yml` | New vLLM container for Qwen3.6-27B on port 8005 |
 | `LAI/eval/contracts/` | Gold set YAML + 5 PDFs (already in VDRs/) |
-| `LAI/scripts/eval_analyzer.py` | New eval harness |
+| `LAI/scripts/eval/eval_analyzer.py` | New eval harness |
 | `LAI/docs/INFRASTRUCTURE.md` | Document the new analyzer service |
 
 ## 15. Estimated effort
