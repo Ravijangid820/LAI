@@ -279,7 +279,7 @@ for the current run's config and lessons learned.
 ## Documentation
 
 - [Project Status](docs/PROJECT_STATUS.md) — Start here if you're new to the project
-- [How It Works](docs/HOW_IT_WORKS.md) — End-to-end data flow: corpus build, upload, query, DDiQ reports
+- [Workflow](docs/WORKFLOW.md) — End-to-end data flow: corpus build, upload, query, DDiQ reports
 - [Architecture Overview](docs/architecture/overview.md)
 - [Infrastructure Guide](docs/INFRASTRUCTURE.md)
 - [Development Guide](docs/DEVELOPMENT.md)

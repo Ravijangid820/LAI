@@ -1,4 +1,4 @@
-# How LAI Works — End-to-End
+# LAI Workflow — End-to-End
 
 A narrative walkthrough of how data flows through the LAI platform: from raw
 legal documents to a searchable corpus, and from a user's question (or uploaded
