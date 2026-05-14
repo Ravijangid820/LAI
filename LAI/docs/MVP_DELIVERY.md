@@ -29,7 +29,7 @@ The MVP for the LAI contract-review platform is now deployed and working end-to-
 
 - Containerized stack (analyzer LLM, embedding service, pgvector database, Redis) orchestrated by a single Docker Compose file.
 - Host processes (FastAPI backend, Vite UI) for fast iteration.
-- One-command bring-up / tear-down scripts (`scripts/start.sh`, `stop.sh`, `status.sh`).
+- One-command bring-up / tear-down scripts (`scripts/ops/start.sh`, `stop.sh`, `status.sh`).
 - Loopback-only by default; VPN-trusted mode supported for remote access via FortiClient.
 
 ## Quality engineering done along the way

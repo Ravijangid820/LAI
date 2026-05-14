@@ -2,7 +2,7 @@
 
 > **Status:** Draft, 2026-04-27
 > **Owner:** rj
-> **Supersedes:** the single-pass `/analyze-contract` flow in `scripts/serve_rag.py`
+> **Supersedes:** the single-pass `/analyze-contract` flow in `lai.api.serve_rag`
 > **Goal:** Increase recall and accuracy of contract review at the cost of latency. Target turnaround ≤ 2 min per contract; no per-clause speed budget.
 
 ---
@@ -261,7 +261,7 @@ Resolved in this revision so implementation is unblocked. Revisit only if eval r
 
 | Path | Change |
 |---|---|
-| `LAI/scripts/serve_rag.py` | New `analyze_contract_v2`, V1 kept; routing via `version` flag |
+| `LAI/src/lai/api/serve_rag.py` | New `analyze_contract_v2`, V1 kept; routing via `version` flag |
 | `LAI/src/lai/analyzer/` | New package: `playbooks/`, `prompts/`, `reconciler.py`, `cadastral_ner.py`, `schema.py` |
 | `Docker/llm-analyzer.docker-compose.yml` | New vLLM container for Qwen3.6-27B on port 8005 |
 | `LAI/eval/contracts/` | Gold set YAML + 5 PDFs (already in VDRs/) |

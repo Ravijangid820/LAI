@@ -13,7 +13,7 @@
 #   docker compose down          # tear down (data survives)
 #   docker compose down -v       # also wipe pgvector + redis data
 #
-# Bring up host processes (serve_rag.py, Vite UI) via scripts/start.sh.
+# Bring up host processes (serve_rag, Vite UI) via scripts/ops/start.sh.
 #
 # Trust model: by default services bind to 127.0.0.1. Override with
 # ANALYZER_BIND_HOST / PG_BIND_HOST / REDIS_BIND_HOST / EMBEDDING_BIND_HOST

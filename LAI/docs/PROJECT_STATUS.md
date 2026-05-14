@@ -521,9 +521,9 @@ their gold chunk in the current corpus even with the best retriever.
 Phase 2 (290K court decisions being added) should lift this substantially
 for queries whose gold answer exists in court decisions.
 
-**Key script**: [`scripts/rag_eval.py`](../scripts/rag_eval.py) — runs
-any of the 6 modes above on N val queries; per-query and aggregated
-metrics saved to `scripts/rag_eval_results/`.
+**Key module**: [`lai.search.eval`](../src/lai/search/eval.py) — `python -m
+lai.search.eval` runs any of the 6 modes above on N val queries; per-query
+and aggregated metrics saved to `scripts/eval/rag_eval_results/`.
 
 ## What's Next
 
@@ -632,9 +632,9 @@ python scripts/export_to_sqlite.py all
 | Run LoRA fine-tune | `python -m training.fine_tuning.scripts.run_lora --epochs 2` (see script for all flags) |
 | Training outputs | `training/fine_tuning/output/qwen25-7b-legal-lora/` (adapter + best checkpoint) |
 | **Process court decisions** | `python scripts/temp/process_court_decisions.py --source all` (handles hf_cases + openlegaldata, writes Step-1-compatible segments) |
-| **Training-data quality audit** | `python scripts/audit_training_data.py` (citations verified against parent chunks; found 15.8% fabrication rate) |
-| **Retrieval eval harness** | `python scripts/rag_eval.py --mode hybrid_rerank --n 500` (6 modes; writes results to `scripts/rag_eval_results/`) |
-| **Retrieval failure analysis** | `python scripts/rag_audit_analysis.py <results.json>` (breaks down recall by task, specificity, doc_type) |
+| **Training-data quality audit** | `python scripts/archive/audit_training_data.py` (citations verified against parent chunks; found 15.8% fabrication rate) |
+| **Retrieval eval harness** | `python -m lai.search.eval --mode hybrid_rerank --n 500` (6 modes; writes results to `scripts/eval/rag_eval_results/`) |
+| **Retrieval failure analysis** | `python scripts/eval/rag_audit_analysis.py <results.json>` (breaks down recall by task, specificity, doc_type) |
 | **End-to-end RAG test** | `python scripts/rag_generate_test.py --n 5` (retrieve + generate with base + FT, side-by-side) |
 | **Raw corpus layout** | `LAI/data/lai-raw/` (671 GB source docs) + `LAI/data/lai-segments/` (1.7 GB Step-1 output) — moved from `minio-backup/` 2026-04-23 |
 | RAG pipeline | [src/lai/api/pipeline.py](../src/lai/api/pipeline.py) |

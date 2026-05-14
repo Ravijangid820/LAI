@@ -58,7 +58,7 @@ docker network create lai_network
 
 ### Host processes (not Docker)
 
-Started via `bash scripts/start.sh` from the LAI repo root:
+Started via `bash scripts/ops/start.sh` from the LAI repo root:
 
 | Process | Port | Notes |
 |---|---|---|

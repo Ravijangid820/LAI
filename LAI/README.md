@@ -35,7 +35,7 @@ uv run python -m lai.api.main
 
 The MVP runtime is a **two-service split** that runs alongside the data pipeline above:
 
-- **`serve_rag`** (host process, `:18000`) — the conversational legal assistant. Document upload + clause analyzer + RAG-grounded chat with conversational memory + vLLM prefix caching. Started via `bash scripts/start.sh`.
+- **`serve_rag`** (host process, `:18000`) — the conversational legal assistant. Document upload + clause analyzer + RAG-grounded chat with conversational memory + vLLM prefix caching. Started via `bash scripts/ops/start.sh`.
 - **`lai-backend`** (Docker container, `:18001`) — the DDiQ multi-document due-diligence microservice at [`micro-services/`](micro-services/). Async report generation with request-fingerprint dedup, incremental persistence, statutory-anchor section prompts, timeline / cross-doc / Grundbuch / Rückbau extraction passes, 10H rule. Brought up via `docker compose -f micro-services/docker-compose.yml up -d`.
 
 The frontend lives in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), cloned by convention to `/data/projects/lai/LAI-UI/` (override via `LAI_UI_DIR`).
@@ -155,13 +155,13 @@ python scripts/temp/process_court_decisions.py --source all
 
 ## RAG Evaluation
 
-`scripts/rag_eval.py` measures retrieval quality end-to-end on stratified
-val queries whose gold `parent_id` is known. Filter the search pool with
-`--exclude-source-corpus multilegalpile` or `--only-doc-types vdr,gesetz,...`
-to test against specific corpus subsets.
+The retrieval eval harness (`lai.search.eval`) measures retrieval quality
+end-to-end on stratified val queries whose gold `parent_id` is known. Filter
+the search pool with `--exclude-source-corpus multilegalpile` or
+`--only-doc-types vdr,gesetz,...` to test against specific corpus subsets.
 
 ```bash
-python scripts/rag_eval.py --mode hybrid_rerank --n 100
+python -m lai.search.eval --mode hybrid_rerank --n 100
 ```
 
 Modes (compared on the **8.3M-embedding corpus** after dedup, n=100):
@@ -188,9 +188,9 @@ are concentrated.
 
 ## End-to-end RAG Service + Web UI
 
-`scripts/serve_rag.py` exposes the full retrieval+generation pipeline
-behind a FastAPI endpoint that matches the contract consumed by the
-**LAI-UI** frontend.
+`lai.api.serve_rag` (`src/lai/api/serve_rag.py`) exposes the full
+retrieval+generation pipeline behind a FastAPI endpoint that matches the
+contract consumed by the **LAI-UI** frontend.
 
 The frontend lives in its own repo as of v1.0.0:
 
@@ -226,9 +226,9 @@ python scripts/rag_generate_test.py --n 5 --top-k 3 \
 
 ## Multi-model RAG comparison
 
-`scripts/multi_model_compare.py` runs the same retrieval contexts
+`scripts/archive/multi_model_compare.py` runs the same retrieval contexts
 through several LLMs side-by-side and writes a markdown report to
-`scripts/rag_eval_results/multi_model_compare.md`.
+`scripts/eval/rag_eval_results/multi_model_compare.md`.
 
 ```bash
 # Small models that fit alongside the embedding container (lai_embedding ~44 GB on GPU)

@@ -1,6 +1,6 @@
 # LAI - Development Guide
 
-> **What's runtime today.** The MVP runtime is a two-service split: the conversational chat (`scripts/serve_rag.py`, `:18000`) and the DDiQ due-diligence microservice (`micro-services/`, `:18001` Docker). The frontend is in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), conventionally cloned to `/data/projects/lai/LAI-UI/`. The `src/lai/` domain-driven backend below is the v5 design target — its FastAPI app (`lai.api.main`) is not yet wired into the runtime that ships. See [`MVP_DELIVERY.md`](MVP_DELIVERY.md) and [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+> **What's runtime today.** The MVP runtime is a two-service split: the conversational chat (`lai.api.serve_rag`, `:18000`) and the DDiQ due-diligence microservice (`micro-services/`, `:18001` Docker). The frontend is in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), conventionally cloned to `/data/projects/lai/LAI-UI/`. The `src/lai/` domain-driven backend below is the v5 design target — its FastAPI app (`lai.api.main`) is not yet wired into the runtime that ships. See [`MVP_DELIVERY.md`](MVP_DELIVERY.md) and [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
 
 ## Project Structure
 

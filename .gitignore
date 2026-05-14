@@ -77,8 +77,10 @@ LAI/.runtime-cache/
 # Raw corpus (671 GB of legal source docs; lives in LAI/data/raw/)
 LAI/data/
 
-# Benchmark files copied out of raw corpus by process_gerdalir.py (~14 MB, regeneratable)
-LAI/scripts/rag_eval_results/gerdalir_benchmark/
+# Eval / audit output artifacts under scripts/ — regenerable, kept local but not tracked.
+LAI/scripts/eval/rag_eval_results/
+LAI/scripts/**/*_results.json
+LAI/scripts/archive/temp/*_audit.json
 
 # Additional virtualenvs outside LAI/.venv
 vllm-env/

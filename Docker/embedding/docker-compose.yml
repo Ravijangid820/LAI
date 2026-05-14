@@ -15,7 +15,7 @@
 services:
   embedding:
     image: vllm/vllm-openai:latest
-    container_name: lai_embedding
+    container_name: ${EMBEDDING_NAME:-lai_embedding}
     restart: unless-stopped
     ipc: host
     # Model as positional arg (the `--model` flag is deprecated in vLLM 0.8+)

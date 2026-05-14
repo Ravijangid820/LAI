@@ -1,40 +1,0 @@
-`torch_dtype` is deprecated! Use `dtype` instead!
-Loaded 500 val queries
-Loading child embeddings into RAM...
-  217,165 vectors loaded in 5.3s (3.31 GB)
-Loading reranker Qwen/Qwen3-Reranker-8B...
-Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]Loading checkpoint shards:  20%|██        | 1/5 [00:01<00:04,  1.02s/it]Loading checkpoint shards:  40%|████      | 2/5 [00:01<00:02,  1.05it/s]Loading checkpoint shards:  60%|██████    | 3/5 [00:02<00:01,  1.04it/s]Loading checkpoint shards:  80%|████████  | 4/5 [00:03<00:00,  1.17it/s]Loading checkpoint shards: 100%|██████████| 5/5 [00:03<00:00,  1.55it/s]Loading checkpoint shards: 100%|██████████| 5/5 [00:03<00:00,  1.30it/s]
-  [25/500] mode=hybrid_rerank
-  [50/500] mode=hybrid_rerank
-  [75/500] mode=hybrid_rerank
-  [100/500] mode=hybrid_rerank
-  [125/500] mode=hybrid_rerank
-  [150/500] mode=hybrid_rerank
-  [175/500] mode=hybrid_rerank
-  [200/500] mode=hybrid_rerank
-  [225/500] mode=hybrid_rerank
-  [250/500] mode=hybrid_rerank
-  [275/500] mode=hybrid_rerank
-  [300/500] mode=hybrid_rerank
-  [325/500] mode=hybrid_rerank
-  [350/500] mode=hybrid_rerank
-  [375/500] mode=hybrid_rerank
-  [400/500] mode=hybrid_rerank
-  [425/500] mode=hybrid_rerank
-  [450/500] mode=hybrid_rerank
-  [475/500] mode=hybrid_rerank
-  [500/500] mode=hybrid_rerank
-
-============================================================
-RESULTS — mode=hybrid_rerank, n=500
-============================================================
-           n: 500
-     elapsed: 2418.2
-     q_per_s: 0.21
-    recall@1: 0.232
-    recall@3: 0.462
-    recall@5: 0.58
-   recall@10: 0.7
-         mrr: 0.373
-
-Saved to scripts/rag_eval_results/hybrid_rerank_n500.json

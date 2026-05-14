@@ -1,0 +1,41 @@
+# CODEOWNERS — review ownership by domain.
+#
+# ⚠️  PLACEHOLDER HANDLES. Replace every @lai/* below with real GitHub
+#     usernames or team slugs before relying on this for required reviews.
+#     GitHub matches the LAST matching pattern, so order matters.
+#
+# Paths are relative to the repository root (/data/projects/lai).
+
+# ── Default — anything not matched below ────────────────────────────────
+*                               @lai/maintainers
+
+# ── Backend domains (src/lai/<package>/) ────────────────────────────────
+/LAI/src/lai/pipeline/          @lai/data-pipeline
+/LAI/src/lai/search/            @lai/retrieval
+/LAI/src/lai/analyzer/          @lai/contract-analyzer
+/LAI/src/lai/documents/         @lai/ingestion
+/LAI/src/lai/extraction/        @lai/ingestion
+/LAI/src/lai/generation/        @lai/generation
+/LAI/src/lai/api/               @lai/platform
+/LAI/src/lai/auth/              @lai/platform
+/LAI/src/lai/core/              @lai/platform
+/LAI/src/lai/infra/             @lai/platform
+
+# ── DDiQ report service ─────────────────────────────────────────────────
+/LAI/micro-services/            @lai/ddiq
+
+# ── Operational scripts & infrastructure ────────────────────────────────
+/LAI/scripts/ops/               @lai/platform
+/LAI/docker-compose.yml         @lai/platform
+/LAI/Docker/                    @lai/platform
+/Docker/                        @lai/platform
+/.github/                       @lai/platform
+
+# ── Eval / benchmark harnesses ──────────────────────────────────────────
+/LAI/scripts/eval/              @lai/retrieval
+
+# ── Archived one-offs — no active owner; review by maintainers ──────────
+/LAI/scripts/archive/           @lai/maintainers
+
+# ── Docs ────────────────────────────────────────────────────────────────
+/LAI/docs/                      @lai/maintainers
