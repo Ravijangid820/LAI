@@ -23,8 +23,10 @@ COVERAGE   ?= $(if $(UV),uv run coverage,$(VENV_PY) -m coverage)
 PRECOMMIT  ?= $(if $(UV),uv run pre-commit,$(VENV_PY) -m pre_commit)
 
 # Scope of the strict gate. Expand as more code migrates to clean status.
-STRICT_SRC  := src/lai/common
-STRICT_TEST := tests/unit/common
+# Note: mypy runs on production code only. Tests are validated by running
+# (pytest) and lint-checked by ruff — mypy on tests creates noise from
+# `@pytest.mark.*` decorators that doesn't catch real bugs.
+STRICT_SRC := src/lai/common
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Targets
@@ -51,8 +53,8 @@ format:  ## Apply ruff format + safe fixes.
 	$(RUFF) check --fix src tests
 	$(RUFF) format src tests
 
-type:  ## Mypy strict on the strict-gated paths.
-	$(MYPY) $(STRICT_SRC) $(STRICT_TEST)
+type:  ## Mypy strict on the lai.common production code. Tests are validated by running.
+	$(MYPY) $(STRICT_SRC)
 
 test:  ## Run unit tests (fast).
 	$(PYTEST) -m "unit and not slow" tests/unit

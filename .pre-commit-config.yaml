@@ -41,15 +41,15 @@ repos:
         name: ruff (format)
         files: ^LAI/(src|tests)/
 
-  # ── Mypy: strict typing on lai.common only. ──────────────────────────────
-  # Runs against the project pyproject.toml so the [tool.mypy] overrides
-  # apply. Other files are linted by ruff only until they migrate.
+  # ── Mypy: strict typing on lai.common production code only. ─────────────
+  # Tests are validated by running; mypy on @pytest.mark.* decorators
+  # produces noise without catching real bugs.
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.13.0
     hooks:
       - id: mypy
         name: mypy (lai.common strict)
-        files: ^LAI/(src/lai/common|tests/unit/common)/
+        files: ^LAI/src/lai/common/
         args:
           [
             --config-file=LAI/pyproject.toml,

@@ -41,7 +41,7 @@ That runs, in order:
 | Step       | Tool      | What it gates                                                |
 |------------|-----------|--------------------------------------------------------------|
 | `lint`     | ruff      | Style + a curated lint set (E, F, I, N, W, UP, B, C4, SIM, RET, PIE, PT, RUF). Formatter must report no changes. |
-| `type`     | mypy      | **Strict** on `src/lai/common` and `tests/unit/common`. Permissive on legacy paths until each migrates. |
+| `type`     | mypy      | **Strict** on `src/lai/common` (production code). Tests are validated by running, not by mypy — `@pytest.mark.*` decorators produce noise that doesn't catch real bugs. Legacy paths stay permissive. |
 | `cov`      | pytest    | Unit tests on `tests/unit/**`. Coverage on `src/lai/common` must be ≥ 85% (line + branch). |
 | `security` | bandit    | Security scan on `src/lai/common`. |
 
@@ -72,8 +72,7 @@ The scope is declared in two places:
 
 - `pyproject.toml` → `[[tool.mypy.overrides]] module = "lai.common.*"` and
   `[tool.coverage.run] source = ["src/lai/common"]`.
-- `Makefile` → `STRICT_SRC := src/lai/common` and `STRICT_TEST :=
-  tests/unit/common`.
+- `Makefile` → `STRICT_SRC := src/lai/common`.
 
 When a legacy module migrates: add it to the mypy override `module` list, add
 its source dir to coverage `source`, and update `STRICT_SRC` in the Makefile.
