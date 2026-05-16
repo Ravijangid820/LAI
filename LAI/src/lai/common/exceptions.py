@@ -41,6 +41,10 @@ __all__ = [
     "LlmJsonParseError",
     "LlmRetryExhaustedError",
     "LlmSchemaValidationError",
+    "RerankerCallError",
+    "RerankerError",
+    "RerankerInvalidResponseError",
+    "RerankerRetryExhaustedError",
 ]
 
 
@@ -176,6 +180,95 @@ class LlmRetryExhaustedError(LlmError):
         message: Human-readable description.
         attempts: Total number of attempts made (including the final failed
             one). Always ``>= 1``.
+
+    Raises:
+        ValueError: If ``attempts`` is less than 1.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int,
+    ) -> None:
+        if attempts < 1:
+            raise ValueError(
+                f"attempts must be >= 1, got {attempts}",
+            )
+        super().__init__(message)
+        self.attempts: int = attempts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reranker-related
+#
+# Parallel hierarchy to ``LlmError``: a base type for any failure interacting
+# with the reranker service, plus three concrete subtypes mirroring the LLM
+# call/content/retry-exhausted split. We do *not* reuse the LLM exceptions
+# here because callers may want to distinguish a reranker failure from an
+# LLM failure (different recovery actions: degrade ranking quality vs. abort
+# generation entirely).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class RerankerError(LaiCommonError):
+    """Base for any failure interacting with the reranker service."""
+
+
+class RerankerCallError(RerankerError):
+    """Transport-level failure when calling the reranker.
+
+    Covers HTTP errors, request timeouts, and connection refusals.
+
+    Args:
+        message: Human-readable description.
+        status_code: HTTP status code, if the failure was a non-2xx response.
+            ``None`` for pre-HTTP failures (timeout, DNS, connection refused).
+        url: The endpoint that failed, for log attribution.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        url: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code: int | None = status_code
+        self.url: str | None = url
+
+
+class RerankerInvalidResponseError(RerankerError):
+    """The reranker responded successfully but the content is unusable.
+
+    Examples: response is not a JSON array; an entry is missing ``index``
+    or ``score``; ``index`` is out of range for the input texts; ``score``
+    is non-numeric.
+
+    Args:
+        message: Human-readable description.
+        raw_response: The exact string the reranker returned, if available.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_response: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_response: str | None = raw_response
+
+
+class RerankerRetryExhaustedError(RerankerError):
+    """All retry attempts against the reranker failed.
+
+    Cause-chained via ``raise ... from`` like :class:`LlmRetryExhaustedError`.
+
+    Args:
+        message: Human-readable description.
+        attempts: Total number of attempts made. Always ``>= 1``.
 
     Raises:
         ValueError: If ``attempts`` is less than 1.

@@ -19,7 +19,33 @@ decisions that motivated each.
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from lai.common.llm import (
+    ChatMessage,
+    LlmClient,
+    LlmConfig,
+    LlmMetrics,
+    SyncLlmClient,
+)
+from lai.common.reranker import (
+    RerankerClient,
+    RerankerConfig,
+    RerankerMetrics,
+    RerankResult,
+    SyncRerankerClient,
+)
+
+__all__: list[str] = [
+    "ChatMessage",
+    "LlmClient",
+    "LlmConfig",
+    "LlmMetrics",
+    "RerankResult",
+    "RerankerClient",
+    "RerankerConfig",
+    "RerankerMetrics",
+    "SyncLlmClient",
+    "SyncRerankerClient",
+]
 
 # Package version is independent of the top-level ``lai`` distribution so the
 # shared primitives can evolve with their own semver cadence once consumed by

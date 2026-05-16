@@ -20,6 +20,10 @@ from lai.common.exceptions import (
     LlmJsonParseError,
     LlmRetryExhaustedError,
     LlmSchemaValidationError,
+    RerankerCallError,
+    RerankerError,
+    RerankerInvalidResponseError,
+    RerankerRetryExhaustedError,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,12 +66,33 @@ def test_dunder_all_is_sorted() -> None:
         LlmSchemaValidationError,
         LlmGuidedDecodingError,
         LlmRetryExhaustedError,
+        RerankerError,
+        RerankerCallError,
+        RerankerInvalidResponseError,
+        RerankerRetryExhaustedError,
     ],
 )
 def test_every_exception_inherits_from_root(subclass: type[Exception]) -> None:
     """Callers can catch the whole package with ``except LaiCommonError``."""
     assert issubclass(subclass, LaiCommonError)
     assert issubclass(subclass, Exception)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "subclass",
+    [
+        RerankerCallError,
+        RerankerInvalidResponseError,
+        RerankerRetryExhaustedError,
+    ],
+)
+def test_reranker_subclasses_inherit_from_reranker_error(
+    subclass: type[Exception],
+) -> None:
+    """Callers can catch every reranker failure with ``except RerankerError``."""
+    assert issubclass(subclass, RerankerError)
+    assert not issubclass(subclass, LlmError)
 
 
 @pytest.mark.unit
@@ -240,6 +265,58 @@ def test_retry_exhausted_chains_last_cause() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Pyright/mypy attribute access shape
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reranker exceptions — construction + attribute preservation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_reranker_call_error_records_status_and_url() -> None:
+    err = RerankerCallError(
+        "503 from reranker",
+        status_code=503,
+        url="http://lai-test-reranker:80/rerank",
+    )
+    assert str(err) == "503 from reranker"
+    assert err.status_code == 503
+    assert err.url == "http://lai-test-reranker:80/rerank"
+
+
+@pytest.mark.unit
+def test_reranker_call_error_defaults_are_none() -> None:
+    err = RerankerCallError("transport failed")
+    assert err.status_code is None
+    assert err.url is None
+
+
+@pytest.mark.unit
+def test_reranker_invalid_response_records_raw_response() -> None:
+    err = RerankerInvalidResponseError("bad shape", raw_response="<html>")
+    assert err.raw_response == "<html>"
+
+
+@pytest.mark.unit
+def test_reranker_retry_exhausted_records_attempts() -> None:
+    err = RerankerRetryExhaustedError("gave up", attempts=3)
+    assert err.attempts == 3
+
+
+@pytest.mark.unit
+def test_reranker_retry_exhausted_rejects_zero_attempts() -> None:
+    with pytest.raises(ValueError, match="attempts must be >= 1"):
+        RerankerRetryExhaustedError("nonsense", attempts=0)
+
+
+@pytest.mark.unit
+def test_reranker_retry_exhausted_chains_cause() -> None:
+    """``raise RerankerRetryExhaustedError(...) from last_exc`` pattern."""
+    last_exc = RerankerCallError("attempt 3 failed", status_code=503)
+    with pytest.raises(RerankerRetryExhaustedError) as exc_info:
+        raise RerankerRetryExhaustedError("exhausted", attempts=3) from last_exc
+    assert exc_info.value.__cause__ is last_exc
+    assert exc_info.value.attempts == 3
 
 
 @pytest.mark.unit
