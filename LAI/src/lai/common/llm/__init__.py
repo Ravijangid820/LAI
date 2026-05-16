@@ -8,6 +8,7 @@ This subpackage hosts the shared LLM client and its pure-function helpers
 from __future__ import annotations
 
 from lai.common.llm.json_salvage import salvage_json
+from lai.common.llm.metrics import LlmMetrics, default_metrics
 from lai.common.llm.think_strip import strip_think
 
-__all__ = ["salvage_json", "strip_think"]
+__all__ = ["LlmMetrics", "default_metrics", "salvage_json", "strip_think"]
