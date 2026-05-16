@@ -33,6 +33,7 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -56,6 +57,9 @@ from lai.search.eval import (
 )
 from lai.analyzer import pipeline as analyzer_pipeline
 from lai.analyzer import llm_client as analyzer_llm
+from lai.common.citation import validate_citations
+from lai.common.exceptions import LlmError
+from lai.common.llm import ChatMessage, LlmConfig, SyncLlmClient
 from lai import persistence
 
 STATE: dict = {
@@ -63,9 +67,15 @@ STATE: dict = {
     "reranker": None,
     # Local LLM (transformers) — used if LLM_API_URL is unset
     "lm": None, "tok": None,
-    # Remote LLM (vLLM container, OpenAI-compatible) — preferred when set
+    # Remote LLM (vLLM container, OpenAI-compatible) — preferred when set.
+    # ``llm_api_url`` / ``llm_model_name`` are read for diagnostics
+    # (``/health``); the real I/O goes through ``llm_client``, a shared
+    # :class:`lai.common.llm.SyncLlmClient` that adds retry, ``<think>``
+    # stripping, structured logging, and Prometheus metrics over the
+    # raw ``httpx.post`` this path previously used.
     "llm_api_url": None,
     "llm_model_name": None,
+    "llm_client": None,
     # Analyzer V2 — separate vLLM endpoint, Qwen3.6-27B with thinking mode
     "analyzer_cfg": None,
     "analyzer_version_default": "1",  # "1" | "2"
@@ -87,10 +97,21 @@ STATE: dict = {
 RAG_SYSTEM = (
     "Du bist ein juristischer KI-Assistent für deutsches Windenergie- und "
     "Due-Diligence-Recht. Beantworte die Nutzerfrage ausschließlich auf "
-    "Grundlage der unten bereitgestellten Rechtstexte. Zitiere bei jeder "
-    "Aussage den entsprechenden Quellabschnitt (z.B. [Quelle 1]). "
-    "Wenn die Frage mit den Quellen nicht eindeutig beantwortet werden "
-    "kann, gib das ehrlich an."
+    "Grundlage der unten bereitgestellten Quellen.\n"
+    "\n"
+    "Jede Quelle trägt ein stabiles Zitations-Handle:\n"
+    "  • [M-n] = Dokument aus dem Mandat (vom Nutzer hochgeladen — "
+    "primäre, autoritative Quelle für DIESEN Fall).\n"
+    "  • [C-n] = Auszug aus dem deutschen Rechtskorpus (Gesetze, "
+    "Urteile, Kommentare — Hintergrund, NICHT der Vertrag des Nutzers).\n"
+    "\n"
+    "Zitiere bei JEDER inhaltlichen Aussage das passende Handle, "
+    "z.B. \"§ 35 Abs. 5 BauGB verlangt eine Rückbauverpflichtung [C-3]\" "
+    "oder \"§ 7 des Pachtvertrags [M-1]\". Verwende AUSSCHLIESSLICH "
+    "Handles, die unten auch tatsächlich erscheinen — erfinde keine "
+    "neuen. Wenn die Frage mit den Quellen nicht eindeutig beantwortet "
+    "werden kann, gib das ehrlich an und markiere unbelegte Aussagen "
+    "mit \"(unbelegt)\"."
 )
 
 CHAT_SYSTEM = (
@@ -348,11 +369,35 @@ def _load_history(session_id: str | None) -> list[dict]:
     return out
 
 
-def build_rag_messages(question: str, sources: list[str],
+def _render_sources_block(sources: list[RetrievedSource]) -> str:
+    """Render the retrieved-source block the LLM sees, with handles intact.
+
+    Each entry opens with its stable handle on its own line so the model
+    sees an unambiguous anchor before reading the chunk text — and so
+    the (future) validator can resolve emitted handles back to a chunk
+    by exact-string match against the prompt.
+    """
+    parts: list[str] = []
+    for src in sources:
+        header = f"[{src.cite_id}]"
+        if src.label:
+            header = f"{header}  {src.label}"
+        parts.append(f"{header}\n{src.text}")
+    return "\n\n".join(parts)
+
+
+def build_rag_messages(question: str, sources: list[RetrievedSource],
                        history: list[dict] | None = None,
                        meta_prefix: str = "") -> list[dict]:
-    src_block = "\n\n".join(f"[Quelle {i+1}]\n{s}" for i, s in enumerate(sources))
-    user = f"Rechtstexte:\n{src_block}\n\nFrage: {question}"
+    """Build the chat-completion message list for a RAG turn.
+
+    ``sources`` carries the retrieved chunks already tagged with stable
+    [M-n] / [C-n] handles; this function only needs to render them
+    deterministically so the system prompt's citation instructions
+    refer to handles that actually appear in the user message.
+    """
+    src_block = _render_sources_block(sources)
+    user = f"Quellen:\n{src_block}\n\nFrage: {question}"
     return [
         {"role": "system", "content": meta_prefix + RAG_SYSTEM},
         *(history or []),
@@ -412,36 +457,56 @@ def _strip_reasoning_trace(text: str) -> str:
     return text
 
 
+def _approx_token_count_from_chars(char_count: int) -> int:
+    """Same approximation as :func:`_approx_token_count` but from a
+    pre-computed character total — avoids redundant ``sum(len(...))``
+    when callers already have that figure."""
+    return max(1, char_count // 4)
+
+
+def _approx_token_count(text: str) -> int:
+    """Cheap character-based token approximation.
+
+    Used when the remote LLM path is served via :class:`SyncLlmClient`,
+    which intentionally does not surface vLLM's ``usage`` block to its
+    callers (ADR 0001 keeps the client surface minimal). Tokenisers for
+    German + English chat content sit around 3-4 chars/token on average;
+    we use 4 so the figure errs on the conservative side. This is for
+    UI display + diagnostics only — never used for billing or routing.
+    """
+    return _approx_token_count_from_chars(len(text))
+
+
 def llm_generate(messages: list[dict], max_new_tokens: int = 400) -> tuple[str, int, int]:
     """Two backends:
 
-    1. Remote (LLM_API_URL set) — POST to an OpenAI-compatible /v1/chat/completions
-       endpoint. Used to swap the LLM (e.g. Gemma 4 in vLLM) without
-       breaking when transformers can't load the architecture.
-    2. Local — load via transformers (legacy path, still default if no
-       LLM_API_URL).
+    1. Remote (LLM_API_URL set) — :class:`lai.common.llm.SyncLlmClient`
+       hits an OpenAI-compatible ``/v1/chat/completions`` endpoint with
+       tenacity retry, ``<think>`` stripping, and Prometheus metrics.
+    2. Local — load via transformers (legacy opt-in path; only used if
+       ``LLM_LOCAL_PATH`` is set and ``LLM_API_URL`` is unset).
+
+    Returns ``(text, prompt_tokens, completion_tokens)``. On the remote
+    path the token counts are approximated from char length; the local
+    path returns the tokenizer's exact counts.
     """
-    if STATE["llm_api_url"]:
-        # Remote vLLM endpoint
-        url = STATE["llm_api_url"].rstrip("/") + "/v1/chat/completions"
+    if STATE["llm_client"] is not None:
+        client: SyncLlmClient = STATE["llm_client"]
+        # Gemma-family models reject the system role in the chat
+        # template; if the active model is one of them, merge system
+        # into the first user message before handing off to the client.
         msgs = _messages_for_remote_model(messages, STATE["llm_model_name"])
-        body = {
-            "model": STATE["llm_model_name"],
-            "messages": msgs,
-            "max_tokens": max_new_tokens,
-            "temperature": 0.0,
-            # Conversational path — thinking mode off so /query stays fast.
-            # The analyzer V2 path uses its own client (lai.analyzer.llm_client)
-            # which enables thinking explicitly per call.
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
-        r = httpx.post(url, json=body, timeout=600.0)
-        r.raise_for_status()
-        data = r.json()
-        text = data["choices"][0]["message"]["content"]
-        text = _strip_reasoning_trace(text)
-        usage = data.get("usage", {}) or {}
-        return text.strip(), int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))
+        chat_msgs = [ChatMessage(role=m["role"], content=m["content"]) for m in msgs]
+        try:
+            text = client.generate(chat_msgs, max_tokens=max_new_tokens, temperature=0.0)
+        except LlmError as exc:
+            # Surface the failure to the caller as the legacy path did
+            # (an unhandled httpx.HTTPError) so the FastAPI exception
+            # handler returns 5xx. Catching here just so the error chain
+            # is one line shorter in the logs.
+            raise RuntimeError(f"llm_generate failed: {exc}") from exc
+        prompt_chars = sum(len(m["content"]) for m in msgs)
+        return text.strip(), _approx_token_count_from_chars(prompt_chars), _approx_token_count(text)
 
     # Local transformers path
     tok = STATE["tok"]; model = STATE["lm"]
@@ -495,17 +560,52 @@ LEGAL_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-# When a contract is already in session, only fire RAG retrieval if the
-# question asks about EXTERNAL law/precedent — not when it just asks
-# about the uploaded doc. Without this, e.g. "tell me about this
-# contract" pulled in chunks from other VDR contracts and the model
-# confused them with the user's upload.
-EXTERNAL_LAW_REFS = re.compile(
-    r"§|Art\.|\bBImSchG\b|\bBauGB\b|\bEEG\b|\bBGB\b|\bStGB\b|\bUStG\b|\bHGB\b|"
-    r"\bUrteil\b|\bBeschluss\b|\bRechtsprechung\b|\bBGH\b|\bOLG\b|\bLG\b|"
-    r"\bgesetzlich\b|\bvorschrift\b",
-    re.IGNORECASE,
-)
+
+# ── Citation handles ──────────────────────────────────────────────────────
+# Every chunk that reaches the LLM carries a stable handle the model is
+# instructed to cite verbatim and the UI renders as a clickable chip:
+#
+#   [M-n]  matter   — user-uploaded document (per-session contract for v1;
+#                     per-Matter document collection in v1.1)
+#   [C-n]  corpus   — chunk from the 350 GB legal corpus
+#
+# Day 4 of the demo plan adds a server-side validator that strips
+# unresolved handles ("(unverified)" fallback); today we only emit them.
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievedSource:
+    """One chunk handed to the LLM with a stable citation handle.
+
+    Attributes:
+        cite_id: Stable handle, e.g. ``"C-1"`` or ``"M-1"``. Must be
+            unique within a single request and must match the form the
+            ``RAG_SYSTEM`` prompt teaches the model to emit.
+        source_kind: ``"corpus"`` (legal corpus) or ``"matter"`` (user
+            upload). Drives UI rendering (different chip colour) and the
+            forthcoming validator's jurisdiction checks.
+        text: The chunk body that will be inlined into the prompt.
+        label: Optional one-line provenance label rendered next to the
+            handle inside the prompt — gives the model a human-readable
+            hint of where the chunk comes from (statute / ruling / the
+            user's contract). Distinct from ``cite_id`` because the UI
+            never renders this; it's a prompt-side aid only.
+    """
+
+    cite_id: str
+    source_kind: str
+    text: str
+    label: str | None = None
+
+
+# Per-request handle factories. Centralised so the format stays in lock-step
+# with the ``RAG_SYSTEM`` instructions above.
+def _corpus_cite_id(n: int) -> str:
+    return f"C-{n}"
+
+
+def _matter_cite_id(n: int) -> str:
+    return f"M-{n}"
 
 
 def needs_rag(question: str) -> bool:
@@ -761,6 +861,12 @@ class ChunkOut(BaseModel):
     sources: list[str]
     similarity: float
     rerank_score: float
+    # ── Citation handles (Day-1 demo addition) ─────────────────────────
+    # Stable identifier the LLM is instructed to cite verbatim and the
+    # UI renders as a clickable chip. Defaults preserve wire compat for
+    # any older client that doesn't ask for citations yet.
+    cite_id: str = ""
+    source_kind: str = "corpus"  # "corpus" | "matter"
 
 
 class TimingsOut(BaseModel):
@@ -881,7 +987,8 @@ async def lifespan(app: FastAPI):
         print(f"[startup]   LLM ready in {time.time()-t0:.1f}s", flush=True)
         STATE.update(corpus=corpus, conn=conn, parent_text=parent_text,
                      reranker=reranker, lm=lm, tok=tok,
-                     llm_api_url=None, llm_model_name=LLM_LOCAL_PATH)
+                     llm_api_url=None, llm_model_name=LLM_LOCAL_PATH,
+                     llm_client=None)
     else:
         # Remote vLLM endpoint (default) — verify it's reachable; no in-process load.
         print(f"[startup]   LLM: remote endpoint {LLM_API_URL} (model={LLM_MODEL})", flush=True)
@@ -895,9 +1002,19 @@ async def lifespan(app: FastAPI):
                 "  → Start the analyzer container: cd Docker/llm-analyzer && docker compose up -d\n"
                 "  → Or override LLM_API_URL to point at a reachable endpoint."
             )
+        # Build the shared SyncLlmClient. The OpenAI-compatible base
+        # URL for vLLM is the endpoint root plus ``/v1``. Other
+        # SyncLlmClient knobs (retry, timeout) come from
+        # ``LAI_LLM_*`` env vars if the operator wants to tune them;
+        # the defaults match the previous hand-rolled ``httpx.post``
+        # behaviour closely enough for drop-in compatibility.
+        llm_client = SyncLlmClient(
+            LlmConfig(base_url=f"{LLM_API_URL.rstrip('/')}/v1", model=LLM_MODEL),
+        )
         STATE.update(corpus=corpus, conn=conn, parent_text=parent_text,
                      reranker=reranker, lm=None, tok=None,
-                     llm_api_url=LLM_API_URL, llm_model_name=LLM_MODEL)
+                     llm_api_url=LLM_API_URL, llm_model_name=LLM_MODEL,
+                     llm_client=llm_client)
 
     # Analyzer V2 config — optional. If env not set, V2 is unavailable
     # and /analyze-contract falls back to V1 regardless of `version` flag.
@@ -953,8 +1070,17 @@ def health():
     }
 
 
-def _do_rag(question: str, top_k: int, candidate_k: int) -> tuple[list[ChunkOut], list[str], TimingsOut]:
-    """Run hybrid+rerank retrieval, return chunks, source texts for prompt, timings."""
+def _do_rag(
+    question: str, top_k: int, candidate_k: int,
+) -> tuple[list[ChunkOut], list[RetrievedSource], TimingsOut]:
+    """Run hybrid+rerank retrieval, return chunks, prompt-ready sources, timings.
+
+    The second return value carries the same chunks as the first but as
+    :class:`RetrievedSource` objects with stable ``[C-n]`` citation
+    handles — that is what :func:`build_rag_messages` inlines into the
+    prompt so the LLM sees and emits the exact handles the UI then
+    renders as chips.
+    """
     corpus: Corpus = STATE["corpus"]
     parent_text = STATE["parent_text"]
     reranker = STATE["reranker"]
@@ -980,24 +1106,33 @@ def _do_rag(question: str, top_k: int, candidate_k: int) -> tuple[list[ChunkOut]
     rerank_s = time.time() - t0
 
     chunks_out: list[ChunkOut] = []
-    seen = set()
+    sources: list[RetrievedSource] = []
+    seen: set[int] = set()
     for j, idx in enumerate(reranked):
         pid = int(corpus.parent_ids[idx])
         if pid in seen or pid not in top_parents:
             continue
         seen.add(pid)
         text = parent_text.get(pid, "")[:1500]
+        cite_id = _corpus_cite_id(len(chunks_out) + 1)
         chunks_out.append(ChunkOut(
             text=text, section=f"Parent {pid}", law_refs=[],
             sources=["dense", "bm25"] if idx in d_idx and idx in b_idx else (
                 ["dense"] if idx in d_idx else ["bm25"]),
             similarity=float(rerank_scores[order[j]]),
             rerank_score=float(rerank_scores[order[j]]),
+            cite_id=cite_id,
+            source_kind="corpus",
+        ))
+        sources.append(RetrievedSource(
+            cite_id=cite_id,
+            source_kind="corpus",
+            text=text,
+            label="Rechtskorpus",
         ))
         if len(chunks_out) >= top_k:
             break
 
-    sources = [parent_text.get(int(p), "")[:1500] for p in top_parents]
     return chunks_out, sources, TimingsOut(
         embed_s=round(embed_s, 3),
         retrieve_s=round(retrieve_s, 3),
@@ -1014,36 +1149,72 @@ def query(req: QueryReq):
     sid = req.session_id or str(uuid.uuid4())
     t_total0 = time.time()
 
-    # Decide mode
+    # Decide mode.
+    #
+    # Strategy doc Day 1: when an uploaded document is in session, always
+    # fire RAG against the corpus too. The previous EXTERNAL_LAW_REFS
+    # regex gate silently dropped retrieval for English questions
+    # ("cross-check this with your database") and German conversational
+    # phrasings that didn't mention §/BImSchG/BauGB — the corpus was
+    # there but unused. Defaulting RAG on whenever a contract exists is
+    # what turns the chat from "GPT with a German glossary" into
+    # "answers grounded in both your contract and the law".
     use_contract = session_uses_contract(sid, req.question)
     if req.force_mode in ("rag", "chat"):
         use_rag = req.force_mode == "rag"
     elif use_contract:
-        # Question is about the uploaded doc. Only also fire RAG when the
-        # user explicitly asks for external law/precedent context — without
-        # this guard, "tell me about this contract" pulled in chunks from
-        # other VDR contracts and the model conflated them with the upload.
-        use_rag = bool(EXTERNAL_LAW_REFS.search(req.question))
+        use_rag = True
     else:
         use_rag = needs_rag(req.question)
 
-    chunks_out: list[ChunkOut] = []
-    rag_sources: list[str] = []
+    corpus_chunks: list[ChunkOut] = []
+    corpus_sources: list[RetrievedSource] = []
     timings = TimingsOut(embed_s=0.0, retrieve_s=0.0, rerank_s=0.0,
                         generate_s=0.0, total_s=0.0)
 
     if use_rag:
-        chunks_out, rag_sources, t = _do_rag(req.question, req.top_k, req.candidate_k)
+        corpus_chunks, corpus_sources, t = _do_rag(
+            req.question, req.top_k, req.candidate_k,
+        )
         timings.embed_s = t.embed_s
         timings.retrieve_s = t.retrieve_s
         timings.rerank_s = t.rerank_s
 
-    # Decide mode label + build prompt
+    # Pull the uploaded contract text (if any) so we can attach it as a
+    # [M-1] matter source. v1 has one upload per session, so a single
+    # M-1 handle is sufficient; the v1.1 Matter workspace will fan this
+    # out to [M-1]..[M-n] per uploaded document.
     contract_text = ""
+    contract_filename = ""
     if use_contract:
         contract_sess = persistence.load_session(sid)
-        if contract_sess and contract_sess.get("contract_text"):
-            contract_text = contract_sess["contract_text"][:8000]
+        if contract_sess:
+            contract_text = (contract_sess.get("contract_text") or "")[:8000]
+            contract_filename = contract_sess.get("filename") or ""
+
+    matter_sources: list[RetrievedSource] = []
+    matter_chunks: list[ChunkOut] = []
+    if use_contract and contract_text:
+        m_cite = _matter_cite_id(1)
+        matter_label = f"Hochgeladener Vertrag — {contract_filename}" if contract_filename else "Hochgeladener Vertrag"
+        matter_sources.append(RetrievedSource(
+            cite_id=m_cite,
+            source_kind="matter",
+            text=contract_text,
+            label=matter_label,
+        ))
+        # Also surface the matter document to the UI as a chunk so the
+        # frontend has a stable target to render the [M-1] chip against.
+        # Excerpt only; the full text is already cached server-side in
+        # the session and the side panel fetches it on click.
+        matter_chunks.append(ChunkOut(
+            text=contract_text[:1500],
+            section=matter_label,
+            law_refs=[], sources=["upload"],
+            similarity=1.0, rerank_score=1.0,
+            cite_id=m_cite,
+            source_kind="matter",
+        ))
 
     # Prior chat turns for the same session — gives the model conversational
     # memory across requests. Without this, every turn is stateless and
@@ -1059,20 +1230,14 @@ def query(req: QueryReq):
     # turn (below) so the freshly stated facts make it into the next refresh.
     meta_prefix = _format_session_meta_prefix(persistence.get_session_meta(sid))
 
+    # Matter sources come first so the LLM sees the user's own document
+    # before the supporting corpus excerpts — and so the [M-n] handles
+    # appear in the prompt in numerical order.
+    rag_sources = matter_sources + corpus_sources
+
     if use_rag and use_contract:
         mode = "rag+contract"
-        # Make the upload's authority explicit so the model doesn't conflate
-        # it with retrieved chunks from OTHER contracts in the corpus.
-        contract_block = (
-            "[HOCHGELADENER VERTRAG — dies ist DER konkrete Vertrag, "
-            "nach dem der Nutzer fragt. Behandle ihn als primäre Quelle.]\n"
-            + contract_text
-        )
-        bg_blocks = [
-            "[Hintergrund-Quelle aus dem Korpus — nur für Kontext, NICHT der Vertrag des Nutzers]\n" + s
-            for s in rag_sources
-        ]
-        msgs = build_rag_messages(req.question, [contract_block] + bg_blocks,
+        msgs = build_rag_messages(req.question, rag_sources,
                                   history=history, meta_prefix=meta_prefix)
     elif use_rag:
         mode = "rag"
@@ -1080,20 +1245,38 @@ def query(req: QueryReq):
                                   history=history, meta_prefix=meta_prefix)
     elif use_contract:
         mode = "contract"
-        msgs = build_rag_messages(
-            req.question,
-            ["[HOCHGELADENER VERTRAG]\n" + contract_text],
-            history=history, meta_prefix=meta_prefix,
-        )
+        msgs = build_rag_messages(req.question, matter_sources,
+                                  history=history, meta_prefix=meta_prefix)
     else:
         mode = "chat"
         msgs = build_chat_messages(req.question, history=history, meta_prefix=meta_prefix)
+
+    chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
 
     t0 = time.time()
     answer, prompt_tokens, completion_tokens = llm_generate(
         msgs, max_new_tokens=600 if (use_rag or use_contract) else 200
     )
     timings.generate_s = round(time.time() - t0, 3)
+
+    # Day-4 server-side citation validator. Strip any [C-n]/[M-n] handles
+    # the model emitted that did NOT appear among the prompt's actual
+    # sources (i.e. fabricated handles), and mark the surrounding
+    # sentence ``(unbelegt)`` so the reader knows the claim has no
+    # underlying source. Only runs on grounded-mode turns (chat-only
+    # has no sources to validate against, so nothing to strip).
+    if rag_sources:
+        allowed_handles = {src.cite_id for src in rag_sources}
+        validation = validate_citations(answer, allowed_handles)
+        if validation.fabricated:
+            print(
+                f"[citation] session={sid} mode={mode} "
+                f"fabricated={list(validation.fabricated)} "
+                f"flagged_sentences={validation.sentences_flagged}",
+                flush=True,
+            )
+        answer = validation.text
+
     timings.total_s = round(time.time() - t_total0, 3)
 
     # Persist chat messages so the UI can rehydrate the thread on refresh.

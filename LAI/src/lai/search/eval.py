@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import struct
 import time
@@ -35,20 +36,51 @@ from typing import Optional
 import httpx
 import numpy as np
 
+from lai.common.embedding import EmbeddingConfig, SyncEmbeddingClient
+
 # src/lai/search/eval.py → parents[3] is the LAI/ project root.
 LAI_DIR = Path(__file__).resolve().parents[3]
 DB      = LAI_DIR / "processed" / "pipeline_local.db"
 VAL     = LAI_DIR / "training" / "fine_tuning" / "data" / "val.jsonl"
 OUT_DIR = LAI_DIR / "scripts" / "eval" / "rag_eval_results"
 
-EMBED_URL   = "http://localhost:8003"
-EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
+# Embedding endpoint defaults: the host-mode runtime exposes the
+# ``lai_embedding`` container at ``localhost:8003``. Inside Docker the
+# DNS name resolves to ``lai_embedding:8000`` (the default
+# :class:`EmbeddingConfig` baseline). ``LAI_EMBEDDING_BASE_URL`` /
+# ``LAI_EMBEDDING_MODEL`` env vars take precedence over the host
+# defaults below, matching the pattern the DDiQ microservice already
+# uses for its ``LLM_URL`` / ``LLM_MODEL`` overrides.
+EMBED_URL   = os.environ.get("LAI_EMBEDDING_BASE_URL", "http://localhost:8003/v1")
+EMBED_MODEL = os.environ.get("LAI_EMBEDDING_MODEL",    "Qwen/Qwen3-Embedding-8B")
 EMBED_DIM   = 4096
 
 QWEN3_QUERY_INSTRUCTION = (
     "Given a user's question about German legal, wind-energy, or "
     "due-diligence matters, retrieve the most relevant passages."
 )
+
+
+# Lazy module-level singleton so importing :mod:`lai.search.eval` (e.g.
+# from a benchmark script) does not require the embedding service to be
+# up. The client is built on first call to :func:`embed_query`. Each
+# uvicorn worker process owns its own client + connection pool.
+_EMBED_CLIENT: SyncEmbeddingClient | None = None
+
+
+def _get_embedding_client() -> SyncEmbeddingClient:
+    global _EMBED_CLIENT
+    if _EMBED_CLIENT is None:
+        _EMBED_CLIENT = SyncEmbeddingClient(
+            EmbeddingConfig(
+                base_url=EMBED_URL,
+                model=EMBED_MODEL,
+                dimension=EMBED_DIM,
+                # Queries are short (a few sentences); the default
+                # 24k-char cap is wildly generous. Leave it alone.
+            ),
+        )
+    return _EMBED_CLIENT
 
 
 # -----------------------------------------------------------------------------
@@ -161,16 +193,20 @@ def ensure_bm25(corpus: Corpus, conn: sqlite3.Connection) -> None:
 # -----------------------------------------------------------------------------
 
 def embed_query(text: str, with_prefix: bool = False) -> np.ndarray:
+    """Embed a query string into a unit-norm fp32 vector.
+
+    Backed by :class:`lai.common.embedding.SyncEmbeddingClient`, which
+    adds tenacity retry, dimension-mismatch detection, Prometheus
+    metrics, and a typed exception hierarchy over the hand-rolled
+    ``httpx.post`` this function used previously. The Qwen3 instruction
+    prefix is applied here (query-side, not client-side) because the
+    same client is also used by background jobs that embed unprefixed
+    document passages.
+    """
     if with_prefix:
         text = f"Instruct: {QWEN3_QUERY_INSTRUCTION}\nQuery: {text}"
-    resp = httpx.post(
-        f"{EMBED_URL}/v1/embeddings",
-        json={"model": EMBED_MODEL, "input": [text],
-              "truncate_prompt_tokens": 32000},
-        timeout=60,
-    )
-    resp.raise_for_status()
-    v = np.asarray(resp.json()["data"][0]["embedding"], dtype=np.float32)
+    vec = _get_embedding_client().embed_one(text)
+    v = np.asarray(vec, dtype=np.float32)
     n = np.linalg.norm(v)
     return v / n if n > 0 else v
 
