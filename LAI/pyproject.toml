@@ -2,7 +2,13 @@
 name = "lai"
 version = "2.0.0"
 description = "German Legal AI Platform for Wind Energy Due Diligence"
-requires-python = ">=3.13"
+# Floor relaxed to 3.11 (2026-05-16) so the DDiQ microservice container
+# (which runs on python:3.11-slim) can install ``lai.common`` and consume
+# the shared LLM / reranker / retrieval clients. The code targets 3.10+
+# syntax (``X | Y`` unions, ``match`` statements) and uses no 3.12/3.13-
+# specific features. ``lai.common`` modules are explicitly tested on 3.13
+# in CI; 3.11 compatibility is verified at the import boundary.
+requires-python = ">=3.11"
 readme = "README.md"
 
 dependencies = [
@@ -84,6 +90,10 @@ packages = ["src/lai"]
 # Ruff — lint + format
 # ─────────────────────────────────────────────────────────────────────────────
 [tool.ruff]
+# Keep linting at py313 — that's the *target* runtime for the core lai
+# package; the relaxed ``requires-python`` floor of 3.11 exists only so
+# the microservice container can install ``lai.common``. Ruff's py313
+# target enforces no-deprecated APIs and modern syntax everywhere.
 target-version = "py313"
 line-length = 120
 src = ["src", "tests"]
