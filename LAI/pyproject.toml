@@ -32,8 +32,9 @@ dependencies = [
     # Auth
     "python-jose[cryptography]>=3.3.0",
     "passlib[bcrypt]>=1.7.4",
-    # Monitoring
+    # Monitoring + structured logging
     "prometheus-client>=0.21.0",
+    "structlog>=24.4.0",
     # Retry logic
     "tenacity>=9.0.0",
     # Utilities
@@ -43,11 +44,22 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    # Lint + format
     "ruff>=0.8.0",
+    # Type checking
     "mypy>=1.13.0",
+    # Tests
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
+    "pytest-httpx>=0.35.0",
+    "hypothesis>=6.115.0",
+    # Hook orchestration
+    "pre-commit>=4.0.0",
+    # Security scanning
+    "bandit[toml]>=1.8.0",
+    # Stubs (for strict-typed third-party libraries that ship none)
+    "types-requests>=2.32.0",
 ]
 training = [
     "torch>=2.5.0",
@@ -68,26 +80,172 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/lai"]
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Ruff — lint + format
+# ─────────────────────────────────────────────────────────────────────────────
 [tool.ruff]
 target-version = "py313"
 line-length = 120
-src = ["src"]
+src = ["src", "tests"]
+extend-exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "scripts/archive",  # legacy archived scripts; not part of the production package
+]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "W", "UP"]
+# Default rule set applied repo-wide. `lai.common` and `tests/unit/common`
+# enable the stricter set via the per-file override below.
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear (catches real bugs)
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "RET",  # return statements
+    "PIE",  # misc
+    "PT",   # pytest style
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line length — ruff format handles wrapping; long URLs in comments are fine
+    "B008",   # function calls in argument defaults — FastAPI Depends() is the canonical example
+    "SIM108", # ternary vs if — readability call, not always cleaner
+]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",     # asserts are the point of tests
+    "ARG",      # unused fixtures appear as unused args
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+# `lai.common` and its tests opt in to the strict ruleset above, with no extra ignores
+# beyond the test-fixture pragmatics. New code goes here; legacy stays under the
+# default set until it's migrated.
+"src/lai/common/**/*.py" = []
+"tests/unit/common/**/*.py" = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mypy — static typing
+#
+# Strict mode is scoped to `lai.common` and its tests. Legacy code keeps the
+# permissive default so we don't break the build before each module migrates.
+# Add new packages to the `lai.common` pattern when they reach strict-ready.
+# ─────────────────────────────────────────────────────────────────────────────
 [tool.mypy]
 python_version = "3.13"
 strict = false
 warn_return_any = true
 warn_unused_configs = true
+warn_redundant_casts = true  # global-only flag in mypy; kept project-wide
+mypy_path = "src"
+namespace_packages = true
+explicit_package_bases = true
+show_error_codes = true
+pretty = true
 
+[[tool.mypy.overrides]]
+module = "lai.common.*"
+strict = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_return_any = true
+
+[[tool.mypy.overrides]]
+# Third-party libraries that don't ship type stubs and that we don't want to
+# block on. Add carefully; prefer fixing the upstream stub before silencing here.
+module = [
+    "vllm.*",
+    "docling.*",
+    "docling_core.*",
+    "fitz.*",
+    "pytesseract.*",
+    "PIL.*",
+    "shapely.*",
+    "pgvector.*",
+    "minio.*",
+    "miniopy_async.*",
+    "passlib.*",
+    "jose.*",
+    "sse_starlette.*",
+]
+ignore_missing_imports = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pytest
+# ─────────────────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
+minversion = "8.3"
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+addopts = [
+    "-ra",                  # short test summary including reasons
+    "--strict-markers",     # unknown @pytest.mark fails
+    "--strict-config",      # unknown pytest config fails
+    "--showlocals",         # show local variables in tracebacks
+    "--tb=short",
+]
+filterwarnings = [
+    "error",                                                   # warnings → errors by default
+    "ignore::DeprecationWarning:pydantic.*",                   # upstream noise we don't control
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
 markers = [
-    "unit: Unit tests",
-    "integration: Integration tests (require running services)",
-    "e2e: End-to-end tests (require full stack)",
-    "slow: Slow tests (>10s)",
+    "unit: Pure unit tests, no external services",
+    "integration: Tests that require running services (vLLM, Postgres, Redis)",
+    "e2e: End-to-end tests requiring the full stack",
+    "slow: Tests that take >10s",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Coverage — gates the `lai.common` build at 85% line + branch coverage.
+# Legacy packages are excluded until migrated; expand `source` as we go.
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.coverage.run]
+branch = true
+source = ["src/lai/common"]
+omit = [
+    "src/lai/common/**/__init__.py",
+]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = false
+precision = 1
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "\\.\\.\\.",
+]
+
+[tool.coverage.html]
+directory = ".coverage_html"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bandit — security scanner, scoped to `lai.common` (where we control quality).
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.bandit]
+exclude_dirs = ["tests", "scripts/archive", ".venv", "build", "dist"]
+skips = [
+    "B101",  # asserts are fine in production code we control
 ]

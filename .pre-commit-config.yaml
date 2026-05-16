@@ -1,0 +1,88 @@
+# LAI — pre-commit hooks
+#
+# Mirrors the CI gate (see .github/workflows/ci.yml and LAI/Makefile). The
+# hooks here are the *fast* subset; the full coverage + security pass runs in
+# CI on push. Run `pre-commit install` once after `uv sync --extra dev`.
+#
+# To run all hooks on the entire repo: `pre-commit run --all-files`.
+
+default_install_hook_types: [pre-commit, commit-msg]
+default_stages: [pre-commit]
+fail_fast: false
+
+repos:
+  # ── File hygiene ────────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.(md|patch)$
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  # ── Ruff: lint + format. Single tool, two hooks. ────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^LAI/(src|tests)/
+      - id: ruff-format
+        name: ruff (format)
+        files: ^LAI/(src|tests)/
+
+  # ── Mypy: strict typing on lai.common only. ──────────────────────────────
+  # Runs against the project pyproject.toml so the [tool.mypy] overrides
+  # apply. Other files are linted by ruff only until they migrate.
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        name: mypy (lai.common strict)
+        files: ^LAI/(src/lai/common|tests/unit/common)/
+        args:
+          [
+            --config-file=LAI/pyproject.toml,
+            --no-incremental,
+          ]
+        # Mypy needs the project's runtime deps available for accurate
+        # checking. The dependencies below are the minimum needed for the
+        # type-checker to resolve `lai.common` imports; expand as more code
+        # joins the strict gate.
+        additional_dependencies:
+          - pydantic>=2.10
+          - pydantic-settings>=2.7
+          - structlog>=24.4
+          - tenacity>=9.0
+          - httpx>=0.28
+          - prometheus-client>=0.21
+          - types-requests>=2.32
+
+  # ── Bandit: security scan on lai.common. ─────────────────────────────────
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.8.0
+    hooks:
+      - id: bandit
+        name: bandit (lai.common security)
+        files: ^LAI/src/lai/common/
+        args: [-c, LAI/pyproject.toml]
+        additional_dependencies:
+          - "bandit[toml]"
+
+  # ── Commit-message convention (Conventional Commits style). ──────────────
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.6.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [feat, fix, docs, refactor, test, chore, ci, build, perf, style, revert]
