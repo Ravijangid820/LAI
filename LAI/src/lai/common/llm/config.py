@@ -177,6 +177,6 @@ class LlmConfig(BaseSettings):
         initial = getattr(info, "data", {}).get("retry_initial_wait_seconds")
         if initial is not None and value < initial:
             raise ValueError(
-                "retry_max_wait_seconds must be >= retry_initial_wait_seconds; " f"got max={value} < initial={initial}",
+                f"retry_max_wait_seconds must be >= retry_initial_wait_seconds; got max={value} < initial={initial}",
             )
         return value

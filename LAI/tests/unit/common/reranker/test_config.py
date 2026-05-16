@@ -141,11 +141,11 @@ def test_retry_equal_initial_and_max_is_allowed() -> None:
 @pytest.mark.unit
 def test_config_is_frozen() -> None:
     cfg = RerankerConfig()
-    with pytest.raises(ValidationError, match="[Ff]rozen"):
+    with pytest.raises(ValidationError, match=r"[Ff]rozen"):
         cfg.base_url = "http://other"  # type: ignore[misc]
 
 
 @pytest.mark.unit
 def test_extra_fields_are_rejected() -> None:
-    with pytest.raises(ValidationError, match="[Ee]xtra"):
+    with pytest.raises(ValidationError, match=r"[Ee]xtra"):
         RerankerConfig(timeout=10)  # type: ignore[call-arg]

@@ -104,7 +104,7 @@ def _normalise_prompt(
 
     if messages and messages[0]["role"] == "system":
         raise ValueError(
-            "system message supplied via both `system=` and the messages list; " "choose one",
+            "system message supplied via both `system=` and the messages list; choose one",
         )
     return [{"role": "system", "content": system}, *messages]
 
@@ -241,7 +241,7 @@ def _classify_http_error(
     )
 
 
-def _validate_against_schema(text: str, schema: type[T]) -> T:
+def _validate_against_schema(text: str, schema: type[T]) -> T:  # noqa: UP047 — PEP 695 generics need py3.12+; runtime floor is 3.11.
     """Parse ``text`` as JSON (with salvage) and validate against ``schema``.
 
     Raises :class:`LlmJsonParseError` on parse failure (already raised by
@@ -579,7 +579,7 @@ class LlmClient:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class SyncLlmClient(Generic[T]):
+class SyncLlmClient(Generic[T]):  # noqa: UP046 — PEP 695 generics need py3.12+; runtime floor is 3.11.
     """Sync version of :class:`LlmClient`.
 
     Holds its own :class:`httpx.Client` (sync). Shares no state with

@@ -47,7 +47,7 @@ def test_think_then_answer_strips_block_and_surrounding_whitespace() -> None:
 
 @pytest.mark.unit
 def test_multiple_think_blocks_all_removed() -> None:
-    text = "<think>step 1</think>" "First conclusion. " "<think>step 2</think>" "Second conclusion."
+    text = "<think>step 1</think>First conclusion. <think>step 2</think>Second conclusion."
     assert strip_think(text) == "First conclusion. Second conclusion."
 
 

@@ -215,12 +215,12 @@ def test_api_key_does_not_leak_in_repr(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.unit
 def test_config_is_frozen() -> None:
     cfg = LlmConfig()
-    with pytest.raises(ValidationError, match="[Ff]rozen"):
+    with pytest.raises(ValidationError, match=r"[Ff]rozen"):
         cfg.model = "different"  # type: ignore[misc]
 
 
 @pytest.mark.unit
 def test_extra_fields_are_rejected() -> None:
     """Typos in field names fail loudly."""
-    with pytest.raises(ValidationError, match="[Ee]xtra"):
+    with pytest.raises(ValidationError, match=r"[Ee]xtra"):
         LlmConfig(modle="qwen2.5-7b")  # type: ignore[call-arg]
