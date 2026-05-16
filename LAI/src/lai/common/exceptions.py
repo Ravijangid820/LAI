@@ -32,6 +32,13 @@ Construction always preserves the ``__cause__`` chain when used with
 from __future__ import annotations
 
 __all__ = [
+    "ChunkError",
+    "ChunkInvalidInputError",
+    "EmbeddingCallError",
+    "EmbeddingDimensionMismatchError",
+    "EmbeddingError",
+    "EmbeddingInvalidResponseError",
+    "EmbeddingRetryExhaustedError",
     "LaiCommonError",
     "LlmCallError",
     "LlmEmptyResponseError",
@@ -41,6 +48,9 @@ __all__ = [
     "LlmJsonParseError",
     "LlmRetryExhaustedError",
     "LlmSchemaValidationError",
+    "PdfError",
+    "PdfExtractError",
+    "PdfOcrUnavailableError",
     "RerankerCallError",
     "RerankerError",
     "RerankerInvalidResponseError",
@@ -286,3 +296,199 @@ class RerankerRetryExhaustedError(RerankerError):
             )
         super().__init__(message)
         self.attempts: int = attempts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Embedding-related
+#
+# Parallel hierarchy to ``LlmError`` and ``RerankerError``. The embedding
+# service is the third upstream the runtime talks to (after LLM and
+# reranker); separating its failure modes lets callers degrade gracefully
+# (e.g., fall through to BM25-only retrieval when embeddings are down).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class EmbeddingError(LaiCommonError):
+    """Base for any failure interacting with the embedding service."""
+
+
+class EmbeddingCallError(EmbeddingError):
+    """Transport-level failure when calling the embedding service.
+
+    Covers HTTP errors, request timeouts, and connection refusals.
+
+    Args:
+        message: Human-readable description.
+        status_code: HTTP status code, if the failure was a non-2xx response.
+            ``None`` for pre-HTTP failures.
+        url: The endpoint that failed, for log attribution.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        url: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code: int | None = status_code
+        self.url: str | None = url
+
+
+class EmbeddingInvalidResponseError(EmbeddingError):
+    """The embedding service responded but the content is unusable.
+
+    Examples: response is not a JSON object; missing ``data`` array; an
+    entry lacks ``embedding``; ``index`` mapping is inconsistent.
+
+    Args:
+        message: Human-readable description.
+        raw_response: The exact string the service returned, if available.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_response: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_response: str | None = raw_response
+
+
+class EmbeddingDimensionMismatchError(EmbeddingInvalidResponseError):
+    """An embedding vector arrived with the wrong dimension.
+
+    Surfaces a configuration drift (e.g., the served model changed) early,
+    before the vector reaches pgvector and corrupts the index. Callers
+    typically alert and refuse to serve further requests until reconciled.
+
+    Args:
+        message: Human-readable description.
+        expected_dimension: The dimension :class:`EmbeddingConfig` was
+            constructed with (e.g., 4096 for Qwen3-Embedding-8B).
+        actual_dimension: The dimension of the offending vector.
+        raw_response: Optional raw response excerpt for log attribution.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        expected_dimension: int,
+        actual_dimension: int,
+        raw_response: str | None = None,
+    ) -> None:
+        super().__init__(message, raw_response=raw_response)
+        self.expected_dimension: int = expected_dimension
+        self.actual_dimension: int = actual_dimension
+
+
+class EmbeddingRetryExhaustedError(EmbeddingError):
+    """All retry attempts against the embedding service failed.
+
+    Cause-chained via ``raise ... from``. Same shape as
+    :class:`LlmRetryExhaustedError` and :class:`RerankerRetryExhaustedError`.
+
+    Args:
+        message: Human-readable description.
+        attempts: Total number of attempts made. Always ``>= 1``.
+
+    Raises:
+        ValueError: If ``attempts`` is less than 1.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int,
+    ) -> None:
+        if attempts < 1:
+            raise ValueError(
+                f"attempts must be >= 1, got {attempts}",
+            )
+        super().__init__(message)
+        self.attempts: int = attempts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF-extraction-related
+#
+# The PDF extractor is a pure-local operation (no upstream service), so the
+# hierarchy is shallower than the network-client families above. Failure
+# modes split between unrecoverable input (corrupt / encrypted / not-a-PDF)
+# and configuration (OCR engine unavailable).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class PdfError(LaiCommonError):
+    """Base for any failure in the PDF extractor."""
+
+
+class PdfExtractError(PdfError):
+    """The supplied bytes / path could not be processed as a PDF.
+
+    Covers: malformed PDF header, password-protected document, zero pages,
+    PyMuPDF / fitz raising on an unsupported feature. Callers route this to
+    a user-visible "this file could not be processed" message rather than
+    treating it as a transient error worth retrying.
+
+    Args:
+        message: Human-readable description.
+        path: Filesystem path the extractor was asked to read, if any. Set
+            to ``None`` when the extractor was given raw bytes.
+        page_index: Zero-based page index where extraction failed, if the
+            failure was page-localised. ``None`` if the document failed to
+            open at all.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: str | None = None,
+        page_index: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.path: str | None = path
+        self.page_index: int | None = page_index
+
+
+class PdfOcrUnavailableError(PdfError):
+    """OCR fallback was needed but the OCR engine is not installed.
+
+    Tesseract is an optional system dependency: production hosts have it,
+    but unit-test containers may not. Surfacing this distinctly lets the
+    caller decide whether a per-page text-quality miss is fatal or a
+    graceful-degradation event.
+
+    Args:
+        message: Human-readable description.
+    """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chunker-related
+#
+# Like the PDF extractor, chunking is local. The only realistic failure
+# mode is invalid input (caller passed non-text, or a configuration that
+# would produce no valid chunks). We surface this as a typed error so
+# callers do not silently emit empty chunk lists.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ChunkError(LaiCommonError):
+    """Base for any failure in the text chunker."""
+
+
+class ChunkInvalidInputError(ChunkError):
+    """The chunker was given input it cannot process.
+
+    Examples: ``None`` instead of a string; a chunk-size configuration that
+    would produce zero chunks; non-finite values in numeric parameters.
+
+    Args:
+        message: Human-readable description.
+    """
