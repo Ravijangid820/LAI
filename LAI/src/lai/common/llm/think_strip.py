@@ -22,11 +22,11 @@ The function handles:
   ``</think>`` means the model was cut off; everything from the opening
   tag onward is discarded.
 * **Empty think blocks** — ``<think></think>`` is removed cleanly.
-* **Whitespace residue** — once we have modified the text, both leading
-  and trailing whitespace are trimmed (via ``str.strip``). This is
-  consistent for both well-formed blocks (which expose leading
-  whitespace) and truncated traces (which expose trailing whitespace).
-  Trailing whitespace in LLM output is almost always stylistic noise; a
+* **Whitespace** — the result is always ``str.strip``-ed, on both the
+  fast path (no tag in input) and the modification path. This is the
+  only invariant that makes properties like
+  ``strip_think(x + "<think>unclosed") == strip_think(x)`` hold for all
+  ``x``. LLM trailing whitespace is almost always stylistic noise; a
   caller that needs the raw text passes ``keep_thinking=True`` to the
   client wrapper instead.
 
@@ -75,16 +75,19 @@ def strip_think(text: str) -> str:
             contain reasoning-trace tags.
 
     Returns:
-        The user-visible answer with reasoning traces removed. If the input
-        contains no ``<think>`` substring, it is returned unchanged.
-        Otherwise, every complete and incomplete reasoning block is
-        removed and the resulting string is ``strip``-ed on both sides
-        to clean up the whitespace artifacts the removal exposes.
+        The user-visible answer with reasoning traces removed. The result
+        is always ``str.strip``-ed so the function's whitespace handling
+        is consistent across the fast path (no tag in input) and the
+        modification path (one or more tags removed). LLM trailing
+        whitespace is almost always stylistic noise; a caller that needs
+        the raw text passes ``keep_thinking=True`` at the client level.
     """
-    # Fast path: avoid regex work and the strip allocation when there is no
-    # thinking trace to strip. Most non-thinking-mode outputs hit this.
+    # Fast path: avoid regex work when there is no thinking trace to strip.
+    # `str.strip` is cheap when there's nothing to remove (returns the same
+    # object), and consistent whitespace handling outweighs the micro-cost
+    # in the case where the model did include leading/trailing whitespace.
     if "<think>" not in text:
-        return text
+        return text.strip()
 
     stripped = _THINK_BLOCK.sub("", text)
     stripped = _UNCLOSED_THINK.sub("", stripped)

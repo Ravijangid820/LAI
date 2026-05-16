@@ -88,10 +88,15 @@ def test_think_block_with_special_characters_in_body() -> None:
 
 
 @pytest.mark.unit
-def test_leading_whitespace_preserved_when_no_think_tag() -> None:
-    """If we did not strip anything, caller's whitespace is preserved."""
-    text = "   leading whitespace is the caller's data"
-    assert strip_think(text) == text
+def test_surrounding_whitespace_stripped_even_with_no_think_tag() -> None:
+    """The result is ``str.strip``-ed on every path for consistency.
+
+    This is the invariant that makes property tests like
+    ``strip_think(x + "<think>unclosed") == strip_think(x)`` hold for
+    every ``x``, regardless of trailing whitespace in ``x``.
+    """
+    text = "   leading and trailing   "
+    assert strip_think(text) == "leading and trailing"
 
 
 @pytest.mark.unit
@@ -180,9 +185,9 @@ def test_strip_think_is_idempotent(text: str) -> None:
 
 @pytest.mark.unit
 @given(st.text(alphabet=st.characters(blacklist_characters="<>"), max_size=200))
-def test_no_think_substring_means_input_returned_unchanged(text: str) -> None:
-    """If the input contains no ``<think>`` substring, the function is the identity."""
-    assert strip_think(text) == text
+def test_no_think_substring_means_strip_of_input(text: str) -> None:
+    """For tag-free inputs, the function is equivalent to ``str.strip``."""
+    assert strip_think(text) == text.strip()
 
 
 @pytest.mark.unit
