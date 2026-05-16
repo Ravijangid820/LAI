@@ -17,6 +17,17 @@ import os, re, json, time, uuid, logging, math, hashlib
 import requests
 import psycopg2
 import psycopg2.extras
+
+# Shared LLM client — see `_llm_*` helpers below. Importing at module
+# level so a single httpx connection pool is reused across all DDiQ
+# extraction passes within a worker process.
+from lai.common.exceptions import LlmError
+from lai.common.llm import (
+    ChatMessage,
+    LlmConfig,
+    SyncLlmClient,
+    salvage_json,
+)
 import fitz  # PyMuPDF
 import numpy as np
 import pytesseract
@@ -501,26 +512,88 @@ def rerank(query, chunks, top_k=5):
         return [chunks[item["index"]] for item in ranked]
     except Exception: return chunks[:top_k]
 
+# ── LLM client (shared) ─────────────────────────────────────────────────────
+# Single module-level SyncLlmClient. Each uvicorn worker (process) instantiates
+# its own client and reuses one httpx connection pool across all extraction
+# passes; the underlying httpx.Client is thread-safe.
+#
+# Config is built from the legacy DDiQ env vars (LLM_URL / LLM_MODEL) rather
+# than the LAI_LLM_* prefix lai.common defaults to, so this drop-in does not
+# require any change to docker-compose.yml. A future cleanup can switch the
+# compose to LAI_LLM_BASE_URL / LAI_LLM_MODEL and drop the explicit kwargs.
+_LLM_CONFIG = LlmConfig(base_url=LLM_URL, model=LLM_MODEL)
+_LLM_CLIENT = SyncLlmClient(_LLM_CONFIG)
+
+
 def llm_call(system, user, temperature=0.1, max_tokens=2048):
-    resp = requests.post(f"{LLM_URL}/chat/completions", json={"model": LLM_MODEL,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "max_tokens": max_tokens, "temperature": temperature}, timeout=300)
-    resp.raise_for_status()
-    # vLLM occasionally returns content=null when the model emits a stop
-    # token immediately (empty completion). Guard with `or ""` so .strip()
-    # doesn't blow up — the caller's JSON parse will then fail cleanly
-    # and fall back to its own error path instead of crashing the pipeline.
-    content = resp.json()["choices"][0]["message"].get("content") or ""
-    return content.strip()
+    """Single-shot chat completion. Returns the stripped string content.
+
+    Backed by :class:`lai.common.llm.SyncLlmClient`, which adds retry with
+    exponential backoff, server-side ``<think>`` stripping, structured
+    logging, and Prometheus metrics over what the legacy hand-rolled
+    ``requests.post`` provided. The signature is preserved exactly so the
+    11 in-module call sites — plus the ``llm_json_fn`` callback handed to
+    :class:`CadastralPipeline` — keep working without changes.
+
+    Returns ``""`` on retry-exhausted / transport / invalid-response
+    failure, matching the legacy behaviour of returning an empty string
+    on null content. The caller's JSON parse will then take its own
+    error path instead of crashing the pipeline.
+    """
+    try:
+        return _LLM_CLIENT.generate(
+            [
+                ChatMessage(role="system", content=system),
+                ChatMessage(role="user", content=user),
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    except LlmError as exc:
+        logger.warning(f"llm_call failed ({type(exc).__name__}): {exc}")
+        return ""
+
 
 def llm_json(system, user, temperature=0.0):
-    raw = llm_call(system, user, temperature, max_tokens=4096)
-    raw = re.sub(r"```json\s*", "", raw); raw = re.sub(r"```\s*$", "", raw)
-    try: return json.loads(raw)
-    except json.JSONDecodeError:
-        raw2 = llm_call(system + "\n\nCRITICAL: Return ONLY valid JSON.", user, temperature, max_tokens=4096)
-        raw2 = re.sub(r"```json\s*", "", raw2); raw2 = re.sub(r"```\s*$", "", raw2)
-        return json.loads(raw2)
+    """Two-shot JSON-structured completion. Returns ``dict`` / ``list`` or ``{}``.
+
+    Strategy:
+      1. Call the LLM, strip code fences, ``json.loads``.
+      2. On parse failure, run the salvage path
+         (:func:`lai.common.llm.salvage_json`) which extracts the first
+         balanced JSON substring with full string-context awareness.
+      3. On second parse failure, retry once with a strengthened
+         instruction (mirrors the legacy two-shot behaviour).
+      4. If everything fails, return ``{}`` rather than raising — the
+         legacy uncaught :class:`json.JSONDecodeError` on the second
+         attempt would crash the entire pipeline mid-report.
+    """
+    def _attempt(sys_prompt, user_prompt):
+        raw = llm_call(sys_prompt, user_prompt, temperature, max_tokens=4096)
+        if not raw:
+            return None
+        # Strip ```json fences before parse; salvage_json handles them
+        # too, but doing it here keeps the fast path cheap.
+        raw = re.sub(r"```json\s*", "", raw)
+        raw = re.sub(r"```\s*$", "", raw)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                return json.loads(salvage_json(raw))
+            except (json.JSONDecodeError, ValueError):
+                return None
+
+    parsed = _attempt(system, user)
+    if parsed is not None:
+        return parsed
+
+    parsed = _attempt(system + "\n\nCRITICAL: Return ONLY valid JSON.", user)
+    if parsed is not None:
+        return parsed
+
+    logger.warning("llm_json: both attempts failed to produce valid JSON; returning {}")
+    return {}
 
 def rag_context(doc_ids, question, top_k=5):
     emb = embed_single(question); chunks = search_doc_chunks(doc_ids, emb, top_k=20)
