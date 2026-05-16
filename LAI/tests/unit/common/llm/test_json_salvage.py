@@ -223,13 +223,18 @@ def test_raw_response_attached_on_empty_input() -> None:
 # A bounded strategy for JSON-like values. Excluded:
 # - Floats: round-trip equality is awkward; not the point of these tests.
 # - Top-level scalars: salvage_json requires an opener `{` or `[`.
+# - Surrogate code points (Unicode category Cs): `json.dumps` + `json.loads`
+#   is not a true round-trip for lone surrogates — `json.loads` combines a
+#   high-low surrogate pair into the actual non-BMP character, so the value
+#   that comes out is not the value that went in. This is a Python stdlib
+#   behaviour, not a salvage_json concern.
 _json_keys = st.text(
-    alphabet=st.characters(blacklist_characters='"\\'),
+    alphabet=st.characters(blacklist_characters='"\\', blacklist_categories=("Cs",)),
     min_size=1,
     max_size=10,
 )
 _json_string_values = st.text(
-    alphabet=st.characters(blacklist_characters='"\\'),
+    alphabet=st.characters(blacklist_characters='"\\', blacklist_categories=("Cs",)),
     max_size=20,
 )
 _json_scalars: st.SearchStrategy[Any] = st.one_of(
