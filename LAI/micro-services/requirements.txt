@@ -2,7 +2,8 @@
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-dotenv>=1.0.0
-pydantic>=2.5.0
+# Bumped from >=2.5.0 to satisfy lai.common (which requires pydantic >=2.10).
+pydantic>=2.10.0
 # Required by FastAPI for multipart/form-data parsing (UploadFile / Form).
 python-multipart>=0.0.9
 
@@ -10,7 +11,11 @@ python-multipart>=0.0.9
 psycopg2-binary>=2.9.9
 
 # ── HTTP Client ──
+# Legacy `requests` is still used by embed/rerank/Nominatim call sites in
+# ddiq_report.py and api.py; remove once those migrate to httpx.
 requests>=2.31.0
+# httpx is the transport for lai.common.llm.SyncLlmClient.
+httpx>=0.28.0
 
 # ── PDF Processing ──
 PyMuPDF>=1.23.0
@@ -22,3 +27,13 @@ numpy>=1.24.0
 
 # ── Spatial Operations (NEW — cadastral pipeline) ──
 shapely>=2.0.0
+
+# ── lai.common transitive runtime deps ──
+# Listed explicitly so the container can pip-install `lai` with --no-deps,
+# avoiding the heavy unused parts of lai's full dep tree (vllm, docling,
+# celery, asyncpg, …). Keep these in sync with the imports under
+# src/lai/common/.
+tenacity>=9.0.0
+structlog>=24.4.0
+pydantic-settings>=2.7.0
+prometheus-client>=0.21.0

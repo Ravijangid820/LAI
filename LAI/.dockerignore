@@ -1,0 +1,51 @@
+# Build-context pruning for the LAI/ root. Used by micro-services/Dockerfile
+# (its compose file sets context: ..). Anything kept here is sent to the
+# Docker daemon on every build, so list aggressively.
+
+# VCS + tooling state
+.git
+.github
+.venv
+.venv-*
+.coverage
+.coverage_html
+.mypy_cache
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Caches & build outputs
+build
+dist
+*.egg-info
+.tox
+
+# Local data / processed artefacts (large + irrelevant to the image)
+data
+processed
+logs
+uploads
+exports
+
+# Other LAI subprojects not needed by the DDiQ microservice
+embedding_server
+training
+eval
+infra
+scripts/archive
+
+# Tests + docs (image is production-only)
+tests
+docs
+harsh
+*.md
+!README.md
+
+# Editor + OS noise
+.idea
+.vscode
+*.swp
+.DS_Store

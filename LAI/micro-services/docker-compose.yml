@@ -33,8 +33,11 @@
 services:
   backend:
     build:
-      context: .
-      dockerfile: Dockerfile
+      # Context widened to the LAI/ repo root so the Dockerfile can install
+      # the in-repo `lai` package (src/lai/) alongside the microservice code.
+      # See LAI/.dockerignore for what gets pruned from the build context.
+      context: ..
+      dockerfile: micro-services/Dockerfile
     container_name: lai-backend
     restart: unless-stopped
     ports:
