@@ -30,6 +30,16 @@
 
 set -u
 
+# ---- file-creation mode -----------------------------------------------------
+# pipeline_local.db lives in LAI/processed/ which has a default POSIX ACL
+# granting group:lai:rwx. The default umask of 022 clips that ACL's mask to
+# r--, so SQLite's auto-created -wal / -shm files end up effectively
+# group-read-only — and a second user (e.g. hc) reopening the DB after rj,
+# or vice versa, gets "attempt to write a readonly database" (2026-05-16
+# incident). umask 002 keeps new files group-writable so any user in the
+# `lai` group can write the WAL/SHM regardless of who created them.
+umask 002
+
 # ---- paths ------------------------------------------------------------------
 # scripts/ops/resume_step6.sh → LAI_DIR is two levels up.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,7 +94,11 @@ container_on_port_8003() {
         | awk -F'\t' '$2 ~ /:8003->/ {print $1; exit}'
 }
 
-step6_pid() { pgrep -f "lai.pipeline.cli step6" | head -1; }
+# Match an *actual* `python -m lai.pipeline.cli step6 ...` process, not any
+# caller (us, sshd command-string, etc.) whose own argv happens to contain
+# that literal — the bracket trick prevents pgrep from matching itself or
+# any wrapper command line that simply *mentions* the step-6 invocation.
+step6_pid() { pgrep -f '[l]ai\.pipeline\.cli step6' | head -1; }
 
 embedding_count() {
     [ -f "$SQLITE_DB" ] || { echo "0"; return; }
