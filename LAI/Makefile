@@ -62,6 +62,9 @@ test:  ## Run unit tests (fast).
 test-all:  ## Run all tests including integration (requires running services).
 	$(PYTEST) tests
 
+integration:  ## Run only integration tests (requires lai_analyzer_llm live).
+	$(PYTEST) -m integration tests/integration
+
 cov:  ## Run unit tests with coverage and enforce the 85% gate on lai.common.
 	$(PYTEST) -m "unit and not slow" \
 	          --cov=src/lai/common \

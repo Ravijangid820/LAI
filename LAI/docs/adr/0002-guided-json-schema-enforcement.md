@@ -1,6 +1,10 @@
 # 0002 — `lai.common.llm`: guided-JSON schema enforcement via vLLM
 
-- **Status:** Accepted
+- **Status:** **Superseded by [ADR 0004](./0004-response-format-supersedes-guided-json.md)** (2026-05-16).
+  The primary mechanism described here — `extra_body.guided_json` — was
+  found by the integration test to be **silently ignored** by the live
+  `vllm/vllm-openai:latest` build. The OpenAI-standard `response_format`
+  is now the primary; this ADR is retained for historical reasoning.
 - **Date:** 2026-05-16
 - **Owner:** `lai.common.llm`
 

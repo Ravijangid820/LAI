@@ -20,8 +20,9 @@ the original to reflect the new state.
 |---|-------|--------|
 | 0000 | [Record architecture decisions](./0000-record-architecture-decisions.md) | Accepted |
 | 0001 | [`lai.common.llm` — async-primary client surface](./0001-llm-client-async-primary.md) | Accepted |
-| 0002 | [`lai.common.llm` — guided-JSON schema enforcement via vLLM](./0002-guided-json-schema-enforcement.md) | Accepted |
+| 0002 | [`lai.common.llm` — guided-JSON schema enforcement via vLLM](./0002-guided-json-schema-enforcement.md) | **Superseded by 0004** |
 | 0003 | [`lai.common.llm` — strip `<think>` traces server-side](./0003-think-trace-server-side-stripping.md) | Accepted |
+| 0004 | [`lai.common.llm` — use OpenAI `response_format` (supersedes 0002 primary)](./0004-response-format-supersedes-guided-json.md) | Accepted |
 
 ## Numbering
 

@@ -173,7 +173,7 @@ class TestBuildRequestBody:
             max_tokens=None,
             temperature=None,
             stop=None,
-            guided_json=None,
+            json_schema=None,
             json_object_mode=False,
             keep_thinking=False,
         )
@@ -194,7 +194,7 @@ class TestBuildRequestBody:
             max_tokens=42,
             temperature=0.7,
             stop=["END", "STOP"],
-            guided_json=None,
+            json_schema=None,
             json_object_mode=False,
             keep_thinking=False,
         )
@@ -203,20 +203,28 @@ class TestBuildRequestBody:
         assert body["stop"] == ["END", "STOP"]
 
     @pytest.mark.unit
-    def test_guided_json_attaches_schema_and_backend(self, config: LlmConfig) -> None:
-        schema: dict[str, Any] = {"type": "object", "properties": {"a": {"type": "integer"}}}
+    def test_json_schema_attaches_response_format(self, config: LlmConfig) -> None:
+        """ADR 0004: structured output uses ``response_format: json_schema``."""
+        schema: dict[str, Any] = {
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+        }
         body = _build_request_body(
             config=config,
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=None,
             temperature=None,
             stop=None,
-            guided_json=schema,
+            json_schema=("MyModel", schema),
             json_object_mode=False,
             keep_thinking=False,
         )
-        assert body["extra_body"]["guided_json"] == schema
-        assert body["extra_body"]["guided_decoding_backend"] == "xgrammar"
+        assert body["response_format"]["type"] == "json_schema"
+        assert body["response_format"]["json_schema"]["name"] == "MyModel"
+        assert body["response_format"]["json_schema"]["schema"] == schema
+        assert body["response_format"]["json_schema"]["strict"] is True
+        # The deprecated extra_body.guided_json path is no longer emitted.
+        assert "extra_body" not in body or "guided_json" not in body.get("extra_body", {})
 
     @pytest.mark.unit
     def test_json_object_mode_sets_response_format(self, config: LlmConfig) -> None:
@@ -226,7 +234,7 @@ class TestBuildRequestBody:
             max_tokens=None,
             temperature=None,
             stop=None,
-            guided_json=None,
+            json_schema=None,
             json_object_mode=True,
             keep_thinking=False,
         )
@@ -241,7 +249,7 @@ class TestBuildRequestBody:
             max_tokens=None,
             temperature=None,
             stop=None,
-            guided_json=None,
+            json_schema=None,
             json_object_mode=False,
             keep_thinking=False,
         )
@@ -256,7 +264,7 @@ class TestBuildRequestBody:
             max_tokens=None,
             temperature=None,
             stop=None,
-            guided_json=None,
+            json_schema=None,
             json_object_mode=False,
             keep_thinking=True,
         )
@@ -266,7 +274,7 @@ class TestBuildRequestBody:
             max_tokens=None,
             temperature=None,
             stop=None,
-            guided_json=None,
+            json_schema=None,
             json_object_mode=False,
             keep_thinking=False,
         )
@@ -505,9 +513,12 @@ class TestAsyncGenerateJson:
             result = await client.generate_json(_ExtractionSchema, "extract")
 
         assert result == _ExtractionSchema(label="red", score=0.9)
-        # The request carried the JSON schema
-        assert "guided_json" in captured["body"]["extra_body"]
-        assert captured["body"]["extra_body"]["guided_decoding_backend"] == "xgrammar"
+        # ADR 0004: the primary path carries response_format: json_schema.
+        rf = captured["body"]["response_format"]
+        assert rf["type"] == "json_schema"
+        assert rf["json_schema"]["name"] == "_ExtractionSchema"
+        assert rf["json_schema"]["strict"] is True
+        assert "schema" in rf["json_schema"]
 
     @pytest.mark.unit
     async def test_falls_back_when_guided_decoding_is_rejected(
@@ -518,10 +529,12 @@ class TestAsyncGenerateJson:
         def handler(request: httpx.Request) -> httpx.Response:
             request_count["n"] += 1
             body = json.loads(request.content)
-            if "guided_json" in body.get("extra_body", {}):
+            rf = body.get("response_format") or {}
+            if rf.get("type") == "json_schema":
+                # vLLM (or a future build) rejects the strict-mode schema.
                 return httpx.Response(400, text="schema feature unsupported")
             # Fallback path: response_format=json_object should be present
-            assert body["response_format"] == {"type": "json_object"}
+            assert rf == {"type": "json_object"}
             return httpx.Response(200, json=_chat_response('{"label": "blue", "score": 0.1}'))
 
         async with LlmClient(config, metrics=metrics, transport=_mock_transport(handler)) as client:
@@ -755,7 +768,8 @@ class TestSyncClient:
     def test_generate_json_fallback(self, config: LlmConfig, metrics: LlmMetrics) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content)
-            if "guided_json" in body.get("extra_body", {}):
+            rf = body.get("response_format") or {}
+            if rf.get("type") == "json_schema":
                 return httpx.Response(400, text="rejected")
             return httpx.Response(200, json=_chat_response('{"label": "x", "score": 0.5}'))
 

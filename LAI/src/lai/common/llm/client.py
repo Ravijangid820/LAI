@@ -1,8 +1,10 @@
 """Async-primary LLM client with a sync façade.
 
-Implements ADRs 0001 (async-primary surface), 0002 (guided-JSON schema
-enforcement via vLLM ``extra_body.guided_json``), and 0003 (server-side
-``<think>``-trace stripping by default). Uses:
+Implements ADRs 0001 (async-primary surface), 0004 (OpenAI-standard
+``response_format`` for structured output — supersedes ADR 0002's
+``extra_body.guided_json`` primary, which the live vLLM build silently
+ignored), and 0003 (server-side ``<think>``-trace stripping by default).
+Uses:
 
 - :mod:`httpx` for HTTP transport (async + sync flavours).
 - :mod:`tenacity` for retry with exponential backoff.
@@ -114,14 +116,23 @@ def _build_request_body(
     max_tokens: int | None,
     temperature: float | None,
     stop: Sequence[str] | None,
-    guided_json: dict[str, Any] | None,
+    json_schema: tuple[str, dict[str, Any]] | None,
     json_object_mode: bool,
     keep_thinking: bool,
 ) -> dict[str, Any]:
     """Assemble the JSON body for the OpenAI-compatible chat-completions endpoint.
 
-    All vLLM-specific knobs live under ``extra_body`` so the OpenAI Python
-    SDK could be swapped in later without changing the surface.
+    Args:
+        json_schema: Optional ``(name, schema_dict)`` pair. When set, the
+            primary structured-output path sends
+            ``response_format = {"type": "json_schema", "json_schema":
+            {"name": name, "schema": schema_dict, "strict": True}}``,
+            per ADR 0004.
+        json_object_mode: When ``True`` *and* ``json_schema`` is ``None``,
+            falls back to ``response_format = {"type": "json_object"}``
+            (loose JSON mode). Mutually exclusive with ``json_schema``
+            being non-None — caller's responsibility to ensure exactly
+            one structured-output mode is requested.
     """
     body: dict[str, Any] = {
         "model": config.model,
@@ -133,12 +144,19 @@ def _build_request_body(
     if stop is not None:
         body["stop"] = list(stop)
 
-    extra_body: dict[str, Any] = {}
-    if guided_json is not None:
-        extra_body["guided_json"] = guided_json
-        extra_body["guided_decoding_backend"] = config.guided_decoding_backend
-    if json_object_mode:
+    if json_schema is not None:
+        name, schema_dict = json_schema
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": name,
+                "schema": schema_dict,
+                "strict": True,
+            },
+        }
+    elif json_object_mode:
         body["response_format"] = {"type": "json_object"}
+
     # ``keep_thinking`` is a response-side concern (whether the client
     # strips the trace before returning); ``config.thinking_mode_enabled``
     # is the request-side concern (whether the model emits the trace at
@@ -148,9 +166,7 @@ def _build_request_body(
     # special-case it.
     _ = keep_thinking
     if not config.thinking_mode_enabled:
-        extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
-    if extra_body:
-        body["extra_body"] = extra_body
+        body["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
     return body
 
 
@@ -176,11 +192,18 @@ def _parse_chat_response(
             "response had no choices",
             raw_response=json.dumps(raw),
         )
-    message = choices[0].get("message") or {}
+    first_choice = choices[0]
+    message = first_choice.get("message") or {}
     content = message.get("content")
     if not isinstance(content, str) or content == "":
+        # vLLM signals truncation with ``finish_reason: 'length'`` —
+        # surfacing it in the exception lets callers tell "the model
+        # ran out of token budget" from "the model emitted a spurious
+        # empty completion" (which is the Qwen3 stop-token quirk).
+        finish_reason = first_choice.get("finish_reason")
+        suffix = f" (finish_reason={finish_reason!r})" if finish_reason else ""
         raise LlmEmptyResponseError(
-            f"empty content from model {config.model!r}",
+            f"empty content from model {config.model!r}{suffix}",
             raw_response=json.dumps(raw),
         )
     usage_raw = raw.get("usage") or {}
@@ -344,7 +367,7 @@ class LlmClient:
             max_tokens=max_tokens,
             temperature=temperature,
             stop=stop,
-            guided_json=None,
+            json_schema=None,
             json_object_mode=False,
             keep_thinking=keep_thinking,
         )
@@ -399,7 +422,7 @@ class LlmClient:
             max_tokens=max_tokens,
             temperature=temperature,
             stop=stop,
-            guided_json=schema_dict,
+            json_schema=(schema.__name__, schema_dict),
             json_object_mode=False,
             keep_thinking=False,
         )
@@ -424,7 +447,7 @@ class LlmClient:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stop=stop,
-                guided_json=None,
+                json_schema=None,
                 json_object_mode=True,
                 keep_thinking=False,
             )
@@ -617,7 +640,7 @@ class SyncLlmClient(Generic[T]):
             max_tokens=max_tokens,
             temperature=temperature,
             stop=stop,
-            guided_json=None,
+            json_schema=None,
             json_object_mode=False,
             keep_thinking=keep_thinking,
         )
@@ -645,7 +668,7 @@ class SyncLlmClient(Generic[T]):
             max_tokens=max_tokens,
             temperature=temperature,
             stop=stop,
-            guided_json=schema_dict,
+            json_schema=(schema.__name__, schema_dict),
             json_object_mode=False,
             keep_thinking=False,
         )
@@ -668,7 +691,7 @@ class SyncLlmClient(Generic[T]):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stop=stop,
-                guided_json=None,
+                json_schema=None,
                 json_object_mode=True,
                 keep_thinking=False,
             )
