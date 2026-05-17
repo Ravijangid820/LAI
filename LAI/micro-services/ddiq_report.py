@@ -167,7 +167,14 @@ ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS progress_step TEXT;
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS progress_percent DOUBLE PRECISION DEFAULT 0.0;
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS error TEXT;
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;
-CREATE INDEX IF NOT EXISTS ddiq_reports_fingerprint_idx
+-- Track A item 6: the fingerprint index is now UNIQUE so two concurrent
+-- /report/generate calls with identical (doc_ids, preset, project_name)
+-- can't both write a row. The old (non-unique) index is dropped first
+-- because ``CREATE UNIQUE INDEX IF NOT EXISTS`` with the same name would
+-- silently no-op if the existing index isn't unique. New name avoids
+-- collision with any in-flight code referencing the old one.
+DROP INDEX IF EXISTS ddiq_reports_fingerprint_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS ddiq_reports_fingerprint_uniq_idx
     ON ddiq_reports(request_fingerprint) WHERE request_fingerprint IS NOT NULL;
 CREATE TABLE IF NOT EXISTS ddiq_geocode_cache (
     address TEXT PRIMARY KEY, lat DOUBLE PRECISION NOT NULL,
@@ -179,7 +186,13 @@ CREATE TABLE IF NOT EXISTS ddiq_geocode_cache (
     expires_at TIMESTAMPTZ);
 ALTER TABLE ddiq_geocode_cache ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS ddiq_parcel_cache (
-    coord_key TEXT PRIMARY KEY, parcel_data JSONB NOT NULL, cached_at TIMESTAMPTZ DEFAULT NOW());
+    coord_key TEXT PRIMARY KEY, parcel_data JSONB NOT NULL, cached_at TIMESTAMPTZ DEFAULT NOW(),
+    -- TTL on the parcel cache. Cadastral data updates quarterly at most
+    -- but 30 days is conservative and matches the geocode-cache pattern
+    -- (Track A item 3). NULL ``expires_at`` is treated as expired so any
+    -- pre-TTL row is refetched once.
+    expires_at TIMESTAMPTZ);
+ALTER TABLE ddiq_parcel_cache ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS ddiq_project_areas (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT,
     polygon JSONB NOT NULL, centroid_lat DOUBLE PRECISION, centroid_lng DOUBLE PRECISION,
@@ -804,11 +817,17 @@ def alkis_query_parcels(lat: float, lng: float, bundesland: str, radius_m: float
     config = ALKIS_WFS_ENDPOINTS.get(bundesland)
     if not config: return []
 
-    # Check cache
+    # Check cache. Track A item 6: filter on ``expires_at`` so legacy
+    # rows (NULL ``expires_at`` from before the TTL column existed) are
+    # treated as expired and re-fetched once.
     cache_key = f"alkis:{lat:.5f},{lng:.5f}"
     try:
         conn = get_conn(); cur = conn.cursor()
-        cur.execute("SELECT parcel_data FROM ddiq_parcel_cache WHERE coord_key = %s", (cache_key,))
+        cur.execute(
+            "SELECT parcel_data FROM ddiq_parcel_cache "
+            "WHERE coord_key = %s AND expires_at IS NOT NULL AND expires_at > NOW()",
+            (cache_key,),
+        )
         row = cur.fetchone(); cur.close(); conn.close()
         if row:
             data = row[0] if isinstance(row[0], list) else json.loads(row[0])
@@ -847,11 +866,19 @@ def alkis_query_parcels(lat: float, lng: float, bundesland: str, radius_m: float
                 parcels = _parse_alkis_xml(resp.text, lat, lng)
         logger.info(f"ALKIS WFS → {len(parcels)} parcels")
 
-        # Cache
+        # Cache. ON CONFLICT … DO UPDATE refreshes ``expires_at`` so
+        # stale rows self-heal on the next miss.
         try:
             conn = get_conn(); cur = conn.cursor()
-            cur.execute("INSERT INTO ddiq_parcel_cache (coord_key, parcel_data) VALUES (%s,%s) ON CONFLICT (coord_key) DO UPDATE SET parcel_data=%s, cached_at=NOW()",
-                (cache_key, json.dumps(parcels), json.dumps(parcels)))
+            cur.execute(
+                "INSERT INTO ddiq_parcel_cache (coord_key, parcel_data, expires_at) "
+                "VALUES (%s, %s, NOW() + INTERVAL '30 days') "
+                "ON CONFLICT (coord_key) DO UPDATE SET "
+                "  parcel_data = EXCLUDED.parcel_data, "
+                "  cached_at = NOW(), "
+                "  expires_at = EXCLUDED.expires_at",
+                (cache_key, json.dumps(parcels)),
+            )
             conn.commit(); cur.close(); conn.close()
         except Exception: pass
 
@@ -862,50 +889,87 @@ def alkis_query_parcels(lat: float, lng: float, bundesland: str, radius_m: float
 
 
 def _parse_alkis_feature(feature: dict) -> Optional[dict]:
-    """Parse one GeoJSON feature from ALKIS INSPIRE WFS."""
-    props = feature.get("properties", {}); geom = feature.get("geometry", {})
+    """Parse one GeoJSON feature from ALKIS INSPIRE WFS.
 
-    # Parcel number
-    pnum = None
-    for key in ["label", "flurstuecksnummer", "flstnrzae", "bezeichnung", "flstNr"]:
-        if props.get(key): pnum = str(props[key]).strip(); break
-    ncr = str(props.get("nationalCadastralReference", ""))
-    if not pnum and ncr:
-        parts = ncr.split("-")
-        if len(parts) >= 3:
-            pnum = re.sub(r"^0+", "", parts[-1])
-            pnum = re.sub(r"/0+", "/", pnum)
-    if not pnum: return None
+    Track A item 6 fix: the inner ``flur`` / ``area_m2`` loops used to
+    read ``pass; break`` on parse failure — two statements on one line,
+    so the ``break`` fired regardless of whether the conversion
+    succeeded. A non-numeric value in the first matching key silently
+    pinned the field to 0 instead of falling through to the next
+    candidate key. Replaced with explicit early-success ``break`` so
+    failed conversions correctly try the remaining keys.
+    """
+    props = feature.get("properties", {})
+    geom = feature.get("geometry", {})
 
-    # Gemarkung
+    # Parcel number — straight string read; first non-empty wins.
+    pnum: Optional[str] = None
+    for key in ("label", "flurstuecksnummer", "flstnrzae", "bezeichnung", "flstNr"):
+        v = props.get(key)
+        if v:
+            pnum = str(v).strip()
+            break
+    # Fallback to ``nationalCadastralReference`` if no direct field matched.
+    if not pnum:
+        ncr = str(props.get("nationalCadastralReference", ""))
+        if ncr:
+            parts = ncr.split("-")
+            if len(parts) >= 3:
+                pnum = re.sub(r"^0+", "", parts[-1])
+                pnum = re.sub(r"/0+", "/", pnum)
+    if not pnum:
+        return None
+
+    # Gemarkung — first non-empty key wins.
     gemarkung = ""
-    for key in ["gemarkungsname", "gemarkung", "gemeinde", "municipality"]:
-        if props.get(key): gemarkung = str(props[key]).strip(); break
+    for key in ("gemarkungsname", "gemarkung", "gemeinde", "municipality"):
+        v = props.get(key)
+        if v:
+            gemarkung = str(v).strip()
+            break
 
-    # Flur
+    # Flur — break only on SUCCESSFUL int conversion; otherwise try the
+    # next candidate key. Previously the bare ``pass; break`` exited the
+    # loop on first failure.
     flur = 0
-    for key in ["flurnummer", "flur", "flurNr"]:
-        if props.get(key):
-            try: flur = int(props[key])
-            except (ValueError, TypeError): pass; break
+    for key in ("flurnummer", "flur", "flurNr"):
+        raw = props.get(key)
+        if raw is None:
+            continue
+        try:
+            flur = int(raw)
+            break
+        except (ValueError, TypeError):
+            continue
 
-    # Area
-    area_m2 = 0
-    for key in ["areaValue", "amtlicheFlaeche", "flaeche", "area"]:
-        if props.get(key):
-            try: area_m2 = float(props[key])
-            except (ValueError, TypeError): pass; break
+    # Area — same fix as flur.
+    area_m2: float = 0.0
+    for key in ("areaValue", "amtlicheFlaeche", "flaeche", "area"):
+        raw = props.get(key)
+        if raw is None:
+            continue
+        try:
+            area_m2 = float(raw)
+            break
+        except (ValueError, TypeError):
+            continue
 
-    # Polygon — GeoJSON [lng,lat] → Leaflet [lat,lng]
-    polygon = []
+    # Polygon — GeoJSON ``[lng, lat]`` → Leaflet ``[lat, lng]``.
+    polygon: list[list[float]] = []
     if geom.get("type") == "Polygon" and geom.get("coordinates"):
         polygon = [[pt[1], pt[0]] for pt in geom["coordinates"][0]]
     elif geom.get("type") == "MultiPolygon" and geom.get("coordinates"):
         largest = max(geom["coordinates"], key=lambda p: len(p[0]))
         polygon = [[pt[1], pt[0]] for pt in largest[0]]
 
-    return {"parcelNumber": pnum, "gemarkung": gemarkung, "flur": flur,
-            "polygon": polygon, "area_m2": area_m2, "source": "ALKIS WFS"}
+    return {
+        "parcelNumber": pnum,
+        "gemarkung": gemarkung,
+        "flur": flur,
+        "polygon": polygon,
+        "area_m2": area_m2,
+        "source": "ALKIS WFS",
+    }
 
 
 def _parse_alkis_xml(xml_text, lat, lng):
@@ -2602,7 +2666,31 @@ def generate_report(req: GenerateReportRequest):
             )
 
     rid = str(uuid.uuid4())
-    report, T = _generate_report_core(rid, req)
+    # Track A item 6: wrap the sync pipeline so a crash mid-run marks the
+    # row ``status='failed'`` with the error captured, rather than
+    # leaving it stuck in whatever progress state the last incremental
+    # persist wrote. Mirrors ``_run_report_generation_job``'s async
+    # error-recovery shape. Pre-existing ``HTTPException`` errors pass
+    # through unchanged so a clean 4xx (e.g. "No text") still surfaces
+    # as itself, not a generic 500.
+    try:
+        report, T = _generate_report_core(rid, req)
+    except HTTPException as e:
+        try:
+            _update_report_progress(
+                rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}",
+            )
+        except Exception:
+            pass  # row may not exist yet if the crash was pre-first-persist
+        raise
+    except Exception as e:
+        logger.exception(f"sync report {rid} failed")
+        try:
+            _update_report_progress(rid, status="failed", error=str(e)[:500])
+        except Exception:
+            pass
+        raise HTTPException(500, f"Report generation failed: {e}") from e
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
