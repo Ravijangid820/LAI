@@ -187,10 +187,22 @@ def sqlite_ro() -> Iterator[sqlite3.Connection]:
 
     Read-only is required because Step 6 may be writing concurrently
     through WAL — we MUST NOT acquire a writer-lock on this DB.
+
+    ``text_factory`` is set to a lenient UTF-8 decoder
+    (``errors='replace'``) because the historical corpus contains a
+    sprinkling of rows with malformed UTF-8 sequences from bad input
+    sources — e.g. PDFs whose extraction pipeline emitted
+    Windows-1252 bytes labelled as UTF-8. The default
+    ``text_factory=str`` raises ``OperationalError: Could not decode
+    to UTF-8`` on those rows and kills the migration; replacement (the
+    invalid bytes become U+FFFD) lets us keep 99.9% of the text intact
+    while losing only the unreadable bytes. Postgres TEXT accepts
+    U+FFFD without complaint.
     """
     uri = f"file:{SQLITE_PATH}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=60.0, isolation_level=None)
     try:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
         # Increase SQLite per-connection cache to speed up the big JOINs.
         # -256000 = 256 MB (negative means kibibytes).
         conn.execute("PRAGMA cache_size = -262144")
@@ -338,11 +350,18 @@ def cmd_migrate_parents(_: argparse.Namespace) -> None:
     with pg_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT COALESCE(MAX(id), 0) FROM corpus_parent_chunks")
         resume_from = cur.fetchone()[0]
+        # NB: ``resume_from`` is the MAX(id) value, NOT a row count.
+        # Parent IDs are not contiguous so we use it only as the WHERE
+        # filter; row-count progress is computed against an explicit
+        # COUNT below.
+        cur.execute("SELECT COUNT(*) FROM corpus_parent_chunks")
+        already_loaded = cur.fetchone()[0]
         log.info(
-            "migrate-parents: resuming from max(id) = %d in corpus_parent_chunks",
+            "migrate-parents: resuming. max(id)=%d, rows already in target=%d",
             resume_from,
+            already_loaded,
         )
-        if resume_from == 0:
+        if already_loaded == 0:
             _set_state(cur, parents_started_at=psycopg2.TimestampFromTicks(time.time()))
             conn.commit()
 
@@ -350,7 +369,13 @@ def cmd_migrate_parents(_: argparse.Namespace) -> None:
         scur = sconn.cursor()
         scur.execute("SELECT COUNT(*) FROM parent_chunks WHERE id > ?", (resume_from,))
         remaining = scur.fetchone()[0]
-        log.info("migrate-parents: %d row(s) to copy", remaining)
+        total_in_source = already_loaded + remaining
+        log.info(
+            "migrate-parents: %d row(s) to copy (%d already done; %d total in source)",
+            remaining,
+            already_loaded,
+            total_in_source,
+        )
         if remaining == 0:
             log.info("migrate-parents: already complete")
             with pg_conn() as conn, conn.cursor() as cur:
@@ -369,16 +394,19 @@ def cmd_migrate_parents(_: argparse.Namespace) -> None:
                 log.exception("migrate-parents: batch failed after retries: %s", exc)
                 raise
             total_inserted += len(batch)
-            done_total = resume_from + total_inserted
-            pct = 100.0 * done_total / (resume_from + remaining)
-            rate = total_inserted / max(time.time() - t0, 1e-6)
+            done_total = already_loaded + total_inserted
+            pct = 100.0 * done_total / max(total_in_source, 1)
+            elapsed = time.time() - t0
+            rate = total_inserted / max(elapsed, 1e-6)
+            eta_s = (remaining - total_inserted) / max(rate, 1e-6)
             log.info(
-                "migrate-parents: +%d (cum %d / %d, %.1f%%, %.0f rows/s)",
+                "migrate-parents: +%d (cum %d / %d, %.2f%%, %.0f rows/s, ETA %s)",
                 len(batch),
                 done_total,
-                resume_from + remaining,
+                total_in_source,
                 pct,
                 rate,
+                _fmt_duration(eta_s),
             )
 
     with pg_conn() as conn, conn.cursor() as cur:
@@ -485,9 +513,12 @@ def cmd_migrate_children(_: argparse.Namespace) -> None:
     with pg_conn() as conn, conn.cursor() as cur:
         state = _read_state(cur)
         resume_from = state["last_child_id"]
+        cur.execute("SELECT COUNT(*) FROM corpus_child_chunks")
+        already_loaded = cur.fetchone()[0]
         log.info(
-            "migrate-children: resuming from last_child_id = %d",
+            "migrate-children: resuming. last_child_id=%d, rows already in target=%d",
             resume_from,
+            already_loaded,
         )
         if state["children_started_at"] is None:
             _set_state(
@@ -502,10 +533,12 @@ def cmd_migrate_children(_: argparse.Namespace) -> None:
             (resume_from,),
         )
         remaining = scur.fetchone()[0]
+        total_in_source = already_loaded + remaining
         log.info(
-            "migrate-children: %d embedded children to copy (resume_from=%d)",
+            "migrate-children: %d embedded children to copy (%d already done; %d total embedded)",
             remaining,
-            resume_from,
+            already_loaded,
+            total_in_source,
         )
         if remaining == 0:
             log.info("migrate-children: already complete")
@@ -528,9 +561,8 @@ def cmd_migrate_children(_: argparse.Namespace) -> None:
                 )
                 raise
             total_inserted += len(batch)
-            done_total = resume_from + total_inserted
-            full_total = resume_from + remaining
-            pct = 100.0 * done_total / full_total
+            done_total = already_loaded + total_inserted
+            pct = 100.0 * done_total / max(total_in_source, 1)
             elapsed = time.time() - t0
             rate = total_inserted / max(elapsed, 1e-6)
             eta_s = (remaining - total_inserted) / max(rate, 1e-6)
@@ -538,7 +570,7 @@ def cmd_migrate_children(_: argparse.Namespace) -> None:
                 "migrate-children: +%d (cum %d / %d, %.2f%%, %.0f rows/s, ETA %s)",
                 len(batch),
                 done_total,
-                full_total,
+                total_in_source,
                 pct,
                 rate,
                 _fmt_duration(eta_s),
