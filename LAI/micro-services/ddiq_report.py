@@ -37,6 +37,11 @@ from bundesland_bbox import (
     has_bbox,
     is_in_bundesland,
 )
+
+# Deterministic reconciler for cross-source value disagreements
+# (total_capacity_mw, turbine_count, bundesland, …). See ``_reconcile.py``
+# for precedence rules + divergence logging.
+from _reconcile import Candidate, reconcile_categorical, reconcile_numeric
 import fitz  # PyMuPDF
 import numpy as np
 import pytesseract
@@ -411,6 +416,14 @@ class DDiQReportData(BaseModel):
     grundbuchChecks: list[GrundbuchCheck] = []
     rueckbauBond: Optional[RueckbauBond] = None
     documentMap: list[dict] = []                 # [{"id": uuid, "filename": str}] for evidence rendering
+    # ── Reconciled cross-source values (Track A item 4) ────────────────
+    # Single source of truth for fields the pipeline historically
+    # disagreed about across sections. ``None`` / 0 means no candidate
+    # source returned a value; downstream code treats those as "unknown"
+    # rather than substituting a fallback. See ``_reconcile.py`` and the
+    # reconciliation block in ``_generate_report_core``.
+    turbineCount: int = 0
+    bundesland: Optional[str] = None             # lowercase, e.g. "niedersachsen"
 class GenerateReportRequest(BaseModel):
     document_ids: list[str]; preset: str = "full"
     project_name: Optional[str] = None; prepared_for: Optional[str] = None
@@ -2310,16 +2323,92 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     report.geojson = pipeline_result.geojson if pipeline_result.geojson else None
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
 
-    # Parse total capacity from the overview section to feed materiality
-    # quantification (mw_affected sizing) and cross-doc consistency.
-    total_mw = None
+    # ── Cross-source reconciliation ──────────────────────────────────────
+    # Compute canonical values for fields that multiple upstream sources
+    # disagree about (the "four-conflicting-turbine-counts" failure mode
+    # from the smoke test). Each downstream consumer uses the reconciled
+    # value, so a single report can no longer show different numbers in
+    # different sections. Precedence: cadastral > llm > regex > fallback.
+    # See ``_reconcile.py`` for the rationale.
+
+    # total_capacity_mw: the overview section's typed cell is a regex hit;
+    # sum(WEA.rated_power_kw) is an LLM-extracted derived value. We take
+    # the LLM-derived sum first when present, falling back to the regex.
+    cap_str = get_section_value(sections, "overview", "Total Capacity")
+    regex_total_mw: Optional[float] = None
     try:
-        cap_str = get_section_value(sections, "overview", "Total Capacity")
         m = re.search(r"([\d,.]+)\s*MW", cap_str or "", re.IGNORECASE)
         if m:
-            total_mw = float(m.group(1).replace(",", "."))
+            regex_total_mw = float(m.group(1).replace(",", "."))
     except Exception:
-        pass
+        regex_total_mw = None
+
+    wea_capacities_kw = [w.rated_power_kw for w in weas if w.rated_power_kw]
+    sum_total_mw: Optional[float] = (
+        round(sum(wea_capacities_kw) / 1000.0, 3) if wea_capacities_kw else None
+    )
+
+    total_mw_reconciled = reconcile_numeric(
+        "total_capacity_mw",
+        [
+            Candidate(value=sum_total_mw, provenance="llm",
+                      source="sum(weas.rated_power_kw)/1000"),
+            Candidate(value=regex_total_mw, provenance="regex",
+                      source="overview.Total Capacity"),
+        ],
+    )
+    total_mw: Optional[float] = total_mw_reconciled.value if total_mw_reconciled else None
+
+    # turbine_count: parse_wea_count(overview cell) is regex; len(weas) is
+    # the LLM extraction. When the LLM successfully extracted per-WEA
+    # rows, that count is more trustworthy than a regex on a single cell.
+    regex_wea_count: Optional[int] = None
+    try:
+        rc = parse_wea_count(get_section_value(sections, "overview", "Number of WEA"))
+        regex_wea_count = rc if rc > 0 else None
+    except Exception:
+        regex_wea_count = None
+    llm_wea_count: Optional[int] = len(weas) if weas else None
+
+    turbine_count_reconciled = reconcile_numeric(
+        "turbine_count",
+        [
+            Candidate(value=llm_wea_count, provenance="llm",
+                      source="len(weas) — extract_wea_statuses"),
+            Candidate(value=regex_wea_count, provenance="regex",
+                      source="overview.Number of WEA"),
+        ],
+    )
+    # Stash the reconciled count on the report so the UI and the cross-doc
+    # consistency check both quote the same number.
+    report.turbineCount = (
+        int(turbine_count_reconciled.value)
+        if turbine_count_reconciled and turbine_count_reconciled.value is not None
+        else 0
+    )
+
+    # bundesland: keyword scan on the location string vs. bbox derivation
+    # from the geocoded project_center. The bbox derivation is grounded
+    # in real coordinates from Nominatim, so it gets the "cadastral"
+    # precedence; the keyword scan is the regex layer.
+    bl_from_keyword: Optional[str] = detect_bundesland(ploc) if ploc else None
+    bl_from_coords: Optional[str] = bundesland_from_coords(*pc) if pc else None
+
+    bundesland_reconciled = reconcile_categorical(
+        "bundesland",
+        [
+            Candidate(value=bl_from_coords, provenance="cadastral",
+                      source="bundesland_from_coords(project_center)"),
+            Candidate(value=bl_from_keyword, provenance="regex",
+                      source="detect_bundesland(location)"),
+        ],
+    )
+    report.bundesland = bundesland_reconciled.value if bundesland_reconciled else None
+
+    logger.info(
+        "reconciled: total_mw=%s  turbine_count=%s  bundesland=%s",
+        total_mw, report.turbineCount, report.bundesland,
+    )
 
     progress("findings", 0.85)
     t = time.time()
