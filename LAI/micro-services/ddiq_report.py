@@ -42,6 +42,11 @@ from bundesland_bbox import (
 # (total_capacity_mw, turbine_count, bundesland, …). See ``_reconcile.py``
 # for precedence rules + divergence logging.
 from _reconcile import Candidate, reconcile_categorical, reconcile_numeric
+
+# Output guardrail: post-LLM cleanup pass that strips defensive-AI
+# paragraphs, removes hedge phrases, and flags mixed-language rows.
+# See ``_guardrail.py`` for the sourced pattern list.
+from _guardrail import apply_to_findings, apply_to_rows
 import fitz  # PyMuPDF
 import numpy as np
 import pytesseract
@@ -2496,6 +2501,37 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     # Combine all findings; section findings stay first, then derived.
     all_findings = list(findings) + deadline_findings
     report.findings = all_findings
+
+    # ── Output guardrail pass (Track A item 5) ────────────────────────
+    # Strip defensive-AI paragraphs ("Die vorliegenden Kontextausschnitte
+    # enthalten keine Informationen zu …"), hedge phrases, and mark
+    # mixed-language rows. Runs last so it sees every section + every
+    # finding the pipeline produced. Pure mutation of the in-memory
+    # ``report`` object — no I/O.
+    section_lang_hint = "de"  # current corpus + clients are DE-first
+    row_counts = {"defensive": 0, "hedges": 0, "mixed_lang": 0}
+    for sec in report.sections:
+        c = apply_to_rows(
+            sec.rows,
+            target_language=section_lang_hint,
+            section_language_hint=section_lang_hint,
+        )
+        for k, v in c.items():
+            row_counts[k] += v
+    finding_counts = apply_to_findings(
+        report.findings, target_language=section_lang_hint,
+    )
+    cross_doc_counts = apply_to_findings(
+        report.crossDocFindings, target_language=section_lang_hint,
+    )
+    logger.info(
+        "guardrail: rows defensive=%d hedges=%d mixed=%d  "
+        "findings defensive=%d hedges=%d  cross_doc defensive=%d hedges=%d",
+        row_counts["defensive"], row_counts["hedges"], row_counts["mixed_lang"],
+        finding_counts["defensive"], finding_counts["hedges"],
+        cross_doc_counts["defensive"], cross_doc_counts["hedges"],
+    )
+
     # Final report_data checkpoint — byte-identical to what the
     # original single end-of-pipeline UPSERT wrote.
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
