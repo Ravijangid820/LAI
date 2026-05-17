@@ -882,6 +882,35 @@ class TokensOut(BaseModel):
     completion: int
 
 
+class CitationValidationOut(BaseModel):
+    """Structured summary of the Day-4 citation validator pass.
+
+    Populated only on grounded-mode turns (i.e. when the prompt actually
+    carried sources). ``None`` on plain-chat turns where validation
+    would have nothing to compare against.
+
+    Attributes:
+        allowed: Handles that the prompt presented to the LLM, e.g.
+            ``["C-1", "C-2", "M-1"]``. The UI uses this as a sanity
+            check when rendering chips — a chip for a handle not in
+            this list should never appear in a well-validated answer.
+        emitted: Handles the model actually emitted in its answer
+            (deduplicated, in first-seen order).
+        fabricated: Subset of ``emitted`` that were NOT in ``allowed``
+            and were therefore stripped from the answer text. The
+            surrounding sentence was rewritten to end "(unbelegt)" so
+            the reader is aware the claim has no source.
+        sentences_flagged: Number of sentences the validator rewrote
+            with the "(unbelegt)" marker. Drives a one-line badge in
+            the UI ("2 unverifiable claims removed").
+    """
+
+    allowed: list[str]
+    emitted: list[str]
+    fabricated: list[str]
+    sentences_flagged: int
+
+
 class QueryResp(BaseModel):
     answer: str
     chunks: list[ChunkOut]
@@ -889,6 +918,7 @@ class QueryResp(BaseModel):
     tokens: TokensOut
     session_id: str
     mode: str  # "chat" | "rag" | "contract" | "rag+contract"
+    citation_validation: CitationValidationOut | None = None
 
 
 class UploadResp(BaseModel):
@@ -1265,6 +1295,7 @@ def query(req: QueryReq):
     # sentence ``(unbelegt)`` so the reader knows the claim has no
     # underlying source. Only runs on grounded-mode turns (chat-only
     # has no sources to validate against, so nothing to strip).
+    citation_validation_out: CitationValidationOut | None = None
     if rag_sources:
         allowed_handles = {src.cite_id for src in rag_sources}
         validation = validate_citations(answer, allowed_handles)
@@ -1276,6 +1307,16 @@ def query(req: QueryReq):
                 flush=True,
             )
         answer = validation.text
+        # Attach the structured summary to the response so the UI can
+        # render fabricated-count badges + sanity-check chips against
+        # the allowed-handle set. ``allowed`` is sorted for stable wire
+        # output; ``emitted`` / ``fabricated`` keep first-seen order.
+        citation_validation_out = CitationValidationOut(
+            allowed=sorted(allowed_handles),
+            emitted=list(validation.emitted),
+            fabricated=list(validation.fabricated),
+            sentences_flagged=validation.sentences_flagged,
+        )
 
     timings.total_s = round(time.time() - t_total0, 3)
 
@@ -1311,6 +1352,7 @@ def query(req: QueryReq):
         answer=answer, chunks=chunks_out, timings=timings,
         tokens=TokensOut(prompt=prompt_tokens, completion=completion_tokens),
         session_id=sid, mode=mode,
+        citation_validation=citation_validation_out,
     )
 
 
