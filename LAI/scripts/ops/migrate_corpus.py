@@ -465,29 +465,62 @@ def _iter_child_batches(
     sqlite_cur: sqlite3.Cursor, batch_size: int, resume_from: int
 ) -> Iterator[list[tuple[Any, ...]]]:
     """Yield batches of (id, parent_id, chunk_id, content, embedding, char_count)
-    for child rows that have an embedding. Ordered by child_id."""
+    for child rows that have an embedding. Ordered by child_id.
+
+    ``parent_id`` is set to ``NULL`` when the source ``parent_chunks``
+    row doesn't exist — the historical SQLite has 26 such orphan
+    children (verified 2026-05-17) and the Postgres FK on
+    ``corpus_child_chunks.parent_id`` would otherwise reject the
+    batch. ``NULL`` preserves the embedding + child text while
+    correctly signalling "no parent context available" downstream.
+    The LEFT JOIN approach is one round-trip per batch (no extra
+    query) and the existence test is index-fast.
+    """
     last_id = resume_from
+    orphan_count = 0
     while True:
         rows = sqlite_cur.execute(
-            "SELECT c.id, c.parent_id, c.chunk_id, c.content, e.embedding, c.char_count "
+            # LEFT JOIN parent_chunks + CASE — when the source parent
+            # is missing, ``p.id`` is NULL and we emit NULL for
+            # parent_id instead of the orphan reference. Otherwise
+            # pass through the real parent_id.
+            "SELECT c.id, "
+            "       (CASE WHEN p.id IS NOT NULL THEN c.parent_id ELSE NULL END) AS parent_id, "
+            "       c.chunk_id, c.content, e.embedding, c.char_count, "
+            "       (CASE WHEN p.id IS NULL AND c.parent_id IS NOT NULL THEN 1 ELSE 0 END) AS is_orphan "
             "FROM child_embeddings e "
             "JOIN child_chunks c ON c.id = e.child_id "
+            "LEFT JOIN parent_chunks p ON p.id = c.parent_id "
             "WHERE c.id > ? ORDER BY c.id ASC LIMIT ?",
             (last_id, batch_size),
         ).fetchall()
         if not rows:
+            if orphan_count > 0:
+                log.info(
+                    "child-iter: total %d orphan parent_id(s) demoted to NULL this run",
+                    orphan_count,
+                )
             return
         # Transform blobs → fp16 arrays before yielding so the producer
         # doesn't pay the conversion cost twice on retry.
         transformed: list[tuple[Any, ...]] = []
-        for cid, pid, chunk_id, content, blob, cc in rows:
+        for cid, pid, chunk_id, content, blob, cc, is_orphan in rows:
             try:
                 vec = _blob_to_halfvec(blob)
             except ValueError as e:
-                log.warning(
-                    "skipping child_id=%d: %s", cid, e,
-                )
+                log.warning("skipping child_id=%d: %s", cid, e)
                 continue
+            if is_orphan:
+                orphan_count += 1
+                if orphan_count <= 10 or orphan_count % 1000 == 0:
+                    # Log the first 10 + a heartbeat thereafter so a
+                    # flood doesn't bury the log but a spike is still
+                    # observable.
+                    log.warning(
+                        "child_id=%d: source parent missing; parent_id NULLed (run total: %d)",
+                        cid,
+                        orphan_count,
+                    )
             transformed.append((cid, pid, chunk_id, content, vec, cc))
         if not transformed:
             # Whole batch was malformed — extremely unlikely but guard the loop.
