@@ -28,6 +28,15 @@ from lai.common.llm import (
     SyncLlmClient,
     salvage_json,
 )
+
+# Geocoding plausibility-gate helpers — used by ``geocode_address`` to
+# reject Nominatim results that fall outside the named Bundesland's bbox.
+# See ``bundesland_bbox.py`` for the data source + the why.
+from bundesland_bbox import (
+    bundesland_from_coords,
+    has_bbox,
+    is_in_bundesland,
+)
 import fitz  # PyMuPDF
 import numpy as np
 import pytesseract
@@ -152,7 +161,13 @@ CREATE INDEX IF NOT EXISTS ddiq_reports_fingerprint_idx
     ON ddiq_reports(request_fingerprint) WHERE request_fingerprint IS NOT NULL;
 CREATE TABLE IF NOT EXISTS ddiq_geocode_cache (
     address TEXT PRIMARY KEY, lat DOUBLE PRECISION NOT NULL,
-    lng DOUBLE PRECISION NOT NULL, cached_at TIMESTAMPTZ DEFAULT NOW());
+    lng DOUBLE PRECISION NOT NULL, cached_at TIMESTAMPTZ DEFAULT NOW(),
+    -- TTL on the geocode cache. Rows are honored only while
+    -- ``expires_at > NOW()``; pre-TTL rows (NULL ``expires_at``) are
+    -- treated as expired so any wrong-state Nominatim answers cached
+    -- before the bbox gate landed get re-geocoded once.
+    expires_at TIMESTAMPTZ);
+ALTER TABLE ddiq_geocode_cache ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS ddiq_parcel_cache (
     coord_key TEXT PRIMARY KEY, parcel_data JSONB NOT NULL, cached_at TIMESTAMPTZ DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS ddiq_project_areas (
@@ -641,22 +656,101 @@ def evidence_from_chunks(reranked, indices):
 # GEOCODING + PARCEL POLYGON
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def geocode_address(address):
-    if not address or not address.strip(): return None
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT lat, lng FROM ddiq_geocode_cache WHERE address = %s", (address,))
+def geocode_address(address, expected_bundesland: Optional[str] = None):
+    """Geocode ``address`` via the cached Nominatim wrapper.
+
+    Args:
+        address: The address string to geocode. Pre-trimmed; an empty /
+            whitespace-only value short-circuits to ``None``.
+        expected_bundesland: Optional Bundesland name (lowercase, as
+            returned by :func:`detect_bundesland`). When provided AND a
+            bbox exists for it (see :data:`bundesland_bbox.BUNDESLAND_BBOX`),
+            any Nominatim result whose coordinates fall outside the bbox
+            is rejected — the gate that closes the "turbines in Bremen"
+            failure mode from the 2026-04 smoke-test where Nominatim
+            resolved a Cuxhaven address to the city-state of Bremen
+            ~70 km south-west. Rejected results are NOT cached; the next
+            call with a more specific address gets a fresh attempt.
+
+    Returns:
+        ``(lat, lng)`` on success, ``None`` if the address is empty, the
+        Nominatim call fails, no result is returned, or the bbox gate
+        rejects the result.
+    """
+    if not address or not address.strip():
+        return None
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Cache lookup: only honor non-expired rows. NULL ``expires_at`` is
+    # treated as expired so legacy rows pre-dating the TTL column get
+    # re-geocoded once (and re-validated against the new bbox gate).
+    cur.execute(
+        "SELECT lat, lng FROM ddiq_geocode_cache "
+        "WHERE address = %s AND expires_at IS NOT NULL AND expires_at > NOW()",
+        (address,),
+    )
     row = cur.fetchone()
-    if row: cur.close(); conn.close(); return (row[0], row[1])
+    if row:
+        cur.close(); conn.close()
+        return (row[0], row[1])
+
     try:
-        resp = requests.get(NOMINATIM_URL, params={"q": address, "format": "json", "limit": 1, "countrycodes": "de"},
-            headers={"User-Agent": NOMINATIM_UA}, timeout=10)
-        resp.raise_for_status(); results = resp.json()
-        if results:
-            lat, lng = float(results[0]["lat"]), float(results[0]["lon"])
-            cur.execute("INSERT INTO ddiq_geocode_cache (address, lat, lng) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING", (address, lat, lng))
-            conn.commit(); cur.close(); conn.close(); time.sleep(1.1); return (lat, lng)
-    except Exception as e: logger.warning(f"Geocoding failed for '{address}': {e}")
-    cur.close(); conn.close(); return None
+        resp = requests.get(
+            NOMINATIM_URL,
+            params={"q": address, "format": "json", "limit": 1, "countrycodes": "de"},
+            headers={"User-Agent": NOMINATIM_UA},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+        if not results:
+            cur.close(); conn.close()
+            return None
+
+        lat = float(results[0]["lat"])
+        lng = float(results[0]["lon"])
+
+        # Plausibility gate. Unknown Bundeslaender pass through silently
+        # (see ``is_in_bundesland`` docstring); known ones reject + log.
+        if (
+            expected_bundesland
+            and has_bbox(expected_bundesland)
+            and not is_in_bundesland(lat, lng, expected_bundesland)
+        ):
+            logger.warning(
+                "Geocoding rejected for '%s': Nominatim returned "
+                "(%.4f, %.4f) which is outside the %s bbox. Likely a "
+                "wrong-Bundesland same-name resolution; not caching.",
+                address, lat, lng, expected_bundesland,
+            )
+            cur.close(); conn.close()
+            time.sleep(1.1)  # we did consume a Nominatim request
+            return None
+
+        # Cache. ``ON CONFLICT (address) DO UPDATE`` so a stale row (NULL
+        # ``expires_at`` from before the TTL column existed, or just an
+        # expired entry) gets refreshed instead of silently re-locking
+        # itself for the next fetch cycle.
+        cur.execute(
+            "INSERT INTO ddiq_geocode_cache (address, lat, lng, expires_at) "
+            "VALUES (%s, %s, %s, NOW() + INTERVAL '90 days') "
+            "ON CONFLICT (address) DO UPDATE SET "
+            "  lat = EXCLUDED.lat, "
+            "  lng = EXCLUDED.lng, "
+            "  cached_at = NOW(), "
+            "  expires_at = EXCLUDED.expires_at",
+            (address, lat, lng),
+        )
+        conn.commit()
+        cur.close(); conn.close()
+        time.sleep(1.1)
+        return (lat, lng)
+    except Exception as e:
+        logger.warning(f"Geocoding failed for '{address}': {e}")
+
+    cur.close(); conn.close()
+    return None
 
 def make_parcel_polygon(lat, lng, area_ha=2.5, rotation_seed=0):
     """Create an estimated parcel polygon. Marked as 'estimated' — not real cadastral data."""
@@ -913,18 +1007,29 @@ def parse_wea_count(value):
 
 def geocode_project_location(sections):
     location = get_section_value(sections, "overview", "Location")
+    # Detect the project's Bundesland from the same location string we're
+    # about to geocode — chains seamlessly because ``detect_bundesland``
+    # returns the exact lowercase keys ``BUNDESLAND_BBOX`` uses. Falls
+    # through to ``None`` (no gate) when location doesn't name a state.
+    expected_bl = detect_bundesland(location) if location else None
     if location:
-        coords = geocode_address(location)
-        if coords: return coords
+        coords = geocode_address(location, expected_bundesland=expected_bl)
+        if coords:
+            return coords
         for part in [p.strip() for p in location.replace(",", " ").split() if len(p.strip()) > 2]:
-            coords = geocode_address(f"{part}, Germany")
-            if coords: return coords
+            coords = geocode_address(f"{part}, Germany", expected_bundesland=expected_bl)
+            if coords:
+                return coords
     name = get_section_value(sections, "overview", "Project Name")
     if name:
         clean = re.sub(r"(?i)windpark|windenergie|wind\s*farm", "", name).strip()
         if clean:
-            coords = geocode_address(f"{clean}, Germany")
-            if coords: return coords
+            # The project name may itself name a Bundesland we missed in
+            # the location string ("Windpark Lamstedt Bayern e.g.).
+            name_bl = expected_bl or detect_bundesland(clean)
+            coords = geocode_address(f"{clean}, Germany", expected_bundesland=name_bl)
+            if coords:
+                return coords
     return None
 
 
@@ -1457,10 +1562,14 @@ Rules:
         try: return float(v) if v not in (None, "") else None
         except Exception: return None
 
+    # WEAs sit inside the project area, so the project's centroid pins
+    # the expected Bundesland for every per-WEA geocode below. None if
+    # we have no project_center yet (rare; falls back to no gate).
+    project_bl = bundesland_from_coords(*project_center) if project_center else None
     statuses = []
     for idx, w in enumerate(weas_raw):
         addr = str(w.get("address", ""))
-        coords = geocode_address(addr) if addr else None
+        coords = geocode_address(addr, expected_bundesland=project_bl) if addr else None
         if not coords and project_center: coords = project_center
         sc = w.get("status_code")
         if sc not in ("errichtet", "genehmigt", "geplant", "abgenommen"):
@@ -1528,10 +1637,15 @@ def extract_infrastructure(doc_ids, sections, project_center=None):
                 {"name": "Cable Start", "type": "cable_start", "address": loc},
                 {"name": f"Cable End ({short})", "type": "cable_end", "address": loc}]
 
+    # Same plausibility logic as ``extract_wea_statuses``: infrastructure
+    # (substations, cable termini, access roads) sits inside or adjacent
+    # to the project area, so the project Bundesland gates per-point
+    # geocode results.
+    project_bl = bundesland_from_coords(*project_center) if project_center else None
     points = []
     for p in infra_raw:
         addr = str(p.get("address", ""))
-        coords = geocode_address(addr) if addr else None
+        coords = geocode_address(addr, expected_bundesland=project_bl) if addr else None
         if not coords and project_center:
             offset = (len(points)+1)*0.004; angle = len(points)*2.1
             coords = (project_center[0]+offset*math.cos(angle), project_center[1]+offset*math.sin(angle))
