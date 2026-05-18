@@ -3,13 +3,12 @@
 FastAPI Backend — Legal AI RAG
 Runs on SSH server, called by React frontend on local machine
 """
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional
-from collections import defaultdict
-import os, time, requests, psycopg2, re, uuid
+import os, time, requests, psycopg2, psycopg2.extras, re, uuid
 import fitz  # PyMuPDF
 import numpy as np
 import pytesseract
@@ -18,11 +17,22 @@ import io
 import logging
 from ddiq_report import router as ddiq_router
 
+# Auth — every protected route depends on ``get_current_user`` (4a).
+# The dependency lives in a shared module so api.py and the imported
+# ddiq_router resolve to the same TokenIssuer/secret instance.
+from auth_dep import get_current_user
+from lai.common.auth import CurrentUser
+from lai.api.auth_router import register_auth_exception_handlers
+
 logger = logging.getLogger("lai_api")
 
 load_dotenv()
 
 app = FastAPI(title="Legal AI RAG API", version="1.0.0")
+
+# Translate auth-module exceptions into 401s app-wide. Must run before
+# include_router so the ddiq sub-router inherits the same handler.
+register_auth_exception_handlers(app)
 
 app.include_router(ddiq_router, prefix="/ddiq")
 
@@ -36,7 +46,7 @@ _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] i
 ]
 # Only allow localhost in development
 if os.getenv("ENVIRONMENT", "development") == "development":
-    _cors_origins.extend(["http://localhost:3000", "http://localhost:5173"])
+    _cors_origins.extend(["http://localhost:3000", "http://localhost:5173","http://192.168.178.82:5173"])
 
 app.add_middleware(
     CORSMiddleware,
@@ -116,24 +126,94 @@ def is_greeting(text: str) -> bool:
     return False
 
 # ─────────────────────────────────────────────
-# Conversation Memory (in-memory store)
+# Persistence — AUTH_PLAN §6.1
 # ─────────────────────────────────────────────
-conversation_store: dict[str, list[dict]] = defaultdict(list)
-MAX_HISTORY = 10  # Keep last 10 messages per session
-
-# ─────────────────────────────────────────────
-# Document Store (in-memory, per session)
-# ─────────────────────────────────────────────
-# Stores uploaded document chunks with embeddings per session
-document_store: dict[str, list[dict]] = defaultdict(list)
+# Conversation history and per-session uploaded documents live in
+# Postgres, keyed by ``user_id`` (from the JWT) and ``conversation_id``
+# (server-issued). The previous in-memory ``conversation_store`` and
+# ``document_store`` dicts are gone — they had no tenant binding and
+# were lost on restart.
+MAX_HISTORY = 10  # Keep last 10 messages per conversation in the prompt window
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
+
+def _ensure_conversation(user_id, conversation_id):
+    """Resolve-or-create a conversation owned by ``user_id``.
+
+    Returns the conversation UUID as a string. If ``conversation_id`` is
+    provided but does not belong to ``user_id``, returns ``None``
+    (caller maps to 404 — no leaking existence of other users' rows).
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn, conn.cursor() as cur:
+            if conversation_id:
+                cur.execute(
+                    "SELECT id FROM conversations WHERE id = %s AND user_id = %s",
+                    (conversation_id, str(user_id)),
+                )
+                row = cur.fetchone()
+                return str(row[0]) if row else None
+            cur.execute(
+                "INSERT INTO conversations (user_id) VALUES (%s) RETURNING id",
+                (str(user_id),),
+            )
+            return str(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+
+def _load_history(conversation_id):
+    """Return the last ``MAX_HISTORY * 2`` messages in chronological order."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT role, content
+                FROM messages
+                WHERE conversation_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (conversation_id, MAX_HISTORY * 2),
+            )
+            rows = cur.fetchall()
+        # Reverse to chronological order.
+        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    finally:
+        conn.close()
+
+
+def _append_message(conversation_id, role, content):
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO messages (conversation_id, role, content)
+                VALUES (%s, %s, %s)
+                """,
+                (conversation_id, role, content),
+            )
+            cur.execute(
+                "UPDATE conversations SET updated_at = NOW() WHERE id = %s",
+                (conversation_id,),
+            )
+    finally:
+        conn.close()
+
 
 # ─────────────────────────────────────────────
 # Pydantic models
 # ─────────────────────────────────────────────
 class QueryRequest(BaseModel):
     question: str
-    session_id: Optional[str] = None  # For conversation memory
+    # Conversation handle (server-issued). Optional — a missing value
+    # creates a fresh conversation owned by the caller. The name is
+    # kept as ``session_id`` to preserve the existing client contract
+    # while the field semantics change to "conversation id".
+    session_id: Optional[str] = None
 
 class ChunkInfo(BaseModel):
     text: str
@@ -149,7 +229,7 @@ class QueryResponse(BaseModel):
     timings: dict
     tokens: dict
     is_greeting: bool = False   # lets frontend know no RAG was used
-    session_id: str = ""        # Return session_id for conversation continuity
+    session_id: str = ""        # echoes the (possibly newly created) conversation id
 
 class UploadResponse(BaseModel):
     session_id: str
@@ -310,32 +390,52 @@ def retrieve_hybrid(embedding: list, query: str, top_k: int = 30) -> list:
     return sorted(scores.values(), key=lambda x: x["rrf_score"], reverse=True)[:top_k]
 
 
-def search_uploaded_docs(session_id: str, query_embedding: list, top_k: int = 5) -> list:
-    """Search within uploaded documents for this session using vector similarity."""
-    docs = document_store.get(session_id, [])
-    if not docs:
-        return []
+def search_uploaded_docs(
+    user_id: str,
+    conversation_id: str,
+    query_embedding: list,
+    top_k: int = 5,
+) -> list:
+    """Search this user's uploaded chunks for the given conversation.
 
-    # Calculate cosine similarity
-    query_vec = np.array(query_embedding)
+    Uses pgvector's cosine distance operator (``<=>``). The join on
+    ``ddiq_documents`` enforces the tenant filter — even if a caller
+    fabricates a ``conversation_id``, only their own documents come
+    back.
+    """
+    emb_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.text, d.filename,
+                       1 - (c.embedding <=> %s::vector) AS similarity
+                FROM ddiq_doc_chunks c
+                JOIN ddiq_documents d ON d.id = c.doc_id
+                WHERE d.user_id = %s
+                  AND d.session_id = %s
+                  AND c.embedding IS NOT NULL
+                ORDER BY c.embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (emb_str, str(user_id), conversation_id, emb_str, top_k),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
 
-    scored = []
-    for doc in docs:
-        doc_vec = np.array(doc["embedding"])
-        # Cosine similarity
-        similarity = float(np.dot(query_vec, doc_vec) / (np.linalg.norm(query_vec) * np.linalg.norm(doc_vec)))
-        scored.append({
-            "text": doc["text"],
-            "section": f"Uploaded: {doc['filename']}",
+    return [
+        {
+            "text": r[0],
+            "section": f"Uploaded: {r[1]}",
             "law_refs": [],
             "doc_type": "uploaded",
-            "similarity": round(similarity, 4),
+            "similarity": round(float(r[2]), 4),
             "sources": ["uploaded"],
-        })
-
-    # Sort by similarity and return top_k
-    scored.sort(key=lambda x: x["similarity"], reverse=True)
-    return scored[:top_k]
+        }
+        for r in rows
+    ]
 
 
 def rerank_chunks(query: str, chunks: list, top_k: int = 3) -> list:
@@ -387,91 +487,121 @@ async def health():
 def upload_document(
     file: UploadFile = File(...),
     session_id: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user),
 ):
-    """Upload a PDF document for analysis.
+    """Upload a PDF document for chat-context augmentation.
 
     Sync handler — FastAPI dispatches to a threadpool. The underlying
-    SpooledTemporaryFile (`file.file`) is readable synchronously, so we
-    don't need `await file.read()` (which only works in an async def).
+    SpooledTemporaryFile (``file.file``) is readable synchronously.
+
+    Tenant isolation (AUTH_PLAN G1/G3): the row's ``user_id`` is taken
+    from the JWT, never from the request body. The optional
+    ``session_id`` parameter is interpreted as a conversation id and
+    is validated to belong to the calling user — an unknown or
+    other-user id 404s.
     """
-    # Validate file type
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    # Read file
     file_bytes = file.file.read()
-
-    # Check file size
     if len(file_bytes) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)} MB")
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)} MB",
+        )
 
-    # Get or create session
-    sid = session_id or str(uuid.uuid4())
+    conv_id = _ensure_conversation(user.id, session_id)
+    if conv_id is None:
+        # session_id was supplied but does not belong to this user.
+        raise HTTPException(status_code=404, detail="conversation not found")
 
     try:
-        # Extract text from PDF
         full_text, page_count = extract_pdf_text(file_bytes)
-
         if not full_text.strip():
             raise HTTPException(status_code=400, detail="Could not extract text from PDF")
 
-        # Chunk the text
         chunks = chunk_text(full_text)
-
         if not chunks:
             raise HTTPException(status_code=400, detail="No text chunks could be created from PDF")
 
-        # Embed all chunks
         chunk_texts = [c["text"] for c in chunks]
         embeddings = embed_texts(chunk_texts)
 
-        # Store in document_store
-        for chunk, embedding in zip(chunks, embeddings):
-            document_store[sid].append({
-                "filename": file.filename,
-                "text": chunk["text"],
-                "embedding": embedding,
-                "chunk_id": chunk["id"],
-            })
+        conn = psycopg2.connect(**DB_CONFIG)
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ddiq_documents (
+                        user_id, filename, size_bytes, status, category,
+                        full_text, chunk_count, session_id
+                    )
+                    VALUES (%s, %s, %s, 'ready', 'Chat upload', %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        str(user.id), file.filename, len(file_bytes),
+                        full_text, len(chunks), conv_id,
+                    ),
+                )
+                doc_id = cur.fetchone()[0]
+                # Batch-insert chunks. ``psycopg2.extras.execute_values``
+                # is materially faster than per-row INSERTs once N > ~20.
+                values = [
+                    (str(doc_id), c["id"], c["text"], "[" + ",".join(str(x) for x in emb) + "]")
+                    for c, emb in zip(chunks, embeddings)
+                ]
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO ddiq_doc_chunks (doc_id, chunk_idx, text, embedding)
+                    VALUES %s
+                    """,
+                    values,
+                    template="(%s, %s, %s, %s::vector)",
+                )
+        finally:
+            conn.close()
 
         return UploadResponse(
-            session_id=sid,
+            session_id=conv_id,
             filename=file.filename,
             pages=page_count,
             chunks=len(chunks),
             message=f"Successfully processed {file.filename}: {page_count} pages, {len(chunks)} chunks",
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error processing PDF '{file.filename}': {str(e)}")
         raise HTTPException(status_code=500, detail="Error processing PDF. Please ensure the file is valid.")
 
 
 @app.post("/query", response_model=QueryResponse)
-def query(req: QueryRequest):
+def query(req: QueryRequest, user: CurrentUser = Depends(get_current_user)):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     t_total = time.time()
 
-    # Get or create session
-    session_id = req.session_id or str(uuid.uuid4())
-    history = conversation_store[session_id]
+    # Resolve or create the conversation. AUTH_PLAN G4: the conversation
+    # id alone is no longer a capability — the JWT must agree.
+    conv_id = _ensure_conversation(user.id, req.session_id)
+    if conv_id is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    history = _load_history(conv_id)
 
     # ── Greeting path — skip RAG entirely ──────────────────────────────
     if is_greeting(req.question) and not history:
-        # Only treat as greeting if no conversation history
         messages = [
             {"role": "system", "content": GREETING_SYSTEM_PROMPT},
             {"role": "user",   "content": req.question},
         ]
         result = generate_answer(messages)
 
-        # Store in history
-        history.append({"role": "user", "content": req.question})
-        history.append({"role": "assistant", "content": result["content"]})
-        if len(history) > MAX_HISTORY * 2:
-            conversation_store[session_id] = history[-MAX_HISTORY * 2:]
+        _append_message(conv_id, "user", req.question)
+        _append_message(conv_id, "assistant", result["content"])
 
         return QueryResponse(
             answer=result["content"],
@@ -479,7 +609,7 @@ def query(req: QueryRequest):
             timings={"total_s": round(time.time() - t_total, 2)},
             tokens={"prompt": result["prompt_tokens"], "completion": result["completion_tokens"]},
             is_greeting=True,
-            session_id=session_id,
+            session_id=conv_id,
         )
 
     # ── RAG path — full hybrid pipeline ────────────────────────────────
@@ -489,18 +619,17 @@ def query(req: QueryRequest):
         embed_s = round(time.time() - t0, 2)
 
         t1 = time.time()
-        # Check if session has uploaded documents - search those FIRST
-        uploaded_chunks = search_uploaded_docs(session_id, embedding, top_k=5)
+        # Search this user's uploaded chunks for THIS conversation first.
+        uploaded_chunks = search_uploaded_docs(user.id, conv_id, embedding, top_k=5)
 
         if uploaded_chunks:
-            # Use uploaded documents primarily
             chunks = uploaded_chunks
             retrieve_s = round(time.time() - t1, 2)
             t2 = time.time()
             reranked = rerank_chunks(req.question, chunks, top_k=5)
             rerank_s = round(time.time() - t2, 2)
         else:
-            # Fall back to database search
+            # Fall back to shared corpus (no PII; same data for all users).
             chunks = retrieve_hybrid(embedding, req.question)
             retrieve_s = round(time.time() - t1, 2)
             t2 = time.time()
@@ -513,22 +642,17 @@ def query(req: QueryRequest):
             for i, c in enumerate(reranked)
         ])
 
-        # Build messages with conversation history
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
         ]
-        # Add recent history (last 4 exchanges = 8 messages)
-        recent_history = history[-8:] if history else []
-        messages.extend(recent_history)
+        # Last 4 exchanges (8 messages) from the persisted history.
+        messages.extend(history[-8:])
         messages.append({"role": "user", "content": req.question})
 
         result = generate_answer(messages)
 
-        # Store in history
-        history.append({"role": "user", "content": req.question})
-        history.append({"role": "assistant", "content": result["content"]})
-        if len(history) > MAX_HISTORY * 2:
-            conversation_store[session_id] = history[-MAX_HISTORY * 2:]
+        _append_message(conv_id, "user", req.question)
+        _append_message(conv_id, "assistant", result["content"])
 
         return QueryResponse(
             answer=result["content"],
@@ -554,7 +678,7 @@ def query(req: QueryRequest):
                 "prompt":     result["prompt_tokens"],
                 "completion": result["completion_tokens"],
             },
-            session_id=session_id,
+            session_id=conv_id,
         )
 
     except requests.RequestException as e:

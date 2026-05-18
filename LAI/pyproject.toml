@@ -40,6 +40,11 @@ dependencies = [
     "passlib[bcrypt]>=1.7.4",
     # Monitoring + structured logging
     "prometheus-client>=0.21.0",
+    # HTTP-level FastAPI instrumentation — exposes /metrics with
+    # per-route http_requests_total + http_request_duration_seconds
+    # so Grafana can chart request volume / latency without each
+    # endpoint adding its own decorator.
+    "prometheus-fastapi-instrumentator>=7.0.0",
     "structlog>=24.4.0",
     # Retry logic
     "tenacity>=9.0.0",

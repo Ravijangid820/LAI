@@ -9,7 +9,7 @@ Mount: from ddiq_report import router as ddiq_router
        app.include_router(ddiq_router, prefix="/ddiq")
 """
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -17,6 +17,13 @@ import os, re, json, time, uuid, logging, math, hashlib
 import requests
 import psycopg2
 import psycopg2.extras
+
+# Auth — AUTH_PLAN §4.4: every protected route depends on
+# ``get_current_user``. The dep is imported from the microservice's
+# shared ``auth_dep`` module so api.py and this router resolve to the
+# same TokenIssuer/secret instance.
+from auth_dep import get_current_user
+from lai.common.auth import CurrentUser
 
 # Shared LLM client — see `_llm_*` helpers below. Importing at module
 # level so a single httpx connection pool is reused across all DDiQ
@@ -529,24 +536,71 @@ def embed_texts(texts: list[str], batch_size: int = 8) -> list[list[float]]:
 def embed_single(text: str) -> list[float]:
     return embed_texts([text])[0]
 
-def search_doc_chunks(doc_ids, query_embedding, top_k=15):
+def _assert_owns_documents(doc_ids, user_id) -> None:
+    """Raise 404 if ``user_id`` does not own every document in ``doc_ids``.
+
+    Single ownership check used at the boundary of every endpoint that
+    takes a list of doc IDs. Returning 404 (not 403) matches AUTH_PLAN
+    §6 rule 4 — never leak the existence of another tenant's row.
+    """
+    if not doc_ids:
+        return
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        ph = ",".join(["%s"] * len(doc_ids))
+        cur.execute(
+            f"SELECT COUNT(*) FROM ddiq_documents "
+            f"WHERE id::text IN ({ph}) AND user_id = %s",
+            (*doc_ids, str(user_id)),
+        )
+        n = cur.fetchone()[0]
+    finally:
+        cur.close(); conn.close()
+    if int(n) != len(set(doc_ids)):
+        raise HTTPException(404, "Document not found")
+
+
+def search_doc_chunks(doc_ids, query_embedding, top_k=15, user_id=None):
+    """Pgvector search over ``doc_ids`` chunks, scoped to ``user_id``.
+
+    When ``user_id`` is supplied (every protected route does), the join
+    filter also enforces tenant isolation at the SQL layer — even if a
+    caller bypassed :func:`_assert_owns_documents`, no chunks belonging
+    to another user can leak.
+    """
     if not doc_ids: return []
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     emb_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
     ph = ",".join(["%s"] * len(doc_ids))
+    user_clause = " AND d.user_id = %s" if user_id is not None else ""
     sql = f"""SELECT c.text, c.doc_id, d.filename,
               1-(c.embedding<=>%s::vector) AS similarity
               FROM ddiq_doc_chunks c JOIN ddiq_documents d ON d.id=c.doc_id
               WHERE c.doc_id::text IN ({ph})
-              AND c.embedding IS NOT NULL
+              AND c.embedding IS NOT NULL{user_clause}
               ORDER BY c.embedding<=>%s::vector LIMIT %s"""
-    cur.execute(sql, (emb_str, *doc_ids, emb_str, top_k))
+    params = (emb_str, *doc_ids)
+    if user_id is not None:
+        params = (*params, str(user_id))
+    params = (*params, emb_str, top_k)
+    cur.execute(sql, params)
     rows = cur.fetchall(); cur.close(); conn.close(); return [dict(r) for r in rows]
 
-def get_all_text_for_docs(doc_ids):
+def get_all_text_for_docs(doc_ids, user_id=None):
+    """Concatenate ``full_text`` from the given documents, scoped to ``user_id``."""
     conn = get_conn(); cur = conn.cursor()
     ph = ",".join(["%s"] * len(doc_ids))
-    cur.execute(f"SELECT full_text FROM ddiq_documents WHERE id::text IN ({ph})", tuple(doc_ids))
+    if user_id is not None:
+        cur.execute(
+            f"SELECT full_text FROM ddiq_documents "
+            f"WHERE id::text IN ({ph}) AND user_id = %s",
+            (*doc_ids, str(user_id)),
+        )
+    else:
+        cur.execute(
+            f"SELECT full_text FROM ddiq_documents WHERE id::text IN ({ph})",
+            tuple(doc_ids),
+        )
     texts = [row[0] for row in cur.fetchall() if row[0]]; cur.close(); conn.close()
     return "\n\n---\n\n".join(texts)
 
@@ -2016,9 +2070,14 @@ def generate_findings(doc_ids, sections, total_capacity_mw: Optional[float] = No
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/documents", response_model=DocumentListResponse)
-def list_documents():
+def list_documents(user: CurrentUser = Depends(get_current_user)):
+    """List the caller's documents only. AUTH_PLAN G1."""
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT id, filename, size_bytes, upload_date, status, category FROM ddiq_documents ORDER BY upload_date DESC")
+    cur.execute(
+        "SELECT id, filename, size_bytes, upload_date, status, category "
+        "FROM ddiq_documents WHERE user_id = %s ORDER BY upload_date DESC",
+        (str(user.id),),
+    )
     rows = cur.fetchall(); cur.close(); conn.close()
     return DocumentListResponse(documents=[DocumentOut(id=str(r["id"]), name=r["filename"],
         size=round(r["size_bytes"]/(1024*1024),2), uploadDate=r["upload_date"].isoformat()[:10],
@@ -2026,9 +2085,15 @@ def list_documents():
         status=r["status"], category=r["category"]) for r in rows], total=len(rows))
 
 @router.post("/documents/upload", response_model=UploadDocResponse)
-def upload_document(file: UploadFile = File(...), category: str = Form("Uncategorized"), session_id: Optional[str] = Form(None)):
+def upload_document(
+    file: UploadFile = File(...),
+    category: str = Form("Uncategorized"),
+    session_id: Optional[str] = Form(None),
+    user: CurrentUser = Depends(get_current_user),
+):
     # Sync handler — runs in FastAPI's threadpool. Use file.file.read()
     # (the underlying SpooledTemporaryFile) instead of `await file.read()`.
+    # user_id comes from the JWT (AUTH_PLAN G3) — never from the body.
     if not file.filename.lower().endswith(".pdf"): raise HTTPException(400, "Only PDF")
     fb = file.file.read()
     if len(fb) > MAX_FILE_SIZE: raise HTTPException(400, "Too large")
@@ -2038,8 +2103,11 @@ def upload_document(file: UploadFile = File(...), category: str = Form("Uncatego
     if not chunks: raise HTTPException(400, "No chunks")
     embs = embed_texts([c["text"] for c in chunks])
     conn = get_conn(); cur = conn.cursor(); did = str(uuid.uuid4())
-    cur.execute("INSERT INTO ddiq_documents (id,filename,size_bytes,status,category,full_text,chunk_count,session_id) VALUES (%s,%s,%s,'analyzed',%s,%s,%s,%s)",
-        (did, file.filename, len(fb), category, full_text, len(chunks), session_id))
+    cur.execute(
+        "INSERT INTO ddiq_documents (id,user_id,filename,size_bytes,status,category,full_text,chunk_count,session_id) "
+        "VALUES (%s,%s,%s,%s,'analyzed',%s,%s,%s,%s)",
+        (did, str(user.id), file.filename, len(fb), category, full_text, len(chunks), session_id),
+    )
     for c, e in zip(chunks, embs):
         cur.execute("INSERT INTO ddiq_doc_chunks (doc_id,chunk_idx,text,embedding) VALUES (%s,%s,%s,%s::vector)",
             (did, c["idx"], c["text"], "["+",".join(str(x) for x in e)+"]"))
@@ -2058,8 +2126,15 @@ def upload_document(file: UploadFile = File(...), category: str = Form("Uncatego
 _INFLIGHT_TTL = "2 hours"  # reuse window for queued/running rows
 
 
-def _compute_fingerprint(doc_ids, preset, project_name) -> str:
+def _compute_fingerprint(doc_ids, preset, project_name, user_id) -> str:
+    """Cache key for report-generation requests.
+
+    Scoped by ``user_id`` so two tenants requesting the same documents
+    do not collide — and so the cache lookup cannot return another
+    user's row.
+    """
     parts = [
+        str(user_id),
         ",".join(sorted(doc_ids or [])),
         (preset or "").strip().lower(),
         (project_name or "").strip().lower(),
@@ -2067,14 +2142,20 @@ def _compute_fingerprint(doc_ids, preset, project_name) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
-def _find_existing_report(fp: str) -> Optional[dict]:
-    """Most recent reusable row for this fingerprint, or None."""
+def _find_existing_report(fp: str, user_id) -> Optional[dict]:
+    """Most recent reusable row for this fingerprint owned by ``user_id``.
+
+    The fingerprint alone already includes the user_id, but the WHERE
+    clause filters explicitly — defense in depth: if a future change
+    drops user_id from the fingerprint, the SQL still refuses to leak.
+    """
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 f"""SELECT id, status, created_at, started_at
                     FROM ddiq_reports
                     WHERE request_fingerprint = %s
+                      AND user_id = %s
                       AND (
                         status = 'done'
                         OR (status IN ('queued','running')
@@ -2082,7 +2163,7 @@ def _find_existing_report(fp: str) -> Optional[dict]:
                       )
                     ORDER BY created_at DESC
                     LIMIT 1""",
-                (fp,),
+                (fp, str(user_id)),
             )
             return cur.fetchone()
 
@@ -2105,8 +2186,14 @@ _report_executor = ThreadPoolExecutor(
 def _update_report_progress(report_id: str, step: Optional[str] = None,
                             percent: Optional[float] = None,
                             status: Optional[str] = None,
-                            error: Optional[str] = None) -> None:
-    """Patch a row in ddiq_reports without touching report_data. Best-effort."""
+                            error: Optional[str] = None,
+                            user_id=None) -> None:
+    """Patch a row in ddiq_reports without touching report_data. Best-effort.
+
+    When ``user_id`` is supplied, the UPDATE is scoped — a teammate's
+    background worker (or a stray retry) can never tamper with another
+    user's report row.
+    """
     sets, params = [], []
     if step is not None:    sets.append("progress_step = %s");    params.append(step)
     if percent is not None: sets.append("progress_percent = %s"); params.append(percent)
@@ -2118,12 +2205,16 @@ def _update_report_progress(report_id: str, step: Optional[str] = None,
         sets.append("started_at = COALESCE(started_at, NOW())")
     if status in ("done", "failed"):
         sets.append("finished_at = NOW()")
+    where = "WHERE id = %s"
     params.append(report_id)
+    if user_id is not None:
+        where += " AND user_id = %s"
+        params.append(str(user_id))
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"UPDATE ddiq_reports SET {', '.join(sets)} WHERE id = %s",
+                    f"UPDATE ddiq_reports SET {', '.join(sets)} {where}",
                     params,
                 )
     except Exception as e:
@@ -2131,7 +2222,7 @@ def _update_report_progress(report_id: str, step: Optional[str] = None,
 
 
 def _persist_report_jsonb(rid: str, project_name: str, doc_ids: list, preset: str,
-                          report: "DDiQReportData") -> None:
+                          report: "DDiQReportData", user_id) -> None:
     """Best-effort UPSERT of just the report_data JSONB. Used as a checkpoint
     after each major pipeline phase — if a later phase crashes, the row
     still has the partial report from the last successful checkpoint
@@ -2141,19 +2232,23 @@ def _persist_report_jsonb(rid: str, project_name: str, doc_ids: list, preset: st
     pipeline overwrites the row in place. Auxiliary table writes
     (ddiq_contracts, ddiq_classified_parcels, ddiq_project_areas) are
     deliberately NOT done here — those are write-once-at-end to avoid
-    duplicate rows from re-running."""
+    duplicate rows from re-running.
+
+    ``user_id`` is set on initial INSERT only; the ON CONFLICT branch
+    leaves it untouched so a stray re-call cannot reassign ownership.
+    """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO ddiq_reports (id, project_name, document_ids, preset, report_data)
-                       VALUES (%s, %s, %s::uuid[], %s, %s)
+                    """INSERT INTO ddiq_reports (id, user_id, project_name, document_ids, preset, report_data)
+                       VALUES (%s, %s, %s, %s::uuid[], %s, %s)
                        ON CONFLICT (id) DO UPDATE SET
                            project_name = EXCLUDED.project_name,
                            document_ids = EXCLUDED.document_ids,
                            preset = EXCLUDED.preset,
                            report_data = EXCLUDED.report_data""",
-                    (rid, project_name, doc_ids, preset, json.dumps(report.dict())),
+                    (rid, str(user_id), project_name, doc_ids, preset, json.dumps(report.dict())),
                 )
     except Exception as e:
         # Checkpoint failure shouldn't kill the pipeline — the next checkpoint
@@ -2161,32 +2256,40 @@ def _persist_report_jsonb(rid: str, project_name: str, doc_ids: list, preset: st
         logger.warning(f"checkpoint persist for {rid} failed: {e}")
 
 
-def _run_report_generation_job(rid: str, req: "GenerateReportRequest") -> None:
+def _run_report_generation_job(rid: str, req: "GenerateReportRequest", user_id) -> None:
     """Runs the same pipeline as the sync /report/generate, but writes
     progress + final report into the existing ddiq_reports row instead
-    of returning. Errors are recorded in ``status='failed'`` + ``error``."""
+    of returning. Errors are recorded in ``status='failed'`` + ``error``.
+
+    ``user_id`` is threaded into every write so a worker on a shared
+    pool cannot accidentally update a different tenant's row.
+    """
     try:
-        _update_report_progress(rid, status="running", step="starting", percent=0.0)
-        report, _T = _generate_report_core(rid, req, progress=lambda step, pct: _update_report_progress(rid, step=step, percent=pct))
-        _update_report_progress(rid, status="done", step="done", percent=1.0)
+        _update_report_progress(rid, status="running", step="starting", percent=0.0, user_id=user_id)
+        report, _T = _generate_report_core(
+            rid, req, user_id,
+            progress=lambda step, pct: _update_report_progress(rid, step=step, percent=pct, user_id=user_id),
+        )
+        _update_report_progress(rid, status="done", step="done", percent=1.0, user_id=user_id)
     except HTTPException as e:
-        _update_report_progress(rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}")
+        _update_report_progress(rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}", user_id=user_id)
     except Exception as e:
         logger.exception(f"report {rid} failed")
-        _update_report_progress(rid, status="failed", error=str(e)[:500])
+        _update_report_progress(rid, status="failed", error=str(e)[:500], user_id=user_id)
 
 
 @router.post("/report/generate/async")
-def generate_report_async(req: GenerateReportRequest):
+def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depends(get_current_user)):
     """Non-blocking variant of /report/generate. Returns
     {report_id, status} immediately and runs the pipeline in a
     background thread. Poll /report/{id}/status (or /report/{id}) for
     progress and the final result."""
     if not req.document_ids:
         raise HTTPException(400, "No documents selected")
+    _assert_owns_documents(req.document_ids, user.id)
 
-    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name)
-    existing = _find_existing_report(fp)
+    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name, user.id)
+    existing = _find_existing_report(fp, user.id)
     if existing:
         return {
             "report_id": str(existing["id"]),
@@ -2201,14 +2304,14 @@ def generate_report_async(req: GenerateReportRequest):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO ddiq_reports (id, project_name, document_ids, preset,
+                """INSERT INTO ddiq_reports (id, user_id, project_name, document_ids, preset,
                                               report_data, status, started_at, progress_step, progress_percent,
                                               request_fingerprint)
-                   VALUES (%s, %s, %s::uuid[], %s, '{}'::jsonb, 'queued', NULL, 'queued', 0.0, %s)""",
-                (rid, pname, req.document_ids, req.preset, fp),
+                   VALUES (%s, %s, %s, %s::uuid[], %s, '{}'::jsonb, 'queued', NULL, 'queued', 0.0, %s)""",
+                (rid, str(user.id), pname, req.document_ids, req.preset, fp),
             )
 
-    _report_executor.submit(_run_report_generation_job, rid, req)
+    _report_executor.submit(_run_report_generation_job, rid, req, user.id)
     return {
         "report_id": rid,
         "status": "queued",
@@ -2218,7 +2321,7 @@ def generate_report_async(req: GenerateReportRequest):
 
 
 @router.get("/report/{report_id}/status")
-def get_report_status(report_id: str):
+def get_report_status(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Poll endpoint for the async report-generation flow. Cheap — only
     reads the row's status fields, not the full payload."""
     with get_conn() as conn:
@@ -2226,8 +2329,8 @@ def get_report_status(report_id: str):
             cur.execute(
                 """SELECT id, status, progress_step, progress_percent, started_at,
                           finished_at, error, project_name
-                   FROM ddiq_reports WHERE id = %s""",
-                (report_id,),
+                   FROM ddiq_reports WHERE id = %s AND user_id = %s""",
+                (report_id, str(user.id)),
             )
             row = cur.fetchone()
     if not row:
@@ -2244,9 +2347,18 @@ def get_report_status(report_id: str):
     }
 
 
-def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None) -> "tuple[DDiQReportData, dict]":
+def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progress=None) -> "tuple[DDiQReportData, dict]":
     """Inner pipeline used by both the sync handler and the async worker.
-    ``progress(step, percent)`` is invoked at each major step when given."""
+    ``progress(step, percent)`` is invoked at each major step when given.
+
+    Tenant isolation: ownership of every doc in ``req.document_ids`` is
+    asserted at the boundary, and ``user_id`` is plumbed into every
+    write (``ddiq_reports``, ``ddiq_project_areas``, ``ddiq_contracts``,
+    ``ddiq_classified_parcels``). Read helpers also filter by user_id
+    as defense in depth.
+    """
+    _assert_owns_documents(req.document_ids, user_id)
+
     if progress is None:
         progress = lambda step, pct: None  # noqa: E731
 
@@ -2254,12 +2366,16 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
 
     progress("gathering", 0.01)
     t = time.time()
-    full_text = get_all_text_for_docs(req.document_ids)
+    full_text = get_all_text_for_docs(req.document_ids, user_id=user_id)
     if not full_text.strip(): raise HTTPException(404, "No text")
     T["gather_s"] = round(time.time()-t, 2)
 
     conn = get_conn(); cur = conn.cursor()
-    cur.execute(f"SELECT id, filename FROM ddiq_documents WHERE id::text IN ({','.join(['%s']*len(req.document_ids))})", tuple(req.document_ids))
+    cur.execute(
+        f"SELECT id, filename FROM ddiq_documents "
+        f"WHERE id::text IN ({','.join(['%s']*len(req.document_ids))}) AND user_id = %s",
+        (*req.document_ids, str(user_id)),
+    )
     _doc_rows = cur.fetchall(); cur.close(); conn.close()
     doc_names = [r[1] for r in _doc_rows]
     document_map = [{"id": str(r[0]), "filename": r[1]} for r in _doc_rows]
@@ -2289,7 +2405,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
         analyzedDocuments=doc_names,
         documentMap=document_map,
     )
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     t = time.time()
     progress("sections", 0.07)
@@ -2297,7 +2413,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     T["sections_s"] = round(time.time()-t, 2)
     progress("sections_done", 0.55)  # sections is the bulk (~80% of wall time)
     report.sections = sections
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     t = time.time()
     progress("geocoding", 0.55)
@@ -2309,12 +2425,12 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     progress("wea_extraction", 0.58)
     t = time.time(); weas = extract_wea_statuses(req.document_ids, full_text, sections, pc); T["wea_s"] = round(time.time()-t, 2)
     report.weaStatuses = weas
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     progress("infrastructure", 0.70)
     t = time.time(); infra = extract_infrastructure(req.document_ids, sections, pc); T["infra_s"] = round(time.time()-t, 2)
     report.infrastructure = infra
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     # ── 13-Step Cadastral Pipeline ────────────────────────────────────────
     progress("cadastral", 0.78)
@@ -2390,7 +2506,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     report.clearanceZones = clearance_data0
     report.validation = pipeline_result.validation.dict() if pipeline_result.validation else None
     report.geojson = pipeline_result.geojson if pipeline_result.geojson else None
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     # ── Cross-source reconciliation ──────────────────────────────────────
     # Compute canonical values for fields that multiple upstream sources
@@ -2484,7 +2600,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     findings = generate_findings(req.document_ids, sections, total_capacity_mw=total_mw)
     T["findings_s"] = round(time.time()-t, 2)
     report.findings = findings  # may be augmented with deadline/rueckbau/grundbuch findings later
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     # P0 #2: Timeline / deadline pass
     progress("timeline", 0.88)
@@ -2492,7 +2608,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     timeline = extract_timeline(req.document_ids, full_text)
     T["timeline_s"] = round(time.time()-t, 2)
     report.timeline = timeline
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     # P0 #3: Cross-document consistency check
     progress("cross_doc", 0.91)
@@ -2500,7 +2616,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     cross_doc_findings = check_cross_doc_consistency(sections, weas, parcels, total_capacity_mw=total_mw)
     T["cross_doc_s"] = round(time.time()-t, 2)
     report.crossDocFindings = cross_doc_findings
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     # P1 #9: Rückbaubürgschaft extraction
     progress("rueckbau", 0.93)
@@ -2508,7 +2624,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     rueckbau = extract_rueckbau_bond(req.document_ids)
     T["rueckbau_s"] = round(time.time()-t, 2)
     report.rueckbauBond = rueckbau
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     # P1 #6: Grundbuch lessor-vs-owner check on secured parcels
     progress("grundbuch", 0.95)
@@ -2516,7 +2632,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     grundbuch_checks = check_grundbuch_match(req.document_ids, parcels)
     T["grundbuch_s"] = round(time.time()-t, 2)
     report.grundbuchChecks = grundbuch_checks
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     # Promote material timeline events (urgent / expired) into Findings so
     # the lawyer's findings list reflects deadline pressure, not just
@@ -2598,7 +2714,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
 
     # Final report_data checkpoint — byte-identical to what the
     # original single end-of-pipeline UPSERT wrote.
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     # Auxiliary-table writes (ddiq_project_areas / ddiq_contracts /
     # ddiq_classified_parcels). These are write-once-at-end because they
@@ -2606,21 +2722,24 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
     # duplicates. The report_data JSONB above already has a copy of all
     # this data; the relational tables are for query performance only.
     pa = pipeline_result.project_area
+    uid = str(user_id)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Persist project area first (parent of contracts and parcels)
+            # Persist project area first (parent of contracts and parcels).
+            # user_id is taken from the JWT, never from the request body
+            # (AUTH_PLAN G3).
             if pa and pa.polygon:
                 cur.execute(
-                    """INSERT INTO ddiq_project_areas (name, polygon, centroid_lat, centroid_lng, area_km2, source, report_id)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-                    (pa.name, json.dumps(pa.polygon), pa.centroid_lat, pa.centroid_lng, pa.area_km2, pa.source, rid))
+                    """INSERT INTO ddiq_project_areas (user_id, name, polygon, centroid_lat, centroid_lng, area_km2, source, report_id)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (uid, pa.name, json.dumps(pa.polygon), pa.centroid_lat, pa.centroid_lng, pa.area_km2, pa.source, rid))
 
             # Persist contracts (parent of classified_parcels via matched_contract_id)
             for contract in pipeline_result.contracts:
                 cur.execute(
-                    """INSERT INTO ddiq_contracts (id, contract_ref, contract_type, contracting_entity, raw_text_excerpt, report_id)
-                       VALUES (%s,%s,%s,%s,%s,%s)""",
-                    (contract.contract_id, contract.contract_ref, contract.contract_type,
+                    """INSERT INTO ddiq_contracts (id, user_id, contract_ref, contract_type, contracting_entity, raw_text_excerpt, report_id)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (contract.contract_id, uid, contract.contract_ref, contract.contract_type,
                      contract.contracting_entity, contract.text_excerpt[:500], rid))
                 for pref in contract.referenced_parcels:
                     cur.execute(
@@ -2631,10 +2750,10 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
             for cp in pipeline_result.classified_parcels:
                 cur.execute(
                     """INSERT INTO ddiq_classified_parcels
-                       (report_id, parcel_number, gemarkung, flur, normalized_id, polygon, polygon_source,
+                       (user_id, report_id, parcel_number, gemarkung, flur, normalized_id, polygon, polygon_source,
                         classification, color, confidence, matched_contract_id, classification_reason, area_ha, owner, linked_wea)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (rid, cp.parcel_number, cp.gemarkung, cp.flur, cp.normalized_id,
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (uid, rid, cp.parcel_number, cp.gemarkung, cp.flur, cp.normalized_id,
                      json.dumps(cp.polygon), cp.polygon_source, cp.classification.value,
                      cp.color, cp.confidence, cp.matched_contract_id, cp.classification_reason,
                      cp.area_ha, cp.owner, cp.linked_wea))
@@ -2644,19 +2763,23 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", progress=None)
 
 
 @router.post("/report/generate", response_model=GenerateReportResponse)
-def generate_report(req: GenerateReportRequest):
+def generate_report(req: GenerateReportRequest, user: CurrentUser = Depends(get_current_user)):
     """Synchronous report generation — kept for back-compat. Blocks the
     request for the entire pipeline runtime (~30-60 min). Prefer
     /report/generate/async + /report/{id}/status for any UI-driven flow."""
     if not req.document_ids:
         raise HTTPException(400, "No documents selected")
+    _assert_owns_documents(req.document_ids, user.id)
 
-    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name)
-    existing = _find_existing_report(fp)
+    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name, user.id)
+    existing = _find_existing_report(fp, user.id)
     if existing and existing["status"] == "done":
         with get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT report_data FROM ddiq_reports WHERE id = %s", (existing["id"],))
+                cur.execute(
+                    "SELECT report_data FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                    (existing["id"], str(user.id)),
+                )
                 row = cur.fetchone()
         if row and row["report_data"]:
             return GenerateReportResponse(
@@ -2670,15 +2793,13 @@ def generate_report(req: GenerateReportRequest):
     # row ``status='failed'`` with the error captured, rather than
     # leaving it stuck in whatever progress state the last incremental
     # persist wrote. Mirrors ``_run_report_generation_job``'s async
-    # error-recovery shape. Pre-existing ``HTTPException`` errors pass
-    # through unchanged so a clean 4xx (e.g. "No text") still surfaces
-    # as itself, not a generic 500.
+    # error-recovery shape.
     try:
-        report, T = _generate_report_core(rid, req)
+        report, T = _generate_report_core(rid, req, user.id)
     except HTTPException as e:
         try:
             _update_report_progress(
-                rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}",
+                rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}", user_id=user.id,
             )
         except Exception:
             pass  # row may not exist yet if the crash was pre-first-persist
@@ -2686,7 +2807,7 @@ def generate_report(req: GenerateReportRequest):
     except Exception as e:
         logger.exception(f"sync report {rid} failed")
         try:
-            _update_report_progress(rid, status="failed", error=str(e)[:500])
+            _update_report_progress(rid, status="failed", error=str(e)[:500], user_id=user.id)
         except Exception:
             pass
         raise HTTPException(500, f"Report generation failed: {e}") from e
@@ -2694,13 +2815,13 @@ def generate_report(req: GenerateReportRequest):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE ddiq_reports SET request_fingerprint = %s WHERE id = %s",
-                (fp, rid),
+                "UPDATE ddiq_reports SET request_fingerprint = %s WHERE id = %s AND user_id = %s",
+                (fp, rid, str(user.id)),
             )
     return GenerateReportResponse(report_id=rid, report=report, timings=T)
 
 @router.get("/reports")
-def list_reports(limit: int = 50):
+def list_reports(limit: int = 50, user: CurrentUser = Depends(get_current_user)):
     """Recent DDiQ reports for the Past Reports browser. Returns lightweight
     summary rows (no full report_data) so the listing is cheap even with
     hundreds of historical reports. Click-to-load fetches the full payload
@@ -2715,9 +2836,10 @@ def list_reports(limit: int = 50):
                           COALESCE(array_length(document_ids, 1), 0) AS doc_count,
                           COALESCE(jsonb_array_length(report_data->'findings'), 0) AS finding_count
                    FROM ddiq_reports
+                   WHERE user_id = %s
                    ORDER BY created_at DESC NULLS LAST
                    LIMIT %s""",
-                (limit,),
+                (str(user.id), limit),
             )
             rows = cur.fetchall()
     return {
@@ -2742,9 +2864,12 @@ def list_reports(limit: int = 50):
 
 
 @router.get("/report/{report_id}")
-def get_report(report_id: str):
+def get_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM ddiq_reports WHERE id = %s", (report_id,))
+    cur.execute(
+        "SELECT * FROM ddiq_reports WHERE id = %s AND user_id = %s",
+        (report_id, str(user.id)),
+    )
     row = cur.fetchone(); cur.close(); conn.close()
     if not row: raise HTTPException(404, "Not found")
     return {"report_id": str(row["id"]), "created_at": row["created_at"].isoformat(),
@@ -2752,34 +2877,58 @@ def get_report(report_id: str):
 
 
 @router.delete("/report/{report_id}")
-def delete_report(report_id: str):
+def delete_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Hard-delete a report and all its cadastral artifacts. Idempotent —
-    returns 404 if the id is unknown. The report_data JSONB has its own
-    copy of parcels/contracts/areas, but the relational rows in the
-    auxiliary tables (ddiq_classified_parcels, ddiq_contracts,
-    ddiq_project_areas) reference report_id without an FK CASCADE, so
-    we clean them up explicitly in one transaction.
+    returns 404 if the id is unknown OR owned by a different user. The
+    report_data JSONB has its own copy of parcels/contracts/areas, but
+    the relational rows in the auxiliary tables (ddiq_classified_parcels,
+    ddiq_contracts, ddiq_project_areas) reference report_id without an
+    FK CASCADE, so we clean them up explicitly in one transaction.
 
     ddiq_contract_parcels.contract_id has ON DELETE CASCADE on its FK to
     ddiq_contracts(id), so deleting the contracts row automatically
-    drops its child contract_parcels rows."""
+    drops its child contract_parcels rows.
+
+    AUTH_PLAN G2: every DELETE includes the user filter. Load-then-mutate
+    means even if the cascade DELETEs were re-ordered, a cross-tenant
+    delete is structurally impossible.
+    """
+    uid = str(user.id)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM ddiq_reports WHERE id = %s", (report_id,))
+            cur.execute(
+                "SELECT 1 FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                (report_id, uid),
+            )
             if not cur.fetchone():
                 raise HTTPException(404, "Report not found")
-            cur.execute("DELETE FROM ddiq_classified_parcels WHERE report_id = %s", (report_id,))
-            cur.execute("DELETE FROM ddiq_contracts WHERE report_id = %s", (report_id,))
-            cur.execute("DELETE FROM ddiq_project_areas WHERE report_id = %s", (report_id,))
-            cur.execute("DELETE FROM ddiq_reports WHERE id = %s", (report_id,))
+            cur.execute(
+                "DELETE FROM ddiq_classified_parcels WHERE report_id = %s AND user_id = %s",
+                (report_id, uid),
+            )
+            cur.execute(
+                "DELETE FROM ddiq_contracts WHERE report_id = %s AND user_id = %s",
+                (report_id, uid),
+            )
+            cur.execute(
+                "DELETE FROM ddiq_project_areas WHERE report_id = %s AND user_id = %s",
+                (report_id, uid),
+            )
+            cur.execute(
+                "DELETE FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                (report_id, uid),
+            )
     return {"deleted": True, "report_id": report_id}
 
 
 @router.get("/report/{report_id}/geojson")
-def get_report_geojson(report_id: str):
+def get_report_geojson(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Return GeoJSON FeatureCollection for GIS import (QGIS, ArcGIS, MapBox, etc.)."""
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT report_data FROM ddiq_reports WHERE id = %s", (report_id,))
+    cur.execute(
+        "SELECT report_data FROM ddiq_reports WHERE id = %s AND user_id = %s",
+        (report_id, str(user.id)),
+    )
     row = cur.fetchone(); cur.close(); conn.close()
     if not row: raise HTTPException(404, "Report not found")
 
@@ -2836,10 +2985,13 @@ def get_report_geojson(report_id: str):
 
 
 @router.get("/report/{report_id}/validate")
-def validate_report(report_id: str):
+def validate_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Run validation checks on a generated report (Step 13)."""
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT report_data FROM ddiq_reports WHERE id = %s", (report_id,))
+    cur.execute(
+        "SELECT report_data FROM ddiq_reports WHERE id = %s AND user_id = %s",
+        (report_id, str(user.id)),
+    )
     row = cur.fetchone(); cur.close(); conn.close()
     if not row: raise HTTPException(404, "Report not found")
 
@@ -2869,8 +3021,11 @@ class ProjectAreaResponse(BaseModel):
 
 
 @router.post("/project-area", response_model=ProjectAreaResponse)
-def create_project_area(req: ProjectAreaRequest):
-    """Define a project area polygon (Step 1 of Output Map)."""
+def create_project_area(req: ProjectAreaRequest, user: CurrentUser = Depends(get_current_user)):
+    """Define a project area polygon (Step 1 of Output Map).
+
+    AUTH_PLAN G3: user_id is taken from the JWT, never from the request.
+    """
     if len(req.polygon) < 3:
         raise HTTPException(400, "Polygon must have at least 3 points")
 
@@ -2880,9 +3035,9 @@ def create_project_area(req: ProjectAreaRequest):
 
     pa_id = str(uuid.uuid4())
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("""INSERT INTO ddiq_project_areas (id, name, polygon, centroid_lat, centroid_lng, area_km2, source)
-        VALUES (%s, %s, %s, %s, %s, %s, 'user_drawn')""",
-        (pa_id, req.name, json.dumps(req.polygon), centroid[0], centroid[1], area))
+    cur.execute("""INSERT INTO ddiq_project_areas (id, user_id, name, polygon, centroid_lat, centroid_lng, area_km2, source)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'user_drawn')""",
+        (pa_id, str(user.id), req.name, json.dumps(req.polygon), centroid[0], centroid[1], area))
     conn.commit(); cur.close(); conn.close()
 
     return ProjectAreaResponse(

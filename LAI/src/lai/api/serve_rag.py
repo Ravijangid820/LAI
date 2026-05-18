@@ -43,6 +43,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -57,10 +58,35 @@ from lai.search.eval import (
 )
 from lai.analyzer import pipeline as analyzer_pipeline
 from lai.analyzer import llm_client as analyzer_llm
+from lai.api.metrics import default_metrics as rag_metrics
 from lai.common.citation import validate_citations
 from lai.common.exceptions import LlmError
+from lai.common.jurisdiction import check_jurisdiction, detect_bundesland
 from lai.common.llm import ChatMessage, LlmConfig, SyncLlmClient
 from lai import persistence
+
+# ── Auth subsystem (AUTH_PLAN §4.1 + §9 step 4) ─────────────────────────────
+# Module-level construction of the AuthConfig / TokenIssuer /
+# get_current_user dependency so route handlers can reference the dep
+# at decoration time (FastAPI resolves ``Depends(...)`` arguments at
+# import). A missing or weak ``LAI_AUTH_JWT_ACCESS_SECRET`` raises
+# here — a clear traceback at uvicorn start beats discovering at
+# first request that auth is disabled.
+from lai.common.auth import (
+    AuthConfig,
+    CurrentUser,
+    PasswordHasher,
+    TokenIssuer,
+    build_get_current_user,
+)
+from lai.common.auth.db import create_pool as _create_auth_pool
+from lai.api.auth_router import AuthDeps, build_auth_router, register_auth_exception_handlers
+from lai.api.email import EmailConfig as _EmailConfig
+from fastapi import Depends
+
+_auth_config: AuthConfig = AuthConfig()
+_token_issuer: TokenIssuer = TokenIssuer(_auth_config)
+get_current_user = build_get_current_user(_token_issuer)
 
 STATE: dict = {
     "corpus": None, "conn": None, "parent_text": None,
@@ -113,6 +139,40 @@ RAG_SYSTEM = (
     "werden kann, gib das ehrlich an und markiere unbelegte Aussagen "
     "mit \"(unbelegt)\"."
 )
+
+# Per-language answer-directive appended to the system prompt. German is
+# the default (the prompts above are already in German and most demo
+# corpora are German), so ``de`` and ``None`` return the empty string —
+# adding a "Antworte auf Deutsch" line on top of an already-German prompt
+# wastes tokens and risks confusing the model. ``en`` switches the model
+# to English but explicitly keeps statute / contract quotations verbatim
+# in German: the lawyer's #1 trust requirement (UI_GUIDE.md §7.4) is
+# that the cited text in the answer matches the source preview in the
+# side panel; translating quoted German would break that match.
+#
+# Unknown codes (e.g. ``fr``) fall back to German rather than crashing —
+# the frontend toggle only emits ``de``/``en`` today, so anything else
+# is a forward-compat surprise we shouldn't dignify with a half-broken
+# response.
+_LANGUAGE_DIRECTIVES: dict[str, str] = {
+    "en": (
+        "\n\nAntworte auf Englisch. Zitiere die deutschen Originalstellen "
+        "(Gesetzestexte, Vertragsklauseln, Urteile) wörtlich und ohne "
+        "Übersetzung — gib die englische Erklärung danach. Behalte die "
+        "[M-n] und [C-n] Zitations-Handles unverändert bei."
+    ),
+}
+
+
+def _language_directive(target_language: Optional[str]) -> str:
+    """Return the system-prompt suffix that switches answer language.
+
+    Empty string for the default German path so we don't bloat the
+    prompt on every German turn.
+    """
+    if not target_language:
+        return ""
+    return _LANGUAGE_DIRECTIVES.get(target_language.lower(), "")
 
 CHAT_SYSTEM = (
     "Du bist ein freundlicher KI-Assistent für deutsche Anwälte, die mit "
@@ -269,20 +329,24 @@ def _format_session_meta_prefix(meta: Optional[dict]) -> str:
     )
 
 
-def _maybe_refresh_session_metadata(session_id: str) -> None:
+def _maybe_refresh_session_metadata(session_id: str, user_id: str | None = None) -> None:
     """Re-extract the pinned profile if it's missing or stale (≥N new user
     turns since last extraction). Best-effort: any failure is logged and
-    swallowed — chat must never break because the meta layer hiccuped."""
+    swallowed — chat must never break because the meta layer hiccuped.
+
+    The ``user_id`` scopes every persistence call so the meta refresh
+    cannot read or write rows owned by a different tenant.
+    """
     if not session_id:
         return
     try:
-        msgs = persistence.list_messages(session_id)
+        msgs = persistence.list_messages(session_id, user_id=user_id)
     except Exception:
         return
     user_turn_count = sum(1 for m in msgs if m.get("role") == "user")
     if user_turn_count < 1:
         return
-    existing = persistence.get_session_meta(session_id) or {}
+    existing = persistence.get_session_meta(session_id, user_id=user_id) or {}
     last_n = int(existing.get("_refreshed_at_n_user_turns", 0))
     if user_turn_count - last_n < META_REFRESH_EVERY_N_USER_TURNS and last_n > 0:
         return  # not stale enough, skip
@@ -340,19 +404,22 @@ def _maybe_refresh_session_metadata(session_id: str) -> None:
             if result.get(k):
                 merged[k] = result[k]
         merged["_refreshed_at_n_user_turns"] = user_turn_count
-        persistence.set_session_meta(session_id, merged)
+        persistence.set_session_meta(session_id, merged, user_id=user_id)
     except Exception as e:
         print(f"[meta] session meta refresh for {session_id} failed: {e}", flush=True)
 
 
-def _load_history(session_id: str | None) -> list[dict]:
+def _load_history(session_id: str | None, user_id: str | None = None) -> list[dict]:
     """Load prior user/assistant turns for a session in OpenAI chat format.
     Returns [] for a brand-new session or any persistence failure — chat
-    must never break because the history layer hiccuped."""
+    must never break because the history layer hiccuped.
+
+    Filters by ``user_id`` to prevent cross-tenant history leak.
+    """
     if not session_id:
         return []
     try:
-        msgs = persistence.list_messages(session_id)
+        msgs = persistence.list_messages(session_id, user_id=user_id)
     except Exception:
         return []
     # Keep only the most recent window. Filter to user/assistant (drop any
@@ -388,18 +455,23 @@ def _render_sources_block(sources: list[RetrievedSource]) -> str:
 
 def build_rag_messages(question: str, sources: list[RetrievedSource],
                        history: list[dict] | None = None,
-                       meta_prefix: str = "") -> list[dict]:
+                       meta_prefix: str = "",
+                       target_language: Optional[str] = None) -> list[dict]:
     """Build the chat-completion message list for a RAG turn.
 
     ``sources`` carries the retrieved chunks already tagged with stable
     [M-n] / [C-n] handles; this function only needs to render them
     deterministically so the system prompt's citation instructions
     refer to handles that actually appear in the user message.
+
+    ``target_language`` (``None`` / ``"de"`` / ``"en"``) appends a
+    language-switch directive — see :func:`_language_directive`.
     """
     src_block = _render_sources_block(sources)
     user = f"Quellen:\n{src_block}\n\nFrage: {question}"
     return [
-        {"role": "system", "content": meta_prefix + RAG_SYSTEM},
+        {"role": "system",
+         "content": meta_prefix + RAG_SYSTEM + _language_directive(target_language)},
         *(history or []),
         {"role": "user",   "content": user},
     ]
@@ -407,9 +479,11 @@ def build_rag_messages(question: str, sources: list[RetrievedSource],
 
 def build_chat_messages(question: str,
                         history: list[dict] | None = None,
-                        meta_prefix: str = "") -> list[dict]:
+                        meta_prefix: str = "",
+                        target_language: Optional[str] = None) -> list[dict]:
     return [
-        {"role": "system", "content": meta_prefix + CHAT_SYSTEM},
+        {"role": "system",
+         "content": meta_prefix + CHAT_SYSTEM + _language_directive(target_language)},
         *(history or []),
         {"role": "user",   "content": question},
     ]
@@ -852,6 +926,13 @@ class QueryReq(BaseModel):
     top_k: int = 3
     candidate_k: int = 30
     force_mode: Optional[str] = None  # "rag" | "chat" | None (auto)
+    # Optional answer-language override. ``None`` / ``"de"`` keeps the
+    # default German prompts; ``"en"`` switches the model to English
+    # while keeping German statute / contract quotations verbatim (see
+    # ``_language_directive``). Unknown codes fall back to German so a
+    # forward-compat frontend can ship new codes without crashing the
+    # backend mid-rollout.
+    target_language: Optional[str] = None
 
 
 class ChunkOut(BaseModel):
@@ -911,6 +992,29 @@ class CitationValidationOut(BaseModel):
     sentences_flagged: int
 
 
+class JurisdictionWarningOut(BaseModel):
+    """One Bundesland-specific rule the model cited that doesn't match
+    the matter's jurisdiction. Drives an amber warning chip above the
+    bubble — same family as ``(unbelegt)`` but for jurisdictional
+    sanity rather than source attribution.
+
+    Populated by :func:`lai.common.jurisdiction.check_jurisdiction`. The
+    canonical case is "10H BayBO" cited for a Niedersachsen matter —
+    the lawyer's #2 v0 complaint.
+
+    Attributes:
+        rule_label: Human-readable rule name.
+        rule_bundesland: The Bundesland the cited rule belongs to.
+        expected_bundesland: The Bundesland the matter is actually in.
+        excerpt: ~80 chars of context around the matching substring.
+    """
+
+    rule_label: str
+    rule_bundesland: str
+    expected_bundesland: str
+    excerpt: str
+
+
 class QueryResp(BaseModel):
     answer: str
     chunks: list[ChunkOut]
@@ -919,6 +1023,17 @@ class QueryResp(BaseModel):
     session_id: str
     mode: str  # "chat" | "rag" | "contract" | "rag+contract"
     citation_validation: CitationValidationOut | None = None
+    # Empty list when no Bundesland was detected for the matter OR when
+    # the model didn't cite anything jurisdictionally suspect. Non-empty
+    # is the actionable signal for the UI.
+    jurisdiction_warnings: list[JurisdictionWarningOut] = []
+    # ``messages.id`` of the persisted assistant row. Lets the UI scope
+    # POST /feedback to a specific bubble rather than the whole session.
+    # ``None`` only when the assistant message somehow failed to persist
+    # (best-effort path; we never fail a query because of a write
+    # hiccup) — the UI silently downgrades to session-level feedback in
+    # that case.
+    message_id: int | None = None
 
 
 class UploadResp(BaseModel):
@@ -1074,14 +1189,75 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[startup]   LLM warmup failed (non-fatal): {e}", flush=True)
 
+    # ── Auth subsystem (AUTH_PLAN §9 step 1-3) ──────────────────────────
+    # Reuses the module-level :data:`_auth_config` and
+    # :data:`_token_issuer` so the route-time ``get_current_user`` and
+    # the per-request ``AuthDeps`` share a single issuer (one secret,
+    # one verifier, no drift). Email config is optional: if
+    # ``LAI_EMAIL_*`` env is absent, /auth/forgot-password still issues
+    # reset tokens but nothing is mailed (logged loudly).
+    print("[startup] auth: wiring router...", flush=True)
+    try:
+        email_config: Optional[_EmailConfig] = _EmailConfig()
+        print("[startup]   auth: email config loaded (Brevo enabled)", flush=True)
+    except Exception as e:
+        email_config = None
+        print(f"[startup]   auth: email config NOT loaded ({e}) — /auth/forgot-password will not mail",
+              flush=True)
+    auth_pool = await _create_auth_pool()
+    auth_deps = AuthDeps(
+        auth_config=_auth_config,
+        email_config=email_config,
+        hasher=PasswordHasher(_auth_config),
+        issuer=_token_issuer,
+        pool=auth_pool,
+    )
+    app.include_router(build_auth_router(auth_deps, get_current_user=get_current_user))
+    app.state.auth_deps = auth_deps
+    app.state.get_current_user = get_current_user
+    print("[startup]   auth: router mounted at /auth/*", flush=True)
+
     print("[startup] READY", flush=True)
-    yield
+    try:
+        yield
+    finally:
+        # Shutdown — close the asyncpg pool we opened above.
+        await auth_pool.close()
 
 
 app = FastAPI(lifespan=lifespan)
+# Translate auth-module exceptions (InvalidCredentialsError, …) into
+# uniform 401s at the app level. APIRouter has no app-scoped
+# exception-handler API, so this lives here, not inside the router.
+register_auth_exception_handlers(app)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+
+# ── Prometheus HTTP-level instrumentation (TRACK_B_TIMING §6) ───────────────
+# ``prometheus-fastapi-instrumentator`` adds ``http_requests_total`` +
+# ``http_request_duration_seconds`` per route and exposes them at
+# ``/metrics``. Domain-level RAG counters (validator alarms, feedback
+# verdicts, retrieval depth) live in :mod:`lai.api.metrics` and are
+# registered against the same default registry the instrumentator
+# scrapes, so a single Prometheus scrape picks up both.
+#
+# ``/health`` and ``/metrics`` are excluded from histogramming — both
+# are scraped on a tight cadence and would dominate the request
+# histograms with high-frequency near-zero values that buries the
+# /query signal we actually care about.
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator(
+        should_group_status_codes=False,
+        should_ignore_untemplated=True,
+        excluded_handlers=["/health", "/metrics"],
+    ).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+except ImportError:
+    # Library missing in some constrained dev envs — log and continue;
+    # the domain counters still emit, the /metrics endpoint is the only
+    # casualty. Production wheels include the dependency.
+    print("[warn] prometheus-fastapi-instrumentator not installed; /metrics disabled", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1172,11 +1348,16 @@ def _do_rag(
 
 
 @app.post("/query", response_model=QueryResp)
-def query(req: QueryReq):
+def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     if STATE["lm"] is None and STATE["llm_api_url"] is None:
         raise HTTPException(503, "Service still loading")
 
     sid = req.session_id or str(uuid.uuid4())
+    uid = str(user.id)
+    # If the caller supplied a session_id, it MUST belong to them.
+    # AUTH_PLAN G4: the session id alone is not a capability.
+    if req.session_id and not persistence.session_exists(sid, user_id=uid):
+        raise HTTPException(404, "session_id not found")
     t_total0 = time.time()
 
     # Decide mode.
@@ -1217,7 +1398,7 @@ def query(req: QueryReq):
     contract_text = ""
     contract_filename = ""
     if use_contract:
-        contract_sess = persistence.load_session(sid)
+        contract_sess = persistence.load_session(sid, user_id=uid)
         if contract_sess:
             contract_text = (contract_sess.get("contract_text") or "")[:8000]
             contract_filename = contract_sess.get("filename") or ""
@@ -1251,14 +1432,14 @@ def query(req: QueryReq):
     # follow-ups like "tell me more about it" or "answer in English from now on"
     # are silently dropped. Loaded BEFORE we inject the current question so
     # the new turn isn't double-counted.
-    history = _load_history(sid)
+    history = _load_history(sid, user_id=uid)
 
     # Pinned session metadata — stable facts (user name, project, deadlines)
     # that survive even when their original turn rolls out of the 32-msg
     # rolling window. Cheap when the session is short or when the previous
     # extraction is still fresh; the refresh fires AFTER persisting the new
     # turn (below) so the freshly stated facts make it into the next refresh.
-    meta_prefix = _format_session_meta_prefix(persistence.get_session_meta(sid))
+    meta_prefix = _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
 
     # Matter sources come first so the LLM sees the user's own document
     # before the supporting corpus excerpts — and so the [M-n] handles
@@ -1268,18 +1449,23 @@ def query(req: QueryReq):
     if use_rag and use_contract:
         mode = "rag+contract"
         msgs = build_rag_messages(req.question, rag_sources,
-                                  history=history, meta_prefix=meta_prefix)
+                                  history=history, meta_prefix=meta_prefix,
+                                  target_language=req.target_language)
     elif use_rag:
         mode = "rag"
         msgs = build_rag_messages(req.question, rag_sources,
-                                  history=history, meta_prefix=meta_prefix)
+                                  history=history, meta_prefix=meta_prefix,
+                                  target_language=req.target_language)
     elif use_contract:
         mode = "contract"
         msgs = build_rag_messages(req.question, matter_sources,
-                                  history=history, meta_prefix=meta_prefix)
+                                  history=history, meta_prefix=meta_prefix,
+                                  target_language=req.target_language)
     else:
         mode = "chat"
-        msgs = build_chat_messages(req.question, history=history, meta_prefix=meta_prefix)
+        msgs = build_chat_messages(req.question, history=history,
+                                   meta_prefix=meta_prefix,
+                                   target_language=req.target_language)
 
     chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
 
@@ -1318,6 +1504,16 @@ def query(req: QueryReq):
             sentences_flagged=validation.sentences_flagged,
         )
 
+    # Day-4 jurisdiction sanity gate. Catches the "10H BayBO cited for
+    # a Niedersachsen project" failure family — independent of the
+    # citation validator above (a citation can be perfectly resolved
+    # against an [C-n] in the prompt and still be JURISDICTIONALLY
+    # wrong if the cited statute is from the wrong Bundesland).
+    jurisdiction_warnings = _run_jurisdiction_check(
+        answer=answer, contract_text=contract_text, question=req.question,
+        mode=mode, sid=sid,
+    )
+
     timings.total_s = round(time.time() - t_total0, 3)
 
     # Persist chat messages so the UI can rehydrate the thread on refresh.
@@ -1325,9 +1521,11 @@ def query(req: QueryReq):
     # bare one first so the messages have somewhere to attach. Without this
     # every chat that didn't follow an /upload was getting silently dropped.
     # Best-effort; never fail the request because of a write hiccup.
+    assistant_message_id: int | None = None
     try:
-        if not persistence.session_exists(sid):
+        if not persistence.session_exists(sid, user_id=uid):
             persistence.save_session(sid, {
+                "user_id": uid,
                 "filename": None,         # chat-only session, no upload
                 "contract_text": None,
                 "n_pages": 0,
@@ -1336,8 +1534,13 @@ def query(req: QueryReq):
                 "clauses": None,
                 "analysis": None,
             })
-        persistence.add_message(sid, "user", req.question, mode=mode)
-        persistence.add_message(sid, "assistant", answer, mode=mode)
+        persistence.add_message(sid, "user", req.question, mode=mode, user_id=uid)
+        # Capture the assistant row id so QueryResp can hand it to the
+        # UI for POST /feedback wiring. ``add_message`` returns 0 only
+        # on the ownership-check failure path (shouldn't fire here —
+        # we just save_session'd above) which we map to None.
+        _aid = persistence.add_message(sid, "assistant", answer, mode=mode, user_id=uid)
+        assistant_message_id = _aid if _aid > 0 else None
     except Exception as e:
         print(f"[warn] failed to persist messages for {sid}: {e}", flush=True)
 
@@ -1346,19 +1549,466 @@ def query(req: QueryReq):
     # stated are part of the extraction context, and the next /query call
     # picks up the refreshed pin. Inline because it's a single LLM call;
     # if it ever becomes hot enough to matter we can move it to a worker.
-    _maybe_refresh_session_metadata(sid)
+    _maybe_refresh_session_metadata(sid, user_id=uid)
+
+    # ── Domain-level metrics (TRACK_B_TIMING §6) ────────────────────────
+    # Emit AFTER the request is fully assembled so failure-path requests
+    # never bump the success counters (they raise above and never reach
+    # here). Status is therefore always ``success`` at this point.
+    _emit_query_metrics(
+        mode=mode,
+        language=req.target_language or "de",
+        latency_s=timings.total_s,
+        chunks_returned=len(chunks_out),
+        citation_validation=citation_validation_out,
+        jurisdiction_warnings=jurisdiction_warnings,
+    )
 
     return QueryResp(
         answer=answer, chunks=chunks_out, timings=timings,
         tokens=TokensOut(prompt=prompt_tokens, completion=completion_tokens),
         session_id=sid, mode=mode,
         citation_validation=citation_validation_out,
+        jurisdiction_warnings=jurisdiction_warnings,
+        message_id=assistant_message_id,
+    )
+
+
+def _emit_query_metrics(
+    *,
+    mode: str,
+    language: str,
+    latency_s: float,
+    chunks_returned: int,
+    citation_validation: CitationValidationOut | None,
+    jurisdiction_warnings: list[JurisdictionWarningOut],
+) -> None:
+    """Bump every domain-level counter / histogram for one completed turn.
+
+    Centralised so the two query endpoints (/query and /query/stream)
+    emit identical metrics — divergence would silently break the Grafana
+    dashboard the moment a user switched between JSON and SSE.
+    """
+    rag_metrics.query_total.labels(
+        mode=mode, language=language, status="success",
+    ).inc()
+    rag_metrics.query_latency_seconds.labels(mode=mode).observe(latency_s)
+    rag_metrics.retrieval_chunks_returned.observe(chunks_returned)
+
+    if citation_validation and citation_validation.sentences_flagged > 0:
+        rag_metrics.citation_unbelegt_responses_total.inc()
+        rag_metrics.citation_unbelegt_sentences_total.inc(
+            citation_validation.sentences_flagged
+        )
+
+    if jurisdiction_warnings:
+        rag_metrics.jurisdiction_warnings_responses_total.inc()
+        rag_metrics.jurisdiction_warnings_total.inc(len(jurisdiction_warnings))
+
+
+def _run_jurisdiction_check(
+    *,
+    answer: str,
+    contract_text: str,
+    question: str,
+    mode: str,
+    sid: str,
+) -> list[JurisdictionWarningOut]:
+    """Detect the matter's Bundesland from session context and warn on
+    Bundesland-specific rules cited for a different state.
+
+    The matter's Bundesland is inferred from the uploaded contract text
+    first (most reliable), the user's question second, falling back to
+    None — which disables the check.
+    """
+    detected = (
+        detect_bundesland(contract_text or "")
+        or detect_bundesland(question)
+    )
+    if detected is None:
+        return []
+    warnings = check_jurisdiction(answer, detected)
+    if not warnings:
+        return []
+    print(
+        f"[jurisdiction] session={sid} mode={mode} expected={detected} "
+        f"warnings={[w.rule_label for w in warnings]}",
+        flush=True,
+    )
+    return [
+        JurisdictionWarningOut(
+            rule_label=w.rule_label,
+            rule_bundesland=w.rule_bundesland,
+            expected_bundesland=w.expected_bundesland,
+            excerpt=w.excerpt,
+        )
+        for w in warnings
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Streaming chat (Day-2 strategy doc deliverable)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Parallel SSE endpoint to ``/query``. Behaviour is identical apart from
+# the wire shape: the answer arrives as a stream of ``event: token``
+# deltas while the model generates, followed by a single ``event:
+# complete`` carrying chunks + citation-validation + timings + tokens.
+#
+# Why a parallel endpoint and not a flag on /query:
+#   1. SSE response shape is fundamentally different from JSON. Folding
+#      both into one route would force every caller through the SSE
+#      parser even when they just want the JSON.
+#   2. The :class:`SyncLlmClient` does not currently expose streaming
+#      (its body always sets ``stream: False``). Adding streaming to
+#      ``lai.common.llm`` is a larger refactor; we bypass the client
+#      here and call vLLM directly with ``httpx.stream()`` so the demo
+#      gets the perceived-speed win without a foundation rewrite.
+#   3. Citation validator runs on the COMPLETE answer (it splits on
+#      sentence boundaries and rewrites). So the stream emits raw
+#      tokens; only the terminal ``complete`` event carries the
+#      validated answer + ``citation_validation`` summary. The
+#      frontend renders rough text during stream, then swaps in the
+#      sanitised version + chips on ``complete``.
+#
+# Local-transformers path: streaming is not implemented. Callers hit
+# the standard ``/query`` endpoint for that backend — the
+# transformers model path is opt-in and very rarely used in
+# production.
+
+
+def _sse_event(event: str, data: object) -> bytes:
+    """Encode one SSE message. ``event:`` line then ``data:`` payload,
+    terminated with a blank line. Always UTF-8.
+    """
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
+
+
+def _stream_vllm_chat(
+    messages: list[dict],
+    max_new_tokens: int,
+):
+    """Generator that yields token deltas from the remote vLLM endpoint.
+
+    Yields raw ``str`` content fragments. Caller wraps in SSE.
+
+    Uses ``httpx.stream`` against the OpenAI-compatible
+    ``/v1/chat/completions`` endpoint with ``stream: True``. vLLM
+    emits OpenAI-shaped ``data:`` SSE lines; each carries one chunk
+    of the response with ``choices[0].delta.content``. The terminal
+    line is ``data: [DONE]``.
+    """
+    if STATE["llm_api_url"] is None:
+        raise RuntimeError("streaming requires the remote vLLM path; local transformers path is non-streaming")
+
+    url = STATE["llm_api_url"].rstrip("/") + "/v1/chat/completions"
+    msgs = _messages_for_remote_model(messages, STATE["llm_model_name"])
+    body = {
+        "model": STATE["llm_model_name"],
+        "messages": msgs,
+        "max_tokens": max_new_tokens,
+        "temperature": 0.0,
+        "stream": True,
+        # Match the non-streaming path: thinking mode off for /query.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    with httpx.stream("POST", url, json=body, timeout=600.0) as response:
+        response.raise_for_status()
+        for raw_line in response.iter_lines():
+            # vLLM SSE lines come as ``data: { ... }`` or ``data: [DONE]``;
+            # blank lines and ``: keepalive`` style comments are dropped.
+            if not raw_line:
+                continue
+            line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8", errors="replace")
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            if payload == "[DONE]":
+                return
+            try:
+                obj = json.loads(payload)
+            except ValueError:
+                # Defensive: skip a malformed chunk rather than blow up
+                # the whole stream. The model occasionally emits
+                # zero-length deltas at the boundaries.
+                continue
+            try:
+                delta = obj["choices"][0].get("delta") or {}
+            except (KeyError, IndexError, TypeError):
+                continue
+            content = delta.get("content")
+            if content:
+                yield content
+
+
+@app.post("/query/stream")
+def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
+    """SSE companion to :func:`query`. Wire format:
+
+        event: token
+        data: {"delta": "..."}
+
+        event: token
+        data: {"delta": "..."}
+
+        ...
+
+        event: complete
+        data: {
+            "answer": "<validated, with [C-n]/[M-n] tags>",
+            "chunks": [...],                       # same as /query
+            "citation_validation": {...} | null,   # same as /query
+            "timings": {...},
+            "tokens": {"prompt": int, "completion": int},
+            "session_id": str,
+            "mode": "rag" | "rag+contract" | "contract" | "chat"
+        }
+
+    The ``token`` events carry the RAW model output (before citation
+    validation) so the UI can render progressively. The ``complete``
+    event carries the validated answer — the frontend swaps the
+    rough text for the validated version once it arrives.
+
+    Error events:
+        event: error
+        data: {"detail": "..."}
+    """
+    if STATE["llm_api_url"] is None:
+        # Local-transformers path doesn't stream; tell the caller
+        # cleanly so they can fall back to /query.
+        raise HTTPException(
+            501,
+            "streaming requires the remote vLLM path (LLM_API_URL); local transformers path is non-streaming. "
+            "Fall back to POST /query.",
+        )
+
+    sid = req.session_id or str(uuid.uuid4())
+    uid = str(user.id)
+    if req.session_id and not persistence.session_exists(sid, user_id=uid):
+        raise HTTPException(404, "session_id not found")
+
+    # ── Same retrieval + matter assembly as /query ──────────────────────
+    t_total0 = time.time()
+    use_contract = session_uses_contract(sid, req.question)
+    if req.force_mode in ("rag", "chat"):
+        use_rag = req.force_mode == "rag"
+    elif use_contract:
+        use_rag = True
+    else:
+        use_rag = needs_rag(req.question)
+
+    corpus_chunks: list[ChunkOut] = []
+    corpus_sources: list[RetrievedSource] = []
+    timings = TimingsOut(embed_s=0.0, retrieve_s=0.0, rerank_s=0.0,
+                         generate_s=0.0, total_s=0.0)
+    if use_rag:
+        corpus_chunks, corpus_sources, t = _do_rag(
+            req.question, req.top_k, req.candidate_k,
+        )
+        timings.embed_s = t.embed_s
+        timings.retrieve_s = t.retrieve_s
+        timings.rerank_s = t.rerank_s
+
+    contract_text = ""
+    contract_filename = ""
+    if use_contract:
+        contract_sess = persistence.load_session(sid, user_id=uid)
+        if contract_sess:
+            contract_text = (contract_sess.get("contract_text") or "")[:8000]
+            contract_filename = contract_sess.get("filename") or ""
+
+    matter_sources: list[RetrievedSource] = []
+    matter_chunks: list[ChunkOut] = []
+    if use_contract and contract_text:
+        m_cite = _matter_cite_id(1)
+        matter_label = (
+            f"Hochgeladener Vertrag — {contract_filename}"
+            if contract_filename else "Hochgeladener Vertrag"
+        )
+        matter_sources.append(RetrievedSource(
+            cite_id=m_cite, source_kind="matter",
+            text=contract_text, label=matter_label,
+        ))
+        matter_chunks.append(ChunkOut(
+            text=contract_text[:1500], section=matter_label,
+            law_refs=[], sources=["upload"],
+            similarity=1.0, rerank_score=1.0,
+            cite_id=m_cite, source_kind="matter",
+        ))
+
+    history = _load_history(sid, user_id=uid)
+    meta_prefix = _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
+    rag_sources = matter_sources + corpus_sources
+
+    if use_rag and use_contract:
+        mode = "rag+contract"
+        msgs = build_rag_messages(req.question, rag_sources,
+                                  history=history, meta_prefix=meta_prefix,
+                                  target_language=req.target_language)
+    elif use_rag:
+        mode = "rag"
+        msgs = build_rag_messages(req.question, rag_sources,
+                                  history=history, meta_prefix=meta_prefix,
+                                  target_language=req.target_language)
+    elif use_contract:
+        mode = "contract"
+        msgs = build_rag_messages(req.question, matter_sources,
+                                  history=history, meta_prefix=meta_prefix,
+                                  target_language=req.target_language)
+    else:
+        mode = "chat"
+        msgs = build_chat_messages(req.question, history=history,
+                                   meta_prefix=meta_prefix,
+                                   target_language=req.target_language)
+
+    chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
+    max_new_tokens = 600 if (use_rag or use_contract) else 200
+
+    def _generator():
+        """Yield SSE bytes for the lifetime of the request."""
+        t0 = time.time()
+        accumulated: list[str] = []
+        try:
+            for delta in _stream_vllm_chat(msgs, max_new_tokens):
+                # ``<think>`` traces only appear when thinking mode is
+                # ON; we explicitly disable it above so streaming
+                # output is the user-facing answer directly. As a
+                # belt-and-braces measure the post-stream strip below
+                # still applies ``strip_think`` so a stray trace
+                # survived in the recorded answer wouldn't leak.
+                accumulated.append(delta)
+                yield _sse_event("token", {"delta": delta})
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            yield _sse_event("error", {"detail": f"transport: {exc}"})
+            return
+        except httpx.HTTPStatusError as exc:
+            yield _sse_event("error", {
+                "detail": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+            })
+            return
+        except Exception as exc:  # noqa: BLE001 — last-line defence; surface anything else cleanly
+            yield _sse_event("error", {"detail": str(exc)})
+            return
+
+        # ── Post-stream: validate, persist, emit terminal event ──────
+        raw_answer = "".join(accumulated)
+        # In case Qwen3 leaks a partial <think> trace despite the
+        # config flag, strip it. ``_strip_reasoning_trace`` mirrors
+        # the non-streaming path's behaviour.
+        answer = _strip_reasoning_trace(raw_answer).strip()
+        timings.generate_s = round(time.time() - t0, 3)
+
+        citation_validation_out: CitationValidationOut | None = None
+        if rag_sources:
+            allowed = {src.cite_id for src in rag_sources}
+            validation = validate_citations(answer, allowed)
+            if validation.fabricated:
+                print(
+                    f"[citation] session={sid} mode={mode} stream=1 "
+                    f"fabricated={list(validation.fabricated)} "
+                    f"flagged_sentences={validation.sentences_flagged}",
+                    flush=True,
+                )
+            answer = validation.text
+            citation_validation_out = CitationValidationOut(
+                allowed=sorted(allowed),
+                emitted=list(validation.emitted),
+                fabricated=list(validation.fabricated),
+                sentences_flagged=validation.sentences_flagged,
+            )
+
+        jurisdiction_warnings = _run_jurisdiction_check(
+            answer=answer, contract_text=contract_text, question=req.question,
+            mode=mode, sid=sid,
+        )
+
+        timings.total_s = round(time.time() - t_total0, 3)
+
+        # Persist exactly as /query does. Best-effort — never fail
+        # the SSE stream because of a write hiccup.
+        assistant_message_id: int | None = None
+        try:
+            if not persistence.session_exists(sid, user_id=uid):
+                persistence.save_session(sid, {
+                    "user_id": uid,
+                    "filename": None,
+                    "contract_text": None,
+                    "n_pages": 0,
+                    "tables": [],
+                    "uploaded_at": time.time(),
+                    "clauses": None, "analysis": None,
+                })
+            persistence.add_message(sid, "user", req.question, mode=mode, user_id=uid)
+            _aid = persistence.add_message(sid, "assistant", answer, mode=mode, user_id=uid)
+            assistant_message_id = _aid if _aid > 0 else None
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] stream: failed to persist messages for {sid}: {exc}", flush=True)
+
+        _maybe_refresh_session_metadata(sid, user_id=uid)
+
+        # Domain-level metrics — same emission as the non-streaming
+        # path so a Grafana panel that sums over /query and
+        # /query/stream sees one coherent number.
+        _emit_query_metrics(
+            mode=mode,
+            language=req.target_language or "de",
+            latency_s=timings.total_s,
+            chunks_returned=len(chunks_out),
+            citation_validation=citation_validation_out,
+            jurisdiction_warnings=jurisdiction_warnings,
+        )
+
+        # Token counts: prompt is approximate from the assembled
+        # messages; completion is approximate from the answer. Same
+        # rationale as the non-streaming path's helpers.
+        prompt_chars = sum(len(m.get("content") or "") for m in msgs)
+        complete_payload: dict[str, object] = {
+            "answer": answer,
+            "chunks": [c.model_dump() for c in chunks_out],
+            "citation_validation": (
+                citation_validation_out.model_dump() if citation_validation_out else None
+            ),
+            "jurisdiction_warnings": [w.model_dump() for w in jurisdiction_warnings],
+            "timings": timings.model_dump(),
+            "tokens": {
+                "prompt": _approx_token_count_from_chars(prompt_chars),
+                "completion": _approx_token_count(answer),
+            },
+            "session_id": sid,
+            "mode": mode,
+            # Same field /query returns — lets the UI scope POST /feedback
+            # to a specific bubble. None when persistence failed (best-effort).
+            "message_id": assistant_message_id,
+        }
+        yield _sse_event("complete", complete_payload)
+
+    return StreamingResponse(
+        _generator(),
+        media_type="text/event-stream",
+        headers={
+            # Disable proxy buffering so events arrive promptly. nginx,
+            # cloudflare etc. otherwise hold SSE in 8 KB buffers and
+            # the stream feels broken on cold connections.
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
     )
 
 
 @app.post("/upload", response_model=UploadResp)
-async def upload(file: UploadFile = File(...), session_id: str | None = Form(None)):
+async def upload(
+    file: UploadFile = File(...),
+    session_id: str | None = Form(None),
+    user: CurrentUser = Depends(get_current_user),
+):
+    uid = str(user.id)
     sid = session_id or str(uuid.uuid4())
+    # If the caller supplied an existing session_id, it MUST be theirs.
+    if session_id and not persistence.session_exists(sid, user_id=uid):
+        raise HTTPException(404, "session_id not found")
+
     contents = await file.read()
     if len(contents) > 50 * 1024 * 1024:
         raise HTTPException(413, "File too large (max 50 MB)")
@@ -1375,6 +2025,7 @@ async def upload(file: UploadFile = File(...), session_id: str | None = Form(Non
     upload_ext = persistence.save_upload(sid, contents, fname)
 
     persistence.save_session(sid, {
+        "user_id": uid,
         "filename": fname,
         "contract_text": md,
         "n_pages": num_pages,
@@ -1410,8 +2061,8 @@ def _v1_issue_to_out(i: dict) -> IssueOut:
                     reason=rationale, type=typ)
 
 
-def _analyze_v1(req: AnalyzeReq) -> AnalyzeResp:
-    sess = persistence.load_session(req.session_id)
+def _analyze_v1(req: AnalyzeReq, user_id: str) -> AnalyzeResp:
+    sess = persistence.load_session(req.session_id, user_id=user_id)
     if sess is None:
         raise HTTPException(404, "session_id not found")
     t0 = time.time()
@@ -1436,6 +2087,7 @@ def _analyze_v1(req: AnalyzeReq) -> AnalyzeResp:
 
     missing = [IssueOut(**m) for m in check_playbook(types_present)]
     sess["clauses"] = [c.model_dump() for c in clauses_out]
+    sess["user_id"] = user_id  # preserve ownership across the upsert
     sess["analysis"] = {
         "n_clauses": len(clauses_out),
         "missing_required_clauses": [m.model_dump() for m in missing],
@@ -1452,8 +2104,8 @@ def _analyze_v1(req: AnalyzeReq) -> AnalyzeResp:
     )
 
 
-def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
-    sess = persistence.load_session(req.session_id)
+def _analyze_v2(req: AnalyzeReq, user_id: str) -> AnalyzeResp:
+    sess = persistence.load_session(req.session_id, user_id=user_id)
     if sess is None:
         raise HTTPException(404, "session_id not found")
     cfg = STATE["analyzer_cfg"]
@@ -1536,6 +2188,7 @@ def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
 
     # Persist the full V2 result on the session for richer UI consumption later
     sess["clauses"] = [c.model_dump() for c in clauses_out]
+    sess["user_id"] = user_id  # preserve ownership across the upsert
     sess["analysis"] = result.model_dump()
     sess["extraction_quality"] = (
         result.extraction_quality.model_dump() if result.extraction_quality else None
@@ -1565,8 +2218,9 @@ def _analyze_v2(req: AnalyzeReq) -> AnalyzeResp:
 
 
 @app.post("/analyze-contract", response_model=AnalyzeResp)
-def analyze_contract(req: AnalyzeReq):
-    sess = persistence.load_session(req.session_id)
+def analyze_contract(req: AnalyzeReq, user: CurrentUser = Depends(get_current_user)):
+    uid = str(user.id)
+    sess = persistence.load_session(req.session_id, user_id=uid)
     if not sess:
         raise HTTPException(404, "session_id not found — upload a document first")
     if not sess.get("contract_text"):
@@ -1574,16 +2228,18 @@ def analyze_contract(req: AnalyzeReq):
 
     requested = (req.version or STATE["analyzer_version_default"]).strip()
     use_v2 = requested == "2" and STATE["analyzer_cfg"] is not None
-    return _analyze_v2(req) if use_v2 else _analyze_v1(req)
+    return _analyze_v2(req, uid) if use_v2 else _analyze_v1(req, uid)
 
 
 @app.get("/analyze-contract/progress")
-def analyze_contract_progress(session_id: str):
+def analyze_contract_progress(session_id: str, user: CurrentUser = Depends(get_current_user)):
     """Live progress for an in-flight V2 analysis. Returns the latest
-    pipeline event (step, current clause / total clauses, percent
-    complete, elapsed seconds). Idempotent — UI polls this every few
-    seconds while the long-running /analyze-contract POST is open.
-    Returns ``status: "idle"`` when no analysis has run for this session."""
+    pipeline event. Returns ``status: "idle"`` when no analysis has
+    run for this session — also when the session isn't owned by the
+    caller (we don't leak existence).
+    """
+    if not persistence.session_exists(session_id, user_id=str(user.id)):
+        return {"status": "idle", "session_id": session_id}
     progress = STATE["analyzer_progress"].get(session_id)
     if not progress:
         return {"status": "idle", "session_id": session_id}
@@ -1591,10 +2247,10 @@ def analyze_contract_progress(session_id: str):
 
 
 @app.get("/analyze-contract/full")
-def analyze_contract_full(session_id: str):
+def analyze_contract_full(session_id: str, user: CurrentUser = Depends(get_current_user)):
     """Return the full V2 ContractAnalysis for a session (parcels, tables,
     cross-clause findings — fields the legacy AnalyzeResp doesn't carry)."""
-    sess = persistence.load_session(session_id)
+    sess = persistence.load_session(session_id, user_id=str(user.id))
     if not sess:
         raise HTTPException(404, "session_id not found")
     analysis = sess.get("analysis")
@@ -1608,19 +2264,24 @@ def analyze_contract_full(session_id: str):
 # ---------------------------------------------------------------------------
 
 @app.get("/sessions")
-def list_sessions(limit: int = 50):
-    """Recent sessions for a sidebar — light payload, no contract_text."""
-    return {"sessions": persistence.list_sessions(limit=limit)}
+def list_sessions(limit: int = 50, user: CurrentUser = Depends(get_current_user)):
+    """Recent sessions for a sidebar — light payload, no contract_text.
+
+    Scoped to the caller (AUTH_PLAN G1). ``persistence.list_sessions``
+    accepts ``user_id`` natively; we always pass it.
+    """
+    return {"sessions": persistence.list_sessions(limit=limit, user_id=str(user.id))}
 
 
 @app.get("/sessions/{session_id}")
-def get_session(session_id: str):
+def get_session(session_id: str, user: CurrentUser = Depends(get_current_user)):
     """Full session payload for UI rehydration after a refresh.
     Returns the contract metadata + last analysis + message history."""
-    sess = persistence.load_session(session_id)
+    uid = str(user.id)
+    sess = persistence.load_session(session_id, user_id=uid)
     if not sess:
         raise HTTPException(404, "session_id not found")
-    messages = persistence.list_messages(session_id)
+    messages = persistence.list_messages(session_id, user_id=uid)
     return {
         "session_id": session_id,
         "filename": sess.get("filename"),
@@ -1633,10 +2294,11 @@ def get_session(session_id: str):
 
 
 @app.get("/sessions/{session_id}/messages")
-def get_session_messages(session_id: str):
-    if not persistence.session_exists(session_id):
+def get_session_messages(session_id: str, user: CurrentUser = Depends(get_current_user)):
+    uid = str(user.id)
+    if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
-    return {"messages": persistence.list_messages(session_id)}
+    return {"messages": persistence.list_messages(session_id, user_id=uid)}
 
 
 class AppendMessageReq(BaseModel):
@@ -1646,28 +2308,231 @@ class AppendMessageReq(BaseModel):
 
 
 @app.post("/sessions/{session_id}/messages")
-def append_session_message(session_id: str, req: AppendMessageReq):
+def append_session_message(
+    session_id: str,
+    req: AppendMessageReq,
+    user: CurrentUser = Depends(get_current_user),
+):
     """Append an assistant- or user-side message to an existing session
     so refresh-replay sees every bubble the UI showed. Used for bubbles
     the backend doesn't generate itself — upload confirmation,
     rendered /analyze-contract output, etc.
 
     /query already self-persists; the UI shouldn't double-save those."""
-    if not persistence.session_exists(session_id):
+    uid = str(user.id)
+    if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     if req.role not in ("user", "assistant"):
         raise HTTPException(400, "role must be 'user' or 'assistant'")
     if not req.content.strip():
         raise HTTPException(400, "content required")
-    msg_id = persistence.add_message(session_id, req.role, req.content, mode=req.mode)
+    msg_id = persistence.add_message(
+        session_id, req.role, req.content, mode=req.mode, user_id=uid,
+    )
     return {"ok": True, "id": msg_id}
 
 
-@app.delete("/sessions/{session_id}")
-def delete_session_endpoint(session_id: str):
-    if not persistence.session_exists(session_id):
+class FeedbackReq(BaseModel):
+    """One lawyer-supplied verdict on an assistant turn.
+
+    The frontend posts this when the user clicks the thumbs-up /
+    thumbs-down icon under a bubble (or, on a free-form complaint
+    dialog, the "Send feedback" button).
+
+    Attributes:
+        session_id: Chat the feedback belongs to. Must belong to the
+            authenticated user — cross-tenant submissions are 404'd.
+        message_id: Optional ``messages.id`` for the specific assistant
+            bubble being rated. Omitted for session-level feedback
+            (a one-off "the whole conversation was wrong" verdict).
+            When supplied, must point to a message in ``session_id``.
+        rating: ``1`` for thumbs-up, ``-1`` for thumbs-down. Star /
+            multi-grade rating is intentionally NOT supported yet —
+            the lawyer wants a thumb, not a Likert scale.
+        reason: Optional short tag from the UI dropdown. Closed enum
+            today (``wrong-citation`` / ``wrong-jurisdiction`` /
+            ``hallucination`` / ``incomplete`` / ``other``); the column
+            is free-text so we can add tags without a migration.
+        comment: Optional free text, capped at 2 KB to keep the
+            SQLite row size in check.
+    """
+    session_id: str
+    message_id: int | None = None
+    rating: int
+    reason: str | None = None
+    comment: str | None = None
+
+
+# Closed-enum reasons the UI's dropdown offers. The route validates
+# against this set so a typo-introduced new tag doesn't silently land
+# in the table (which would break downstream aggregation queries).
+# ``None`` is also valid — feedback may carry no reason.
+_FEEDBACK_REASONS: frozenset[str] = frozenset({
+    "wrong-citation",
+    "wrong-jurisdiction",
+    "hallucination",
+    "incomplete",
+    "tone",
+    "other",
+})
+
+
+@app.post("/feedback")
+def submit_feedback(
+    req: FeedbackReq, user: CurrentUser = Depends(get_current_user),
+):
+    """Capture a lawyer's verdict on an assistant turn.
+
+    Idempotent on ``(user_id, session_id, message_id)`` — repeat
+    submissions overwrite via persistence's ON CONFLICT … DO UPDATE,
+    so the UI can let the user toggle thumbs-up → thumbs-down without
+    polluting the table.
+
+    Returns:
+        ``{"ok": True, "id": <feedback row id>}``
+
+    Errors:
+        400 — invalid rating, unknown reason tag, or oversize comment.
+        404 — session does not belong to the caller, OR ``message_id``
+              was supplied and does not belong to the session.
+    """
+    if req.rating not in (-1, 1):
+        raise HTTPException(400, "rating must be -1 or 1")
+    if req.reason is not None and req.reason not in _FEEDBACK_REASONS:
+        raise HTTPException(
+            400, f"reason must be one of {sorted(_FEEDBACK_REASONS)} or null"
+        )
+    if req.comment is not None and len(req.comment) > 2048:
+        raise HTTPException(400, "comment must be ≤ 2048 characters")
+
+    uid = str(user.id)
+    if not persistence.session_exists(req.session_id, user_id=uid):
+        # 404 (not 403) so we don't leak existence across tenants.
         raise HTTPException(404, "session_id not found")
-    persistence.delete_session(session_id)
+    if req.message_id is not None and not persistence.message_belongs_to_session(
+        req.message_id, req.session_id,
+    ):
+        raise HTTPException(404, "message_id does not belong to session_id")
+
+    row_id = persistence.record_feedback(
+        session_id=req.session_id,
+        user_id=uid,
+        rating=req.rating,
+        message_id=req.message_id,
+        reason=req.reason,
+        comment=req.comment,
+    )
+    if row_id is None:
+        # Defence-in-depth: persistence already rechecks ownership and
+        # would return None if the session disappeared between the
+        # check above and the insert. Surface as 404 so the UI can
+        # retry cleanly.
+        raise HTTPException(404, "session_id not found")
+
+    # Metric: rating label is the two-valued enum the dashboard pivots
+    # on — never the raw int (a future reviewer extending to e.g.
+    # 5-star ratings should also rename the label values).
+    rag_metrics.feedback_total.labels(
+        rating="thumbs_up" if req.rating == 1 else "thumbs_down",
+    ).inc()
+
+    return {"ok": True, "id": row_id}
+
+
+@app.get("/sessions/{session_id}/feedback")
+def get_session_feedback(
+    session_id: str, user: CurrentUser = Depends(get_current_user),
+):
+    """All feedback rows the calling user has left on a session.
+
+    Used by the UI to render the persisted thumbs-up/down state under
+    each assistant bubble after a reload — without this, the verdict
+    visually resets every time the lawyer refreshes the page.
+
+    Cross-tenant sessions return 404 rather than 403 so the response
+    shape never leaks existence across tenants.
+    """
+    uid = str(user.id)
+    if not persistence.session_exists(session_id, user_id=uid):
+        raise HTTPException(404, "session_id not found")
+    return {"feedback": persistence.list_feedback(session_id, user_id=uid)}
+
+
+@app.get("/sessions/{session_id}/document")
+def get_session_document(
+    session_id: str,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Stream the raw uploaded document bytes for a session.
+
+    Backs the frontend's ``CitationPanel`` PDF preview: when the user
+    clicks an ``[M-n]`` chip, the panel mounts ``<Document file={url}>``
+    with the URL of this endpoint. The browser fetches the PDF over the
+    same origin (no CORS), pdf.js renders it client-side.
+
+    Returns the file with an ``inline`` content disposition so the
+    browser displays it in the page rather than triggering a download.
+    Content-Type is inferred from the upload extension — PDFs render
+    natively in ``react-pdf``; other types (.docx, .txt) the UI falls
+    back to the chunk excerpt the chat already showed.
+
+    Auth: scoped to the calling user (AUTH_PLAN G1). A session ID
+    belonging to another tenant returns 404 rather than 403 so we never
+    leak session existence across tenants.
+
+    Errors:
+        404 — session not found, or session owner mismatch, or the
+        upload file has been GC'd / never existed (e.g. chat-only
+        session with no upload).
+    """
+    uid = str(user.id)
+    sess = persistence.load_session(session_id, user_id=uid)
+    if not sess:
+        raise HTTPException(404, "session_id not found")
+    ext = sess.get("upload_ext")
+    if not ext:
+        # Chat-only session never had an upload — distinguish from
+        # 404 by message so the frontend can render a friendlier
+        # "no document attached" state in the panel.
+        raise HTTPException(404, "no document attached to this session")
+    path = persistence.upload_path(session_id, ext)
+    if path is None or not path.exists():
+        # Row says there was an upload but the file is gone from disk.
+        # This is a real-world failure mode (manual cleanup, disk
+        # restore from a snapshot that predates the upload). Tell the
+        # frontend so it can fall back to the chunk excerpt instead of
+        # showing an empty PDF viewer.
+        raise HTTPException(404, "upload file no longer available")
+
+    # Map known extensions to canonical media types. Unknown extensions
+    # fall back to application/octet-stream — the browser will refuse
+    # inline preview, which is the right behaviour for anything we
+    # can't render.
+    media_type = {
+        ".pdf":  "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc":  "application/msword",
+        ".txt":  "text/plain; charset=utf-8",
+        ".md":   "text/markdown; charset=utf-8",
+    }.get(ext, "application/octet-stream")
+
+    # Filename for the inline disposition. Falls back to the session id
+    # when the original filename is somehow null on the row.
+    display_name = sess.get("filename") or f"{session_id}{ext}"
+    return FileResponse(
+        path=path,
+        media_type=media_type,
+        # ``inline`` lets the browser render in-page rather than
+        # forcing a download; the frontend wants this.
+        headers={"Content-Disposition": f'inline; filename="{display_name}"'},
+    )
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session_endpoint(session_id: str, user: CurrentUser = Depends(get_current_user)):
+    uid = str(user.id)
+    if not persistence.delete_session(session_id, user_id=uid):
+        raise HTTPException(404, "session_id not found")
     return {"ok": True}
 
 
@@ -1676,11 +2541,13 @@ class RenameReq(BaseModel):
 
 
 @app.patch("/sessions/{session_id}")
-def rename_session(session_id: str, req: RenameReq):
+def rename_session(
+    session_id: str, req: RenameReq, user: CurrentUser = Depends(get_current_user),
+):
     """Set a user-facing title for the conversation. Empty string clears
     the override and the display title falls back to filename / first
     user message / 'Untitled chat'."""
-    if not persistence.update_session_title(session_id, req.title):
+    if not persistence.update_session_title(session_id, req.title, user_id=str(user.id)):
         raise HTTPException(404, "session_id not found")
     return {"ok": True, "title": req.title.strip()}
 

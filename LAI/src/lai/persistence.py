@@ -78,6 +78,32 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_session
     ON messages(session_id, created_at);
+
+-- Lawyer-supplied feedback on an assistant turn. One row per
+-- (user_id, session_id, message_id) — re-submitting from the UI
+-- overwrites via INSERT OR REPLACE so toggling thumbs-up → thumbs-down
+-- collapses to a single most-recent verdict. ``message_id`` is COALESCEd
+-- to 0 in the unique key so session-level feedback (no specific bubble)
+-- still benefits from the upsert. ``rating`` is constrained to -1 / +1
+-- by the route handler; the column itself stays unconstrained so we
+-- can add e.g. star ratings later without a destructive migration.
+CREATE TABLE IF NOT EXISTS feedback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    message_id  INTEGER,
+    user_id     TEXT NOT NULL,
+    rating      INTEGER NOT NULL,
+    reason      TEXT,
+    comment     TEXT,
+    created_at  REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_feedback_user_session_msg
+    ON feedback(user_id, session_id, COALESCE(message_id, 0));
+
+CREATE INDEX IF NOT EXISTS idx_feedback_session
+    ON feedback(session_id, created_at DESC);
 """
 
 
@@ -105,6 +131,16 @@ def init(db_path: Path, uploads_dir: Path) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
     if "session_meta_json" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN session_meta_json TEXT")
+
+    # The feedback table + its unique index were added late; older DBs
+    # predate the unique index even when they have the table. Re-running
+    # the relevant CREATE statements is cheap and idempotent.
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_feedback_user_session_msg
+            ON feedback(user_id, session_id, COALESCE(message_id, 0))
+        """
+    )
 
     _STATE["conn"] = conn
     _STATE["uploads_dir"] = uploads_dir
@@ -163,10 +199,21 @@ def _display_title_sql_expr() -> str:
 # sessions
 # ---------------------------------------------------------------------------
 
-def load_session(sid: str) -> Optional[dict]:
-    r = _conn().execute(
-        "SELECT * FROM sessions WHERE id = ?", (sid,)
-    ).fetchone()
+def load_session(sid: str, user_id: Optional[str] = None) -> Optional[dict]:
+    """Load a session by id, optionally constrained to a user.
+
+    When ``user_id`` is supplied the lookup filters on ownership; a
+    miss returns ``None`` so callers map to 404 (AUTH_PLAN §6 rule 4 —
+    never leak existence of another tenant's row).
+    """
+    if user_id is None:
+        r = _conn().execute(
+            "SELECT * FROM sessions WHERE id = ?", (sid,)
+        ).fetchone()
+    else:
+        r = _conn().execute(
+            "SELECT * FROM sessions WHERE id = ? AND user_id = ?", (sid, user_id),
+        ).fetchone()
     return _row_to_session(r) if r else None
 
 
@@ -215,29 +262,61 @@ def save_session(sid: str, data: dict) -> None:
         )
 
 
-def update_session_title(sid: str, title: str) -> bool:
+def update_session_title(sid: str, title: str, user_id: Optional[str] = None) -> bool:
     """Set the user-facing title for a session. Pass an empty string to
     clear (which falls back to the COALESCE chain in list_sessions).
-    Returns True if a row was updated."""
+    Returns True if a row was updated.
+
+    When ``user_id`` is supplied the UPDATE is scoped so a foreign
+    caller cannot mutate another tenant's row (AUTH_PLAN G2).
+    """
     cleaned = (title or "").strip()
     with _STATE["lock"]:
-        cur = _conn().execute(
-            "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
-            (cleaned or None, time.time(), sid),
-        )
+        if user_id is None:
+            cur = _conn().execute(
+                "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
+                (cleaned or None, time.time(), sid),
+            )
+        else:
+            cur = _conn().execute(
+                "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                (cleaned or None, time.time(), sid, user_id),
+            )
         return cur.rowcount > 0
 
 
-def delete_session(sid: str) -> None:
+def delete_session(sid: str, user_id: Optional[str] = None) -> bool:
+    """Delete a session and its messages.
+
+    Returns ``True`` when a session row was actually deleted (caller
+    maps a ``False`` return to 404 — never 403 — to avoid leaking
+    existence).
+    """
     with _STATE["lock"]:
-        _conn().execute("DELETE FROM sessions WHERE id = ?", (sid,))
-        _conn().execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+        if user_id is None:
+            cur = _conn().execute("DELETE FROM sessions WHERE id = ?", (sid,))
+        else:
+            cur = _conn().execute(
+                "DELETE FROM sessions WHERE id = ? AND user_id = ?", (sid, user_id),
+            )
+        deleted = cur.rowcount > 0
+        if deleted:
+            # Foreign-keys ON CASCADE was added to the schema, but
+            # historical DBs may predate that; clean up messages
+            # explicitly to keep the contract identical across schemas.
+            _conn().execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+        return deleted
 
 
-def session_exists(sid: str) -> bool:
-    r = _conn().execute(
-        "SELECT 1 FROM sessions WHERE id = ?", (sid,)
-    ).fetchone()
+def session_exists(sid: str, user_id: Optional[str] = None) -> bool:
+    if user_id is None:
+        r = _conn().execute(
+            "SELECT 1 FROM sessions WHERE id = ?", (sid,)
+        ).fetchone()
+    else:
+        r = _conn().execute(
+            "SELECT 1 FROM sessions WHERE id = ? AND user_id = ?", (sid, user_id),
+        ).fetchone()
     return r is not None
 
 
@@ -289,8 +368,20 @@ def count_sessions() -> int:
 # ---------------------------------------------------------------------------
 
 def add_message(
-    session_id: str, role: str, content: str, mode: Optional[str] = None,
+    session_id: str,
+    role: str,
+    content: str,
+    mode: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> int:
+    """Append a message. Returns the new row id (or 0 on insert failure).
+
+    When ``user_id`` is provided we verify ownership before writing —
+    a foreign caller cannot inject messages into someone else's chat
+    history (AUTH_PLAN G3).
+    """
+    if user_id is not None and not session_exists(session_id, user_id=user_id):
+        return 0
     with _STATE["lock"]:
         cur = _conn().execute(
             """
@@ -302,7 +393,16 @@ def add_message(
         return int(cur.lastrowid or 0)
 
 
-def list_messages(session_id: str) -> list[dict]:
+def list_messages(session_id: str, user_id: Optional[str] = None) -> list[dict]:
+    """Return all messages for a session.
+
+    When ``user_id`` is supplied we verify the session belongs to that
+    user first — returns an empty list otherwise. Combined with the
+    endpoint's existence check, this enforces "no cross-tenant message
+    reads" without leaking via response shape.
+    """
+    if user_id is not None and not session_exists(session_id, user_id=user_id):
+        return []
     rows = _conn().execute(
         """
         SELECT id, role, content, mode, created_at
@@ -324,14 +424,24 @@ def list_messages(session_id: str) -> list[dict]:
     ]
 
 
-def get_session_meta(session_id: str) -> Optional[dict]:
+def get_session_meta(session_id: str, user_id: Optional[str] = None) -> Optional[dict]:
     """Pinned conversational context (user name, project, key dates, ...)
     extracted by the LLM and saved alongside the session. None when the
-    column is empty (brand-new session or extraction never ran)."""
-    row = _conn().execute(
-        "SELECT session_meta_json FROM sessions WHERE id = ?",
-        (session_id,),
-    ).fetchone()
+    column is empty (brand-new session or extraction never ran).
+
+    Filters by ``user_id`` when supplied so meta blobs do not leak
+    between tenants.
+    """
+    if user_id is None:
+        row = _conn().execute(
+            "SELECT session_meta_json FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    else:
+        row = _conn().execute(
+            "SELECT session_meta_json FROM sessions WHERE id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
     if not row or not row["session_meta_json"]:
         return None
     try:
@@ -340,13 +450,114 @@ def get_session_meta(session_id: str) -> Optional[dict]:
         return None
 
 
-def set_session_meta(session_id: str, meta: dict) -> None:
+def set_session_meta(session_id: str, meta: dict, user_id: Optional[str] = None) -> None:
     """Persist a refreshed metadata snapshot for the session."""
     with _STATE["lock"]:
-        _conn().execute(
-            "UPDATE sessions SET session_meta_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(meta, ensure_ascii=False), time.time(), session_id),
+        if user_id is None:
+            _conn().execute(
+                "UPDATE sessions SET session_meta_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(meta, ensure_ascii=False), time.time(), session_id),
+            )
+        else:
+            _conn().execute(
+                "UPDATE sessions SET session_meta_json = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                (json.dumps(meta, ensure_ascii=False), time.time(), session_id, user_id),
+            )
+
+
+# ---------------------------------------------------------------------------
+# feedback (lawyer's thumbs-up/down on an assistant turn)
+# ---------------------------------------------------------------------------
+
+def record_feedback(
+    *,
+    session_id: str,
+    user_id: str,
+    rating: int,
+    message_id: Optional[int] = None,
+    reason: Optional[str] = None,
+    comment: Optional[str] = None,
+) -> Optional[int]:
+    """Upsert a feedback row keyed by ``(user_id, session_id, message_id)``.
+
+    Returns the row id on success, or ``None`` when the session does not
+    belong to ``user_id`` — we treat cross-tenant feedback as silently
+    dropped (matches the rest of persistence.py's pattern).
+
+    The upsert uses ``ON CONFLICT ... DO UPDATE`` rather than ``INSERT OR
+    REPLACE`` so the auto-incremented ``id`` is preserved across edits
+    (REPLACE deletes and re-inserts, which makes ``id`` churn). That
+    keeps any future audit trail / link-back-by-id stable.
+    """
+    if not session_exists(session_id, user_id=user_id):
+        return None
+    with _STATE["lock"]:
+        cur = _conn().execute(
+            """
+            INSERT INTO feedback
+                (session_id, message_id, user_id, rating, reason, comment, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, session_id, COALESCE(message_id, 0))
+            DO UPDATE SET
+                rating     = excluded.rating,
+                reason     = excluded.reason,
+                comment    = excluded.comment,
+                created_at = excluded.created_at
+            RETURNING id
+            """,
+            (session_id, message_id, user_id, rating, reason, comment, time.time()),
         )
+        row = cur.fetchone()
+        return int(row["id"]) if row else None
+
+
+def list_feedback(session_id: str, user_id: Optional[str] = None) -> list[dict]:
+    """All feedback rows attached to a session.
+
+    Filtered by ``user_id`` when supplied — matches the access model of
+    ``list_messages``. Order is newest-first so the UI can show the
+    lawyer their most-recent verdict at the top without re-sorting.
+    """
+    if user_id is not None and not session_exists(session_id, user_id=user_id):
+        return []
+    rows = _conn().execute(
+        """
+        SELECT id, session_id, message_id, user_id, rating, reason, comment, created_at
+        FROM feedback
+        WHERE session_id = ?
+        ORDER BY created_at DESC, id DESC
+        """,
+        (session_id,),
+    ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "session_id": r["session_id"],
+            "message_id": r["message_id"],
+            "user_id": r["user_id"],
+            "rating": int(r["rating"]),
+            "reason": r["reason"],
+            "comment": r["comment"],
+            "created_at": float(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+def message_belongs_to_session(message_id: int, session_id: str) -> bool:
+    """Cheap referential-integrity check used by the /feedback route.
+
+    The unique index on feedback already prevents duplicate rows per
+    (user, session, message), but it doesn't catch ``message_id`` values
+    that point at a different session's message — that would silently
+    record feedback against the wrong bubble. This guard is the cheap
+    fix.
+    """
+    row = _conn().execute(
+        "SELECT 1 FROM messages WHERE id = ? AND session_id = ?",
+        (message_id, session_id),
+    ).fetchone()
+    return row is not None
 
 
 # ---------------------------------------------------------------------------

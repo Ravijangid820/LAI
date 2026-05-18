@@ -113,6 +113,15 @@ LAI-UI/
 # Micro-services local env (DB credentials, CORS origins, etc.)
 LAI/micro-services/.env
 
+# Local backend env (auth secrets, Brevo key, etc.). The .env.example*
+# templates are committed; the resolved .env files with real values
+# are never. AUTH_PLAN §8.1 puts production secrets at
+# /etc/lai/secrets/*.env outside the repo entirely.
+LAI/.env
+LAI/.env.auth
+LAI/.env.local
+LAI/.env.*.local
+
 # Top-level scripts folder (personal scripts, not project code)
 /scripts/
 
