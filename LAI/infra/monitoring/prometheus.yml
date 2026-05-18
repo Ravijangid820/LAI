@@ -1,0 +1,49 @@
+# Prometheus scrape config for the LAI demo stack.
+#
+# Targets:
+#   - serve_rag (chat backend, port 18000) — HTTP + RAG/feedback metrics
+#   - api.py    (microservices, port 18001) — HTTP metrics + Sumit's auth
+#   - ddiq_report (mounted under /ddiq) — DDiQ pipeline metrics
+#
+# All three FastAPI processes expose ``/metrics`` once the
+# prometheus-fastapi-instrumentator wiring lands; serve_rag is the only
+# one wired today (the others get wired as part of their own metrics
+# stories). Prometheus will simply fail those scrapes until they
+# expose the endpoint — Grafana ignores missing-target series in
+# panels, so no dashboard fallout.
+#
+# Run with:
+#   docker compose -f infra/monitoring/docker-compose.yml up -d
+#
+# When the chat backend is bound to host port 18000, the
+# `host.docker.internal` target works on macOS/Windows; on Linux the
+# compose file adds an explicit `extra_hosts` mapping so the same
+# target works from inside the Prometheus container.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: lai-serve-rag
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:18000"]
+        labels:
+          service: serve_rag
+          component: chat-backend
+
+  - job_name: lai-microservices
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:18001"]
+        labels:
+          service: microservices
+          component: api
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          service: prometheus

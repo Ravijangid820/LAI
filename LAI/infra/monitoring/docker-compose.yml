@@ -1,0 +1,69 @@
+# Local monitoring stack for LAI (TRACK_B_TIMING §6).
+#
+# Two services:
+#   - prometheus:9090 — scrapes serve_rag (and friends) every 15s
+#   - grafana:3000    — visualises Prometheus, auto-provisioned with
+#                       the LAI RAG dashboard
+#
+# Storage is local volumes so a `docker compose down -v` wipes both
+# without touching the host. The chat backend runs OUTSIDE compose
+# (on the host's port 18000 via uvicorn under rj's venv) — both
+# services reach it through ``host.docker.internal`` which is mapped
+# to the host gateway via ``extra_hosts`` for Linux compatibility.
+#
+# Bring up:
+#   docker compose -f infra/monitoring/docker-compose.yml up -d
+# Tear down (keeping dashboards):
+#   docker compose -f infra/monitoring/docker-compose.yml down
+# Tear down + wipe Grafana / Prometheus state:
+#   docker compose -f infra/monitoring/docker-compose.yml down -v
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: lai-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    extra_hosts:
+      # Make the chat backend on the host reachable as
+      # ``host.docker.internal`` on Linux (already works on macOS /
+      # Windows out of the box).
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: lai-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+    environment:
+      # Demo defaults — change before any non-local deploy. Anonymous
+      # viewer access lets the partner-lawyer demo open the dashboard
+      # without a login dance, while admin still requires the password
+      # below.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: lai-demo
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  prom-data:
+  grafana-data:

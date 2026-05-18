@@ -1,0 +1,21 @@
+# Grafana dashboard provisioning.
+#
+# Tells Grafana to load every JSON file in ``/var/lib/grafana/dashboards``
+# at startup (and reload when the file changes). The compose file
+# bind-mounts ``infra/monitoring/grafana/dashboards/`` into that
+# location, so dropping a new dashboard JSON in the repo and
+# restarting Grafana is the whole workflow.
+
+apiVersion: 1
+
+providers:
+  - name: lai-dashboards
+    orgId: 1
+    folder: LAI
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,18 @@
+# Grafana datasource provisioning.
+#
+# Points the freshly-created Grafana container at the colocated
+# Prometheus service. ``isDefault: true`` means every dashboard
+# imported below picks this DS up automatically — no manual click
+# during the demo.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 15s
