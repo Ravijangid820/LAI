@@ -54,11 +54,40 @@ from _reconcile import Candidate, reconcile_categorical, reconcile_numeric
 # paragraphs, removes hedge phrases, and flags mixed-language rows.
 # See ``_guardrail.py`` for the sourced pattern list.
 from _guardrail import apply_to_findings, apply_to_rows
-import fitz  # PyMuPDF
+
+# Shared PDF extractor (PyMuPDF + Tesseract OCR fallback) and chunker
+# (German-legal-aware sentence splitter). One module-level instance of
+# each so callers reuse the lazy ``fitz`` / ``pytesseract`` / ``PIL``
+# imports and the per-instance pydantic config, instead of paying the
+# cost on every upload.
+from lai.common.chunk import Chunk, Chunker, ChunkerConfig
+from lai.common.pdf import PdfExtractor, PdfExtractorConfig
+
+_PDF_EXTRACTOR = PdfExtractor(
+    PdfExtractorConfig(
+        # Keep the existing DDiQ defaults: OCR fallback in DE+EN when an
+        # embedded page produces less than 50 chars of usable text. Lazy
+        # imports of fitz / pytesseract / PIL so this module loads even
+        # without Tesseract on the host (the OCR path raises a typed
+        # exception in that case).
+        ocr_languages="deu+eng",
+        min_chars_per_page=50,
+        ocr_zoom=2.0,
+    )
+)
+_CHUNKER = Chunker(
+    ChunkerConfig(
+        # Sized to match the historical hand-rolled chunker
+        # (chunk_size=1000, overlap=200, no min/max enforced). The new
+        # chunker is sentence-aware so the boundaries land cleaner; the
+        # downstream INSERT into ``ddiq_doc_chunks`` is shape-compatible.
+        target_chars=1000,
+        max_chars=1500,
+        min_chars=100,
+        overlap_chars=200,
+    )
+)
 import numpy as np
-import pytesseract
-from PIL import Image
-import io
 from cadastral_pipeline import (
     CadastralPipeline, PipelineResult, ProjectArea, ClassifiedParcel,
     ClearanceZone, ValidationReport, ContractRecord,
@@ -475,23 +504,50 @@ def clean_value(val, fallback: str = "Not specified in documents") -> str:
     return fallback if s.lower() in ("null", "none", "n/a", "na", "nil", "undefined", "") else s
 
 def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
-    doc = fitz.open(stream=file_bytes, filetype="pdf"); pages = []
-    for page in doc:
-        text = page.get_text().strip()
-        if not text or len(text) < 50:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            text = pytesseract.image_to_string(img, lang="deu+eng")
-        if text.strip(): pages.append(text.strip())
-    doc.close(); return "\n\n".join(pages), len(pages)
+    """Extract joined text + page count from a PDF.
+
+    Thin shim around :class:`lai.common.pdf.PdfExtractor` that preserves
+    the legacy ``(text, page_count)`` tuple shape so the upload route
+    needs no other changes. The shared extractor adds:
+
+      - Structured ``PdfExtractError`` / ``PdfOcrUnavailableError`` on
+        unrecoverable input (was: raw PyMuPDF exceptions).
+      - Provenance tagging per page (embedded vs OCR vs empty) — we
+        discard the tag here since the legacy return type is bare text;
+        promoting to a structured caller is a future refactor.
+      - Quality gate via ``min_page_text_chars`` — same 50-char threshold
+        the legacy code used.
+      - Bounded ``max_pages`` so a 10k-page PDF can't OOM the worker.
+    """
+    result = _PDF_EXTRACTOR.extract_bytes(file_bytes)
+    return result.text, result.page_count
+
 
 def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[dict]:
-    chunks = []; start = 0; idx = 0
-    while start < len(text):
-        ct = text[start:start+chunk_size].strip()
-        if ct: chunks.append({"idx": idx, "text": ct}); idx += 1
-        start += chunk_size - overlap
-    return chunks
+    """Greedy sentence-aware chunking; returns the legacy [{"idx", "text"}] shape.
+
+    Thin shim around :class:`lai.common.chunk.Chunker`. The ``chunk_size``
+    / ``overlap`` arguments are accepted for backwards compatibility but
+    are IGNORED — the module-level ``_CHUNKER`` is pre-configured with
+    matching values (``target_chars=1000``, ``overlap_chars=200``). If
+    a caller ever passes different values, we'd need to either propagate
+    them as a one-off Chunker or document the override; no current
+    caller does so.
+
+    The downstream INSERT into ``ddiq_doc_chunks`` uses ``["idx"]`` and
+    ``["text"]``, so the return shape is preserved exactly.
+    """
+    # Pre-existing callers pass only the defaults; warn loudly if not.
+    if chunk_size != 1000 or overlap != 200:
+        logger.warning(
+            "chunk_text called with non-default args (chunk_size=%s, overlap=%s); "
+            "the shared Chunker config is fixed at 1000/200 — values ignored.",
+            chunk_size, overlap,
+        )
+    return [
+        {"idx": c.index, "text": c.text}
+        for c in _CHUNKER.chunk(text)
+    ]
 
 # Embedding service shape:
 #   - The current LAI runtime exposes vLLM's OpenAI-compatible API at

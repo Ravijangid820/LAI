@@ -37,3 +37,14 @@ tenacity>=9.0.0
 structlog>=24.4.0
 pydantic-settings>=2.7.0
 prometheus-client>=0.21.0
+# Auth subsystem (lai.common.auth + lai.api.auth_router + lai.api.email)
+# added in commits c15f2f1 and 85008f1. Required by ``import ddiq_report``
+# (which now pulls in auth_dep) and ``import api`` (which mounts the
+# auth router). Without these, the container crash-loops at startup.
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+# auth_router uses an asyncpg connection pool for the users / refresh
+# tokens tables (separate from DDiQ's psycopg2 sync access).
+asyncpg>=0.30.0
+# pydantic EmailStr requires the email-validator package at runtime.
+email-validator>=2.0.0

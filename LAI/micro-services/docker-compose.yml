@@ -58,6 +58,12 @@ services:
       - DB_NAME=${DB_NAME:-lai_db}
       - DB_USER=${DB_USER:-lai_user}
       - DB_PASSWORD=${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      # Auth subsystem (lai.common.auth) — secret comes from .env in
+      # production. A dev-only placeholder lets the container start when
+      # the operator hasn't configured a real secret yet; using the
+      # placeholder for actually-issued tokens is unsafe and the
+      # AUTH_PLAN.md §8.1 deployment checklist requires overriding it.
+      - LAI_AUTH_JWT_ACCESS_SECRET=${LAI_AUTH_JWT_ACCESS_SECRET:?Set LAI_AUTH_JWT_ACCESS_SECRET in .env}
       # Application config
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - CORS_ORIGINS=${CORS_ORIGINS:-https://lai-beta.vercel.app,https://lai-pied.vercel.app,https://lai-ashen.vercel.app,http://192.168.178.82:5173,}
