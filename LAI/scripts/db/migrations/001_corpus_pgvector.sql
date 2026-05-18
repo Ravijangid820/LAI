@@ -38,16 +38,25 @@ CREATE INDEX IF NOT EXISTS corpus_parent_doc_id_idx    ON corpus_parent_chunks(d
 CREATE INDEX IF NOT EXISTS corpus_parent_doc_type_idx  ON corpus_parent_chunks(doc_type);
 
 -- ── child_chunks (text + embedding; ~50 M rows when Step 6 completes) ────
--- ``embedding halfvec(4096)`` = fp16 in pgvector. Halves storage vs fp32 with
--- negligible recall loss at this dimensionality. NOT NULL because every row
--- we migrate already has an embedding by definition (we filter on
--- child_embeddings JOIN).
+-- ``embedding halfvec(4000)`` = fp16 in pgvector, truncated to 4000-d.
+--
+-- Why 4000 not the full 4096 that Qwen3-Embedding emits: pgvector caps
+-- HNSW indexes at 4000 dimensions for halfvec (2000 for vector). Qwen3-
+-- Embedding uses Matryoshka representation learning — the model is
+-- trained to be truncatable to any prefix length without recall loss
+-- (per Qwen's HuggingFace model card). The migrate_corpus.py loader
+-- slices ``[:4000]`` on the fp16 array before insert. Index built on
+-- the same column, in a tablespace on the overlay disk so /data doesn't
+-- balloon.
+--
+-- NOT NULL because every row we migrate already has an embedding by
+-- definition (we filter on child_embeddings JOIN).
 CREATE TABLE IF NOT EXISTS corpus_child_chunks (
     id          BIGINT PRIMARY KEY,
     parent_id   BIGINT REFERENCES corpus_parent_chunks(id) ON DELETE CASCADE,
     chunk_id    TEXT,
     content     TEXT NOT NULL,
-    embedding   halfvec(4096) NOT NULL,
+    embedding   halfvec(4000) NOT NULL,
     char_count  INTEGER,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

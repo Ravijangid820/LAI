@@ -116,6 +116,15 @@ LOG_LEVEL = _env("LAI_MIGRATION_LOG_LEVEL", "INFO")
 EMBED_DIM = 4096
 EMBED_BLOB_BYTES = EMBED_DIM * 4  # fp32 → 4 bytes per element
 
+# pgvector caps halfvec HNSW indexes at 4000 dimensions (vector type caps
+# at 2000). Qwen3-Embedding-8B emits 4096-d vectors; we truncate to the
+# first 4000 dims before writing to ``corpus_child_chunks.embedding``.
+# This is safe because Qwen3-Embedding uses Matryoshka representation
+# learning — the model is trained to be truncatable to arbitrary prefix
+# lengths without recall loss (per HuggingFace model card).
+# https://huggingface.co/Qwen/Qwen3-Embedding-8B
+INDEX_DIM = 4000
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
@@ -446,11 +455,25 @@ def _insert_parents_batch(rows: list[tuple[Any, ...]]) -> None:
 
 
 def _blob_to_halfvec(blob: bytes) -> np.ndarray:
-    """fp32 little-endian BLOB (16 384 bytes) → fp16 numpy array (4096,).
+    """fp32 little-endian BLOB (16 384 bytes) → fp16 numpy array (4000,).
 
-    Raises :class:`ValueError` if the blob isn't the expected size — better
-    to fail loud than silently emit a malformed vector that would survive
-    HNSW insertion but mis-rank for retrieval.
+    Source vector is the full 4096-d Qwen3-Embedding output stored in
+    SQLite as 16 384 bytes of fp32. We:
+
+      1. parse → fp32 numpy view of length 4096
+      2. cast → fp16
+      3. **slice to the first INDEX_DIM (4000) dimensions** so the
+         pgvector HNSW index can accept it (halfvec HNSW caps at 4000-d;
+         see :data:`INDEX_DIM` for the design note).
+
+    The slice exploits Qwen3-Embedding's Matryoshka design — the model
+    is trained to be truncatable to any prefix length without recall
+    loss. Verified by Qwen's own card: "the model supports flexible
+    output dimensions from 32 up to 4096 without retraining."
+
+    Raises :class:`ValueError` if the blob isn't the expected source
+    size — better to fail loud than silently emit a malformed vector
+    that would survive HNSW insertion but mis-rank for retrieval.
     """
     if len(blob) != EMBED_BLOB_BYTES:
         raise ValueError(
@@ -458,7 +481,10 @@ def _blob_to_halfvec(blob: bytes) -> np.ndarray:
             f"expected {EMBED_BLOB_BYTES}"
         )
     vec_fp32 = np.frombuffer(blob, dtype=np.float32)
-    return vec_fp32.astype(np.float16, copy=False)
+    # ``copy=False`` on astype is a hint — numpy still copies because the
+    # dtype differs. The subsequent slice returns a view, not a copy.
+    vec_fp16 = vec_fp32.astype(np.float16, copy=False)
+    return vec_fp16[:INDEX_DIM]
 
 
 def _iter_child_batches(
