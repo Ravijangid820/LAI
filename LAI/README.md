@@ -283,35 +283,69 @@ for the current run's config and lessons learned.
 - [Architecture Overview](docs/architecture/overview.md)
 - [Infrastructure Guide](docs/INFRASTRUCTURE.md)
 - [Development Guide](docs/DEVELOPMENT.md)
-- [Improvement Roadmap](docs/analysis/LAIV5_IMPROVEMENTS.md)
-- [Project History (V1-V4)](docs/analysis/LAI_PROJECT_ANALYSIS.md)
+- [Contributor contract + quality gate](CONTRIBUTING.md)
+- [v1 Strategy + 10-day roadmap](docs/LAI_V1_STRATEGY.md)
+- [Demo Status](docs/DEMO_STATUS.md) · [UI Guide](docs/UI_GUIDE.md)
+- [Architecture Decision Records](docs/adr/)
 
 ## Project Structure
 
 `src/lai/` is an installable package — `uv sync` (or `pip install -e .`)
 makes `from lai... import ...` work everywhere, with no `sys.path` hacks.
 Each subpackage is one **domain**; ownership is declared in
-[`.github/CODEOWNERS`](../.github/CODEOWNERS) and each package has its own
-`README.md`. See [`src/lai/README.md`](src/lai/README.md) for the package map.
+[`.github/CODEOWNERS`](../.github/CODEOWNERS). See
+[`src/lai/README.md`](src/lai/README.md) for the package map.
 
 ```
 src/lai/                  Installable domain-driven package (`lai`)
-  core/                   Config, logging, exceptions, models
-  api/                    FastAPI app + serve_rag.py (the chat backend, :18000)
-  auth/                   JWT authentication, user management
-  documents/              Upload, parse, chunk, embed, store
-  search/                 Hybrid search, reranking + eval.py (retrieval eval harness)
-  generation/             LLM client, prompts, CRAG, citation verification
-  infra/                  Database pool, Redis cache, MinIO client
-  pipeline/               Data processing pipeline (6 steps; cli.py is the entry point)
-micro-services/           DDiQ due-diligence report service (:18001)
+  common/                 Shared production-grade primitives — the v1 foundation.
+                          Held to strict mypy + ruff + ≥85% coverage + bandit.
+    llm/                    LlmClient (async + sync), strip_think, salvage_json
+    embedding/              EmbeddingClient + sync façade
+    reranker/               RerankerClient (TEI /rerank)
+    pdf/                    PdfExtractor with OCR fallback
+    chunk/                  German-legal-aware Chunker
+    citation/               Extract + validate [C-n]/[M-n] handles, strip fabricated ones
+    jurisdiction/           Bundesland detection + JurisdictionWarning
+    auth/                   JWT auth + tenant isolation (Sumit's work)
+  pipeline/               Offline 6-step corpus build (`python -m lai.pipeline.cli`)
+  search/                 Retrieval kernel — eval.py (Corpus, dense + BM25 + RRF, Reranker)
+  analyzer/               Qwen3.6-27B contract analyzer — playbooks, prompts, schema
+  api/                    serve_rag.py (the :18000 chat backend) + auth_router + metrics
+  core/                   Config, logging, exceptions, constants
+
+  (Deleted on 2026-05-15: auth/, documents/, extraction/, generation/, infra/, and
+   api/main.py + api/pipeline.py — unwired FastAPI scaffolding that never talked to
+   the live corpus. Capabilities moved into lai.common; equivalents will return in
+   a forthcoming `lai.retrieval` package as part of v1.1.)
+
+micro-services/           DDiQ due-diligence report service (:18001, Docker)
+infra/monitoring/         Prometheus + Grafana stack — backend exposes /metrics
 scripts/
-  ops/                    Operational entry points — start/stop/status{,-host}.sh,
-                          resume_step5/6.sh (host-mode variants run Docker-free)
-  eval/                   Eval & benchmark harnesses (rag_*, vllm_compare, ...)
-  db/                     DB export / backup / restore utilities
+  ops/                    Entry points — start/stop/status{,-host}.sh, resume_step5/6.sh,
+                          migrate_corpus.py (Track B), load_demo_matter.py
+  eval/                   Eval & benchmark harnesses + golden_retrieval_sanity.py
+  db/migrations/          SQL migrations (auth + tenant isolation; corpus → pgvector)
   archive/                Completed one-off migrations, audits, pilots
 training/                 Model fine-tuning (separate lifecycle)
-tests/                    Unit, integration, E2E tests
-docs/                     Documentation
+tests/                    Unit / integration / e2e (strict-gated under lai.common)
+docs/                     Documentation (incl. adr/ and the v1 strategy/demo docs)
+demo-seed/                Curated demo matters (e.g. lamstedt/) — input to load_demo_matter.py
 ```
+
+## v1 features (as of 2026-05-18, see [`docs/DEMO_STATUS.md`](docs/DEMO_STATUS.md))
+
+The chat backend (`lai.api.serve_rag`) wires the `lai.common` primitives into a
+production-grade Q&A flow:
+
+- **Streaming** answers via `POST /query/stream` (SSE) + non-streaming `POST /query`
+- **Citation rigor** — `[C-n]` / `[M-n]` handles in retrieved chunks; `lai.common.citation.validate_citations` strips fabricated handles post-LLM and rewrites the sentence to end `(unbelegt)`
+- **Jurisdictional sanity** — `lai.common.jurisdiction.check_jurisdiction` returns a `JurisdictionWarning` when the matter's Bundesland disagrees with citations
+- **Auth + tenant isolation** — JWT (`POST /auth/login`, `auth_router`), per-tenant scoping
+- **Feedback** — `POST /feedback` lawyer thumbs-up/down, persisted, optimistic UI
+- **Observability** — `/metrics` Prometheus endpoint; 9-panel Grafana dashboard at [`infra/monitoring/`](infra/monitoring/)
+- **Bilingual EN ⇄ DE** — `target_language` on `/query`
+
+## Quality gate
+
+[`Makefile`](Makefile) + [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) run the same checks locally and in CI: `ruff` (lint+format), `mypy --strict` on `lai.common`, `pytest` with ≥85 % branch coverage on `lai.common`, `bandit` security scan. See [`CONTRIBUTING.md`](CONTRIBUTING.md) — *"if `make check` doesn't pass locally, your change is not done."*

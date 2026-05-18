@@ -37,25 +37,28 @@ LAI is a German legal AI platform for wind energy due diligence. It answers lega
    +---------------------------------------------------+
 ```
 
-## Packages (Domain-Driven)
+## Packages
 
-`src/lai/` is an installable package (`uv sync` / `pip install -e .`). Each
-subpackage is one domain with its own `README.md`; review ownership is in
-[`.github/CODEOWNERS`](../../../.github/CODEOWNERS) (owner column below uses
-its team scheme).
+`src/lai/` is an installable package (`uv sync` / `pip install -e .`). Review
+ownership is in [`.github/CODEOWNERS`](../../../.github/CODEOWNERS) (owner
+column below uses its team scheme). The **v1 demo restructure** (2026-05-15)
+collapsed the previous wide domain layout into a strict-gated `lai.common`
+foundation plus the runtime packages that actually ship.
 
-| Package | Owner | Purpose | Key Files |
-|---------|-------------|---------|-----------|
-| `lai.core` | platform | Config, models, logging, utils, exceptions, constants | config.py, models.py, logging.py, constants.py, utils.py, exceptions.py |
-| `lai.infra` | platform | Infrastructure clients: DB pool, MinIO, Redis | database.py, minio.py, redis.py |
-| `lai.api` | platform | FastAPI app shell + `serve_rag.py` (the :18000 chat backend) | main.py, serve_rag.py, pipeline.py |
-| `lai.auth` | platform | Auth: JWT, users, sessions, per-user schema creation | jwt.py, repository.py, routes.py |
-| `lai.documents` | ingestion | Document ingestion: parsing, chunking, embedding, CRUD | chunker.py, embedder.py, parser.py, repository.py, routes.py |
-| `lai.extraction` | ingestion | Location/geo extraction from legal docs | location.py, models.py, repository.py, routes.py |
-| `lai.search` | retrieval | Hybrid search, reranking, query analysis + `eval.py` (retrieval eval) | hybrid_search.py, query_analyzer.py, reranker.py, eval.py, repository.py, routes.py |
-| `lai.generation` | generation | LLM: prompt building, CRAG grading, citation verification | llm_client.py, prompt_builder.py, citation_verifier.py, crag.py |
-| `lai.analyzer` | contract-analyzer | Qwen3.6-27B contract analyzer — playbooks, prompts, schema | pipeline.py, playbooks.py, prompts.py, schema.py, reconciler.py |
-| `lai.pipeline` | data-pipeline | The 6-step corpus build (`python -m lai.pipeline.cli`) | cli.py, convert.py, chunk.py, classify.py, enrich.py, generate.py, embed.py |
+| Package | Owner | Purpose | Key files |
+|---|---|---|---|
+| `lai.common` | platform/foundation | Strict-gated shared primitives — held to `mypy --strict` + ≥85 % branch coverage + bandit. Building blocks every other module imports. | `llm/`, `embedding/`, `reranker/`, `pdf/`, `chunk/`, `citation/`, `jurisdiction/`, `auth/`, `exceptions.py` |
+| `lai.api` | api/chat | `serve_rag.py` — the :18000 chat backend; auth router; metrics endpoint. | `serve_rag.py`, `auth_router.py`, `metrics.py`, `email.py` |
+| `lai.search` | retrieval | Retrieval kernel — `Corpus`, dense + BM25 + RRF fusion, in-process `Reranker`. Used by `serve_rag` + eval scripts. | `eval.py` |
+| `lai.analyzer` | contract-analyzer | Qwen3.6-27B contract analyzer — playbooks, prompts, schema, cadastral NER, reconciler. | `pipeline.py`, `playbooks.py`, `prompts.py`, `schema.py`, `reconciler.py`, `cadastral_ner.py`, `llm_client.py` |
+| `lai.pipeline` | data-pipeline | Offline 6-step corpus build. | `cli.py`, `convert.py`, `chunk.py`, `classify.py`, `enrich.py`, `generate.py`, `embed.py`, `utils/` |
+| `lai.core` | platform | Config, constants, logging, utils, exceptions. Imported by `pipeline` and `analyzer`. | `config.py`, `models.py`, `logging.py`, `constants.py`, `utils.py`, `exceptions.py` |
+
+> **Removed on 2026-05-15** (commit `8431797`): `lai.auth`, `lai.documents`,
+> `lai.extraction`, `lai.generation`, `lai.infra`, plus `api/main.py` +
+> `api/pipeline.py`. These were unwired FastAPI scaffolding that never talked
+> to the live corpus. Their capabilities migrated into `lai.common`;
+> retrieval/document services return as `lai.retrieval` in v1.1.
 
 ## RAG Pipeline (8 steps + CRAG loop)
 

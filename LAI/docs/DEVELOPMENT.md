@@ -1,6 +1,6 @@
 # LAI - Development Guide
 
-> **What's runtime today.** The MVP runtime is a two-service split: the conversational chat (`lai.api.serve_rag`, `:18000`) and the DDiQ due-diligence microservice (`micro-services/`, `:18001` Docker). The frontend is in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), conventionally cloned to `/data/projects/lai/LAI-UI/`. As of the v2 restructure, `src/lai/` is an installable package (`uv sync` / `pip install -e .`) and `serve_rag` lives in it at `lai.api.serve_rag`; the unified FastAPI app shell (`lai.api.main`) is still the design target and not yet the shipping entry point. See [`MVP_DELIVERY.md`](MVP_DELIVERY.md) and [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+> **What's runtime today.** The MVP runtime is a two-service split: the conversational chat (`lai.api.serve_rag`, `:18000`) and the DDiQ due-diligence microservice (`micro-services/`, `:18001` Docker). The frontend is in its own repo, [LAI-UI](https://github.com/Ravijangid820/LAI-UI), conventionally cloned to `/data/projects/lai/LAI-UI/`. `src/lai/` is an installable package (`uv sync` / `pip install -e .`); the **v1 demo restructure** (2026-05-15) collapsed it to a strict-gated `lai.common` foundation plus the runtime packages that actually ship. See [`LAI_V1_STRATEGY.md`](LAI_V1_STRATEGY.md), [`DEMO_STATUS.md`](DEMO_STATUS.md), [`CONTRIBUTING.md`](../CONTRIBUTING.md), and [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
 
 ## Project Structure
 
@@ -12,40 +12,63 @@ Each subpackage is one **domain** with its own `README.md`; ownership is in
 
 ```
 LAI/
-├── src/lai/                      # Installable domain-driven package (`lai`)
-│   ├── core/                     # Config, constants, models, logging, utils, exceptions
-│   ├── api/                      # FastAPI app shell + serve_rag.py (chat backend, :18000)
-│   ├── auth/                     # JWT auth, user CRUD, routes
-│   ├── documents/                # Chunking, embedding, parsing, document CRUD, routes
-│   ├── search/                   # Hybrid search, reranking, routes + eval.py (retrieval eval)
-│   ├── generation/               # LLM client, prompts, CRAG grading, citation verification
-│   ├── infra/                    # Database pool, Redis cache, MinIO client
-│   └── pipeline/                 # Data processing pipeline (6 steps, CLI)
+├── src/lai/                      # Installable package (`lai`)
+│   ├── common/                   # Strict-gated shared primitives (the v1 foundation)
+│   │   ├── llm/                  # LlmClient (async + sync), strip_think, salvage_json, metrics
+│   │   ├── embedding/            # EmbeddingClient + sync façade
+│   │   ├── reranker/             # RerankerClient (TEI /rerank)
+│   │   ├── pdf/                  # PdfExtractor with OCR fallback
+│   │   ├── chunk/                # German-legal-aware Chunker
+│   │   ├── citation/             # Extract + validate [C-n]/[M-n] handles (strips fabricated)
+│   │   ├── jurisdiction/         # Bundesland detection + JurisdictionWarning
+│   │   └── auth/                 # JWT auth + tenant isolation
+│   ├── api/                      # serve_rag.py (chat :18000) + auth_router + metrics
+│   ├── search/                   # eval.py — retrieval kernel (Corpus, dense + BM25 + RRF, Reranker)
+│   ├── analyzer/                 # Qwen3.6-27B contract analyzer (playbooks, prompts, schema)
+│   ├── pipeline/                 # Offline 6-step corpus build (CLI)
+│   └── core/                     # Config, constants, logging, utils, exceptions
+│   #
+│   # Removed on 2026-05-15 (commit 8431797): auth/, documents/, extraction/,
+│   # generation/, infra/, api/main.py, api/pipeline.py — unwired FastAPI scaffolding.
+│   # Capabilities migrated into lai.common; retrieval/document services return as
+│   # `lai.retrieval` in v1.1. See src/lai/README.md.
 │
-├── micro-services/               # Runtime DDiQ microservice (lai-backend, :18001)
+├── micro-services/               # DDiQ microservice (lai-backend, :18001, Docker)
 │   ├── api.py                    # FastAPI app with the /ddiq/* routes
-│   ├── ddiq_report.py            # Pipeline + extraction passes (Evidence, Timeline, Grundbuch, Rückbau, ...)
+│   ├── ddiq_report.py            # Pipeline + 8 LLM extraction passes
 │   ├── cadastral_pipeline.py     # 13-step parcel pipeline + 10H rule
-│   ├── docker-compose.yml        # Container definition
-│   └── Dockerfile
+│   ├── _guardrail.py             # validation/guardrail layer (v1)
+│   ├── _reconcile.py             # deterministic cross-source reconciler (v1)
+│   └── auth_dep.py               # JWT verification dependency (v1)
 │
+├── infra/monitoring/             # Prometheus + Grafana stack (9-panel lai-rag dashboard)
 ├── scripts/
-│   ├── ops/                      # Entry points — start/stop/status{,-host}.sh, resume_step5/6.sh
-│   ├── eval/                     # Eval & benchmark harnesses (rag_*, vllm_compare, ...)
-│   ├── db/                       # DB export / backup / restore utilities
-│   └── archive/                  # Completed one-off migrations, audits, pilots
+│   ├── ops/                      # Entry points: start/stop/status{,-host}.sh, resume_step5/6.sh,
+│   │                             # migrate_corpus.py (Track B), load_demo_matter.py
+│   ├── eval/                     # Eval harnesses + golden_retrieval_sanity.py
+│   ├── db/migrations/            # SQL migrations (auth + tenant; corpus → pgvector)
+│   └── archive/                  # Completed one-offs
 │
-├── training/                     # Model training (separate lifecycle)
-├── tests/                        # Test suites (unit, integration, e2e)
-├── docs/                         # Documentation
-├── pyproject.toml
-└── .github/CODEOWNERS            # Per-domain review ownership
+├── tests/                        # Strict-gated unit / integration / e2e
+├── docs/
+│   ├── adr/                      # Architecture Decision Records 0000–0004
+│   ├── LAI_V1_STRATEGY.md        # Master strategy + 10-day roadmap
+│   ├── DEMO_STATUS.md            # Live state vs strategy
+│   └── UI_GUIDE.md, WORKFLOW.md, PROJECT_STATUS.md, ...
+├── demo-seed/                    # Curated demo matters (input to load_demo_matter.py)
+├── training/                     # Model fine-tuning (separate lifecycle)
+├── Makefile · CONTRIBUTING.md    # `make check` — the single quality gate
+├── .pre-commit-config.yaml
+└── pyproject.toml                # `lai` v2.0.0, Python ≥ 3.13, uv-managed
 
 # Sibling clone (its own repo — not under LAI/)
 /data/projects/lai/LAI-UI/        # Frontend (Vite + React) — github.com/Ravijangid820/LAI-UI
 ```
 
-Each domain package under `src/lai/` contains its own `routes.py` (API endpoints), business logic, and `repository.py` (database operations).
+**The strict-gated foundation (`lai.common`)** — every new module enters
+here under `mypy --strict`, full ruff rule set, ≥85 % branch coverage, and a
+clean bandit scan. Legacy paths (serve_rag.py internals, DDiQ, the pipeline)
+stay permissive and migrate in module-by-module. See [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
 
 ## Quick Start
 
@@ -140,12 +163,12 @@ All steps log extensively to aid debugging. Logs include step timing, batch prog
 
 ## Adding a New Feature
 
-1. Add code to the appropriate domain package (`documents/`, `search/`, `generation/`, `auth/`)
-2. Each package is self-contained: routes, logic, and repository in one place
-3. Shared utilities go in `core/`, infrastructure clients in `infra/`
-4. Add tests in `tests/unit/` or `tests/integration/`
-5. If it needs a new config value: add to the appropriate settings class in `config.py`
-6. If it needs a feature flag: add a `bool` field with default `False`
+1. Prefer landing reusable primitives in **`lai.common`** — that's where the strict gate (`mypy --strict`, ≥85 % branch coverage, full ruff, bandit) lives, and the building blocks (`LlmClient`, `EmbeddingClient`, `RerankerClient`, `Chunker`, `PdfExtractor`, citation/jurisdiction utils) get reused across `serve_rag`, DDiQ, and the pipeline.
+2. Wire from the live consumer — `lai.api.serve_rag` for chat; `micro-services/` for DDiQ; `lai.pipeline.cli` for batch. Don't duplicate logic across consumers — pull the shared piece up into `lai.common` instead.
+3. If the new code introduces a tunable, add it to `lai.common.<sub>/config.py` (pydantic-settings) and document any environment variables in `.env.example.auth` style.
+4. Add tests in `tests/unit/common/<sub>/` (covered by the gate). Integration tests under `tests/integration/`.
+5. Architecturally novel decisions get a new ADR under [`docs/adr/`](adr/) (see ADR 0000 for the template).
+6. **Run `make check` locally before committing** — CI runs the same. [`CONTRIBUTING.md`](../CONTRIBUTING.md) has the contract.
 
 ## Versioning
 

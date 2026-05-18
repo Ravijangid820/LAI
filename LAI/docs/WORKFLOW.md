@@ -76,28 +76,44 @@ PDF/DOCX  →  Docling (text + tables)  →  segment  →  embed  →  store in-
 Per-session uploaded documents live in process memory, so the next `/query` in
 that session can retrieve over *both* the global corpus and the user's own doc.
 
-### B2 — Asking a question (`POST /query`)
+### B2 — Asking a question (`POST /query` and `POST /query/stream`)
 
 ```
 question
-  → route        (RAG / plain chat / contract / rag+contract)
-  → embed query  (Qwen3-Embedding-8B)
-  → retrieve     dense exact-cosine (corpus.embs @ q_vec)  +  BM25
-  → fuse         Reciprocal Rank Fusion (RRF)
-  → rerank       Qwen3-Reranker-8B cross-encoder, in-process on GPU
-  → generate     Qwen3.6-27B (remote vLLM, thinking mode) writes a cited answer
-  → return       { answer, chunks, timings, tokens, session_id }
+  → route               (RAG / plain chat / contract / rag+contract)
+  → embed query         (lai.common.embedding.EmbeddingClient → Qwen3-Embedding-8B)
+  → retrieve            dense exact-cosine + BM25 (lai.search.eval)
+  → fuse                Reciprocal Rank Fusion (RRF)
+  → rerank              lai.common.reranker.RerankerClient → Qwen3-Reranker-8B in-proc
+  → generate            lai.common.llm.SyncLlmClient → Qwen3.6-27B (thinking mode);
+                        strip_think + salvage_json applied server-side
+  → citation validate   lai.common.citation.validate_citations strips fabricated
+                        [C-n]/[M-n] handles, rewrites the sentence to "(unbelegt)"
+  → jurisdiction check  lai.common.jurisdiction.check_jurisdiction returns a
+                        JurisdictionWarning if Bundesland disagrees with citations
+  → return              { answer, chunks, citation_validation, jurisdiction_warning,
+                          timings, tokens, session_id }
 ```
 
-Retrieval, BM25, RRF and the reranker all live in
-[`lai.search.eval`](../src/lai/search/eval.py). The fuller design also has CRAG
-(retrieval-quality grading + correction) and citation verification in
-[`lai.generation`](../src/lai/generation/).
+`POST /query/stream` is the same flow with **SSE token streaming**; the trailing
+SSE event carries the validation + warning payload.
+
+The `lai.common` building blocks (`llm`, `embedding`, `reranker`, `citation`,
+`jurisdiction`) are held to `mypy --strict` + ≥85 % branch coverage —
+[`CONTRIBUTING.md`](../CONTRIBUTING.md). The `serve_rag` legacy paths consume
+them; new modules go directly under `lai.common`.
 
 **Conversational memory:** each session keeps a rolling 32-message window plus
 LLM-extracted "pinned" stable facts (who the user is, the matter they're on).
 Both are replayed into the prompt; vLLM prefix caching keeps the repeated
 context cheap.
+
+**Auth + tenant isolation:** every `/query*` and `/sessions/*` call is JWT-gated
+via `lai.api.auth_router` (backed by `lai.common.auth`). Sessions and uploaded
+documents are scoped per tenant.
+
+**Lawyer feedback:** `POST /feedback` persists thumbs-up/down per message — the
+UI's optimistic chip rehydrates from the persisted verdict on reload.
 
 ### B3 — Analyzing a contract (`POST /analyze-contract`)
 
@@ -118,10 +134,14 @@ documents into a structured due-diligence report. It's a separate codebase
 ### C1 — Uploading documents (`POST /ddiq/documents/upload`)
 
 ```
-PDF  →  PyMuPDF text extraction (Tesseract OCR fallback for scans)
-     →  chunk  →  4096-dim Qwen3-Embedding-8B vectors  →  pgvector
-        (ddiq_documents / ddiq_doc_chunks tables)
+PDF  →  lai.common.pdf.PdfExtractor (PyMuPDF text + Tesseract OCR fallback)
+     →  lai.common.chunk.Chunker (German-legal-aware)
+     →  4096-dim Qwen3-Embedding-8B vectors (via lai.common.embedding)
+     →  pgvector (ddiq_documents / ddiq_doc_chunks tables)
 ```
+
+DDiQ adopted the `lai.common.pdf` + `lai.common.chunk` primitives in commit
+`9c0a8cf` so bug fixes land once across both backends.
 
 ### C2 — Generating a report (`POST /ddiq/report/generate/async`)
 
@@ -131,6 +151,11 @@ Returns `{ report_id, status: "queued", cached? }` immediately. A
 returns the cached report instantly. Progress is checkpointed incrementally as
 JSONB so a crash can resume (`reap_orphans()` runs on startup). Poll
 `GET /ddiq/report/{id}/status`, fetch `GET /ddiq/report/{id}` when done.
+
+A **guardrail layer** (`_guardrail.py`) validates LLM output before it lands
+in the report; a **deterministic cross-source reconciler** (`_reconcile.py`)
+merges findings from multiple documents. Geocoding has a plausibility gate +
+cache TTL.
 
 Inside the worker, two things run:
 
@@ -175,7 +200,21 @@ timeline, cross-doc findings, Grundbuch checks, the Rückbau bond, and a
 Both backends are stateless-ish front-ends over the **same two model servers**
 (embedding + analyzer LLM) and the **same PostgreSQL**. `serve_rag` additionally
 holds the big in-RAM embedding matrix and the in-process reranker; DDiQ reaches
-the reranker over HTTP.
+the reranker over HTTP. Both consume `lai.common` primitives so bug fixes land
+once across both codebases.
+
+**Track B — corpus → pgvector migration:** `scripts/ops/migrate_corpus.py`
+streams the SQLite corpus into pgvector with a `topup` daemon that keeps the
+two stores in sync as Step 6 emits new embeddings. `serve_rag` still uses the
+in-RAM SQLite matrix today; the switch to pgvector retrieval is a separate
+commit after the HNSW index finishes building (per
+[`DEMO_STATUS.md`](DEMO_STATUS.md)).
+
+**Observability:** both backends expose `/metrics` for Prometheus, scraped by
+the stack at [`infra/monitoring/`](../infra/monitoring/) (`docker compose -f
+infra/monitoring/docker-compose.yml up`). A 9-panel Grafana dashboard renders
+request latency, token usage, citation-validation counts, and retrieval
+quality.
 
 Bring it all up with [`scripts/ops/start.sh`](../scripts/ops/start.sh) (Docker)
 or [`start-host.sh`](../scripts/ops/start-host.sh) (Docker-free, host
@@ -189,9 +228,13 @@ several ways — `harsh/TECH_STACK.md` §14 catalogs them.)
 
 | You want to… | Read |
 |---|---|
-| See the tech stack | Tech Stack table in [`PROJECT_STATUS.md`](PROJECT_STATUS.md) (+ `harsh/TECH_STACK.md` for the exhaustive WIP inventory) |
-| See the feature list / what ships | [`MVP_DELIVERY.md`](MVP_DELIVERY.md) |
-| Understand one domain package deeply | `src/lai/<package>/README.md` |
-| See the architecture diagram + parameters | [`architecture/overview.md`](architecture/overview.md) |
+| Current v1 demo state + remaining work | [`DEMO_STATUS.md`](DEMO_STATUS.md) |
+| Master strategy + 10-day roadmap + USPs | [`LAI_V1_STRATEGY.md`](LAI_V1_STRATEGY.md) |
+| See the tech stack | Tech Stack table in [`PROJECT_STATUS.md`](PROJECT_STATUS.md) (+ `harsh/TECH_STACK.md` for the exhaustive code-grounded inventory) |
+| Architecture diagram + parameters | [`architecture/overview.md`](architecture/overview.md) |
+| Feature list / what ships | [`MVP_DELIVERY.md`](MVP_DELIVERY.md) |
+| Architecture decisions on `lai.common.llm` | [`adr/`](adr/) (ADRs 0000–0004) |
+| Contributor contract + quality gate | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
+| Per-screen UI design | [`UI_GUIDE.md`](UI_GUIDE.md) |
 | Onboard as a developer | [`PROJECT_STATUS.md`](PROJECT_STATUS.md), [`DEVELOPMENT.md`](DEVELOPMENT.md) |
-| Run / operate the stack | [`scripts/ops/README.md`](../scripts/ops/README.md) |
+| Run / operate the stack | [`../scripts/ops/README.md`](../scripts/ops/README.md) |

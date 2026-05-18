@@ -75,73 +75,96 @@ User Query
 
 ## Project Structure
 
-As of the **v2 restructure**, `src/lai/` is an installable package (`uv sync`
-/ `pip install -e .`) — `from lai... import ...` works everywhere, no
-`sys.path` hacks. `scripts/` is organized by purpose, and each `src/lai/`
-subpackage has its own `README.md` (see [`src/lai/README.md`](../src/lai/README.md)).
+`src/lai/` is an installable package (`uv sync` / `pip install -e .`) — `from
+lai... import ...` works everywhere, no `sys.path` hacks. The **v1 demo
+restructure** (2026-05-15) collapsed the previous wide domain layout into a
+strict-gated `lai.common` foundation plus the runtime packages that actually
+ship. See [`src/lai/README.md`](../src/lai/README.md) for the canonical map.
 
 ```
 /data/projects/lai/
 ├── LAI/                              # Application code
-│   ├── src/lai/                      # Installable domain-driven package (`lai`)
-│   │   ├── core/                     # Config, logging, exceptions, models, constants
-│   │   ├── api/                      # FastAPI app shell + serve_rag.py (chat backend, :18000)
-│   │   ├── auth/                     # JWT auth, user CRUD, routes
-│   │   ├── documents/                # Upload, parse, chunk, embed, store
-│   │   ├── extraction/               # Location/geo extraction from legal docs (LLM-based)
-│   │   ├── search/                   # Hybrid search, reranking + eval.py (retrieval eval harness)
-│   │   ├── generation/               # LLM client, prompts, CRAG, citation verification
-│   │   ├── infra/                    # Database pool, Redis cache, MinIO client
-│   │   └── pipeline/                 # Data processing pipeline (Steps 1-6)
-│   ├── micro-services/               # DDiQ due-diligence report service (lai-backend, :18001)
+│   ├── src/lai/                      # Installable package (`lai`)
+│   │   ├── common/                   # Production-grade shared primitives — held to strict
+│   │   │   │                         # mypy + ruff + ≥85% coverage + bandit (CONTRIBUTING.md)
+│   │   │   ├── llm/                  # LlmClient (async+sync), strip_think, salvage_json, metrics
+│   │   │   ├── embedding/            # EmbeddingClient + sync façade
+│   │   │   ├── reranker/             # RerankerClient (TEI /rerank)
+│   │   │   ├── pdf/                  # PdfExtractor + OCR fallback
+│   │   │   ├── chunk/                # German-legal-aware Chunker
+│   │   │   ├── citation/             # [C-n]/[M-n] extract + validate (strips fabricated)
+│   │   │   ├── jurisdiction/         # Bundesland detection + JurisdictionWarning
+│   │   │   └── auth/                 # JWT auth + tenant isolation
+│   │   ├── api/                      # serve_rag.py (chat backend :18000) + auth_router + metrics
+│   │   ├── search/                   # eval.py — retrieval kernel (Corpus, dense+BM25+RRF, Reranker)
+│   │   ├── analyzer/                 # Qwen3.6-27B contract analyzer (playbooks, prompts, schema)
+│   │   ├── pipeline/                 # 6-step corpus build (`python -m lai.pipeline.cli`)
+│   │   └── core/                     # Config, logging, exceptions, constants
+│   │
+│   │   (Deleted on 2026-05-15: auth/, documents/, extraction/, generation/, infra/, and
+│   │    api/main.py + api/pipeline.py — unwired FastAPI scaffolding that never talked to
+│   │    the live corpus. Capabilities migrated into lai.common; equivalent retrieval/
+│   │    document services return as `lai.retrieval` in v1.1.)
+│   │
+│   ├── micro-services/               # DDiQ due-diligence report service (:18001, Docker)
+│   ├── infra/monitoring/             # Prometheus + Grafana stack (9-panel dashboard)
 │   ├── scripts/
-│   │   ├── ops/                      # Entry points — start/stop/status{,-host}.sh, resume_step5/6.sh
-│   │   ├── eval/                     # Eval & benchmark harnesses (rag_*, vllm_compare, ...)
-│   │   ├── db/                       # DB export / backup / restore utilities
+│   │   ├── ops/                      # start/stop/status{,-host}.sh, resume_step{5,6}.sh,
+│   │   │                             #   migrate_corpus.py (Track B), load_demo_matter.py
+│   │   ├── eval/                     # Eval harnesses + golden_retrieval_sanity.py
+│   │   ├── db/migrations/            # 001_auth_and_tenant_isolation, 001_corpus_pgvector
 │   │   └── archive/                  # Completed one-off migrations, audits, pilots
+│   ├── docs/
+│   │   ├── adr/                      # Architecture Decision Records (0000-0004 on lai.common.llm)
+│   │   ├── LAI_V1_STRATEGY.md        # Master strategy + 10-day roadmap
+│   │   ├── DEMO_STATUS.md            # Demo state vs strategy (refreshed during the sprint)
+│   │   ├── UI_GUIDE.md               # Per-screen UI design
+│   │   └── WORKFLOW.md               # End-to-end data-flow narrative
+│   ├── demo-seed/                    # Curated demo matters (input to load_demo_matter.py)
 │   ├── training/                     # Model fine-tuning (separate lifecycle)
-│   ├── tests/                        # Unit, integration, E2E
-│   ├── logs/                         # Auto-generated logs (pipeline/ per step, host/ per service)
-│   ├── docs/                         # Documentation
-│   └── pyproject.toml
+│   ├── tests/                        # Unit / integration / e2e (strict-gated on lai.common)
+│   ├── logs/                         # pipeline/ + host/ + migration/
+│   ├── Makefile · CONTRIBUTING.md    # The quality gate contract — `make check`
+│   ├── .pre-commit-config.yaml
+│   └── pyproject.toml                # `lai` v2.0.0, Python ≥3.13, uv-managed
 │
-├── .github/CODEOWNERS                # Per-domain review ownership
+├── .github/
+│   ├── CODEOWNERS                    # Per-domain review ownership
+│   └── workflows/ci.yml              # ruff + mypy strict + pytest+cov + bandit
 └── Docker/                           # Containerized services (one dir per service)
-    ├── database/
-    │   ├── pgvector/                 # PostgreSQL + pgvector (port 5434)
-    │   ├── minio/                    # Object storage (port 9000)
-    │   └── redis/                    # Cache (port 6380)
-    ├── embedding/                    # Qwen3-Embedding-8B via vLLM (port 8003, GPU 0)
-    ├── reranker/                     # MiniLM via vLLM (port 8004, GPU 0)
-    ├── llm/                          # Qwen2.5-7B via vLLM (port 8001, GPU 1)
-    ├── mlflow/                       # Experiment tracking (port 5000)
-    └── monitoring/                   # Prometheus (9090) + Grafana (3001)
+    ├── database/{pgvector,minio,redis}/
+    ├── embedding/                    # Qwen3-Embedding-8B vLLM (port 8003, GPU 1)
+    ├── reranker/                     # TEI MiniLM (legacy DDiQ-side reranker on :8004)
+    ├── llm/                          # Qwen3.6-27B analyzer vLLM (port 8005, GPU 0)
+    └── mlflow/                       # Experiment tracking
 ```
 
-### Why Domain-Driven?
+### Why this shape?
 
-Packages are organized by **business domain** (documents, search, generation, auth), not by technical layer (retrieval, ingestion, db). This means:
-
-- Each developer owns a package end-to-end (routes → logic → repository)
-- Merge conflicts are rare — you mostly work in your own package
-- Each package has its own `routes.py` (API), logic files, and `repository.py` (DB)
+`lai.common` is the **discipline layer** — strict mypy + ≥85% branch coverage +
+bandit. Every new module enters here under the strict gate; legacy paths
+(serve_rag.py, DDiQ, the pipeline) stay permissive and migrate in module-by-
+module. This is how the codebase moves from prototype to production without
+big-bang rewrites. See [`CONTRIBUTING.md`](../CONTRIBUTING.md) for the contract.
 
 ---
 
 ## Team Ownership
 
 Authoritative ownership is declared in [`.github/CODEOWNERS`](../../.github/CODEOWNERS)
-(replace the placeholder `@lai/*` handles with real team slugs). Summary:
+(replace placeholder `@lai/*` handles with real team slugs). Summary:
 
-| Area | Owner | What You Touch |
+| Area | Role | What You Touch |
 |---------|-------|---------------|
+| `lai.common` (all subpackages) | platform/foundation | Strict-gated primitives — every new feature usually starts here |
 | `lai.pipeline` | data-pipeline | The 6-step corpus build; `python -m lai.pipeline.cli` |
-| `lai.search` | retrieval | Hybrid search, reranking, query analysis, `lai.search.eval` |
+| `lai.search` | retrieval | Retrieval kernel (`eval.py`) — dense+BM25+RRF+Reranker; `lai.retrieval` (v1.1) |
 | `lai.analyzer` | contract-analyzer | Qwen3.6-27B contract analyzer — playbooks, prompts, schema |
-| `lai.documents` / `lai.extraction` | ingestion | Document upload, parsing, chunking, geo-extraction |
-| `lai.generation` | generation | LLM client, prompt templates, CRAG loop, citation verification |
-| `lai.api` / `lai.auth` / `lai.core` / `lai.infra` | platform | App shell, serve_rag, JWT, config, DB/Redis/MinIO clients, `scripts/ops/` |
+| `lai.api` | api / chat | `serve_rag.py`, `auth_router.py`, `/metrics`, `/feedback`, `/query/stream` |
+| `lai.core` | platform | Config, logging, exceptions, constants |
 | `micro-services/` | ddiq | DDiQ due-diligence report service |
+| `infra/monitoring/` | platform | Prometheus + Grafana stack |
+| `scripts/ops/` | platform / ops | Entry points, migrations, demo seed loader |
 
 ---
 
@@ -178,9 +201,6 @@ uv sync                       # installs deps + the `lai` package (editable)
 bash scripts/ops/start.sh                 # Docker services + serve_rag + Vite
 #   or, Docker-free (host processes, no root):
 bash scripts/ops/start-host.sh
-
-# Planned-v2 unified FastAPI app (not yet the shipping runtime):
-uv run python -m lai.api.main             # API at http://localhost:8000
 ```
 
 ### 3. Run tests
@@ -195,19 +215,26 @@ uv run pytest -m "not slow"      # Skip slow tests
 
 ## API Endpoints
 
-> **Runtime today vs. planned v2 app.** What's actually running (and shipping in `MVP_DELIVERY.md`) is the two-service split below: `serve_rag` (now `lai.api.serve_rag`) for the conversational legal assistant on `:18000` and `lai-backend` (the DDiQ microservice) for multi-doc due-diligence reports on `:18001`. The unified `lai.api.main` FastAPI app in the next subsection is the design target — those endpoints (`/extraction/locations/...`, schema-per-user multi-tenancy) are not yet wired into the runtime.
+The runtime is a two-service split: `serve_rag` (the conversational legal
+assistant on `:18000`) and `lai-backend` (the DDiQ multi-doc due-diligence
+microservice on `:18001`). Below is the surface area as of the v1 demo build.
 
 ### Runtime: serve_rag (`:18000`) — conversational chat
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/query` | Ask a legal question (auto-routes RAG / chat / contract / rag+contract); injects last 16 user/assistant turns from sessions.db as conversation memory |
+| `POST` | `/query` | Ask a legal question. Response includes `answer`, `chunks` with `[C-n]`/`[M-n]` handles, `citation_validation` (count of fabricated handles stripped), `jurisdiction_warning` (when Bundesland mismatch detected), `timings`, `tokens`. Injects rolling 32-message memory + pinned session facts. |
+| `POST` | `/query/stream` | Same as `/query` but **SSE streaming** — token-by-token output for the UI. Trailing event carries the same validation + warning payload. |
 | `POST` | `/upload` | Upload PDF/DOCX (OCR via Tesseract de+en, segment, embed, store) and bind to a session |
+| `GET`  | `/sessions/{id}/document` | Native PDF stream of an uploaded doc (used by the UI's `<object>` PDF preview when a `[M-n]` chip is clicked) |
+| `POST` | `/feedback` | Lawyer thumbs-up / thumbs-down per message (persisted; rehydrates on reload) |
 | `GET`  | `/sessions` | List recent chat sessions for the sidebar (light payload, auto-derived titles) |
-| `GET`  | `/sessions/{id}` | Full session payload — metadata + last analysis + message history (for UI rehydration on refresh) |
+| `GET`  | `/sessions/{id}` | Full session payload — metadata + last analysis + message history |
 | `POST` | `/sessions/{id}/messages` | Append a user/assistant message |
 | `PATCH`| `/sessions/{id}` | Set a user-facing title (rename) |
 | `DELETE`| `/sessions/{id}` | Delete a session |
+| `POST` | `/auth/login`, `/auth/register`, `/auth/me` | JWT auth (via `auth_router`). Tenant isolation is enforced per-request. |
+| `GET`  | `/metrics` | Prometheus instrumentation (request latency, token usage, citation-validation counters) — scraped by `infra/monitoring/` |
 | `GET`  | `/health` | Liveness |
 
 ### Runtime: lai-backend / DDiQ microservice (`:18001`) — multi-doc due-diligence
@@ -225,24 +252,9 @@ uv run pytest -m "not slow"      # Skip slow tests
 | `DELETE`| `/ddiq/report/{id}` | Hard-delete a report and cascade through `ddiq_classified_parcels` / `ddiq_contracts` / `ddiq_project_areas` in one transaction |
 | `GET`  | `/ddiq/config/map-tiles` | Map tile layer config for the frontend Leaflet map |
 
-> **Auth status (Apr 30):** the frontend `AuthContext` is currently a demo that accepts any credentials; both backends do not validate JWTs and do not scope by user. Sessions / documents / reports are globally visible. Real auth + user scoping is on the to-do list before any shared deployment — see `MVP_DELIVERY.md` "Known gaps".
+> **Auth status (2026-05-18):** JWT auth + tenant isolation are built (`lai.common.auth`, `api/auth_router.py`, `001_auth_and_tenant_isolation.up.sql`) and partly landed; per [`DEMO_STATUS.md`](DEMO_STATUS.md) some of this is still uncommitted on `v2-restructure` pending Sumit's commit. The frontend `AuthContext` is fake-auth in v0; the v1 demo build wires real JWT through.
 
-### Planned: unified `lai.api.main` app (`src/lai/` domain-driven backend, not yet runtime)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/query` | Ask a legal question (full RAG pipeline) |
-| `POST` | `/documents/upload` | Upload PDF/DOCX (parse → chunk → embed → store) |
-| `GET` | `/documents` | List user's uploaded documents |
-| `DELETE` | `/documents/{id}` | Delete a document and its chunks |
-| `POST` | `/extraction/locations/{segment_id}` | Extract geo locations from a segment |
-| `POST` | `/extraction/locations/batch` | Batch extract locations by source |
-| `GET` | `/extraction/locations/{segment_id}` | Get extracted locations for a segment |
-| `GET` | `/extraction/locations/summary` | Location extraction statistics |
-| `POST` | `/auth/register` | Create account |
-| `POST` | `/auth/login` | Get JWT tokens |
-| `GET` | `/auth/me` | Current user info |
-| `GET` | `/health` | Health check (DB + Redis status) |
+> **Deferred to v1.1.** A unified `lai.api.main` FastAPI app with explicit `/documents/*`, `/extraction/locations/*` routes was scoped but never wired — that scaffolding (`api/main.py`, `lai.auth`, `lai.documents`, `lai.extraction`, `lai.generation`, `lai.infra`) was **deleted in commit `8431797`** on 2026-05-15. The capabilities will return as `lai.retrieval` + related modules in the v1.1 unification work. See [`LAI_V1_STRATEGY.md`](LAI_V1_STRATEGY.md) §9.1 (out-of-v1) and [`src/lai/README.md`](../src/lai/README.md) "Removed during the v1 demo restructure".
 
 ---
 
@@ -383,7 +395,7 @@ immissionsschutzrecht, energierecht, baurecht, umweltrecht, vertragsrecht, gesel
 - [x] Step 3 domain classification completed (Phase 1)
 - [x] Step 4 contextual enrichment completed (Phase 1, 217K chunks, 4h 51m)
 - [x] Step 5 fine-tuning data generation in progress (8 concurrent, ~46h ETA)
-- [x] Location/geo extraction module (`lai.extraction`) — LLM-based extraction of geocodable addresses, Flurstücke, coordinates from legal documents
+- [x] Location/geo extraction prototype (was `lai.extraction`) — LLM-based extraction of geocodable addresses, Flurstücke, coordinates from legal documents. Package was deleted on 2026-05-15 along with the dead FastAPI stack; the live geocoding path is now inside DDiQ (`cadastral_pipeline.py` + Nominatim). A revived `lai.extraction`-equivalent returns in v1.1.
 - [x] Extraction API endpoints (single, batch, summary)
 - [x] Extraction smoke-tested (the ad-hoc `scripts/test_extraction.py` was removed in the v2 restructure — superseded by the `lai.extraction` package + `scripts/eval/smoke_test_analyzer.py`)
 
@@ -639,9 +651,10 @@ python scripts/db/export_to_sqlite.py all
 |------|-------|
 | App config | [src/lai/core/config.py](../src/lai/core/config.py) |
 | Data pipeline | [src/lai/pipeline/](../src/lai/pipeline/) — Steps 1-6 |
-| Location extraction | [src/lai/extraction/](../src/lai/extraction/) — LLM-based geo extraction |
+| Shared primitives (v1 foundation) | [src/lai/common/](../src/lai/common/) — `llm`, `embedding`, `reranker`, `pdf`, `chunk`, `citation`, `jurisdiction`, `auth` |
 | Chat backend (serve_rag) | [src/lai/api/serve_rag.py](../src/lai/api/serve_rag.py) — `python -m lai.api.serve_rag` |
 | Retrieval eval harness | [src/lai/search/eval.py](../src/lai/search/eval.py) — `python -m lai.search.eval` |
+| Geocoding / Flurstück extraction | DDiQ — [micro-services/cadastral_pipeline.py](../micro-services/cadastral_pipeline.py) (Nominatim + ALKIS WFS) |
 | Per-domain ownership | [.github/CODEOWNERS](../../.github/CODEOWNERS) + per-package `README.md` under `src/lai/` |
 | Pipeline progress report | [PIPELINE_PROGRESS_REPORT.md](PIPELINE_PROGRESS_REPORT.md) |
 | Pipeline CLI | `python -m lai.pipeline.cli step1 --help` |
@@ -658,9 +671,11 @@ python scripts/db/export_to_sqlite.py all
 | **Retrieval failure analysis** | `python scripts/eval/rag_audit_analysis.py <results.json>` (breaks down recall by task, specificity, doc_type) |
 | **End-to-end RAG test** | `python scripts/eval/rag_generate_test.py --n 5` (retrieve + generate with base + FT, side-by-side) |
 | **Raw corpus layout** | `LAI/data/lai-raw/` (671 GB source docs) + `LAI/data/lai-segments/` (1.7 GB Step-1 output) — moved from `minio-backup/` 2026-04-23 |
-| RAG pipeline | [src/lai/api/pipeline.py](../src/lai/api/pipeline.py) |
-| Hybrid search SQL | [src/lai/search/hybrid_search.py](../src/lai/search/hybrid_search.py) |
-| Prompt templates | [src/lai/generation/prompt_builder.py](../src/lai/generation/prompt_builder.py) |
+| RAG pipeline (chat path) | [src/lai/api/serve_rag.py](../src/lai/api/serve_rag.py) — orchestrates retrieve → rerank → generate → validate citations → jurisdiction check |
+| Retrieval kernel (Corpus + dense + BM25 + RRF + Reranker) | [src/lai/search/eval.py](../src/lai/search/eval.py) |
+| LLM client / prompt building / JSON salvage / think-strip | [src/lai/common/llm/](../src/lai/common/llm/) |
+| Citation handle validation | [src/lai/common/citation/](../src/lai/common/citation/) |
+| Jurisdiction (Bundesland) check | [src/lai/common/jurisdiction/](../src/lai/common/jurisdiction/) |
 | Docker services | [/data/projects/lai/Docker/](../../../Docker/) |
 | Infrastructure docs | [INFRASTRUCTURE.md](INFRASTRUCTURE.md) |
 | Architecture overview | [architecture/overview.md](architecture/overview.md) |

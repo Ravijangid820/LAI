@@ -71,6 +71,23 @@ stack as host processes — vLLM analyzer/embedding/reranker servers,
 with no Docker daemon and no root. `stop-host.sh` / `status-host.sh` manage
 it. Use this when the Docker socket is unavailable.
 
+### Monitoring stack (v1)
+
+A dedicated Prometheus + Grafana compose lives at
+[`infra/monitoring/`](../infra/monitoring/) — separate from the runtime compose
+so it can be brought up/down independently:
+
+```bash
+docker compose -f infra/monitoring/docker-compose.yml up -d
+```
+
+It scrapes `serve_rag`'s `/metrics` endpoint (FastAPI instrumented via
+`prometheus-fastapi-instrumentator` in `lai.api.metrics`) and renders a 9-panel
+Grafana dashboard (`lai-rag.json`) — request latency, token usage,
+citation-validation counts, retrieval quality. Datasources + dashboard
+provisioning are committed under `grafana/provisioning/`. See
+[`DEMO_STATUS.md`](DEMO_STATUS.md) for the current state of observability.
+
 ### Starting Services
 
 Each service is independent. Start only what you need:
