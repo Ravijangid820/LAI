@@ -55,6 +55,16 @@ from _reconcile import Candidate, reconcile_categorical, reconcile_numeric
 # See ``_guardrail.py`` for the sourced pattern list.
 from _guardrail import apply_to_findings, apply_to_rows
 
+# Jurisdiction validator (H-2): scan finalised section / finding text
+# for cross-Bundesland rule citations (e.g. Bayern's 10H BayBO mentioned
+# in a Niedersachsen report). See ``lai.common.jurisdiction`` for the
+# rule set and detection logic. We import only what we use to keep the
+# top-of-file imports auditable.
+from lai.common.jurisdiction import (
+    JurisdictionWarning as _LcJurisdictionWarning,
+    check_jurisdiction,
+)
+
 # Shared PDF extractor (PyMuPDF + Tesseract OCR fallback) and chunker
 # (German-legal-aware sentence splitter). One module-level instance of
 # each so callers reuse the lazy ``fitz`` / ``pytesseract`` / ``PIL``
@@ -485,6 +495,16 @@ class DDiQReportData(BaseModel):
     # reconciliation block in ``_generate_report_core``.
     turbineCount: int = 0
     bundesland: Optional[str] = None             # lowercase, e.g. "niedersachsen"
+    # ── Jurisdiction warnings (H-2) ────────────────────────────────────
+    # Populated by the post-guardrail jurisdiction scan in
+    # ``_generate_report_core``. Each entry flags a Bundesland-specific
+    # rule (e.g. ``"Bayerns 10H-Regel"``) cited in this report when the
+    # matter's actual Bundesland is a different state. Empty list when
+    # the matter has no detected Bundesland (the validator returns []
+    # for ``expected_bundesland=None``) OR no cross-state rule was
+    # mentioned. Same shape as serve_rag's ``JurisdictionWarningOut`` so
+    # the UI can render both with the same component.
+    jurisdictionWarnings: list[dict] = []
 class GenerateReportRequest(BaseModel):
     document_ids: list[str]; preset: str = "full"
     project_name: Optional[str] = None; prepared_for: Optional[str] = None
@@ -2826,6 +2846,74 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
         finding_counts["defensive"], finding_counts["hedges"],
         cross_doc_counts["defensive"], cross_doc_counts["hedges"],
     )
+
+    # ── Jurisdiction scan (H-2) ───────────────────────────────────────
+    # Cross-Bundesland rule check. For each section row + finding (the
+    # guardrail-cleaned versions, so we don't false-match canonical
+    # "Nicht in den vorgelegten Dokumenten enthalten" placeholders),
+    # detect mentions of Bundesland-specific rules — e.g. Bayern's 10H
+    # BayBO setback — that don't belong to the matter's actual state.
+    # Empty when ``report.bundesland is None`` (the validator
+    # short-circuits) so this is safe to call unconditionally.
+    #
+    # De-duplicates across the whole report: if the same rule is cited
+    # in three different rows, only one warning is emitted (keyed by
+    # rule label). That matches the chat-side validator's behaviour and
+    # avoids drowning the UI in repetition.
+    report.jurisdictionWarnings = []
+    if report.bundesland:
+        seen_rule_labels: set[str] = set()
+        scan_texts: list[str] = []
+        for sec in report.sections:
+            for row in sec.rows:
+                val = (getattr(row, "value", None) or "").strip()
+                note = (getattr(row, "note", None) or "").strip()
+                if val:
+                    scan_texts.append(val)
+                if note:
+                    scan_texts.append(note)
+        for f in report.findings:
+            t = (getattr(f, "text", None) or "").strip()
+            if t:
+                scan_texts.append(t)
+        for f in report.crossDocFindings:
+            t = (getattr(f, "text", None) or "").strip()
+            if t:
+                scan_texts.append(t)
+
+        for txt in scan_texts:
+            for w in check_jurisdiction(txt, report.bundesland):
+                if w.rule_label in seen_rule_labels:
+                    continue
+                seen_rule_labels.add(w.rule_label)
+                # Convert the dataclass to a dict so the report JSONB
+                # round-trips through Postgres + Pydantic without
+                # depending on lai.common imports at deserialisation
+                # time. Shape matches serve_rag's JurisdictionWarningOut.
+                report.jurisdictionWarnings.append({
+                    "rule_label": w.rule_label,
+                    "rule_bundesland": w.rule_bundesland,
+                    "expected_bundesland": w.expected_bundesland,
+                    "excerpt": w.excerpt,
+                })
+
+    if report.jurisdictionWarnings:
+        logger.warning(
+            "jurisdiction: %d cross-Bundesland rule citation(s) detected "
+            "(matter is in %s). Rules: %s",
+            len(report.jurisdictionWarnings),
+            report.bundesland,
+            ", ".join(
+                f"{w['rule_label']} ({w['rule_bundesland']})"
+                for w in report.jurisdictionWarnings
+            ),
+        )
+    else:
+        logger.info(
+            "jurisdiction: no cross-Bundesland rule citations "
+            "(matter bundesland=%s; scanned %d text fragments)",
+            report.bundesland, len(scan_texts) if report.bundesland else 0,
+        )
 
     # Final report_data checkpoint — byte-identical to what the
     # original single end-of-pipeline UPSERT wrote.
