@@ -225,9 +225,22 @@ def llm_json(
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
+            # salvage_json already calls json.loads internally and
+            # returns the parsed value — wrapping it in another
+            # ``json.loads(...)`` was a long-standing bug that always
+            # raised TypeError on success.
+            #
+            # On unrecoverable input, salvage raises
+            # ``lai.common.exceptions.LlmJsonParseError`` (subclass of
+            # ``Exception``, NOT ``ValueError``). Catch broadly so a
+            # truly malformed response just returns None — the caller
+            # retries once with a strengthened prompt and then falls
+            # through to ``{}``. Without the broad catch the documented
+            # "return {} on total failure" contract is broken and a
+            # single bad response kills the whole report.
             try:
-                return json.loads(salvage_json(raw))
-            except (json.JSONDecodeError, ValueError):
+                return salvage_json(raw)
+            except Exception:
                 return None
 
     parsed = _attempt(system, user)
