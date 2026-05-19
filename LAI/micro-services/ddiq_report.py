@@ -14,7 +14,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 import os, re, json, time, uuid, logging, math, hashlib
-import requests
 import psycopg2
 import psycopg2.extras
 
@@ -25,16 +24,10 @@ import psycopg2.extras
 from auth_dep import get_current_user
 from lai.common.auth import CurrentUser
 
-# Shared LLM client — see `_llm_*` helpers below. Importing at module
-# level so a single httpx connection pool is reused across all DDiQ
-# extraction passes within a worker process.
-from lai.common.exceptions import LlmError
-from lai.common.llm import (
-    ChatMessage,
-    LlmConfig,
-    SyncLlmClient,
-    salvage_json,
-)
+# lai.common.llm / lai.common.exceptions imports moved to ``ddiq.llm``
+# (H-5 phase 2). The shared SyncLlmClient singleton and the
+# llm_call / llm_json helpers live there now; this file imports them
+# at the top of the section below.
 
 # Geocoding plausibility-gate helpers — used by ``geocode_address`` to
 # reject Nominatim results that fall outside the named Bundesland's bbox.
@@ -84,8 +77,6 @@ from lai.common.connectors import (
 # imports and the per-instance pydantic config, instead of paying the
 # cost on every upload.
 from lai.common.chunk import Chunk, Chunker, ChunkerConfig
-from lai.common.embedding import EmbeddingConfig, SyncEmbeddingClient
-from lai.common.exceptions import EmbeddingError
 from lai.common.pdf import PdfExtractor, PdfExtractorConfig
 
 _PDF_EXTRACTOR = PdfExtractor(
@@ -218,6 +209,51 @@ from ddiq.models import (  # noqa: E402 — re-exported for legacy callers
 )
 
 
+# LLM + embedding infrastructure (H-5 phase 2). The module-level
+# singletons (one ``SyncLlmClient`` + one ``SyncEmbeddingClient`` per
+# uvicorn / Celery worker process) live in ``ddiq.llm`` now.
+# ``EXTRACTION_SYSTEM`` is the shared system prompt every extractor
+# sends as ``system``; the per-extractor module imports it directly
+# from ``ddiq.llm``, so this re-export is purely for legacy callers
+# still doing ``ddiq_report.EXTRACTION_SYSTEM``.
+from ddiq.llm import (  # noqa: E402 — re-exported for legacy callers
+    EXTRACTION_SYSTEM,
+    embed_single,
+    embed_texts,
+    get_embedding_client,
+    get_llm_client,
+    llm_call,
+    llm_json,
+)
+
+# Retrieval helpers (H-5 phase 2). Pgvector search + reranker call +
+# context rendering + Evidence resolution all live in ``ddiq.rag``.
+from ddiq.rag import (  # noqa: E402 — re-exported for legacy callers
+    evidence_from_chunks,
+    get_all_text_for_docs,
+    rag_context,
+    rag_context_with_meta,
+    rerank,
+    search_doc_chunks,
+)
+
+# Per-domain extractors (H-5 phase 2). The remaining inline extractors
+# (extract_wea_statuses, extract_infrastructure, build_parcels,
+# analyze_section, extract_parcel_refs) are too tightly coupled to
+# this file's geocoding + cadastral_pipeline integration to extract
+# without a third phase; they stay here for now.
+from ddiq.extractors import (  # noqa: E402 — re-exported for legacy callers
+    _finding_from_llm_obj,
+    _findings_prompt_for_issue,
+    _placeholder_finding_for_issue,
+    check_cross_doc_consistency,
+    check_grundbuch_match,
+    extract_rueckbau_bond,
+    extract_timeline,
+    generate_findings,
+)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CORE HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -275,56 +311,8 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[di
         for c in _CHUNKER.chunk(text)
     ]
 
-def embed_texts(texts: list[str], batch_size: int = 8) -> list[list[float]]:
-    """Embed a list of texts; returns ``list[list[float]]`` in input order.
+# embed_texts() / embed_single() moved to ``ddiq.llm`` (H-5 phase 2).
 
-    Thin shim over :class:`lai.common.embedding.SyncEmbeddingClient`.
-    The legacy ``batch_size`` argument is accepted for backwards
-    compatibility but is **ignored** — the shared client batches
-    internally based on ``EmbeddingConfig.max_batch_size`` (32), which
-    is what vLLM actually accepts per request. The previous
-    ``batch_size=8`` default was unnecessarily conservative.
-
-    Empty input list returns an empty list cheaply (the client would
-    raise ``ValueError`` on an empty ``inputs``; we short-circuit so
-    callers like ``embed_texts([])`` in dead-branch paths don't crash
-    the route).
-
-    Returns ``list[list[float]]`` — same shape as the legacy code.
-    ``SyncEmbeddingClient.embed`` returns
-    ``list[EmbeddingResult(index, embedding)]`` already sorted by
-    ``index`` after the internal batch merge, so we just unpack
-    ``.embedding``.
-
-    Raises:
-        EmbeddingError (and subclasses) — transport failure after
-        ``max_retries=3`` exhausted, dimension mismatch, malformed
-        response. The legacy code would raise ``requests.HTTPError``
-        which the upload route at line ~2160 doesn't catch
-        specifically; in either case the request fails with a 500.
-    """
-    if not texts:
-        return []
-    if batch_size != 8:
-        logger.warning(
-            "embed_texts called with batch_size=%s (ignored — "
-            "SyncEmbeddingClient uses max_batch_size=32). Update the "
-            "caller or extend the shim if a non-default is genuinely "
-            "needed.",
-            batch_size,
-        )
-    results = _EMBEDDING_CLIENT.embed(texts)
-    return [r.embedding for r in results]
-
-
-def embed_single(text: str) -> list[float]:
-    """Embed a single text. Returns the bare ``list[float]`` (4096-d).
-
-    Routes through the shared client's ``embed_one`` for the cleanest
-    code path. Equivalent to ``embed_texts([text])[0]`` but avoids the
-    list-of-lists round trip.
-    """
-    return _EMBEDDING_CLIENT.embed_one(text)
 
 def _assert_owns_documents(doc_ids, user_id) -> None:
     """Raise 404 if ``user_id`` does not own every document in ``doc_ids``.
@@ -350,113 +338,19 @@ def _assert_owns_documents(doc_ids, user_id) -> None:
         raise HTTPException(404, "Document not found")
 
 
-def search_doc_chunks(doc_ids, query_embedding, top_k=15, user_id=None):
-    """Pgvector search over ``doc_ids`` chunks, scoped to ``user_id``.
+# search_doc_chunks() / get_all_text_for_docs() / rerank() moved to
+# ``ddiq.rag`` (H-5 phase 2).
 
-    When ``user_id`` is supplied (every protected route does), the join
-    filter also enforces tenant isolation at the SQL layer — even if a
-    caller bypassed :func:`_assert_owns_documents`, no chunks belonging
-    to another user can leak.
-    """
-    if not doc_ids: return []
-    conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    emb_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
-    ph = ",".join(["%s"] * len(doc_ids))
-    user_clause = " AND d.user_id = %s" if user_id is not None else ""
-    sql = f"""SELECT c.text, c.doc_id, d.filename,
-              1-(c.embedding<=>%s::vector) AS similarity
-              FROM ddiq_doc_chunks c JOIN ddiq_documents d ON d.id=c.doc_id
-              WHERE c.doc_id::text IN ({ph})
-              AND c.embedding IS NOT NULL{user_clause}
-              ORDER BY c.embedding<=>%s::vector LIMIT %s"""
-    params = (emb_str, *doc_ids)
-    if user_id is not None:
-        params = (*params, str(user_id))
-    params = (*params, emb_str, top_k)
-    cur.execute(sql, params)
-    rows = cur.fetchall(); cur.close(); conn.close(); return [dict(r) for r in rows]
 
-def get_all_text_for_docs(doc_ids, user_id=None):
-    """Concatenate ``full_text`` from the given documents, scoped to ``user_id``."""
-    conn = get_conn(); cur = conn.cursor()
-    ph = ",".join(["%s"] * len(doc_ids))
-    if user_id is not None:
-        cur.execute(
-            f"SELECT full_text FROM ddiq_documents "
-            f"WHERE id::text IN ({ph}) AND user_id = %s",
-            (*doc_ids, str(user_id)),
-        )
-    else:
-        cur.execute(
-            f"SELECT full_text FROM ddiq_documents WHERE id::text IN ({ph})",
-            tuple(doc_ids),
-        )
-    texts = [row[0] for row in cur.fetchall() if row[0]]; cur.close(); conn.close()
-    return "\n\n---\n\n".join(texts)
-
-def rerank(query, chunks, top_k=5):
-    texts = [c["text"] for c in chunks]
-    try:
-        resp = requests.post(f"{RERANKER_URL}/rerank", json={"query": query, "texts": texts, "truncate": True}, timeout=30)
-        resp.raise_for_status(); ranked = sorted(resp.json(), key=lambda x: x["score"], reverse=True)[:top_k]
-        return [chunks[item["index"]] for item in ranked]
-    except Exception: return chunks[:top_k]
-
-# ── LLM client (shared) ─────────────────────────────────────────────────────
-# Single module-level SyncLlmClient. Each uvicorn worker (process) instantiates
-# its own client and reuses one httpx connection pool across all extraction
-# passes; the underlying httpx.Client is thread-safe.
+# ── LLM + embedding singletons — moved to ``ddiq.llm`` (H-5 phase 2).
+# The LlmConfig + SyncLlmClient + EmbeddingConfig + SyncEmbeddingClient
+# construction happens once at ddiq.llm import time. Use
+# ``get_llm_client()`` / ``get_embedding_client()`` if you need the
+# raw client; otherwise call ``llm_call`` / ``llm_json`` /
+# ``embed_texts`` / ``embed_single`` directly.
 #
-# Config is built from the legacy DDiQ env vars (LLM_URL / LLM_MODEL) rather
-# than the LAI_LLM_* prefix lai.common defaults to, so this drop-in does not
-# require any change to docker-compose.yml. A future cleanup can switch the
-# compose to LAI_LLM_BASE_URL / LAI_LLM_MODEL and drop the explicit kwargs.
-_LLM_CONFIG = LlmConfig(base_url=LLM_URL, model=LLM_MODEL)
-_LLM_CLIENT = SyncLlmClient(_LLM_CONFIG)
-
-# Embedding client — single module-level singleton so every call reuses
-# one ``httpx.Client`` connection pool. DDiQ embeds tens of thousands
-# of chunks per upload; a fresh connection per batch would burn ~50 ms
-# extra each.
-#
-# Construction note: the live container env sets ``EMBEDDING_URL`` to
-# ``http://lai_embedding:8000`` (no ``/v1`` suffix because the legacy
-# code appended it per-call). ``EmbeddingConfig.base_url`` expects the
-# full OpenAI base, so we re-add ``/v1`` here. Existing env-var
-# contract is preserved (DDiQ's compose.yml stays unchanged).
-#
-# Compared to the legacy hand-rolled ``_embed_via_openai`` /
-# ``_embed_via_tei`` block we gain:
-#   * tenacity retry with exponential backoff (was: single-shot
-#     ``requests.post``; one network blip = full pipeline failure)
-#   * dimension validation against ``EmbeddingConfig.dimension=4096``
-#     (was: silent corruption if the model ever returned wrong shape)
-#   * Prometheus metrics (``lai_embedding_calls_total``,
-#     ``lai_embedding_request_duration_seconds``,
-#     ``lai_embedding_dimension_mismatch_total``, …)
-#   * typed exceptions (the ``EmbeddingError`` hierarchy)
-#
-# What we lose: the legacy fallback to HuggingFace TEI's ``/embed``
-# shape. The live ``lai_embedding`` container is vLLM-based and serves
-# the OpenAI shape directly, so the TEI fallback path was already dead
-# in production. If TEI support is ever needed it gets added to
-# ``lai.common.embedding`` (benefitting ``serve_rag`` too), not here.
-_EMBEDDING_CLIENT = SyncEmbeddingClient(
-    EmbeddingConfig(
-        base_url=EMBEDDING_URL.rstrip("/") + "/v1",
-        model="Qwen/Qwen3-Embedding-8B",
-        # 4096-d for DDiQ's own ``ddiq_doc_chunks.embedding vector(4096)``
-        # column. Note: the corpus-side ``corpus_child_chunks.embedding
-        # halfvec(4000)`` truncates to 4000 — that's done by the
-        # migration / topup script, NOT here, because the DDiQ upload
-        # path still writes to its own 4096-d table.
-        dimension=4096,
-        # Match vLLM's per-request limit; the legacy ``batch_size=8`` was
-        # very conservative. 32 is what the live ``Qwen3-Embedding-8B``
-        # container accepts in one POST without OOM risk.
-        max_batch_size=32,
-    )
-)
+# Helpers moved with them: llm_call, llm_json (ddiq.llm) +
+# rag_context, rag_context_with_meta, evidence_from_chunks (ddiq.rag).
 
 # Connector singletons (H-3) — single httpx.Client per upstream.
 # Pydantic-settings defaults are intentionally permissive: the actual
@@ -466,118 +360,6 @@ _EMBEDDING_CLIENT = SyncEmbeddingClient(
 # Nominatim or an alternate WFS proxy is configured.
 _NOMINATIM_CLIENT = NominatimClient()
 _ALKIS_CLIENT = AlkisClient()
-
-
-def llm_call(system, user, temperature=0.1, max_tokens=2048):
-    """Single-shot chat completion. Returns the stripped string content.
-
-    Backed by :class:`lai.common.llm.SyncLlmClient`, which adds retry with
-    exponential backoff, server-side ``<think>`` stripping, structured
-    logging, and Prometheus metrics over what the legacy hand-rolled
-    ``requests.post`` provided. The signature is preserved exactly so the
-    11 in-module call sites — plus the ``llm_json_fn`` callback handed to
-    :class:`CadastralPipeline` — keep working without changes.
-
-    Returns ``""`` on retry-exhausted / transport / invalid-response
-    failure, matching the legacy behaviour of returning an empty string
-    on null content. The caller's JSON parse will then take its own
-    error path instead of crashing the pipeline.
-    """
-    try:
-        return _LLM_CLIENT.generate(
-            [
-                ChatMessage(role="system", content=system),
-                ChatMessage(role="user", content=user),
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-    except LlmError as exc:
-        logger.warning(f"llm_call failed ({type(exc).__name__}): {exc}")
-        return ""
-
-
-def llm_json(system, user, temperature=0.0):
-    """Two-shot JSON-structured completion. Returns ``dict`` / ``list`` or ``{}``.
-
-    Strategy:
-      1. Call the LLM, strip code fences, ``json.loads``.
-      2. On parse failure, run the salvage path
-         (:func:`lai.common.llm.salvage_json`) which extracts the first
-         balanced JSON substring with full string-context awareness.
-      3. On second parse failure, retry once with a strengthened
-         instruction (mirrors the legacy two-shot behaviour).
-      4. If everything fails, return ``{}`` rather than raising — the
-         legacy uncaught :class:`json.JSONDecodeError` on the second
-         attempt would crash the entire pipeline mid-report.
-    """
-    def _attempt(sys_prompt, user_prompt):
-        raw = llm_call(sys_prompt, user_prompt, temperature, max_tokens=4096)
-        if not raw:
-            return None
-        # Strip ```json fences before parse; salvage_json handles them
-        # too, but doing it here keeps the fast path cheap.
-        raw = re.sub(r"```json\s*", "", raw)
-        raw = re.sub(r"```\s*$", "", raw)
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            try:
-                return json.loads(salvage_json(raw))
-            except (json.JSONDecodeError, ValueError):
-                return None
-
-    parsed = _attempt(system, user)
-    if parsed is not None:
-        return parsed
-
-    parsed = _attempt(system + "\n\nCRITICAL: Return ONLY valid JSON.", user)
-    if parsed is not None:
-        return parsed
-
-    logger.warning("llm_json: both attempts failed to produce valid JSON; returning {}")
-    return {}
-
-def rag_context(doc_ids, question, top_k=5):
-    emb = embed_single(question); chunks = search_doc_chunks(doc_ids, emb, top_k=20)
-    if not chunks: return "(No relevant content found)"
-    reranked = rerank(question, chunks, top_k=top_k)
-    return "\n\n".join([f"[Doc: {c.get('filename','?')}]\n{c['text'][:800]}" for c in reranked])
-
-
-def rag_context_with_meta(doc_ids, question, top_k=5):
-    """Same retrieval as rag_context, but also returns the chunk metadata
-    so callers can attach Evidence pointers ({doc_id, doc_filename,
-    excerpt}) to whatever facts the LLM extracts. Format mirrors
-    rag_context with a [#1], [#2]... numbering so the LLM can cite
-    chunks back by index, which we then resolve to Evidence."""
-    emb = embed_single(question); chunks = search_doc_chunks(doc_ids, emb, top_k=20)
-    if not chunks: return "(No relevant content found)", []
-    reranked = rerank(question, chunks, top_k=top_k)
-    parts = []
-    for i, c in enumerate(reranked, 1):
-        parts.append(f"[#{i} | Doc: {c.get('filename','?')}]\n{c['text'][:800]}")
-    return "\n\n".join(parts), reranked
-
-
-def evidence_from_chunks(reranked, indices):
-    """Resolve LLM-cited chunk indices (1-based) to Evidence records.
-    Tolerates strings ('1','#1','chunk_1') and out-of-range silently."""
-    out = []
-    if not reranked: return out
-    for idx in indices or []:
-        try:
-            n = int(re.sub(r"[^0-9]", "", str(idx)))
-        except Exception:
-            continue
-        if 1 <= n <= len(reranked):
-            c = reranked[n-1]
-            out.append(Evidence(
-                doc_id=str(c.get("doc_id")) if c.get("doc_id") else None,
-                doc_filename=c.get("filename"),
-                excerpt=(c.get("text", "") or "")[:300],
-            ))
-    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -832,22 +614,9 @@ def extract_parcel_refs(text):
 # SECTION ANALYSIS + WEA + INFRA + PARCELS + FINDINGS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-EXTRACTION_SYSTEM = """You are a senior German legal due-diligence analyst for wind-energy
-projects. Read the supplied document context and answer like a Berufsanwalt working
-on an acquisition red-flag report.
-
-Rules:
-- ALWAYS return valid JSON only. No markdown, no preamble, no trailing text.
-- Cite specific German statutes when relevant: BImSchG (§§4,6,10,15,52), BauGB (§35
-  privileged use, §35 Abs. 5 Rückbau), BNatSchG (§44 Zugriffsverbote, §45 Ausnahme),
-  UVPG, EEG (Marktwert, Marktprämie §20, Direktvermarktung §35a), TA Lärm,
-  22./32. BImSchV, AVV Kennzeichnung, VwGO §70 (Widerspruchsfrist), §550 BGB Schriftform.
-- For every fact-bearing answer, identify the supporting context chunks by their
-  [#N] index from the supplied context and return them in the "evidence_chunks" array.
-  Empty array if you have no source. Never fabricate citations.
-- Use null for unknown optional fields. Don't guess monetary amounts or dates.
-- Distinguish formal status (BImSchG §6 erteilt) from construction status (errichtet)
-  from operational status (in Betrieb genommen) — these are different things."""
+# EXTRACTION_SYSTEM moved to ``ddiq.llm`` (H-5 phase 2) so the per-
+# domain extractor modules (ddiq.extractors.*) can import it without
+# circling back through this file.
 
 
 # SECTION_QUESTIONS — each entry is {label, question, anchor (statutory hook)}.
@@ -991,285 +760,8 @@ green for verified-compliant, null when not enough information.""")
     return AusgabeblattSection(id=section_id, title=title_map.get(section_id, section_id.title()), rows=rows)
 
 
-# ─── P0 #2: Timeline / deadline extraction ──────────────────────────────────
-def extract_timeline(doc_ids, full_text):
-    """Pull every date-bound milestone out of the documents and tag it.
-    A real DD report ranks issues by their proximity to a deadline; without
-    this pass the pipeline is date-blind and misses things like
-    'BImSchG-Genehmigung gilt bis 2027-06-30, Verlängerungsantrag 6 Mt vorher'."""
-    ctx, reranked = rag_context_with_meta(
-        doc_ids,
-        "Frist Ablauf Bestandskraft Inbetriebnahme Genehmigung gültig bis Verlängerung Pachtdauer Bürgschaft Laufzeit",
-        top_k=8,
-    )
-    prompt = f"""Extract every date or deadline relevant to the wind-park DD.
-
-Context:
-{ctx}
-
-Return JSON array. Each entry:
-{{"kind":"permit_expiry|lease_term_end|renewal_deadline|warranty_end|bond_validity|construction_milestone|objection_window|other",
-  "date":"YYYY-MM-DD or free text if month/year only",
-  "description":"what this date governs (e.g. 'BImSchG permit Aktenzeichen 12-345 expires')",
-  "legal_basis":"statute if applicable, e.g. 'VwGO §70 Widerspruchsfrist'",
-  "evidence_chunks":[1,2]}}
-
-Look specifically for:
-- BImSchG permit Ausfertigungsdatum + Bestandskraft (3 Mt nach Zustellung per §70 VwGO)
-- Pachtvertrag-Laufzeit-Ende and Verlängerungsoptionen-Frist
-- Bürgschaft (Rückbaubürgschaft) Ablaufdatum
-- EEG-Zuschlag-Inbetriebnahmefrist (regelmäßig 30 Mt nach Gebotstermin)
-- Hersteller-Gewährleistung Ende
-- Netzanschluss vereinbartes Inbetriebnahmedatum
-- DIBt/§52 BImSchG wiederkehrende Prüfungstermine
-Return [] if nothing date-bound is in the documents. Never invent a date."""
-    try:
-        result = llm_json(EXTRACTION_SYSTEM, prompt)
-        if isinstance(result, dict):
-            result = result.get("timeline", result.get("data", []))
-        if not isinstance(result, list):
-            return []
-        from datetime import datetime, date
-        today = date.today()
-        out: list[TimelineEntry] = []
-        for r in result:
-            ds = str(r.get("date", "")).strip()
-            if not ds:
-                continue
-            days = None
-            urgency = None
-            try:
-                d = datetime.strptime(ds[:10], "%Y-%m-%d").date()
-                days = (d - today).days
-                urgency = (
-                    "expired" if days < 0 else
-                    "urgent" if days <= 30 else
-                    "soon" if days <= 180 else
-                    "future"
-                )
-            except Exception:
-                pass
-            ev = evidence_from_chunks(reranked, r.get("evidence_chunks", []))
-            out.append(TimelineEntry(
-                kind=str(r.get("kind", "other")),
-                date=ds,
-                description=str(r.get("description", "")),
-                legal_basis=r.get("legal_basis"),
-                evidence=ev,
-                days_from_now=days,
-                urgency=urgency,
-            ))
-        return sorted(out, key=lambda t: (t.days_from_now if t.days_from_now is not None else 99999))
-    except Exception as e:
-        logger.error(f"Timeline extraction: {e}")
-        return []
-
-
-# ─── P0 #3: Cross-document consistency check ────────────────────────────────
-def check_cross_doc_consistency(sections, weas, parcels, total_capacity_mw=None):
-    """Detect contradictions BETWEEN the analysed documents — the classic
-    DD red flag that pure-RAG Q&A misses because each question runs in
-    isolation. Examples: BImSchG permit count ≠ lease parcel count, lease
-    term shorter than EEG-award duration, lessor names inconsistent."""
-    facts = {
-        "sections": [{"section": s.title, "label": r.label, "value": r.value, "ampel": r.ampel}
-                     for s in sections for r in s.rows],
-        "wea_count": len(weas),
-        "wea_status_codes": [w.status_code for w in weas if w.status_code],
-        "parcel_count": len(parcels),
-        "parcel_secured": sum(1 for p in parcels if p.status == "secured"),
-        "parcel_not_secured": sum(1 for p in parcels if p.status == "not_secured"),
-        "total_capacity_mw": total_capacity_mw,
-    }
-    prompt = f"""You are doing the cross-document consistency check on a wind-park DD.
-Scan these extracted facts for contradictions, missing-document red flags, or
-inconsistencies that a Berufsanwalt would immediately challenge.
-
-Facts:
-{json.dumps(facts, ensure_ascii=False, indent=2)}
-
-Look for:
-- Turbine count differs across BImSchG-Bescheid / Pachtvertrag / EEG-Zuschlag
-- Total MW from sections doesn't match (#turbines × rated power)
-- Pachtdauer < expected operational life (typically 25 yr)
-- Lessor / Verpächter names inconsistent across leases
-- Project Company in Pachtvertrag ≠ Antragstellerin im BImSchG-Antrag
-- Number of secured parcels < number of WEA (each WEA needs Standort + Zuwegung)
-- BImSchG permit erteilt but no Pachtvertrag for one or more parcels
-- EEG-Zuschlag erteilt but Inbetriebnahme-Frist conflicts with construction status
-- Cited capacity in Erläuterungsbericht ≠ EEG-Zuschlag MW
-- Missing core document type: BImSchG-Bescheid / Pachtvertrag / Netzanschluss / Rückbaubürgschaft
-
-Return JSON array. Each entry:
-{{"text":"clear factual statement of the inconsistency",
-  "severity":"red|yellow",
-  "domain":"Land|Permits|Economics|Regulatory|General",
-  "legal_basis":"if applicable",
-  "recommended_action":"what to do about it",
-  "quantification":{{"mw_affected":..,"eur_impact_estimate":..,"days_until_deadline":..,"rationale":".."}}}}
-
-Return [] if no inconsistencies found. Never fabricate — only flag what the
-facts clearly contradict."""
-    try:
-        result = llm_json(EXTRACTION_SYSTEM, prompt)
-        if isinstance(result, dict):
-            result = result.get("inconsistencies", result.get("findings", result.get("data", [])))
-        if not isinstance(result, list):
-            return []
-        out: list[Finding] = []
-        for r in result:
-            text = str(r.get("text", "")).strip()
-            if not text:
-                continue
-            q_raw = r.get("quantification") or {}
-            quant = None
-            if isinstance(q_raw, dict) and any(q_raw.get(k) is not None for k in ("mw_affected","eur_impact_estimate","days_until_deadline")):
-                quant = Quantification(
-                    mw_affected=q_raw.get("mw_affected"),
-                    eur_impact_estimate=q_raw.get("eur_impact_estimate"),
-                    days_until_deadline=q_raw.get("days_until_deadline"),
-                    rationale=q_raw.get("rationale"),
-                )
-            out.append(Finding(
-                domain=str(r.get("domain", "General")),
-                severity=r.get("severity") if r.get("severity") in ("red", "yellow", "green") else "yellow",
-                text=text,
-                legal_basis=r.get("legal_basis"),
-                recommended_action=r.get("recommended_action"),
-                quantification=quant,
-                kind="cross_document",
-            ))
-        return out
-    except Exception as e:
-        logger.error(f"Cross-doc consistency: {e}")
-        return []
-
-
-# ─── P1 #9: Rückbaubürgschaft extraction ────────────────────────────────────
-def extract_rueckbau_bond(doc_ids):
-    """§35 Abs. 5 BauGB requires the operator to post a decommissioning bond.
-    Recurring DD red flag — without verifying it, the project can be blocked
-    at financial close. Pull amount, provider, beneficiary, validity from
-    the Auflagen of the BImSchG-Bescheid or a separate Bürgschaftsurkunde."""
-    ctx, reranked = rag_context_with_meta(
-        doc_ids,
-        "Rückbau Bürgschaft Sicherheitsleistung Hinterlegung Konzernbürgschaft §35 BauGB Abriss Beseitigung",
-        top_k=6,
-    )
-    prompt = f"""Extract the Rückbaubürgschaft (decommissioning bond) facts.
-
-Context:
-{ctx}
-
-Return JSON object:
-{{"amount_eur": <number or null>,
-  "provider": "<bank/insurer/parent or null>",
-  "beneficiary": "<usually Standortgemeinde>",
-  "valid_until": "YYYY-MM-DD or null",
-  "instrument_type": "Bürgschaft|Hinterlegung|Konzernbürgschaft|null",
-  "sufficient": <true/false/null — your read on whether the amount covers
-   expected Rückbaukosten (typical 80-150k €/MW)>,
-  "note": "one-sentence assessment",
-  "evidence_chunks":[1,3]}}
-
-If no Rückbau bond is mentioned, return null fields with note='not found in documents'.
-Never fabricate amounts."""
-    try:
-        result = llm_json(EXTRACTION_SYSTEM, prompt)
-        if not isinstance(result, dict):
-            return None
-        if all(result.get(k) is None for k in ("amount_eur", "provider", "valid_until", "instrument_type")):
-            # Nothing real extracted; surface a placeholder so the lawyer
-            # knows the absence is intentional, not a UI bug.
-            return RueckbauBond(note=str(result.get("note", "Rückbaubürgschaft not found in supplied documents.")))
-        return RueckbauBond(
-            amount_eur=result.get("amount_eur"),
-            provider=result.get("provider"),
-            beneficiary=result.get("beneficiary"),
-            valid_until=result.get("valid_until"),
-            instrument_type=result.get("instrument_type"),
-            sufficient=result.get("sufficient"),
-            note=result.get("note"),
-            evidence=evidence_from_chunks(reranked, result.get("evidence_chunks", [])),
-        )
-    except Exception as e:
-        logger.error(f"Rückbaubürgschaft extraction: {e}")
-        return None
-
-
-# ─── P1 #6: Grundbuch lessor-vs-owner check ─────────────────────────────────
-def check_grundbuch_match(doc_ids, parcels):
-    """Compare Pachtvertrag-lessor against the registered Eigentümer per
-    Grundbuch. A parcel can show 'secured' under contract logic even if
-    the lessor has no legal title — this is the next layer of validation."""
-    if not parcels:
-        return []
-    # Sample a manageable subset of secured parcels — Grundbuch lookup
-    # is the most expensive LLM pass per parcel. Lawyer-grade DD would
-    # check every one externally, but we surface the LLM's read on what's
-    # actually extractable from the supplied PDFs.
-    target = [p for p in parcels if p.status == "secured" and p.normalizedId][:25]
-    if not target:
-        return []
-    ctx, reranked = rag_context_with_meta(
-        doc_ids,
-        "Grundbuch Eigentümer Eintragung Belastung Wegerecht Vorkaufsrecht Hypothek Reallast Pächter Verpächter",
-        top_k=10,
-    )
-    parcel_list = [{"parcel_id": p.normalizedId, "owner_per_alkis": p.owner,
-                    "lessor_or_contract_ref": p.contractRef or "unknown"} for p in target]
-    prompt = f"""For each parcel in the list, judge whether the registered Grundbuch-
-Eigentümer matches the Verpächter named in the Pachtvertrag, and list any
-encumbrances (Belastungen) you can find in the documents.
-
-Context:
-{ctx}
-
-Parcels:
-{json.dumps(parcel_list, ensure_ascii=False)}
-
-Return JSON array. Each entry:
-{{"parcel_id":"...",
-  "registered_owner":"Eigentümer per Grundbuch or null",
-  "lessor_name":"Verpächter per Pachtvertrag or null",
-  "owner_match":<true/false/null — null if undeterminable>,
-  "match_confidence":<0.0..1.0>,
-  "encumbrances":["Wegerecht zugunsten Gemeinde X","§24 BauGB Vorkaufsrecht",...],
-  "note":"short explanation",
-  "evidence_chunks":[1,4]}}
-
-Only return parcels that appear in the supplied list. owner_match=null is fine
-if the documents don't show enough — don't guess. encumbrances=[] is fine when
-nothing is registered."""
-    try:
-        result = llm_json(EXTRACTION_SYSTEM, prompt)
-        if isinstance(result, dict):
-            result = result.get("checks", result.get("data", []))
-        if not isinstance(result, list):
-            return []
-        out: list[GrundbuchCheck] = []
-        for r in result:
-            pid = str(r.get("parcel_id", "")).strip()
-            if not pid:
-                continue
-            try:
-                conf = float(r.get("match_confidence", 0.0))
-            except Exception:
-                conf = 0.0
-            out.append(GrundbuchCheck(
-                parcel_id=pid,
-                registered_owner=r.get("registered_owner"),
-                lessor_name=r.get("lessor_name"),
-                owner_match=r.get("owner_match"),
-                match_confidence=conf,
-                encumbrances=[str(x) for x in (r.get("encumbrances") or []) if x],
-                note=r.get("note"),
-                evidence=evidence_from_chunks(reranked, r.get("evidence_chunks", [])),
-            ))
-        return out
-    except Exception as e:
-        logger.error(f"Grundbuch check: {e}")
-        return []
+# extract_timeline / check_cross_doc_consistency / extract_rueckbau_bond
+# / check_grundbuch_match — moved to ``ddiq.extractors.*`` (H-5 phase 2).
 
 
 def extract_wea_statuses(doc_ids, full_text, sections, project_center=None):
@@ -1506,206 +998,9 @@ def build_parcels(doc_ids, full_text, wea_statuses, project_center=None, locatio
     return parcels
 
 
-def _findings_prompt_for_issue(issue: dict, total_capacity_mw: Optional[float] = None) -> str:
-    """Build the per-row LLM prompt asking for ONE Finding object.
-
-    Pre-serialise the issue dict outside the f-string so its JSON braces
-    don't collide with f-string brace escaping.
-    """
-    issue_json = json.dumps(issue, ensure_ascii=False)
-    capacity_hint = (
-        f"\nProject total capacity (for MW-affected sizing): {total_capacity_mw} MW"
-        if total_capacity_mw
-        else ""
-    )
-    return f"""You are drafting ONE entry of the FINDINGS chapter of a wind-park red-flag DD report.
-For the single material issue below, produce ONE Finding with:
-- domain: "Land" | "Permits" | "Economics" | "Regulatory" | "General"
-- severity: "red" (deal-blocker) | "yellow" (open issue, manageable) | "green" (resolved)
-- text: 1-2 sentence factual statement of the issue.
-- legal_basis: cite the specific German statute (e.g. "BImSchG §6", "BauGB §35 Abs. 5",
-  "BNatSchG §44", "VwGO §70") if known. null otherwise.
-- recommended_action: concrete next step a lawyer would take (e.g. "Obtain certified
-  Grundbuch extract for parcel 12/4 and verify lessor identity", "Renew Bürgschaft
-  with bank guarantee letter before 2027-06-30").
-- quantification: object with mw_affected (number, null if unknown), eur_impact_estimate
-  (number in EUR, null if unknown), days_until_deadline (integer, null if no
-  date-bound deadline), rationale (one short sentence justifying the numbers).{capacity_hint}
-
-Issue to draft for:
-{issue_json}
-
-Return a single JSON object (not an array). Use null for any field you cannot determine."""
-
-
-def _finding_from_llm_obj(obj: dict, source_issue: dict) -> Optional[Finding]:
-    """Convert one LLM-returned JSON object into a :class:`Finding`.
-
-    Returns ``None`` if the object is unusable (wrong shape, missing the
-    mandatory ``text`` field, etc.) so the caller can emit a structured
-    placeholder for this specific issue instead.
-
-    Evidence is attached directly from ``source_issue`` rather than asked
-    from the LLM — the old batched prompt routed Evidence through a
-    1-indexed ``evidence_indices`` array because each LLM response covered
-    multiple issues; per-row that indirection is dead weight.
-    """
-    if not isinstance(obj, dict):
-        return None
-    text = str(obj.get("text", "")).strip()
-    if not text:
-        return None
-    sev = obj.get("severity") if obj.get("severity") in ("green", "yellow", "red") else "yellow"
-
-    ev: list[Evidence] = []
-    for e in source_issue.get("evidence") or []:
-        if isinstance(e, dict):
-            ev.append(Evidence(**{k: v for k, v in e.items() if k in Evidence.__fields__}))
-
-    q_raw = obj.get("quantification") or {}
-    quant = None
-    if isinstance(q_raw, dict) and any(
-        q_raw.get(k) is not None
-        for k in ("mw_affected", "eur_impact_estimate", "days_until_deadline")
-    ):
-        quant = Quantification(
-            mw_affected=q_raw.get("mw_affected"),
-            eur_impact_estimate=q_raw.get("eur_impact_estimate"),
-            days_until_deadline=q_raw.get("days_until_deadline"),
-            rationale=q_raw.get("rationale"),
-        )
-
-    return Finding(
-        domain=str(obj.get("domain", "General")),
-        severity=sev,
-        text=text,
-        evidence=ev,
-        quantification=quant,
-        legal_basis=obj.get("legal_basis"),
-        recommended_action=obj.get("recommended_action"),
-        kind="section",
-    )
-
-
-def _placeholder_finding_for_issue(i: int, issue: dict) -> Finding:
-    """Emit a structured stand-in when the LLM call for one issue failed.
-
-    Carries the issue's section + label + Evidence so a human reviewer can
-    locate the source row immediately. Previously the whole chapter was
-    replaced with "Manual review required" on the first parse failure;
-    per-row, the lawyer still sees the other findings in their slots and
-    only this one shows the placeholder.
-    """
-    ev: list[Evidence] = []
-    for e in issue.get("evidence") or []:
-        if isinstance(e, dict):
-            ev.append(Evidence(**{k: v for k, v in e.items() if k in Evidence.__fields__}))
-    return Finding(
-        domain="General",
-        severity="yellow",
-        text=(
-            f"(Extraction failed for issue #{i}: "
-            f"{issue.get('section', '?')} → {issue.get('label', '?')}). "
-            "Manual review of the source row required."
-        ),
-        evidence=ev,
-        kind="section",
-    )
-
-
-def generate_findings(doc_ids, sections, total_capacity_mw: Optional[float] = None):
-    """Build evidence-aware Findings, **one LLM call per flagged row**.
-
-    Each finding carries: legal_basis, recommended_action, quantification
-    (mw_affected, eur_impact, days_until_deadline) and Evidence pointers
-    back to the cited chunks in ``sections`` — a lawyer can click through
-    to the source PDF instead of taking the LLM at its word.
-
-    Per-row iteration (Track A item 2) replaces the historical single
-    batched call. The previous shape was fragile: if the LLM emitted a
-    malformed array OR its response was truncated mid-element, the entire
-    ``llm_json`` parse would fail and the whole chapter was lost
-    ("Manual review required" placeholder for everything). Per-row, a
-    single malformed response only loses ONE finding and emits a
-    structured placeholder in its slot — the other findings still come
-    through and the lawyer can locate the missing one by its section +
-    label.
-
-    Cost: N× more LLM calls. Measured single-call latency against the
-    live ``lai_analyzer_llm`` (Qwen3.6-27B in thinking-mode) is ~120-150s
-    for a realistic findings prompt — substantially higher than a chat
-    completion because the model reasons through the legal basis +
-    quantification before emitting JSON. For a 10-row report that's
-    ~20-25min of extra wall-time on top of the existing multi-minute
-    pipeline. The reliability win (no more whole-chapter loss on one
-    malformed row) outweighs this, but two follow-ups can claw most of
-    it back if the latency starts mattering for live demos:
-
-    1. Parallelise via ``concurrent.futures.ThreadPoolExecutor`` over a
-       single shared :class:`SyncLlmClient` (its underlying
-       ``httpx.Client`` is thread-safe). The analyzer LLM container
-       still serialises GPU-side, but pipeline overlap and HTTP-side
-       concurrency typically cut total wall-time 30-50%.
-    2. Disable thinking-mode for the findings pass (``keep_thinking=
-       False`` + ``LlmConfig(thinking_mode_enabled=False)``) since the
-       prompt is narrow enough that we don't need the reasoning trace
-       — typically halves per-call latency.
-    """
-    flagged = []
-    for sec in sections:
-        for row in sec.rows:
-            if row.ampel not in ("red", "yellow"):
-                continue
-            ev = row.__dict__.get("_evidence") or []
-            anchor = row.__dict__.get("_anchor")
-            flagged.append({
-                "section": sec.title, "label": row.label, "value": row.value,
-                "ampel": row.ampel, "note": row.note, "anchor": anchor,
-                "evidence": [e.dict() if hasattr(e, "dict") else e for e in ev],
-            })
-
-    if not flagged:
-        return [Finding(
-            domain="General", severity="green",
-            text="No material issues identified across the analysed sections.",
-            kind="section",
-        )]
-
-    out: list[Finding] = []
-    failures = 0
-    for i, issue in enumerate(flagged, start=1):
-        prompt = _findings_prompt_for_issue(issue, total_capacity_mw)
-        try:
-            obj = llm_json(EXTRACTION_SYSTEM, prompt)
-        except Exception as e:
-            # llm_json itself shouldn't raise (it returns {} on hard
-            # failure since the SyncLlmClient migration), but a transport
-            # crash mid-call still could. Don't let one bad row stop
-            # the rest.
-            logger.warning(f"findings.issue#{i}: llm_json raised — {e}")
-            obj = {}
-
-        finding: Optional[Finding] = None
-        if isinstance(obj, dict):
-            finding = _finding_from_llm_obj(obj, issue)
-        elif isinstance(obj, list) and obj and isinstance(obj[0], dict):
-            # Be lenient: the prompt asks for a single object, but if the
-            # model returned a single-element array we'll still take it.
-            finding = _finding_from_llm_obj(obj[0], issue)
-
-        if finding is None:
-            failures += 1
-            out.append(_placeholder_finding_for_issue(i, issue))
-        else:
-            out.append(finding)
-
-    if failures:
-        logger.warning(
-            f"findings: {failures}/{len(flagged)} issues fell through to "
-            "placeholder (extraction failed). Other findings unaffected."
-        )
-
-    return out
+# _findings_prompt_for_issue / _finding_from_llm_obj /
+# _placeholder_finding_for_issue / generate_findings — moved to
+# ``ddiq.extractors.findings`` (H-5 phase 2).
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
