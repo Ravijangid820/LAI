@@ -61,6 +61,8 @@ from _guardrail import apply_to_findings, apply_to_rows
 # imports and the per-instance pydantic config, instead of paying the
 # cost on every upload.
 from lai.common.chunk import Chunk, Chunker, ChunkerConfig
+from lai.common.embedding import EmbeddingConfig, SyncEmbeddingClient
+from lai.common.exceptions import EmbeddingError
 from lai.common.pdf import PdfExtractor, PdfExtractorConfig
 
 _PDF_EXTRACTOR = PdfExtractor(
@@ -87,6 +89,11 @@ _CHUNKER = Chunker(
         overlap_chars=200,
     )
 )
+
+# NOTE: the embedding-client singleton is defined LATER in the file,
+# next to the LLM-client singleton, because both depend on env vars
+# (``EMBEDDING_URL``, ``LLM_URL``) that are read at module-import time
+# further down. Search for ``_EMBEDDING_CLIENT`` for the init site.
 import numpy as np
 from cadastral_pipeline import (
     CadastralPipeline, PipelineResult, ProjectArea, ClassifiedParcel,
@@ -549,48 +556,56 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[di
         for c in _CHUNKER.chunk(text)
     ]
 
-# Embedding service shape:
-#   - The current LAI runtime exposes vLLM's OpenAI-compatible API at
-#     /v1/embeddings (POST {model, input: [...]} → {data: [{embedding}, ...]})
-#   - Older HuggingFace TEI servers used /embed with {inputs: ...}
-# We try OpenAI-shape first; on 404 fall back to TEI-shape so this code
-# works regardless of which embedding server the host is running.
-def _embed_via_openai(texts: list[str], timeout: int = 120) -> list[list[float]]:
-    resp = requests.post(
-        f"{EMBEDDING_URL}/v1/embeddings",
-        json={"model": "Qwen/Qwen3-Embedding-8B", "input": texts},
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-    return [item["embedding"] for item in resp.json().get("data", [])]
-
-
-def _embed_via_tei(texts: list[str], timeout: int = 120) -> list[list[float]]:
-    resp = requests.post(
-        f"{EMBEDDING_URL}/embed",
-        json={"inputs": texts},
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
 def embed_texts(texts: list[str], batch_size: int = 8) -> list[list[float]]:
-    all_emb: list[list[float]] = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        try:
-            all_emb.extend(_embed_via_openai(batch))
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                all_emb.extend(_embed_via_tei(batch))
-            else:
-                raise
-    return all_emb
+    """Embed a list of texts; returns ``list[list[float]]`` in input order.
+
+    Thin shim over :class:`lai.common.embedding.SyncEmbeddingClient`.
+    The legacy ``batch_size`` argument is accepted for backwards
+    compatibility but is **ignored** — the shared client batches
+    internally based on ``EmbeddingConfig.max_batch_size`` (32), which
+    is what vLLM actually accepts per request. The previous
+    ``batch_size=8`` default was unnecessarily conservative.
+
+    Empty input list returns an empty list cheaply (the client would
+    raise ``ValueError`` on an empty ``inputs``; we short-circuit so
+    callers like ``embed_texts([])`` in dead-branch paths don't crash
+    the route).
+
+    Returns ``list[list[float]]`` — same shape as the legacy code.
+    ``SyncEmbeddingClient.embed`` returns
+    ``list[EmbeddingResult(index, embedding)]`` already sorted by
+    ``index`` after the internal batch merge, so we just unpack
+    ``.embedding``.
+
+    Raises:
+        EmbeddingError (and subclasses) — transport failure after
+        ``max_retries=3`` exhausted, dimension mismatch, malformed
+        response. The legacy code would raise ``requests.HTTPError``
+        which the upload route at line ~2160 doesn't catch
+        specifically; in either case the request fails with a 500.
+    """
+    if not texts:
+        return []
+    if batch_size != 8:
+        logger.warning(
+            "embed_texts called with batch_size=%s (ignored — "
+            "SyncEmbeddingClient uses max_batch_size=32). Update the "
+            "caller or extend the shim if a non-default is genuinely "
+            "needed.",
+            batch_size,
+        )
+    results = _EMBEDDING_CLIENT.embed(texts)
+    return [r.embedding for r in results]
 
 
 def embed_single(text: str) -> list[float]:
-    return embed_texts([text])[0]
+    """Embed a single text. Returns the bare ``list[float]`` (4096-d).
+
+    Routes through the shared client's ``embed_one`` for the cleanest
+    code path. Equivalent to ``embed_texts([text])[0]`` but avoids the
+    list-of-lists round trip.
+    """
+    return _EMBEDDING_CLIENT.embed_one(text)
 
 def _assert_owns_documents(doc_ids, user_id) -> None:
     """Raise 404 if ``user_id`` does not own every document in ``doc_ids``.
@@ -679,6 +694,50 @@ def rerank(query, chunks, top_k=5):
 # compose to LAI_LLM_BASE_URL / LAI_LLM_MODEL and drop the explicit kwargs.
 _LLM_CONFIG = LlmConfig(base_url=LLM_URL, model=LLM_MODEL)
 _LLM_CLIENT = SyncLlmClient(_LLM_CONFIG)
+
+# Embedding client — single module-level singleton so every call reuses
+# one ``httpx.Client`` connection pool. DDiQ embeds tens of thousands
+# of chunks per upload; a fresh connection per batch would burn ~50 ms
+# extra each.
+#
+# Construction note: the live container env sets ``EMBEDDING_URL`` to
+# ``http://lai_embedding:8000`` (no ``/v1`` suffix because the legacy
+# code appended it per-call). ``EmbeddingConfig.base_url`` expects the
+# full OpenAI base, so we re-add ``/v1`` here. Existing env-var
+# contract is preserved (DDiQ's compose.yml stays unchanged).
+#
+# Compared to the legacy hand-rolled ``_embed_via_openai`` /
+# ``_embed_via_tei`` block we gain:
+#   * tenacity retry with exponential backoff (was: single-shot
+#     ``requests.post``; one network blip = full pipeline failure)
+#   * dimension validation against ``EmbeddingConfig.dimension=4096``
+#     (was: silent corruption if the model ever returned wrong shape)
+#   * Prometheus metrics (``lai_embedding_calls_total``,
+#     ``lai_embedding_request_duration_seconds``,
+#     ``lai_embedding_dimension_mismatch_total``, …)
+#   * typed exceptions (the ``EmbeddingError`` hierarchy)
+#
+# What we lose: the legacy fallback to HuggingFace TEI's ``/embed``
+# shape. The live ``lai_embedding`` container is vLLM-based and serves
+# the OpenAI shape directly, so the TEI fallback path was already dead
+# in production. If TEI support is ever needed it gets added to
+# ``lai.common.embedding`` (benefitting ``serve_rag`` too), not here.
+_EMBEDDING_CLIENT = SyncEmbeddingClient(
+    EmbeddingConfig(
+        base_url=EMBEDDING_URL.rstrip("/") + "/v1",
+        model="Qwen/Qwen3-Embedding-8B",
+        # 4096-d for DDiQ's own ``ddiq_doc_chunks.embedding vector(4096)``
+        # column. Note: the corpus-side ``corpus_child_chunks.embedding
+        # halfvec(4000)`` truncates to 4000 — that's done by the
+        # migration / topup script, NOT here, because the DDiQ upload
+        # path still writes to its own 4096-d table.
+        dimension=4096,
+        # Match vLLM's per-request limit; the legacy ``batch_size=8`` was
+        # very conservative. 32 is what the live ``Qwen3-Embedding-8B``
+        # container accepts in one POST without OOM risk.
+        max_batch_size=32,
+    )
+)
 
 
 def llm_call(system, user, temperature=0.1, max_tokens=2048):
