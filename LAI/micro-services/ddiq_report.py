@@ -63,6 +63,19 @@ from _guardrail import apply_to_findings, apply_to_rows
 from lai.common.jurisdiction import (
     JurisdictionWarning as _LcJurisdictionWarning,
     check_jurisdiction,
+    detect_bundesland,
+)
+
+# Public-registry connectors (H-3): Nominatim geocoder + ALKIS INSPIRE
+# WFS. The Postgres caches around them (``ddiq_geocode_cache`` /
+# ``ddiq_parcel_cache``) stay DDiQ-internal because they use the
+# microservice's psycopg2 pool; the actual HTTP + parsing + retries
+# now live in ``lai.common.connectors``.
+from lai.common.connectors import (
+    AlkisClient,
+    AlkisError,
+    NominatimClient,
+    NominatimError,
 )
 
 # Shared PDF extractor (PyMuPDF + Tesseract OCR fallback) and chunker
@@ -124,8 +137,11 @@ LLM_URL       = os.getenv("LLM_URL", "http://localhost:8001/v1")
 LLM_MODEL     = os.getenv("LLM_MODEL", "legal-lora")
 EMBEDDING_URL = os.getenv("EMBEDDING_URL", "http://localhost:8002")
 RERANKER_URL  = os.getenv("RERANKER_URL", "http://localhost:8004")
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-NOMINATIM_UA  = "LAI-DDiQ/1.0 (legal-ai-report-generator)"
+# Nominatim + ALKIS configs come from ``lai.common.connectors`` now —
+# search for ``_NOMINATIM_CLIENT`` / ``_ALKIS_CLIENT`` for the
+# singletons. The legacy NOMINATIM_URL / NOMINATIM_UA constants were
+# removed in commit (H-3); their values now live in the new
+# ``NominatimConfig`` defaults.
 
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST", "localhost"),
@@ -138,42 +154,17 @@ DB_CONFIG = {
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ALKIS WFS — German Federal State Cadastral Services (INSPIRE CadastralParcels)
+# ALKIS WFS endpoints and Bundesland keyword table moved to:
+#   - ``lai.common.connectors.config.ALKIS_WFS_ENDPOINTS`` (12 state WFS)
+#   - ``lai.common.jurisdiction.BUNDESLAND_KEYWORDS`` (16-state keyword set)
+# H-3 extraction commit. Kept here as one-line aliases for the few
+# legacy call sites that referenced them by name — none in this file
+# after the H-3 refactor, but a downstream consumer in cadastral_pipeline
+# may still import ``ALKIS_WFS_ENDPOINTS`` for label display.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-ALKIS_WFS_ENDPOINTS = {
-    "niedersachsen": {"url": "https://www.opengeodata.lgln.niedersachsen.de/doorman/noauth/wfs_ni_inspire-flurstuecke_alkis", "typename": "cp:CadastralParcel", "label": "Niedersachsen LGLN"},
-    "nordrhein-westfalen": {"url": "https://www.wfs.nrw.de/geobasis/wfs_nw_inspire-flurstuecke_alkis", "typename": "cp:CadastralParcel", "label": "NRW Geobasis"},
-    "schleswig-holstein": {"url": "https://service.gdi-sh.de/WFS_SH_INSPIRE_CP", "typename": "cp:CadastralParcel", "label": "SH GDI"},
-    "brandenburg": {"url": "https://inspire.brandenburg.de/services/cp_wfs", "typename": "cp:CadastralParcel", "label": "Brandenburg LGB"},
-    "mecklenburg-vorpommern": {"url": "https://www.geodaten-mv.de/dienste/inspire_cp_alkis_download", "typename": "cp:CadastralParcel", "label": "MV LAIV"},
-    "sachsen-anhalt": {"url": "https://www.geodatenportal.sachsen-anhalt.de/wss/service/ST_LVermGeo_INSPIRE_CP_WFS/guest", "typename": "cp:CadastralParcel", "label": "SA LVG"},
-    "hessen": {"url": "https://www.gds.hessen.de/wfs2/aaa-bkg/inspire_cp_alkis", "typename": "cp:CadastralParcel", "label": "Hessen HVBG"},
-    "thueringen": {"url": "https://www.geoproxy.geoportal-th.de/geoproxy/services/inspire_cp_alkis_wfs", "typename": "cp:CadastralParcel", "label": "Thueringen TLVermGeo"},
-    "sachsen": {"url": "https://geodienste.sachsen.de/wfs_geobasis_inspire_cp/guest", "typename": "cp:CadastralParcel", "label": "Sachsen GeoSN"},
-    "rheinland-pfalz": {"url": "https://www.geoportal.rlp.de/spatial-objects/314/services/inspire_cp_alkis_wfs", "typename": "cp:CadastralParcel", "label": "RLP LVermGeo"},
-    "bayern": {"url": "https://geoservices.bayern.de/wfs/ogc_inspire_cp.cgi", "typename": "cp:CadastralParcel", "label": "Bayern LDBV"},
-    "baden-wuerttemberg": {"url": "https://owsproxy.lgl-bw.de/owsproxy/wfs/WFS_ALKIS_INSPIRE_CP", "typename": "cp:CadastralParcel", "label": "BW LGL"},
-}
-
-BUNDESLAND_KEYWORDS = {
-    "niedersachsen": ["niedersachsen", "hannover", "braunschweig", "oldenburg", "osnabrück", "lüneburg", "göttingen", "wolfsburg", "cuxhaven", "hude", "hatten", "lamstedt"],
-    "nordrhein-westfalen": ["nordrhein-westfalen", "nrw", "düsseldorf", "köln", "münster", "detmold", "arnsberg", "dortmund", "essen"],
-    "schleswig-holstein": ["schleswig-holstein", "kiel", "lübeck", "flensburg", "husum", "dithmarschen"],
-    "brandenburg": ["brandenburg", "potsdam", "cottbus", "uckermark", "prignitz"],
-    "mecklenburg-vorpommern": ["mecklenburg", "vorpommern", "rostock", "schwerin", "stralsund", "rügen"],
-    "sachsen-anhalt": ["sachsen-anhalt", "magdeburg", "halle", "dessau", "stendal", "altmark"],
-    "bayern": ["bayern", "bavaria", "münchen", "nürnberg", "augsburg"],
-    "hessen": ["hessen", "wiesbaden", "frankfurt", "kassel", "darmstadt"],
-    "thüringen": ["thüringen", "erfurt", "jena", "weimar"],
-    "sachsen": ["sachsen", "dresden", "leipzig", "chemnitz"],
-    "rheinland-pfalz": ["rheinland-pfalz", "mainz", "koblenz", "trier"],
-    "baden-württemberg": ["baden-württemberg", "stuttgart", "karlsruhe", "freiburg"],
-    "saarland": ["saarland", "saarbrücken"],
-    "bremen": ["bremen", "bremerhaven"],
-    "hamburg": ["hamburg"],
-    "berlin": ["berlin"],
-}
+from lai.common.connectors.config import ALKIS_WFS_ENDPOINTS  # noqa: E402,F401 — re-export for legacy callers
+from lai.common.jurisdiction import BUNDESLAND_KEYWORDS  # noqa: E402,F401 — re-export for legacy callers
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -759,6 +750,15 @@ _EMBEDDING_CLIENT = SyncEmbeddingClient(
     )
 )
 
+# Connector singletons (H-3) — single httpx.Client per upstream.
+# Pydantic-settings defaults are intentionally permissive: the actual
+# endpoint URLs are hard-coded in lai.common.connectors.config (one
+# per Bundesland for ALKIS; hosted OSM for Nominatim). Override via
+# ``LAI_NOMINATIM_*`` / ``LAI_ALKIS_*`` env vars if a self-hosted
+# Nominatim or an alternate WFS proxy is configured.
+_NOMINATIM_CLIENT = NominatimClient()
+_ALKIS_CLIENT = AlkisClient()
+
 
 def llm_call(system, user, temperature=0.1, max_tokens=2048):
     """Single-shot chat completion. Returns the stripped string content.
@@ -876,35 +876,40 @@ def evidence_from_chunks(reranked, indices):
 # GEOCODING + PARCEL POLYGON
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def geocode_address(address, expected_bundesland: Optional[str] = None):
-    """Geocode ``address`` via the cached Nominatim wrapper.
+def geocode_address(
+    address: str,
+    expected_bundesland: Optional[str] = None,
+) -> Optional[tuple[float, float]]:
+    """Geocode ``address`` to ``(lat, lng)`` with DDiQ-side caching.
 
-    Args:
-        address: The address string to geocode. Pre-trimmed; an empty /
-            whitespace-only value short-circuits to ``None``.
-        expected_bundesland: Optional Bundesland name (lowercase, as
-            returned by :func:`detect_bundesland`). When provided AND a
-            bbox exists for it (see :data:`bundesland_bbox.BUNDESLAND_BBOX`),
-            any Nominatim result whose coordinates fall outside the bbox
-            is rejected — the gate that closes the "turbines in Bremen"
-            failure mode from the 2026-04 smoke-test where Nominatim
-            resolved a Cuxhaven address to the city-state of Bremen
-            ~70 km south-west. Rejected results are NOT cached; the next
-            call with a more specific address gets a fresh attempt.
+    Thin shim that wraps :class:`lai.common.connectors.NominatimClient`
+    with a Postgres-backed cache (``ddiq_geocode_cache``). The cache
+    stays DDiQ-internal because it uses this microservice's psycopg2
+    pool; the actual HTTP + tenacity retry + bbox plausibility gate
+    now live in the shared connector.
 
-    Returns:
-        ``(lat, lng)`` on success, ``None`` if the address is empty, the
-        Nominatim call fails, no result is returned, or the bbox gate
-        rejects the result.
+    Lookup → cache fast path (only non-expired rows; legacy rows with
+    NULL ``expires_at`` are treated as expired).
+
+    Miss → call the connector. The bbox gate inside the connector
+    rejects wrong-Bundesland results (the "Cuxhaven→Bremen" failure
+    mode from the wind-lawyer's smoke test). Rejected results are
+    NOT cached; the next call with a more specific address gets a
+    fresh attempt.
+
+    Returns ``None`` on:
+      - empty address
+      - Nominatim returned no result
+      - bbox gate rejected the result
+      - transport failure after the connector's retry budget exhausted
+        (we swallow connector errors here because geocoding is a
+        nice-to-have for the report; mid-pipeline crashes from a
+        Nominatim outage would be disproportionate)
     """
     if not address or not address.strip():
         return None
     conn = get_conn()
     cur = conn.cursor()
-
-    # Cache lookup: only honor non-expired rows. NULL ``expires_at`` is
-    # treated as expired so legacy rows pre-dating the TTL column get
-    # re-geocoded once (and re-validated against the new bbox gate).
     cur.execute(
         "SELECT lat, lng FROM ddiq_geocode_cache "
         "WHERE address = %s AND expires_at IS NOT NULL AND expires_at > NOW()",
@@ -916,61 +921,41 @@ def geocode_address(address, expected_bundesland: Optional[str] = None):
         return (row[0], row[1])
 
     try:
-        resp = requests.get(
-            NOMINATIM_URL,
-            params={"q": address, "format": "json", "limit": 1, "countrycodes": "de"},
-            headers={"User-Agent": NOMINATIM_UA},
-            timeout=10,
+        result = _NOMINATIM_CLIENT.geocode(
+            address, expected_bundesland=expected_bundesland,
         )
-        resp.raise_for_status()
-        results = resp.json()
-        if not results:
-            cur.close(); conn.close()
-            return None
-
-        lat = float(results[0]["lat"])
-        lng = float(results[0]["lon"])
-
-        # Plausibility gate. Unknown Bundeslaender pass through silently
-        # (see ``is_in_bundesland`` docstring); known ones reject + log.
-        if (
-            expected_bundesland
-            and has_bbox(expected_bundesland)
-            and not is_in_bundesland(lat, lng, expected_bundesland)
-        ):
-            logger.warning(
-                "Geocoding rejected for '%s': Nominatim returned "
-                "(%.4f, %.4f) which is outside the %s bbox. Likely a "
-                "wrong-Bundesland same-name resolution; not caching.",
-                address, lat, lng, expected_bundesland,
-            )
-            cur.close(); conn.close()
-            time.sleep(1.1)  # we did consume a Nominatim request
-            return None
-
-        # Cache. ``ON CONFLICT (address) DO UPDATE`` so a stale row (NULL
-        # ``expires_at`` from before the TTL column existed, or just an
-        # expired entry) gets refreshed instead of silently re-locking
-        # itself for the next fetch cycle.
-        cur.execute(
-            "INSERT INTO ddiq_geocode_cache (address, lat, lng, expires_at) "
-            "VALUES (%s, %s, %s, NOW() + INTERVAL '90 days') "
-            "ON CONFLICT (address) DO UPDATE SET "
-            "  lat = EXCLUDED.lat, "
-            "  lng = EXCLUDED.lng, "
-            "  cached_at = NOW(), "
-            "  expires_at = EXCLUDED.expires_at",
-            (address, lat, lng),
-        )
-        conn.commit()
+    except NominatimError as e:
+        # The connector exhausts retries / surfaces invalid responses
+        # as typed errors. Log + return None — the bbox gate's
+        # warning log already fires inside the connector when that
+        # specific rejection happens.
+        logger.warning("Geocoding failed for %r: %s", address, e)
         cur.close(); conn.close()
-        time.sleep(1.1)
-        return (lat, lng)
-    except Exception as e:
-        logger.warning(f"Geocoding failed for '{address}': {e}")
+        return None
 
+    if result is None:
+        # No result from Nominatim OR bbox-rejected. Don't cache.
+        cur.close(); conn.close()
+        return None
+
+    lat, lng = result
+    # ``ON CONFLICT (address) DO UPDATE`` so a stale row (NULL
+    # ``expires_at`` from before the TTL column existed, or an
+    # expired entry) gets refreshed instead of silently locking
+    # itself out for the next fetch cycle.
+    cur.execute(
+        "INSERT INTO ddiq_geocode_cache (address, lat, lng, expires_at) "
+        "VALUES (%s, %s, %s, NOW() + INTERVAL '90 days') "
+        "ON CONFLICT (address) DO UPDATE SET "
+        "  lat = EXCLUDED.lat, "
+        "  lng = EXCLUDED.lng, "
+        "  cached_at = NOW(), "
+        "  expires_at = EXCLUDED.expires_at",
+        (address, lat, lng),
+    )
+    conn.commit()
     cur.close(); conn.close()
-    return None
+    return (lat, lng)
 
 def make_parcel_polygon(lat, lng, area_ha=2.5, rotation_seed=0):
     """Create an estimated parcel polygon. Marked as 'estimated' — not real cadastral data."""
@@ -995,20 +980,33 @@ def make_parcel_polygon(lat, lng, area_ha=2.5, rotation_seed=0):
 # ALKIS WFS QUERY — Real Cadastral Parcels from Coordinates
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def detect_bundesland(location: str) -> Optional[str]:
-    loc = location.lower()
-    for state, keywords in BUNDESLAND_KEYWORDS.items():
-        if any(kw in loc for kw in keywords): return state
-    return None
+# NOTE: ``detect_bundesland`` is imported from ``lai.common.jurisdiction``
+# at the top of this file. The legacy inline definition that used to
+# live here shadowed the import; deleted in H-3 (commit follows).
 
-def alkis_query_parcels(lat: float, lng: float, bundesland: str, radius_m: float = 150) -> list[dict]:
-    """Query ALKIS INSPIRE WFS → returns real Flurstück data with polygons."""
-    config = ALKIS_WFS_ENDPOINTS.get(bundesland)
-    if not config: return []
+def alkis_query_parcels(
+    lat: float,
+    lng: float,
+    bundesland: str,
+    radius_m: float = 150,
+) -> list[dict]:
+    """Query ALKIS INSPIRE WFS with DDiQ-side caching.
 
-    # Check cache. Track A item 6: filter on ``expires_at`` so legacy
-    # rows (NULL ``expires_at`` from before the TTL column existed) are
-    # treated as expired and re-fetched once.
+    Thin shim that wraps :class:`lai.common.connectors.AlkisClient` with
+    a Postgres cache (``ddiq_parcel_cache``). The HTTP + tenacity retry
+    + JSON/GML shape detection live inside the connector.
+
+    Cache lookup → fast path on non-expired rows (Track A item 6 added
+    the ``expires_at`` column; pre-TTL rows are treated as expired and
+    re-fetched once).
+
+    Returns ``[]`` on:
+      - unsupported Bundesland (city-states have no WFS)
+      - empty result inside the bbox
+      - connector error (retry exhausted, invalid response) — we
+        swallow rather than crash mid-pipeline; the report just shows
+        no ALKIS data for that WEA
+    """
     cache_key = f"alkis:{lat:.5f},{lng:.5f}"
     try:
         conn = get_conn(); cur = conn.cursor()
@@ -1022,244 +1020,46 @@ def alkis_query_parcels(lat: float, lng: float, bundesland: str, radius_m: float
             data = row[0] if isinstance(row[0], list) else json.loads(row[0])
             logger.info(f"ALKIS cache hit: {cache_key} ({len(data)} parcels)")
             return data
-    except Exception: pass
+    except Exception:
+        # Cache lookup failure is non-fatal — fall through to the
+        # connector. The cache write path below has its own except
+        # block.
+        pass
 
-    buf = radius_m / 111000
-    params = {"SERVICE": "WFS", "VERSION": "2.0.0", "REQUEST": "GetFeature",
-        "TYPENAMES": config["typename"], "SRSNAME": "EPSG:4326",
-        "BBOX": f"{lat-buf},{lng-buf},{lat+buf},{lng+buf},EPSG:4326",
-        "COUNT": "10", "OUTPUTFORMAT": "application/json"}
-
-    parcels: list[dict] = []
-    headers = {"User-Agent": NOMINATIM_UA}
     try:
-        logger.info(f"ALKIS WFS: {config['label']} at {lat:.5f},{lng:.5f}")
-        # Try JSON first
-        resp = requests.get(config["url"], params=params, timeout=20, headers=headers)
-        # Several state WFS (e.g. NRW INSPIRE-CP) return 400 when asked for JSON
-        # because they only speak GML. Fall back without OUTPUTFORMAT.
-        if resp.status_code == 400 or "application/json" not in (resp.headers.get("content-type") or "").lower():
-            logger.info(f"ALKIS WFS: JSON not accepted ({resp.status_code}), retrying with GML")
-            params_gml = {k: v for k, v in params.items() if k != "OUTPUTFORMAT"}
-            resp = requests.get(config["url"], params=params_gml, timeout=20, headers=headers)
-            resp.raise_for_status()
-            parcels = _parse_alkis_xml(resp.text, lat, lng)
-        else:
-            resp.raise_for_status()
-            try:
-                data = resp.json()
-                features = data.get("features", [])
-                parcels = [p for p in (_parse_alkis_feature(f) for f in features) if p]
-            except json.JSONDecodeError:
-                logger.info("ALKIS returned non-JSON despite header; trying XML parser")
-                parcels = _parse_alkis_xml(resp.text, lat, lng)
-        logger.info(f"ALKIS WFS → {len(parcels)} parcels")
+        parcels = _ALKIS_CLIENT.query_parcels(
+            lat=lat, lng=lng, bundesland=bundesland, radius_m=radius_m,
+        )
+    except AlkisError as e:
+        logger.warning("ALKIS WFS failed for %s: %s", bundesland, e)
+        return []
 
-        # Cache. ON CONFLICT … DO UPDATE refreshes ``expires_at`` so
-        # stale rows self-heal on the next miss.
-        try:
-            conn = get_conn(); cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO ddiq_parcel_cache (coord_key, parcel_data, expires_at) "
-                "VALUES (%s, %s, NOW() + INTERVAL '30 days') "
-                "ON CONFLICT (coord_key) DO UPDATE SET "
-                "  parcel_data = EXCLUDED.parcel_data, "
-                "  cached_at = NOW(), "
-                "  expires_at = EXCLUDED.expires_at",
-                (cache_key, json.dumps(parcels)),
-            )
-            conn.commit(); cur.close(); conn.close()
-        except Exception: pass
-
-        return parcels
-    except Exception as e:
-        logger.warning(f"ALKIS WFS failed for {bundesland}: {e}")
-    return []
-
-
-def _parse_alkis_feature(feature: dict) -> Optional[dict]:
-    """Parse one GeoJSON feature from ALKIS INSPIRE WFS.
-
-    Track A item 6 fix: the inner ``flur`` / ``area_m2`` loops used to
-    read ``pass; break`` on parse failure — two statements on one line,
-    so the ``break`` fired regardless of whether the conversion
-    succeeded. A non-numeric value in the first matching key silently
-    pinned the field to 0 instead of falling through to the next
-    candidate key. Replaced with explicit early-success ``break`` so
-    failed conversions correctly try the remaining keys.
-    """
-    props = feature.get("properties", {})
-    geom = feature.get("geometry", {})
-
-    # Parcel number — straight string read; first non-empty wins.
-    pnum: Optional[str] = None
-    for key in ("label", "flurstuecksnummer", "flstnrzae", "bezeichnung", "flstNr"):
-        v = props.get(key)
-        if v:
-            pnum = str(v).strip()
-            break
-    # Fallback to ``nationalCadastralReference`` if no direct field matched.
-    if not pnum:
-        ncr = str(props.get("nationalCadastralReference", ""))
-        if ncr:
-            parts = ncr.split("-")
-            if len(parts) >= 3:
-                pnum = re.sub(r"^0+", "", parts[-1])
-                pnum = re.sub(r"/0+", "/", pnum)
-    if not pnum:
-        return None
-
-    # Gemarkung — first non-empty key wins.
-    gemarkung = ""
-    for key in ("gemarkungsname", "gemarkung", "gemeinde", "municipality"):
-        v = props.get(key)
-        if v:
-            gemarkung = str(v).strip()
-            break
-
-    # Flur — break only on SUCCESSFUL int conversion; otherwise try the
-    # next candidate key. Previously the bare ``pass; break`` exited the
-    # loop on first failure.
-    flur = 0
-    for key in ("flurnummer", "flur", "flurNr"):
-        raw = props.get(key)
-        if raw is None:
-            continue
-        try:
-            flur = int(raw)
-            break
-        except (ValueError, TypeError):
-            continue
-
-    # Area — same fix as flur.
-    area_m2: float = 0.0
-    for key in ("areaValue", "amtlicheFlaeche", "flaeche", "area"):
-        raw = props.get(key)
-        if raw is None:
-            continue
-        try:
-            area_m2 = float(raw)
-            break
-        except (ValueError, TypeError):
-            continue
-
-    # Polygon — GeoJSON ``[lng, lat]`` → Leaflet ``[lat, lng]``.
-    polygon: list[list[float]] = []
-    if geom.get("type") == "Polygon" and geom.get("coordinates"):
-        polygon = [[pt[1], pt[0]] for pt in geom["coordinates"][0]]
-    elif geom.get("type") == "MultiPolygon" and geom.get("coordinates"):
-        largest = max(geom["coordinates"], key=lambda p: len(p[0]))
-        polygon = [[pt[1], pt[0]] for pt in largest[0]]
-
-    return {
-        "parcelNumber": pnum,
-        "gemarkung": gemarkung,
-        "flur": flur,
-        "polygon": polygon,
-        "area_m2": area_m2,
-        "source": "ALKIS WFS",
-    }
-
-
-def _parse_alkis_xml(xml_text, lat, lng):
-    """Parse INSPIRE Cadastral Parcels GML/XML responses.
-
-    Many state WFS (NRW, Bayern, Hessen, ...) only return GML — not JSON.
-    Schema (INSPIRE CP v4.0):
-
-        <wfs:FeatureCollection>
-          <wfs:member>
-            <cp:CadastralParcel>
-              <cp:areaValue uom="m2">…</cp:areaValue>
-              <cp:label>…</cp:label>
-              <cp:nationalCadastralReference>…</cp:nationalCadastralReference>
-              <cp:geometry>
-                <gml:Polygon srsName="…4326">
-                  <gml:exterior><gml:LinearRing>
-                    <gml:posList>lat lng lat lng …</gml:posList>
-                  </gml:LinearRing></gml:exterior>
-                  …optional gml:interior…
-                </gml:Polygon>
-              </cp:geometry>
-              <cp:referencePoint><gml:Point><gml:pos>lat lng</gml:pos></gml:Point></cp:referencePoint>
-            </cp:CadastralParcel>
-          </wfs:member>
-        </wfs:FeatureCollection>
-
-    For EPSG:4326 INSPIRE specifies lat-lng axis order, which matches what
-    we use everywhere in the UI ([lat,lng] for Leaflet). For projected SRS
-    we'd need pyproj — out of scope here; we request 4326 to avoid that.
-
-    Falls back to a synthetic polygon around (lat, lng) only if the parser
-    finds a CadastralParcel element with no geometry — better than dropping
-    the parcel silently.
-    """
-    import xml.etree.ElementTree as ET
-    parcels: list[dict] = []
+    # Cache. ON CONFLICT … DO UPDATE refreshes ``expires_at`` so stale
+    # rows self-heal on the next miss.
     try:
-        root = ET.fromstring(xml_text)
-    except Exception as e:
-        logger.warning(f"ALKIS XML parse: {e}")
-        return parcels
-
-    NS_GML = "{http://www.opengis.net/gml/3.2}"
-    NS_CP = "{http://inspire.ec.europa.eu/schemas/cp/4.0}"
-
-    def _local(tag: str) -> str:
-        # strip namespace for tolerant matching
-        return tag.split("}", 1)[-1] if "}" in tag else tag
-
-    def _text_of_child(parent, local_name: str) -> Optional[str]:
-        for c in parent:
-            if _local(c.tag) == local_name and (c.text or "").strip():
-                return c.text.strip()
-        return None
-
-    def _parse_pos_list(text: str) -> list[list[float]]:
-        nums = [float(x) for x in (text or "").split() if x]
-        # Pairs of (lat, lng)
-        return [[nums[i], nums[i + 1]] for i in range(0, len(nums) - 1, 2)]
-
-    # Walk all CadastralParcel elements regardless of namespace prefix
-    for parcel_el in root.iter():
-        if _local(parcel_el.tag) != "CadastralParcel":
-            continue
-
-        label = _text_of_child(parcel_el, "label") or ""
-        ncr = _text_of_child(parcel_el, "nationalCadastralReference") or ""
-        area_text = _text_of_child(parcel_el, "areaValue")
-        try:
-            area_m2 = float(area_text) if area_text else 0.0
-        except ValueError:
-            area_m2 = 0.0
-
-        # Find first gml:posList descendant for the exterior ring
-        polygon: list[list[float]] = []
-        for posList in parcel_el.iter(NS_GML + "posList"):
-            polygon = _parse_pos_list(posList.text or "")
-            if polygon:
-                break
-        # If no polygon, fall back to a small synthetic ring at the query point
-        if not polygon:
-            polygon = make_parcel_polygon(lat, lng)
-
-        # Parcel number — prefer cp:label, otherwise tail of nationalCadastralReference
-        pnum = label
-        if not pnum and ncr:
-            tail = re.sub(r"_+$", "", ncr).split("-")[-1]
-            pnum = re.sub(r"^0+", "", tail) or tail
-
-        parcels.append({
-            "parcelNumber": pnum,
-            "gemarkung": "",
-            "flur": 0,
-            "polygon": polygon,
-            "area_m2": area_m2,
-            "source": "ALKIS WFS (GML)",
-            "nationalCadastralReference": ncr,
-        })
-
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO ddiq_parcel_cache (coord_key, parcel_data, expires_at) "
+            "VALUES (%s, %s, NOW() + INTERVAL '30 days') "
+            "ON CONFLICT (coord_key) DO UPDATE SET "
+            "  parcel_data = EXCLUDED.parcel_data, "
+            "  cached_at = NOW(), "
+            "  expires_at = EXCLUDED.expires_at",
+            (cache_key, json.dumps(parcels)),
+        )
+        conn.commit(); cur.close(); conn.close()
+    except Exception:
+        # Cache write failure shouldn't drop the result — return what
+        # we got.
+        pass
     return parcels
+
+
+# NOTE: ``_parse_alkis_feature`` and ``_parse_alkis_xml`` moved to
+# ``lai.common.connectors._parsers`` (H-3). Same logic, with the
+# Track A item 6 bug-fix preserved (break only on successful parse,
+# not on first non-None key). Tests for the pure parsers live in
+# ``tests/unit/common/connectors/test_parsers.py``.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
