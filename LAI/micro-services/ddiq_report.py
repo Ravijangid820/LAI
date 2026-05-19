@@ -143,15 +143,20 @@ RERANKER_URL  = os.getenv("RERANKER_URL", "http://localhost:8004")
 # removed in commit (H-3); their values now live in the new
 # ``NominatimConfig`` defaults.
 
-DB_CONFIG = {
-    "host":     os.getenv("DB_HOST", "localhost"),
-    "port":     int(os.getenv("DB_PORT", 5433)),
-    "dbname":   os.getenv("DB_NAME", "lai_db"),
-    "user":     os.getenv("DB_USER", "lai_user"),
-    "password": os.getenv("DB_PASSWORD", "lai_test_password_2024"),
-}
-
-MAX_FILE_SIZE = 50 * 1024 * 1024
+# DB layer (schema + pool + lifecycle) moved to ``ddiq.db`` in H-5.
+# ``DB_CONFIG`` and ``MAX_FILE_SIZE`` are re-exported here so call
+# sites that still reference them by attribute (api.py, in-tree
+# tests) don't break.
+from ddiq.db import (  # noqa: E402 — re-exported for legacy callers
+    DB_CONFIG,
+    MAX_FILE_SIZE,
+    SCHEMA_SQL,
+    close_pool,
+    get_conn,
+    init_db,
+    init_pool,
+    reap_orphans,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ALKIS WFS endpoints and Bundesland keyword table moved to:
@@ -168,357 +173,57 @@ from lai.common.jurisdiction import BUNDESLAND_KEYWORDS  # noqa: E402,F401 — r
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DATABASE SETUP
+# DATABASE SETUP — moved to ``ddiq.db`` in H-5.
+# Schema (SCHEMA_SQL), connection pool (init_pool / close_pool /
+# get_conn / _PooledConn), and startup helpers (init_db,
+# reap_orphans) live in ``ddiq/db.py`` now. The import block earlier
+# in this file re-binds them onto the module namespace so call sites
+# using ``ddiq_report.SCHEMA_SQL`` (or any other moved name) keep
+# working unchanged.
 # ═══════════════════════════════════════════════════════════════════════════════
-
-SCHEMA_SQL = """
--- pgvector is required for ddiq_doc_chunks.embedding (4096-dim Qwen3 vectors).
--- Idempotent: no-op when the extension is already enabled. The whole
--- SCHEMA_SQL runs in one transaction, so without this every CREATE TABLE
--- below fails when the DB is fresh.
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE TABLE IF NOT EXISTS ddiq_documents (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), filename TEXT NOT NULL,
-    size_bytes BIGINT DEFAULT 0, upload_date TIMESTAMPTZ DEFAULT NOW(),
-    status TEXT DEFAULT 'pending', category TEXT DEFAULT 'Uncategorized',
-    full_text TEXT, chunk_count INT DEFAULT 0, session_id TEXT);
-CREATE TABLE IF NOT EXISTS ddiq_doc_chunks (
-    id SERIAL PRIMARY KEY, doc_id UUID REFERENCES ddiq_documents(id) ON DELETE CASCADE,
-    chunk_idx INT NOT NULL, text TEXT NOT NULL, embedding vector(4096), UNIQUE(doc_id, chunk_idx));
-    -- Qwen3-Embedding-8B returns 4096-dim vectors. If you swap to a different
-    -- embedding model (1024-dim sentence-transformers / 1536-dim ada / etc.),
-    -- update this column and drop ddiq_doc_chunks first.
-CREATE TABLE IF NOT EXISTS ddiq_reports (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), created_at TIMESTAMPTZ DEFAULT NOW(),
-    project_name TEXT, document_ids UUID[], preset TEXT,
-    report_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-    -- Status fields for the async job pattern. NULL/legacy rows count as "done".
-    status TEXT DEFAULT 'done',          -- queued | running | done | failed
-    started_at TIMESTAMPTZ,
-    finished_at TIMESTAMPTZ,
-    progress_step TEXT,                  -- short label for UI ("classifying", etc.)
-    progress_percent DOUBLE PRECISION DEFAULT 0.0,
-    error TEXT,
-    -- Stable hash of (sorted doc_ids, preset, project_name) — lets us dedup
-    -- repeat requests and return the cached/in-flight report instead of
-    -- recomputing the 30-60 min pipeline.
-    request_fingerprint TEXT);
--- Forward-compat: add the columns if the table already exists.
-ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'done';
-ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
-ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
-ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS progress_step TEXT;
-ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS progress_percent DOUBLE PRECISION DEFAULT 0.0;
-ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS error TEXT;
-ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;
--- H-4: Celery task id. Set when the API enqueues a job; the worker
--- doesn't read it. Operators correlate Celery logs to this row by id.
-ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS celery_task_id TEXT;
--- Track A item 6: the fingerprint index is now UNIQUE so two concurrent
--- /report/generate calls with identical (doc_ids, preset, project_name)
--- can't both write a row. The old (non-unique) index is dropped first
--- because ``CREATE UNIQUE INDEX IF NOT EXISTS`` with the same name would
--- silently no-op if the existing index isn't unique. New name avoids
--- collision with any in-flight code referencing the old one.
-DROP INDEX IF EXISTS ddiq_reports_fingerprint_idx;
-CREATE UNIQUE INDEX IF NOT EXISTS ddiq_reports_fingerprint_uniq_idx
-    ON ddiq_reports(request_fingerprint) WHERE request_fingerprint IS NOT NULL;
-CREATE TABLE IF NOT EXISTS ddiq_geocode_cache (
-    address TEXT PRIMARY KEY, lat DOUBLE PRECISION NOT NULL,
-    lng DOUBLE PRECISION NOT NULL, cached_at TIMESTAMPTZ DEFAULT NOW(),
-    -- TTL on the geocode cache. Rows are honored only while
-    -- ``expires_at > NOW()``; pre-TTL rows (NULL ``expires_at``) are
-    -- treated as expired so any wrong-state Nominatim answers cached
-    -- before the bbox gate landed get re-geocoded once.
-    expires_at TIMESTAMPTZ);
-ALTER TABLE ddiq_geocode_cache ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
-CREATE TABLE IF NOT EXISTS ddiq_parcel_cache (
-    coord_key TEXT PRIMARY KEY, parcel_data JSONB NOT NULL, cached_at TIMESTAMPTZ DEFAULT NOW(),
-    -- TTL on the parcel cache. Cadastral data updates quarterly at most
-    -- but 30 days is conservative and matches the geocode-cache pattern
-    -- (Track A item 3). NULL ``expires_at`` is treated as expired so any
-    -- pre-TTL row is refetched once.
-    expires_at TIMESTAMPTZ);
-ALTER TABLE ddiq_parcel_cache ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
-CREATE TABLE IF NOT EXISTS ddiq_project_areas (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT,
-    polygon JSONB NOT NULL, centroid_lat DOUBLE PRECISION, centroid_lng DOUBLE PRECISION,
-    area_km2 DOUBLE PRECISION DEFAULT 0, source TEXT DEFAULT 'user_drawn',
-    created_at TIMESTAMPTZ DEFAULT NOW(), report_id UUID);
-CREATE TABLE IF NOT EXISTS ddiq_contracts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), doc_id UUID,
-    contract_ref TEXT, contract_type TEXT, contracting_entity TEXT,
-    raw_text_excerpt TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), report_id UUID);
-CREATE TABLE IF NOT EXISTS ddiq_contract_parcels (
-    id SERIAL PRIMARY KEY, contract_id UUID REFERENCES ddiq_contracts(id) ON DELETE CASCADE,
-    parcel_identifier TEXT NOT NULL, match_type TEXT DEFAULT 'exact',
-    confidence DOUBLE PRECISION DEFAULT 1.0);
-CREATE TABLE IF NOT EXISTS ddiq_classified_parcels (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), report_id UUID,
-    parcel_number TEXT NOT NULL, gemarkung TEXT, flur INT DEFAULT 0,
-    normalized_id TEXT, polygon JSONB, polygon_source TEXT DEFAULT 'estimated',
-    classification TEXT NOT NULL DEFAULT 'not_secured',
-    color TEXT DEFAULT 'red', confidence DOUBLE PRECISION DEFAULT 0,
-    matched_contract_id UUID, classification_reason TEXT,
-    area_ha DOUBLE PRECISION DEFAULT 0, owner TEXT, linked_wea TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW());
-CREATE INDEX IF NOT EXISTS idx_ddiq_chunks_doc ON ddiq_doc_chunks(doc_id);
-CREATE INDEX IF NOT EXISTS idx_ddiq_classified_report ON ddiq_classified_parcels(report_id);
-CREATE INDEX IF NOT EXISTS idx_ddiq_contracts_report ON ddiq_contracts(report_id);
-"""
-
-def init_db():
-    try:
-        conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
-        cur.execute(SCHEMA_SQL); conn.commit(); cur.close(); conn.close()
-        logger.info("DDiQ tables initialized")
-    except Exception as e:
-        logger.warning(f"DDiQ DB init skipped: {e}")
-
-
-# ─── Connection pool ───────────────────────────────────────────────────────
-# Every endpoint used to call psycopg2.connect() directly, paying the TCP +
-# auth handshake cost (~5-50ms) per request. /report/generate opened ~20+
-# connections in a single call. A single shared ThreadedConnectionPool
-# eliminates the cost; a thin _PooledConn wrapper makes existing call sites
-# (`conn.close()`) return the connection to the pool instead of really
-# closing it, so we don't have to refactor every endpoint.
-
-from psycopg2.pool import ThreadedConnectionPool
-
-_pg_pool: Optional[ThreadedConnectionPool] = None
-
-
-class _PooledConn:
-    """Proxy a psycopg2 connection from the pool. ``close()`` returns it
-    to the pool; everything else delegates to the underlying connection
-    so existing code continues to work."""
-    def __init__(self, conn, pool: ThreadedConnectionPool):
-        self.__dict__["_conn"] = conn
-        self.__dict__["_pool"] = pool
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-
-    def __setattr__(self, name, value):
-        # Mirror writes onto the underlying connection.
-        setattr(self._conn, name, value)
-
-    def close(self):
-        if self._conn is None or self._pool is None:
-            return
-        try:
-            # If the txn is in a bad state, return aborted so the pool can
-            # reset/discard the connection cleanly.
-            if not self._conn.closed:
-                self._pool.putconn(self._conn)
-        finally:
-            self.__dict__["_conn"] = None
-            self.__dict__["_pool"] = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        # Mirror psycopg2 connection-as-context-manager semantics: commit
-        # on clean exit, rollback on exception, then return to pool.
-        try:
-            if exc is None:
-                self._conn.commit()
-            else:
-                self._conn.rollback()
-        finally:
-            self.close()
-
-
-def init_pool() -> None:
-    global _pg_pool
-    if _pg_pool is not None:
-        return
-    _pg_pool = ThreadedConnectionPool(
-        minconn=int(os.getenv("DB_POOL_MIN", "2")),
-        maxconn=int(os.getenv("DB_POOL_MAX", "20")),
-        **DB_CONFIG,
-    )
-    logger.info(f"DDiQ DB pool: {_pg_pool.minconn}/{_pg_pool.maxconn} connections")
-
-
-def close_pool() -> None:
-    global _pg_pool
-    if _pg_pool is not None:
-        _pg_pool.closeall()
-        _pg_pool = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PYDANTIC MODELS
+# PYDANTIC MODELS — moved to ``ddiq.models`` in H-5.
+# DocumentOut, DocumentListResponse, UploadDocResponse,
+# AusgabeblattRow / Section, WEAStatus, InfraPoint, CadastralParcel,
+# Evidence, Quantification, Finding, TimelineEntry, GrundbuchCheck,
+# RueckbauBond, DDiQReportData, GenerateReportRequest /
+# GenerateReportResponse, ProjectAreaRequest / Response — all now in
+# ``ddiq/models.py``. Imported below and re-bound onto this module
+# so call sites doing ``ddiq_report.Finding`` etc. keep working.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class DocumentOut(BaseModel):
-    id: str; name: str; size: float; uploadDate: str; type: str; status: str; category: str
-class DocumentListResponse(BaseModel):
-    documents: list[DocumentOut]; total: int
-class UploadDocResponse(BaseModel):
-    id: str; filename: str; pages: int; chunks: int; status: str; message: str
-class AusgabeblattRow(BaseModel):
-    label: str; value: str; ampel: Optional[str] = None; note: Optional[str] = None
-class AusgabeblattSection(BaseModel):
-    id: str; title: str; rows: list[AusgabeblattRow]
-class WEAStatus(BaseModel):
-    name: str; ampel: str; owner: str; parcel: str; contract: str; lat: float; lng: float; address: str
-    clearance_radius_m: float = 1000.0
-    # Technical attributes (P1 #7) — pulled from Erläuterungsbericht / BImSchG
-    # permit. Hub height drives the 10H clearance for Bayern/Hessen.
-    hub_height_m: Optional[float] = None
-    rotor_diameter_m: Optional[float] = None
-    rated_power_kw: Optional[float] = None
-    manufacturer: Optional[str] = None
-    model: Optional[str] = None
-    # Status code per BImSchG procedure: errichtet | genehmigt | geplant | abgenommen
-    status_code: Optional[str] = None
-    permit_ref: Optional[str] = None      # Aktenzeichen of the BImSchG Bescheid
-    warranty_end: Optional[str] = None    # ISO date or free text
-class InfraPoint(BaseModel):
-    name: str; type: str; lat: float; lng: float
-class CadastralParcel(BaseModel):
-    id: str; parcelNumber: str; gemarkung: str; flur: int; polygon: list[list[float]]
-    status: str; owner: str; area: float; contractRef: Optional[str] = None
-    linkedWEA: Optional[str] = None; notes: Optional[str] = None
-    polygonSource: str = "estimated"  # "alkis_wfs", "document", "estimated"
-    confidence: float = 0.0
-    normalizedId: str = ""
 
-# ─── Evidence + quantification (P0 #1, #4) ──────────────────────────────────
-# Every Finding/TimelineEntry/Grundbuch/Rückbau check carries Evidence so a
-# lawyer can verify the LLM's claim by jumping to the right page of the
-# right document. Without this, output is unverifiable.
-class Evidence(BaseModel):
-    doc_id: Optional[str] = None
-    doc_filename: Optional[str] = None
-    page: Optional[int] = None        # currently no per-page chunking — left None
-    excerpt: str = ""                 # short snippet (≤300 chars) from the chunk
-    clause: Optional[str] = None      # e.g. "§4 Abs. 1 BImSchG", "Pachtvertrag §7"
-
-class Quantification(BaseModel):
-    """Materiality scorecard on a finding. Lawyer DD ranks by impact, not text."""
-    mw_affected: Optional[float] = None
-    eur_impact_estimate: Optional[float] = None
-    days_until_deadline: Optional[int] = None
-    rationale: Optional[str] = None   # how the LLM arrived at these numbers
-
-class Finding(BaseModel):
-    domain: str
-    severity: str
-    text: str
-    # P0 additions
-    evidence: list[Evidence] = []
-    quantification: Optional[Quantification] = None
-    legal_basis: Optional[str] = None        # "§4 BImSchG" / "§35 Abs. 1 Nr. 5 BauGB" / "§44 BNatSchG"
-    recommended_action: Optional[str] = None
-    # section | cross_document | deadline | grundbuch | rueckbau | regulatory
-    kind: str = "section"
-
-# ─── Timeline (P0 #2) ───────────────────────────────────────────────────────
-class TimelineEntry(BaseModel):
-    """Date-bound milestone or deadline pulled from the documents.
-    Surfaces 'permit valid until 2027-06-30, renewal 6 months prior' style
-    findings that pure-RAG Q&A misses."""
-    kind: str  # permit_expiry | lease_term_end | renewal_deadline | warranty_end | bond_validity | construction_milestone | objection_window | other
-    date: str  # ISO YYYY-MM-DD when known, free-text fallback otherwise
-    description: str
-    legal_basis: Optional[str] = None       # e.g. "§70 VwGO Widerspruchsfrist"
-    evidence: list[Evidence] = []
-    days_from_now: Optional[int] = None
-    urgency: Optional[str] = None           # expired | urgent | soon | future
-
-# ─── Grundbuch consistency (P1 #6) ──────────────────────────────────────────
-class GrundbuchCheck(BaseModel):
-    """Per-parcel: does Pachtvertrag-lessor match the registered Eigentümer?
-    What encumbrances (Belastungen) are on the title? Without this, a parcel
-    can show 'secured' even if the contract is signed by someone with no
-    legal title."""
-    parcel_id: str                          # normalized: gemarkung:flur:parcel_number
-    registered_owner: Optional[str] = None
-    lessor_name: Optional[str] = None
-    owner_match: Optional[bool] = None      # None when undeterminable from documents
-    match_confidence: float = 0.0
-    encumbrances: list[str] = []            # "Wegerecht zugunsten Gemeinde", "§24 BauGB Vorkaufsrecht", "Hypothek 250k €"
-    evidence: list[Evidence] = []
-    note: Optional[str] = None
-
-# ─── Rückbaubürgschaft (P1 #9) ──────────────────────────────────────────────
-class RueckbauBond(BaseModel):
-    """§35 Abs. 5 BauGB requires a decommissioning bond. Recurring DD red flag.
-    Pulled out of the BImSchG-Bescheid Auflagen or a separate Bürgschaftsurkunde."""
-    amount_eur: Optional[float] = None
-    provider: Optional[str] = None          # bank, insurer, parent guarantor
-    beneficiary: Optional[str] = None       # usually the Standortgemeinde
-    valid_until: Optional[str] = None       # ISO date
-    instrument_type: Optional[str] = None   # "Bürgschaft" | "Hinterlegung" | "Konzernbürgschaft"
-    sufficient: Optional[bool] = None       # vs. expected Rückbaukosten (LLM's read)
-    evidence: list[Evidence] = []
-    note: Optional[str] = None
-
-class DDiQReportData(BaseModel):
-    projectName: str; preparedBy: str; preparedFor: str; date: str; projectCenter: dict
-    # Defaults to empty so we can construct the report at the start of the
-    # pipeline and fill fields in as each phase completes — supports
-    # incremental persistence, so a mid-pipeline crash still leaves a
-    # usable report instead of an empty placeholder row.
-    sections: list[AusgabeblattSection] = []
-    weaStatuses: list[WEAStatus] = []
-    infrastructure: list[InfraPoint] = []
-    parcels: list[CadastralParcel] = []
-    findings: list[Finding] = []
-    analyzedDocuments: list[str] = []
-    projectArea: Optional[dict] = None          # Project area polygon data
-    clearanceZones: Optional[list[dict]] = None  # WEA clearance zone circles
-    validation: Optional[dict] = None            # Validation report
-    geojson: Optional[dict] = None               # GeoJSON FeatureCollection
-    # P0/P1 additions
-    timeline: list[TimelineEntry] = []
-    crossDocFindings: list[Finding] = []         # inter-document inconsistencies
-    grundbuchChecks: list[GrundbuchCheck] = []
-    rueckbauBond: Optional[RueckbauBond] = None
-    documentMap: list[dict] = []                 # [{"id": uuid, "filename": str}] for evidence rendering
-    # ── Reconciled cross-source values (Track A item 4) ────────────────
-    # Single source of truth for fields the pipeline historically
-    # disagreed about across sections. ``None`` / 0 means no candidate
-    # source returned a value; downstream code treats those as "unknown"
-    # rather than substituting a fallback. See ``_reconcile.py`` and the
-    # reconciliation block in ``_generate_report_core``.
-    turbineCount: int = 0
-    bundesland: Optional[str] = None             # lowercase, e.g. "niedersachsen"
-    # ── Jurisdiction warnings (H-2) ────────────────────────────────────
-    # Populated by the post-guardrail jurisdiction scan in
-    # ``_generate_report_core``. Each entry flags a Bundesland-specific
-    # rule (e.g. ``"Bayerns 10H-Regel"``) cited in this report when the
-    # matter's actual Bundesland is a different state. Empty list when
-    # the matter has no detected Bundesland (the validator returns []
-    # for ``expected_bundesland=None``) OR no cross-state rule was
-    # mentioned. Same shape as serve_rag's ``JurisdictionWarningOut`` so
-    # the UI can render both with the same component.
-    jurisdictionWarnings: list[dict] = []
-class GenerateReportRequest(BaseModel):
-    document_ids: list[str]; preset: str = "full"
-    project_name: Optional[str] = None; prepared_for: Optional[str] = None
-class GenerateReportResponse(BaseModel):
-    report_id: str; report: DDiQReportData; timings: dict
+from ddiq.models import (  # noqa: E402 — re-exported for legacy callers
+    AusgabeblattRow,
+    AusgabeblattSection,
+    CadastralParcel,
+    DDiQReportData,
+    DocumentListResponse,
+    DocumentOut,
+    Evidence,
+    Finding,
+    GenerateReportRequest,
+    GenerateReportResponse,
+    GrundbuchCheck,
+    InfraPoint,
+    ProjectAreaRequest,
+    ProjectAreaResponse,
+    Quantification,
+    RueckbauBond,
+    TimelineEntry,
+    UploadDocResponse,
+    WEAStatus,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CORE HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def get_conn():
-    """Return a connection from the pool (lazy-init the pool on first use).
+# get_conn() lives in ``ddiq.db`` (imported above).
 
-    Call ``conn.close()`` as before — that returns it to the pool, not
-    actually closes it. Use ``with get_conn() as conn:`` to also pick up
-    auto-commit-on-success / rollback-on-exception."""
-    if _pg_pool is None:
-        init_pool()
-    return _PooledConn(_pg_pool.getconn(), _pg_pool)
 
 def clean_value(val, fallback: str = "Not specified in documents") -> str:
     s = str(val).strip()
@@ -3041,18 +2746,8 @@ def validate_report(report_id: str, user: CurrentUser = Depends(get_current_user
     return {"message": "Validation data not available for this report. Re-generate the report to include validation."}
 
 
-class ProjectAreaRequest(BaseModel):
-    polygon: list[list[float]]               # [[lat, lng], ...]
-    name: Optional[str] = "User-Defined Area"
-
-class ProjectAreaResponse(BaseModel):
-    id: str
-    name: str
-    polygon: list[list[float]]
-    centroid_lat: float
-    centroid_lng: float
-    area_km2: float
-    source: str
+# ProjectAreaRequest / ProjectAreaResponse moved to ``ddiq.models`` in
+# H-5; imported at top of file.
 
 
 @router.post("/project-area", response_model=ProjectAreaResponse)
@@ -3111,50 +2806,7 @@ async def get_map_tiles():
         ],
     }
 
-def reap_orphans() -> None:
-    """Mark long-stuck queued/running reports as failed.
-
-    H-4: Celery's ``acks_late=True`` puts crashed-worker tasks back on
-    the queue automatically — so a row in ``running`` state does NOT
-    imply the work is lost. Could be:
-
-      a) actively running on a worker (correct, leave alone),
-      b) just-requeued waiting for a worker (correct, leave alone),
-      c) genuinely stuck — the worker died before recording any
-         progress AND the broker lost the message, OR the row was
-         created before the Celery refactor landed.
-
-    The reaper now distinguishes (c) from (a)+(b) by AGE: anything
-    older than 3 hours is well past the observed 60-min worst-case
-    runtime AND past the Celery hard-time-limit of 120 min. Anything
-    younger is left alone.
-
-    The previous "fail everything not done at startup" behaviour
-    was correct for the ThreadPoolExecutor design (threads literally
-    died with the API process) but is wrong now — that would kill
-    reports still being processed by a separate worker container.
-    """
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """UPDATE ddiq_reports
-                       SET status = 'failed',
-                           error = COALESCE(error, '') ||
-                                   ' (reaper: stuck > 3h past started_at)',
-                           finished_at = NOW()
-                       WHERE status IN ('queued','running')
-                         AND started_at IS NOT NULL
-                         AND started_at < NOW() - INTERVAL '3 hours'"""
-                )
-                n = cur.rowcount
-        if n:
-            logger.warning(
-                "reaped %d stuck report(s) older than 3h (started_at"
-                " > Celery hard time limit)", n,
-            )
-    except Exception as e:
-        logger.warning(f"orphan reap failed: {e}")
+# reap_orphans() lives in ``ddiq.db`` (imported above).
 
 
 @router.on_event("startup")
