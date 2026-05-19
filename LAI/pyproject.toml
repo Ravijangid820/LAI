@@ -50,7 +50,14 @@ dependencies = [
     "tenacity>=9.0.0",
     # Utilities
     "numpy>=1.26.0",
-    "vllm>=0.19.0",
+    # NOTE: vllm is intentionally NOT a runtime dep of this package.
+    # The LAI runtime serves models via the ``vllm/vllm-openai`` Docker
+    # image — the authoritative serving path — so the Python code never
+    # imports vllm directly. The legacy entry "vllm>=0.19.0" was a
+    # holdover from when serve_rag attempted in-process vLLM; that
+    # branch was retired with the dead-stack purge (commit 8431797).
+    # Confirmed 2026-05-19 with
+    # ``grep -rE '^(import|from) vllm' src/ micro-services/`` → no hits.
 ]
 
 [project.optional-dependencies]
@@ -186,7 +193,7 @@ warn_return_any = true
 # Third-party libraries that don't ship type stubs and that we don't want to
 # block on. Add carefully; prefer fixing the upstream stub before silencing here.
 module = [
-    "vllm.*",
+    # vllm.* dropped 2026-05-19 alongside the runtime dep — nothing imports it.
     "docling.*",
     "docling_core.*",
     "fitz.*",
