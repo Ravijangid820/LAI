@@ -211,6 +211,9 @@ ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS progress_step TEXT;
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS progress_percent DOUBLE PRECISION DEFAULT 0.0;
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS error TEXT;
 ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;
+-- H-4: Celery task id. Set when the API enqueues a job; the worker
+-- doesn't read it. Operators correlate Celery logs to this row by id.
+ALTER TABLE ddiq_reports ADD COLUMN IF NOT EXISTS celery_task_id TEXT;
 -- Track A item 6: the fingerprint index is now UNIQUE so two concurrent
 -- /report/generate calls with identical (doc_ids, preset, project_name)
 -- can't both write a row. The old (non-unique) index is dropped first
@@ -2103,19 +2106,22 @@ def _find_existing_report(fp: str, user_id) -> Optional[dict]:
             return cur.fetchone()
 
 
-# ─── Background-task worker for /report/generate/async ────────────────────
+# ─── Background-task queue for /report/generate/async (H-4) ───────────────
 # /report/generate is synchronous — fine for direct API use, but the
 # 30-60 minute report blocks a request the whole time. Browsers and
 # proxies time out long before that. The async path lets callers POST,
 # get a {report_id, status:"queued"} immediately, and poll
 # /report/{id}/status (or /report/{id}) for completion.
-
-from concurrent.futures import ThreadPoolExecutor
-
-_report_executor = ThreadPoolExecutor(
-    max_workers=int(os.getenv("REPORT_WORKERS", "2")),
-    thread_name_prefix="ddiq-report",
-)
+#
+# H-4: moved from an in-process ``ThreadPoolExecutor(max_workers=2)`` to
+# a Redis-backed Celery queue. The thread-pool design had two prod
+# problems: (1) docker restarts orphaned reports mid-pipeline because
+# the threads die with the API process, (2) hard ceiling of 2
+# concurrent reports per backend. Celery's acks_late semantics put a
+# crashed worker's message back on the queue automatically, and you
+# scale by running more ``lai-worker`` containers. See
+# ``micro-services/worker.py`` for the worker module + Celery config.
+from worker import generate_report_task
 
 
 def _update_report_progress(report_id: str, step: Optional[str] = None,
@@ -2246,7 +2252,33 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
                 (rid, str(user.id), pname, req.document_ids, req.preset, fp),
             )
 
-    _report_executor.submit(_run_report_generation_job, rid, req, user.id)
+    # Enqueue via Celery (H-4). The worker process picks up the message
+    # from the ``ddiq`` queue on the shared Redis broker. Returns a
+    # Celery ``AsyncResult`` whose ``.id`` is the task UUID; we capture
+    # it on the row for traceability (correlate Celery logs to DB rows).
+    #
+    # ``model_dump(mode="json")`` because Celery JSON-serialises the
+    # message body; ``UUID`` instances aren't JSON-serialisable by
+    # default, but ``mode="json"`` converts them to strings. The worker
+    # rehydrates via ``GenerateReportRequest.model_validate``.
+    async_result = generate_report_task.delay(
+        rid, req.model_dump(mode="json"), str(user.id),
+    )
+
+    # Best-effort: attach the celery task id to the row so an operator
+    # can grep flower / worker logs by report_id. Non-fatal if the
+    # column doesn't exist yet (gets added by init_db on next boot).
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE ddiq_reports SET celery_task_id = %s "
+                    "WHERE id = %s AND user_id = %s",
+                    (async_result.id, rid, str(user.id)),
+                )
+    except Exception:
+        pass  # column missing or transient DB issue — non-blocking
+
     return {
         "report_id": rid,
         "status": "queued",
@@ -3080,26 +3112,47 @@ async def get_map_tiles():
     }
 
 def reap_orphans() -> None:
-    """Mark queued/running reports as failed at startup. After a backend
-    restart the in-process ThreadPoolExecutor tasks are gone, so any row
-    left in those states is dead weight — without this the UI would
-    poll forever. Safe with a single uvicorn worker (our deployment);
-    with multiple workers this would race against siblings still
-    booting and should move into a leader-election or external job
-    runner."""
+    """Mark long-stuck queued/running reports as failed.
+
+    H-4: Celery's ``acks_late=True`` puts crashed-worker tasks back on
+    the queue automatically — so a row in ``running`` state does NOT
+    imply the work is lost. Could be:
+
+      a) actively running on a worker (correct, leave alone),
+      b) just-requeued waiting for a worker (correct, leave alone),
+      c) genuinely stuck — the worker died before recording any
+         progress AND the broker lost the message, OR the row was
+         created before the Celery refactor landed.
+
+    The reaper now distinguishes (c) from (a)+(b) by AGE: anything
+    older than 3 hours is well past the observed 60-min worst-case
+    runtime AND past the Celery hard-time-limit of 120 min. Anything
+    younger is left alone.
+
+    The previous "fail everything not done at startup" behaviour
+    was correct for the ThreadPoolExecutor design (threads literally
+    died with the API process) but is wrong now — that would kill
+    reports still being processed by a separate worker container.
+    """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """UPDATE ddiq_reports
                        SET status = 'failed',
-                           error = 'orphaned: backend restarted mid-job',
+                           error = COALESCE(error, '') ||
+                                   ' (reaper: stuck > 3h past started_at)',
                            finished_at = NOW()
-                       WHERE status IN ('queued','running')"""
+                       WHERE status IN ('queued','running')
+                         AND started_at IS NOT NULL
+                         AND started_at < NOW() - INTERVAL '3 hours'"""
                 )
                 n = cur.rowcount
         if n:
-            logger.warning(f"reaped {n} orphaned report(s) from previous run")
+            logger.warning(
+                "reaped %d stuck report(s) older than 3h (started_at"
+                " > Celery hard time limit)", n,
+            )
     except Exception as e:
         logger.warning(f"orphan reap failed: {e}")
 

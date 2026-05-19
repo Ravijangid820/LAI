@@ -79,6 +79,73 @@ services:
     networks:
       - lai_network
 
+  # ── H-4: async report worker ────────────────────────────────────────
+  # Same image as `backend`. Replaces the in-process
+  # ThreadPoolExecutor(max_workers=2) inside ddiq_report.py with a
+  # Celery worker that survives backend restarts (acks_late + Redis
+  # broker). The worker imports ddiq_report's job function lazily so
+  # the API and the worker share one codebase.
+  #
+  # Concurrency=2 matches the original ThreadPoolExecutor capacity.
+  # Bump only if the embedding / LLM upstreams can absorb more parallel
+  # report jobs (each one issues hundreds of embedding + chat calls).
+  worker:
+    build:
+      context: ..
+      dockerfile: micro-services/Dockerfile
+    container_name: lai-worker
+    restart: unless-stopped
+    # No ports — workers consume off the Redis queue, no HTTP surface.
+    command:
+      [
+        "celery",
+        "-A",
+        "worker",
+        "worker",
+        "-Q",
+        "ddiq",
+        "--concurrency=2",
+        "--loglevel=INFO",
+      ]
+    environment:
+      # Identical to the backend service: the report job uses the same
+      # LLM / embedding / reranker / DB / auth env. Keep these in sync
+      # whenever the backend block changes.
+      - LLM_URL=http://lai_analyzer_llm:8000/v1
+      - LLM_MODEL=${LLM_MODEL:-qwen3.6-27b}
+      - EMBEDDING_URL=http://lai_embedding:8000
+      - RERANKER_URL=${RERANKER_URL:-http://host.docker.internal:8004}
+      - DB_HOST=lai_postgres_main
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-lai_db}
+      - DB_USER=${DB_USER:-lai_user}
+      - DB_PASSWORD=${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      - LAI_AUTH_JWT_ACCESS_SECRET=${LAI_AUTH_JWT_ACCESS_SECRET:?Set LAI_AUTH_JWT_ACCESS_SECRET in .env}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      # Celery broker — runtime-stack Redis. Override only if pointing
+      # at a different Redis (staging vs prod, off-box queue, etc.).
+      - LAI_CELERY_BROKER_URL=${LAI_CELERY_BROKER_URL:-redis://lai_redis:6379/0}
+      # Celery's entry point doesn't add WORKDIR to sys.path the way
+      # uvicorn does, so deferred imports inside tasks (e.g.
+      # ``from ddiq_report import ...`` in worker.generate_report_task)
+      # would fail with ModuleNotFoundError. Setting PYTHONPATH puts
+      # the microservice source on the import path explicitly.
+      - PYTHONPATH=/app
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    extra_hosts:
+      # Workers issue the same ALKIS WFS calls + reranker calls as the
+      # API path (since the job function is shared), so the same hosts
+      # must resolve here too.
+      - "www.opengeodata.lgln.niedersachsen.de:104.20.47.7"
+      - "www.wfs.nrw.de:93.184.133.217"
+      - "host.docker.internal:host-gateway"
+    networks:
+      - lai_network
+    depends_on:
+      - backend
+
 networks:
   lai_network:
     external: true

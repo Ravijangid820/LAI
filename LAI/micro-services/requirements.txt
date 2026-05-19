@@ -48,3 +48,11 @@ passlib[bcrypt]>=1.7.4
 asyncpg>=0.30.0
 # pydantic EmailStr requires the email-validator package at runtime.
 email-validator>=2.0.0
+
+# ── H-4: async report worker ──
+# Celery + Redis broker for the DDiQ async-report task queue. The
+# `lai-worker` compose service runs `celery -A worker worker` against
+# the runtime stack's Redis at lai_redis:6379/0 (see worker.py).
+# `celery[redis]` brings in `redis-py` as the broker transport; we
+# don't use a result backend (task_ignore_result=True).
+celery[redis]>=5.4.0
