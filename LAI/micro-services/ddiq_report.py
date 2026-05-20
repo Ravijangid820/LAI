@@ -1797,6 +1797,16 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
         logger.info("A6: back-filled owner on %d/%d WEA row(s) from project company",
                     backfilled, len(report.weaStatuses))
 
+    # Checkpoint the reconciled facts NOW, before the expensive findings
+    # pass. Without this, turbineCount / bundesland / projectFacts (just
+    # computed above) would only be persisted by the post-findings
+    # checkpoint — so a findings-phase failure (e.g. the §14 re-smoke,
+    # which timed out at the Celery hard limit during findings) loses the
+    # canonical facts from the saved row even though the pipeline derived
+    # them. Persisting here means a usable report survives a findings
+    # crash with its reconciled numbers intact.
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
+
     progress("findings", 0.85)
     t = time.time()
     findings = generate_findings(req.document_ids, sections, total_capacity_mw=total_mw)
