@@ -184,16 +184,32 @@ def evidence_from_chunks(
     indices: list[Any],
 ) -> list[Evidence]:
     """Resolve LLM-cited chunk indices (1-based) to :class:`Evidence`
-    records. Tolerates strings (``'1'``, ``'#1'``, ``'chunk_1'``) and
-    out-of-range silently.
+    records. Tolerates strings (``'1'``, ``'#1'``, ``'chunk_1'``).
+
+    E9: out-of-range / unparseable indices used to be dropped silently,
+    which made an evidence-less finding indistinguishable from a finding
+    the LLM legitimately had no source for. We now log every dropped
+    index, and warn specifically when the LLM cited sources but NONE
+    resolved (the silent-evidence-loss case the caller should treat as
+    low-confidence). The function still returns only the resolvable
+    Evidence — callers decide what to do with a count mismatch.
     """
     out: list[Evidence] = []
+    requested = list(indices or [])
     if not reranked:
+        if requested:
+            _log.warning(
+                "evidence_from_chunks: %d cited index(es) but no reranked "
+                "chunks to resolve against — finding will be evidence-less",
+                len(requested),
+            )
         return out
-    for idx in indices or []:
+    dropped: list[Any] = []
+    for idx in requested:
         try:
             n = int(re.sub(r"[^0-9]", "", str(idx)))
         except Exception:
+            dropped.append(idx)
             continue
         if 1 <= n <= len(reranked):
             c = reranked[n-1]
@@ -202,4 +218,18 @@ def evidence_from_chunks(
                 doc_filename=c.get("filename"),
                 excerpt=(c.get("text", "") or "")[:300],
             ))
+        else:
+            dropped.append(idx)
+    if dropped:
+        _log.warning(
+            "evidence_from_chunks: dropped %d/%d out-of-range or "
+            "unparseable cited index(es): %r (had %d chunks)",
+            len(dropped), len(requested), dropped, len(reranked),
+        )
+    if requested and not out:
+        _log.warning(
+            "evidence_from_chunks: %d index(es) cited but none resolved — "
+            "finding is evidence-less; treat as low-confidence",
+            len(requested),
+        )
     return out

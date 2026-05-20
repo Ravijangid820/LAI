@@ -18,6 +18,7 @@ from lai.common.pdf.extractor import (
     PdfExtractor,
     PdfPageResult,
     PdfPageSource,
+    _readable_char_ratio,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -256,4 +257,98 @@ class TestPageSource:
     def test_str_enum_values(self) -> None:
         assert PdfPageSource.EMBEDDED.value == "embedded"
         assert PdfPageSource.OCR.value == "ocr"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E11 — OCR quality gate (alphabetic-ratio / mojibake)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestReadableCharRatio:
+    @pytest.mark.unit
+    def test_clean_german_legal_text_scores_high(self) -> None:
+        text = (
+            "Die BImSchG-Genehmigung nach §6 wurde am 15.03.2024 erteilt; "
+            "die Bestandskraft (§70 VwGO) tritt 3 Monate später ein. "
+            "Pachtzins: 12.500 € pro Jahr je Windenergieanlage."
+        )
+        assert _readable_char_ratio(text) > 0.97
+
+    @pytest.mark.unit
+    def test_mojibake_scores_low(self) -> None:
+        # Private-use-area + control + replacement chars — the signature
+        # of a broken embedded font.
+        garbage = "".join(chr(0xE000 + (i % 100)) for i in range(300))
+        assert _readable_char_ratio(garbage) < 0.1
+
+    @pytest.mark.unit
+    def test_empty_string_is_zero(self) -> None:
+        assert _readable_char_ratio("") == 0.0
+
+    @pytest.mark.unit
+    def test_umlauts_and_symbols_are_readable(self) -> None:
+        assert _readable_char_ratio("äöüß §€„“»«–—…") == 1.0  # noqa: RUF001
+
+
+class TestQualityGate:
+    @pytest.mark.unit
+    def test_long_garbled_page_triggers_ocr(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A page long enough to pass the length check but full of
+        mojibake must fall through to OCR (E11), not be accepted as
+        embedded text."""
+        garbage = "".join(chr(0xE000 + (i % 50)) for i in range(400))
+        _install_fake_document(monkeypatch, _FakeDocument(pages=[_FakePage(garbage)]))
+        monkeypatch.setattr(ext, "_ocr_page_image", lambda png, *, languages: "RECOVERED TEXT")
+        e = PdfExtractor(config=PdfExtractorConfig(min_chars_per_page=50))
+        result = e.extract_bytes(b"%PDF-")
+        assert result.pages[0].source is PdfPageSource.OCR
+        assert result.pages[0].text == "RECOVERED TEXT"
+
+    @pytest.mark.unit
+    def test_long_clean_page_stays_embedded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        body = "Genehmigung nach BImSchG §6 erteilt. " * 20
+        _install_fake_document(monkeypatch, _FakeDocument(pages=[_FakePage(body)]))
+        e = PdfExtractor(config=PdfExtractorConfig(min_chars_per_page=50))
+        result = e.extract_bytes(b"%PDF-")
+        assert result.pages[0].source is PdfPageSource.EMBEDDED
+
+    @pytest.mark.unit
+    def test_short_low_ratio_page_not_forced_to_ocr(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A SHORT garbled string (below min_chars_for_ratio_check) is
+        not subjected to the ratio gate — the length heuristic governs.
+        Here it's above min_chars_per_page but below the ratio-check
+        floor, so it stays embedded."""
+        # 60 chars: above min_chars_per_page=50, below ratio floor=200.
+        garbage = "".join(chr(0xE000 + i) for i in range(60))
+        _install_fake_document(monkeypatch, _FakeDocument(pages=[_FakePage(garbage)]))
+        e = PdfExtractor(config=PdfExtractorConfig(
+            min_chars_per_page=50, min_chars_for_ratio_check=200,
+        ))
+        result = e.extract_bytes(b"%PDF-")
+        assert result.pages[0].source is PdfPageSource.EMBEDDED
+
+    @pytest.mark.unit
+    def test_ratio_gate_disabled_keeps_garbled_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """min_alpha_ratio=0 restores the pure length-only heuristic —
+        garbled-but-long text is accepted as embedded."""
+        garbage = "".join(chr(0xE000 + (i % 50)) for i in range(400))
+        _install_fake_document(monkeypatch, _FakeDocument(pages=[_FakePage(garbage)]))
+        e = PdfExtractor(config=PdfExtractorConfig(
+            min_chars_per_page=50, min_alpha_ratio=0.0,
+        ))
+        result = e.extract_bytes(b"%PDF-")
+        assert result.pages[0].source is PdfPageSource.EMBEDDED
+
+    @pytest.mark.unit
+    def test_garbled_page_with_ocr_disabled_kept_as_embedded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When OCR is off, a garbled page can't be rescued — it's
+        returned as-is rather than dropped."""
+        garbage = "".join(chr(0xE000 + (i % 50)) for i in range(400))
+        _install_fake_document(monkeypatch, _FakeDocument(pages=[_FakePage(garbage)]))
+        e = PdfExtractor(config=PdfExtractorConfig(
+            min_chars_per_page=50, enable_ocr=False,
+        ))
+        result = e.extract_bytes(b"%PDF-")
+        assert result.pages[0].source is PdfPageSource.EMBEDDED
+        assert result.pages[0].text == garbage
         assert PdfPageSource.EMPTY.value == "empty"

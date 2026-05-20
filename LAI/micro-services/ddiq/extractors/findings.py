@@ -4,7 +4,7 @@ Builds the FINDINGS chapter one entry at a time: for every red/yellow
 row in the analysed Ausgabeblatt sections we run a dedicated LLM
 call that returns ``{domain, severity, text, legal_basis,
 recommended_action, quantification}``. Evidence pointers come from
-the row's ``_evidence`` shadow attribute (attached upstream during
+the row's ``evidence`` field (attached upstream during
 section analysis) rather than re-querying the LLM, so the prompt
 stays narrow and the evidence stays grounded.
 
@@ -185,7 +185,7 @@ def generate_findings(
     """Build evidence-aware findings, one LLM call per flagged row.
 
     ``doc_ids`` is currently unused (evidence comes from the row's
-    ``_evidence`` shadow attribute attached during section analysis,
+    ``evidence`` field attached during section analysis,
     not from a fresh RAG pass) — kept in the signature for
     backwards compatibility with the orchestrator call site.
     """
@@ -194,8 +194,12 @@ def generate_findings(
         for row in sec.rows:
             if row.ampel not in ("red", "yellow"):
                 continue
-            ev = row.__dict__.get("_evidence") or []
-            anchor = row.__dict__.get("_anchor")
+            # E10: evidence + anchor are real AusgabeblattRow fields now
+            # (were __dict__ shadow attrs). ``getattr`` with a default
+            # keeps this resilient if an older row dict without the field
+            # is rehydrated from a pre-E10 JSONB checkpoint.
+            ev = getattr(row, "evidence", None) or []
+            anchor = getattr(row, "anchor", None)
             flagged.append({
                 "section": sec.title, "label": row.label, "value": row.value,
                 "ampel": row.ampel, "note": row.note, "anchor": anchor,

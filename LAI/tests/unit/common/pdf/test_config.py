@@ -18,6 +18,8 @@ class TestDefaults:
         assert cfg.ocr_zoom == 2.0
         assert cfg.max_pages == 2000
         assert cfg.page_separator == "\n\n"
+        assert cfg.min_alpha_ratio == 0.5
+        assert cfg.min_chars_for_ratio_check == 200
 
     @pytest.mark.unit
     def test_frozen(self) -> None:
@@ -56,6 +58,21 @@ class TestBounds:
     def test_min_chars_negative_rejected(self) -> None:
         with pytest.raises(ValidationError):
             PdfExtractorConfig(min_chars_per_page=-1)
+
+    @pytest.mark.unit
+    def test_min_alpha_ratio_bounds(self) -> None:
+        assert PdfExtractorConfig(min_alpha_ratio=0.0).min_alpha_ratio == 0.0
+        assert PdfExtractorConfig(min_alpha_ratio=1.0).min_alpha_ratio == 1.0
+        with pytest.raises(ValidationError):
+            PdfExtractorConfig(min_alpha_ratio=-0.1)
+        with pytest.raises(ValidationError):
+            PdfExtractorConfig(min_alpha_ratio=1.1)
+
+    @pytest.mark.unit
+    def test_min_chars_for_ratio_check_non_negative(self) -> None:
+        assert PdfExtractorConfig(min_chars_for_ratio_check=0).min_chars_for_ratio_check == 0
+        with pytest.raises(ValidationError):
+            PdfExtractorConfig(min_chars_for_ratio_check=-1)
 
 
 class TestEnvLoading:

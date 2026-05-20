@@ -70,6 +70,32 @@ class PdfExtractorConfig(BaseSettings):
             "threshold without exploding memory."
         ),
     )
+    min_alpha_ratio: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Quality gate (E11): a page with enough characters can still be "
+            "garbage — a botched embedded font maps glyphs to control bytes / "
+            "private-use codepoints, so the page passes the length check but "
+            "is unreadable. If the fraction of 'real' characters (letters, "
+            "digits, whitespace, common punctuation) in the embedded text is "
+            "below this ratio, the page is treated as low-quality and OCR is "
+            "attempted (when ``enable_ocr``). ``0.0`` disables the ratio "
+            "check, restoring the pure length-only heuristic."
+        ),
+    )
+    min_chars_for_ratio_check: int = Field(
+        default=200,
+        ge=0,
+        description=(
+            "The alphabetic-ratio gate only applies to pages with at least "
+            "this many embedded characters. Short pages (headers, cover "
+            "sheets, a single stamp) legitimately have a low ratio and "
+            "shouldn't be forced through OCR on that basis alone; the "
+            "length heuristic already covers them."
+        ),
+    )
 
     # ── Document limits ────────────────────────────────────────────────
     max_pages: int = Field(

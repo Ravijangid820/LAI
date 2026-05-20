@@ -227,7 +227,15 @@ class PdfExtractor:
         page = _document_page(document, index)
         embedded_text = _page_embedded_text(page).strip()
 
-        if len(embedded_text) >= self._config.min_chars_per_page:
+        # The embedded text is good enough only if it clears BOTH the
+        # length threshold AND the quality gate (E11). A page can be long
+        # but garbled — a broken embedded font maps glyphs to control
+        # bytes / private-use codepoints, so it passes the length check
+        # yet is unreadable. In that case we fall through to OCR.
+        if (
+            len(embedded_text) >= self._config.min_chars_per_page
+            and not self._is_low_quality_text(embedded_text)
+        ):
             return PdfPageResult(
                 index=index,
                 text=embedded_text,
@@ -251,6 +259,59 @@ class PdfExtractor:
             text=embedded_text,
             source=PdfPageSource.EMPTY if not embedded_text else PdfPageSource.EMBEDDED,
         )
+
+    def _is_low_quality_text(self, text: str) -> bool:
+        """E11 quality gate: detect garbled embedded text that passes the
+        length check but is unreadable (broken-font mojibake → control
+        bytes / private-use codepoints / replacement chars).
+
+        Only applies to pages with at least
+        ``min_chars_for_ratio_check`` characters — short pages (cover
+        sheets, a lone stamp) legitimately have a low readable-character
+        ratio and shouldn't be forced through OCR on that basis. Returns
+        ``False`` (gate disabled) when ``min_alpha_ratio == 0``.
+        """
+        if self._config.min_alpha_ratio <= 0.0:
+            return False
+        if len(text) < self._config.min_chars_for_ratio_check:
+            return False
+        ratio = _readable_char_ratio(text)
+        if ratio < self._config.min_alpha_ratio:
+            _log.info(
+                "pdf.low_quality_text",
+                readable_ratio=round(ratio, 3),
+                threshold=self._config.min_alpha_ratio,
+                chars=len(text),
+            )
+            return True
+        return False
+
+
+# Punctuation + symbols that legitimately appear in German legal text and
+# must count as "readable" alongside alphanumerics and whitespace. Anything
+# outside this set AND not alnum/space (control bytes, private-use-area
+# glyphs, U+FFFD replacement chars) signals broken-font mojibake.
+# The en/em dashes and German typographic quotes in the set below are
+# intentional: they are exactly the characters real German legal text
+# uses, so they must count as readable. RUF001 (ambiguous-unicode in a
+# string) is therefore expected here and suppressed on the data line.
+_READABLE_PUNCT: frozenset[str] = frozenset(
+    " .,;:!?-–—()[]{}'\"/%&§€$@#*+=<>|~`^_\\…„“”‚‘’«»°№"  # noqa: RUF001
+)
+
+
+def _readable_char_ratio(text: str) -> float:
+    """Fraction of characters that are alphanumeric, whitespace, or common
+    punctuation. A genuinely-text page scores ~0.97-1.0; a mojibake page
+    (control / private-use codepoints) scores far lower. Empty string → 0.0.
+    """
+    if not text:
+        return 0.0
+    readable = sum(
+        1 for ch in text
+        if ch.isalnum() or ch.isspace() or ch in _READABLE_PUNCT
+    )
+    return readable / len(text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

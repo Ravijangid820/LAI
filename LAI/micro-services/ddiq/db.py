@@ -164,6 +164,15 @@ CREATE TABLE IF NOT EXISTS ddiq_classified_parcels (
 CREATE INDEX IF NOT EXISTS idx_ddiq_chunks_doc ON ddiq_doc_chunks(doc_id);
 CREATE INDEX IF NOT EXISTS idx_ddiq_classified_report ON ddiq_classified_parcels(report_id);
 CREATE INDEX IF NOT EXISTS idx_ddiq_contracts_report ON ddiq_contracts(report_id);
+-- Tenant isolation (auth migration): the aux tables carry user_id so a
+-- report's parcels/contracts/area are scoped to their owner. The live
+-- DB gained these columns via the auth rollout, but the CREATE TABLE
+-- statements above predate it — without these forward-compat ALTERs a
+-- fresh init_db() would build the tables without user_id and every
+-- aux INSERT (which supplies user_id) would fail. Idempotent.
+ALTER TABLE ddiq_project_areas ADD COLUMN IF NOT EXISTS user_id UUID;
+ALTER TABLE ddiq_contracts ADD COLUMN IF NOT EXISTS user_id UUID;
+ALTER TABLE ddiq_classified_parcels ADD COLUMN IF NOT EXISTS user_id UUID;
 """
 
 

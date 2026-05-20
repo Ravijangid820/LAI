@@ -743,16 +743,16 @@ green for verified-compliant, null when not enough information.""")
             val = clean_value(result.get("value"), "Information not found in documents")
             note_raw = result.get("note"); note = clean_value(note_raw, "") if note_raw else None
             if note == "": note = None
+            # E10: evidence + anchor are real AusgabeblattRow fields now,
+            # so they serialize through model_dump → JSONB + API response
+            # (was a __dict__ shadow attr that was silently dropped).
             row = AusgabeblattRow(
                 label=label, value=val,
                 ampel=result.get("ampel") if result.get("ampel") in ("green","yellow","red") else None,
                 note=note,
+                evidence=evidence_from_chunks(reranked, result.get("evidence_chunks", [])),
+                anchor=anchor,
             )
-            # Stash evidence onto the row via a dynamic attr; AusgabeblattRow
-            # doesn't have a field for it but findings/timeline that re-derive
-            # from these rows pull evidence from a parallel structure below.
-            row.__dict__["_evidence"] = evidence_from_chunks(reranked, result.get("evidence_chunks", []))
-            row.__dict__["_anchor"] = anchor
             rows.append(row)
         except Exception as e:
             logger.error(f"Section {section_id}/{label}: {e}")
@@ -1752,14 +1752,36 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     # Auxiliary-table writes (ddiq_project_areas / ddiq_contracts /
-    # ddiq_classified_parcels). These are write-once-at-end because they
-    # have no ON CONFLICT handling — running them twice would create
-    # duplicates. The report_data JSONB above already has a copy of all
-    # this data; the relational tables are for query performance only.
+    # ddiq_classified_parcels). The report_data JSONB above already has a
+    # copy of all this data; the relational tables are for query
+    # performance only.
+    #
+    # E7: these tables are keyed by report_id and have no natural unique
+    # key for a per-row ON CONFLICT (and a regeneration can yield a
+    # different parcel/contract count, so per-row upsert would leave
+    # stale rows from the prior run). The correct idempotency is
+    # delete-then-insert by report_id, all inside one transaction:
+    # re-running the same report fully replaces its aux rows instead of
+    # appending duplicates. ddiq_contract_parcels cascade-deletes via its
+    # FK to ddiq_contracts (ON DELETE CASCADE). user_id is included in
+    # the delete predicate as defense in depth (AUTH_PLAN G3).
     pa = pipeline_result.project_area
     uid = str(user_id)
     with get_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM ddiq_classified_parcels WHERE report_id = %s AND user_id = %s",
+                (rid, uid),
+            )
+            cur.execute(
+                "DELETE FROM ddiq_contracts WHERE report_id = %s AND user_id = %s",
+                (rid, uid),
+            )
+            cur.execute(
+                "DELETE FROM ddiq_project_areas WHERE report_id = %s AND user_id = %s",
+                (rid, uid),
+            )
+
             # Persist project area first (parent of contracts and parcels).
             # user_id is taken from the JWT, never from the request body
             # (AUTH_PLAN G3).
@@ -1824,6 +1846,59 @@ def generate_report(req: GenerateReportRequest, user: CurrentUser = Depends(get_
             )
 
     rid = str(uuid.uuid4())
+    pname = req.project_name or "Wind Energy Project"
+
+    # E5: claim the fingerprint atomically at row creation, mirroring the
+    # async path. The old code set request_fingerprint in an UPDATE only
+    # AFTER the 30-60 min pipeline finished, so two concurrent identical
+    # requests both passed the dedup check above and both ran the full
+    # pipeline. Worse, since E4 made the fingerprint index UNIQUE, the
+    # second request's post-pipeline UPDATE would raise UniqueViolation
+    # after an hour of work. Pre-inserting with the fingerprint + a
+    # partial-index ON CONFLICT collapses the race to a cheap, immediate
+    # claim: the loser does no pipeline work.
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ddiq_reports
+                       (id, user_id, project_name, document_ids, preset,
+                        report_data, status, started_at, progress_step,
+                        progress_percent, request_fingerprint)
+                   VALUES (%s, %s, %s, %s::uuid[], %s, '{}'::jsonb,
+                           'running', NOW(), 'starting', 0.0, %s)
+                   ON CONFLICT (request_fingerprint)
+                       WHERE request_fingerprint IS NOT NULL
+                   DO NOTHING
+                   RETURNING id""",
+                (rid, str(user.id), pname, req.document_ids, req.preset, fp),
+            )
+            claimed = cur.fetchone()
+
+    if claimed is None:
+        # A concurrent request already holds this fingerprint. Don't run a
+        # duplicate pipeline — surface the in-flight (or just-finished)
+        # row instead of recomputing.
+        other = _find_existing_report(fp, user.id)
+        if other and other["status"] == "done":
+            with get_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT report_data FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                        (other["id"], str(user.id)),
+                    )
+                    row = cur.fetchone()
+            if row and row["report_data"]:
+                return GenerateReportResponse(
+                    report_id=str(other["id"]),
+                    report=DDiQReportData(**row["report_data"]),
+                    timings={"cached": True},
+                )
+        raise HTTPException(
+            409,
+            "An identical report is already being generated; poll "
+            "/ddiq/reports for it.",
+        )
+
     # Track A item 6: wrap the sync pipeline so a crash mid-run marks the
     # row ``status='failed'`` with the error captured, rather than
     # leaving it stuck in whatever progress state the last incremental
@@ -1847,12 +1922,9 @@ def generate_report(req: GenerateReportRequest, user: CurrentUser = Depends(get_
             pass
         raise HTTPException(500, f"Report generation failed: {e}") from e
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE ddiq_reports SET request_fingerprint = %s WHERE id = %s AND user_id = %s",
-                (fp, rid, str(user.id)),
-            )
+    # Fingerprint was set at creation (above); the pipeline's checkpoint
+    # upserts touch report_data by id and leave it intact. Mark done.
+    _update_report_progress(rid, status="done", step="done", percent=1.0, user_id=user.id)
     return GenerateReportResponse(report_id=rid, report=report, timings=T)
 
 @router.get("/reports")

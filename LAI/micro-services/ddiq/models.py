@@ -64,6 +64,22 @@ class UploadDocResponse(BaseModel):
     message: str
 
 
+# ── Evidence (P0 #1) ─────────────────────────────────────────────────
+# Defined here, before AusgabeblattRow, because that row now carries an
+# ``evidence`` field (E10). Every Finding / TimelineEntry / Grundbuch /
+# Rückbau check also carries Evidence so a lawyer can verify the LLM's
+# claim by jumping to the right page of the right document. Without
+# this, output is unverifiable.
+
+
+class Evidence(BaseModel):
+    doc_id: Optional[str] = None
+    doc_filename: Optional[str] = None
+    page: Optional[int] = None        # currently no per-page chunking — left None
+    excerpt: str = ""                 # short snippet (≤300 chars) from the chunk
+    clause: Optional[str] = None      # e.g. "§4 Abs. 1 BImSchG", "Pachtvertrag §7"
+
+
 # ── Rendered Ausgabeblatt grid ───────────────────────────────────────
 
 
@@ -72,6 +88,16 @@ class AusgabeblattRow(BaseModel):
     value: str
     ampel: Optional[str] = None
     note: Optional[str] = None
+    # E10: the chunks the LLM cited for this row + the statutory anchor
+    # from SECTION_QUESTIONS. Previously stashed on ``__dict__`` as
+    # ``_evidence`` / ``_anchor`` shadow attrs, which ``model_dump`` does
+    # not serialise — so the per-row evidence was silently lost on the
+    # JSONB checkpoint and the API response. Declared as real fields now
+    # so it survives end-to-end (the UI's "click to see source" per row
+    # depends on it). ``exclude=False`` is the default; these ride along
+    # in model_dump.
+    evidence: list[Evidence] = []
+    anchor: Optional[str] = None
 
 
 class AusgabeblattSection(BaseModel):
@@ -130,19 +156,9 @@ class CadastralParcel(BaseModel):
     normalizedId: str = ""
 
 
-# ── Evidence + quantification (P0 #1, #4) ────────────────────────────
-# Every Finding / TimelineEntry / Grundbuch / Rückbau check carries
-# Evidence so a lawyer can verify the LLM's claim by jumping to the
-# right page of the right document. Without this, output is
-# unverifiable.
-
-
-class Evidence(BaseModel):
-    doc_id: Optional[str] = None
-    doc_filename: Optional[str] = None
-    page: Optional[int] = None        # currently no per-page chunking — left None
-    excerpt: str = ""                 # short snippet (≤300 chars) from the chunk
-    clause: Optional[str] = None      # e.g. "§4 Abs. 1 BImSchG", "Pachtvertrag §7"
+# ── Quantification (P0 #4) ───────────────────────────────────────────
+# ``Evidence`` is defined earlier (above the Ausgabeblatt grid) because
+# AusgabeblattRow now references it (E10).
 
 
 class Quantification(BaseModel):
