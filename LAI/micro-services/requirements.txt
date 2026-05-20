@@ -1,53 +1,75 @@
+# DDiQ microservice — pinned dependencies (O4)
+# =============================================
+# Versions are pinned to the exact set the working lai-backend /
+# lai-worker image currently runs (captured 2026-05-20 via
+# importlib.metadata in the live container), so a rebuild is
+# reproducible rather than silently picking up a newer release that
+# changes behaviour. Bump deliberately + re-verify, never implicitly.
+#
+# (The base image in the Dockerfile is the minor-pinned
+# ``python:3.11-slim`` — not ``:latest`` — already reasonable; a
+# full sha256 digest pin is deferred, it needs a registry pull to
+# capture the digest and 3.11-slim is stable.)
+
 # ── Core API ──
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-python-dotenv>=1.0.0
-# Bumped from >=2.5.0 to satisfy lai.common (which requires pydantic >=2.10).
-pydantic>=2.10.0
+fastapi==0.136.1
+uvicorn[standard]==0.47.0
+python-dotenv==1.2.2
+# pydantic >=2.10 is the lai.common floor; pinned to the running patch.
+pydantic==2.13.4
 # Required by FastAPI for multipart/form-data parsing (UploadFile / Form).
-python-multipart>=0.0.9
+python-multipart==0.0.29
 
 # ── Database ──
-psycopg2-binary>=2.9.9
+psycopg2-binary==2.9.12
 
 # ── HTTP Client ──
 # Legacy `requests` is still used by embed/rerank/Nominatim call sites in
 # ddiq_report.py and api.py; remove once those migrate to httpx.
-requests>=2.31.0
+requests==2.34.2
 # httpx is the transport for lai.common.llm.SyncLlmClient.
-httpx>=0.28.0
+httpx==0.28.1
 
 # ── PDF Processing ──
-PyMuPDF>=1.23.0
-pytesseract>=0.3.10
-Pillow>=10.0.0
+PyMuPDF==1.27.2.3
+pytesseract==0.3.13
+Pillow==12.2.0
 
 # ── ML / Embeddings ──
-numpy>=1.24.0
+numpy==2.4.6
 
-# ── Spatial Operations (NEW — cadastral pipeline) ──
-shapely>=2.0.0
+# ── Spatial Operations (cadastral pipeline) ──
+shapely==2.1.2
 
 # ── lai.common transitive runtime deps ──
 # Listed explicitly so the container can pip-install `lai` with --no-deps,
 # avoiding the heavy unused parts of lai's full dep tree (vllm, docling,
 # celery, asyncpg, …). Keep these in sync with the imports under
 # src/lai/common/.
-tenacity>=9.0.0
-structlog>=24.4.0
-pydantic-settings>=2.7.0
-prometheus-client>=0.21.0
+tenacity==9.1.4
+structlog==25.5.0
+pydantic-settings==2.14.1
+prometheus-client==0.25.0
 # Auth subsystem (lai.common.auth + lai.api.auth_router + lai.api.email)
 # added in commits c15f2f1 and 85008f1. Required by ``import ddiq_report``
 # (which now pulls in auth_dep) and ``import api`` (which mounts the
 # auth router). Without these, the container crash-loops at startup.
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+# bcrypt MUST stay <4.0: passlib 1.7.4 (abandoned upstream) reads
+# ``bcrypt.__about__.__version__``, removed in bcrypt 4.0, and its probe
+# feeds bcrypt a >72-byte vector that bcrypt 4.x hard-errors on. The live
+# container happened to pull bcrypt 5.0.0 (the unpinned `passlib[bcrypt]`
+# extra grabbed latest) and only survived because the DDiQ microservice
+# verifies JWTs but never HASHES passwords — a latent break for any
+# password-hash path. Pin <4 to match pyproject.toml's authoritative
+# constraint and remove the trap.
+bcrypt<4.0
 # auth_router uses an asyncpg connection pool for the users / refresh
 # tokens tables (separate from DDiQ's psycopg2 sync access).
-asyncpg>=0.30.0
+asyncpg==0.31.0
 # pydantic EmailStr requires the email-validator package at runtime.
-email-validator>=2.0.0
+email-validator==2.3.0
 
 # ── H-4: async report worker ──
 # Celery + Redis broker for the DDiQ async-report task queue. The
@@ -55,4 +77,4 @@ email-validator>=2.0.0
 # the runtime stack's Redis at lai_redis:6379/0 (see worker.py).
 # `celery[redis]` brings in `redis-py` as the broker transport; we
 # don't use a result backend (task_ignore_result=True).
-celery[redis]>=5.4.0
+celery[redis]==5.6.3
