@@ -35,6 +35,23 @@ export ANALYZER_LLM_MODEL="${ANALYZER_LLM_MODEL:-qwen3.6-27b}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 VPN_MODE="${VPN_MODE:-1}"
 
+# Auth subsystem needs LAI_AUTH_JWT_ACCESS_SECRET (and friends) and
+# DB_* env to reach lai_postgres_main. Source .env.auth if present so
+# serve_rag boots with auth enabled; defaults below match the
+# lai_postgres_main host port mapping in docker-compose.yml.
+if [ -f "$LAI_DIR/.env.auth" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$LAI_DIR/.env.auth"
+    set +a
+fi
+export DB_HOST="${DB_HOST:-127.0.0.1}"
+export DB_PORT="${DB_PORT:-5434}"
+export DB_NAME="${DB_NAME:-lai_db}"
+export DB_USER="${DB_USER:-lai_user}"
+export DB_PASSWORD="${DB_PASSWORD:-lai_test_password_2024}"
+export CORS_ORIGINS="${CORS_ORIGINS:-http://192.168.178.82:5173,http://localhost:5173,http://localhost:3000}"
+
 # ── Docker network sanity ────────────────────────────────────────────────
 docker network inspect lai_network >/dev/null 2>&1 || {
     echo "[start] creating Docker network lai_network"

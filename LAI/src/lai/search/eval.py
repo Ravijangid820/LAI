@@ -162,6 +162,36 @@ def load_embeddings(conn: sqlite3.Connection,
     return Corpus(child_ids=child_ids, parent_ids=parent_ids, embs=embs)
 
 
+def ensure_bm25_fts(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Build (once) the FTS5 virtual table; return the same connection.
+
+    The corpus-free companion to :func:`ensure_bm25` — used by serve_rag's
+    pgvector path, which keeps the SQLite connection ONLY for lexical
+    BM25 (the FTS5 index is small; the 144 GB that moved to pgvector was
+    the dense embedding matrix, not this). Idempotent: a no-op when the
+    ``child_chunks_fts`` table already exists.
+    """
+    cur = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='child_chunks_fts'"
+    )
+    if cur.fetchone():
+        return conn
+    print("Building FTS5 index (one-time; may take a couple minutes)...")
+    t0 = time.time()
+    conn.execute("""
+        CREATE VIRTUAL TABLE child_chunks_fts USING fts5(
+            content,
+            content='child_chunks',
+            content_rowid='id',
+            tokenize='unicode61 remove_diacritics 2'
+        )
+    """)
+    conn.execute("INSERT INTO child_chunks_fts(child_chunks_fts) VALUES('rebuild')")
+    conn.commit()
+    print(f"  FTS5 built in {time.time()-t0:.1f}s")
+    return conn
+
+
 def ensure_bm25(corpus: Corpus, conn: sqlite3.Connection) -> None:
     """Build (once) a SQLite FTS5 virtual table over child_chunks.content.
     Stored in the same DB so subsequent runs are instant."""
@@ -257,6 +287,51 @@ def retrieve_bm25(query: str, corpus: Corpus, k: int) -> tuple[list[int], list[f
             indices.append(rowid_to_idx[rowid])
             scores.append(-score)   # bm25() returns negative scores; flip for "higher is better"
     return indices, scores
+
+
+# FTS5 token-selection shared by ``retrieve_bm25`` (offline, corpus-array
+# space) and ``retrieve_bm25_ids`` (serve_rag, child_id space). Kept as one
+# helper so the two paths can't drift on tokenisation.
+def _bm25_match_expr(query: str) -> str | None:
+    safe = query.replace('"', " ").strip()
+    tokens = sorted(set(t for t in safe.split() if len(t) > 4), key=len, reverse=True)[:6]
+    if not tokens:
+        tokens = sorted(set(t for t in safe.split() if len(t) > 2), key=len, reverse=True)[:6]
+    if not tokens:
+        return None
+    return " OR ".join(f'"{t}"' for t in tokens)
+
+
+def retrieve_bm25_ids(
+    query: str, conn: sqlite3.Connection, k: int,
+) -> list[tuple[int, float]]:
+    """BM25 over the FTS5 index, returning ``(child_id, score)`` directly.
+
+    The child_id-space companion to :func:`retrieve_bm25`. Where the
+    original maps FTS5 rowids to positions in the in-RAM ``Corpus``
+    arrays, this returns the rowids themselves — which equal
+    ``child_chunks.id`` (and therefore ``corpus_child_chunks.id`` in
+    Postgres, since the migration preserves ids). This is what lets
+    ``serve_rag._do_rag`` fuse BM25 with the pgvector dense hits in
+    child_id space, with no in-RAM matrix.
+
+    ``score`` is flipped so higher = more relevant (FTS5 ``bm25()``
+    returns smaller-is-better).
+    """
+    match_expr = _bm25_match_expr(query)
+    if match_expr is None:
+        return []
+    rows = conn.execute(
+        """
+        SELECT rowid, bm25(child_chunks_fts) AS score
+        FROM child_chunks_fts
+        WHERE child_chunks_fts MATCH ?
+        ORDER BY score
+        LIMIT ?
+        """,
+        (match_expr, k),
+    ).fetchall()
+    return [(int(rowid), -float(score)) for rowid, score in rows]
 
 
 def rrf_fuse(rankings: list[list[int]], k_rrf: int = 60) -> list[tuple[int, float]]:

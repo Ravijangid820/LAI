@@ -492,3 +492,104 @@ class ChunkInvalidInputError(ChunkError):
     Args:
         message: Human-readable description.
     """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Retrieval-related (pgvector corpus search)
+#
+# The retrieval client talks to Postgres (pgvector). Failure modes split
+# between connectivity (pool exhausted, server down, auth) and query-time
+# errors (bad SQL, dimension mismatch on the query vector). Same shape as
+# the network-client families above so callers can catch the base
+# :class:`RetrievalError` or a specific subtype.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class RetrievalError(LaiCommonError):
+    """Base for any failure in the pgvector retrieval client."""
+
+
+class RetrievalConnectionError(RetrievalError):
+    """The client could not obtain or use a Postgres connection.
+
+    Covers: pool exhausted, server unreachable, authentication failure,
+    connection dropped mid-query. Callers treat this as transient — it is
+    the error type the retry policy is built around.
+
+    Args:
+        message: Human-readable description.
+    """
+
+
+class RetrievalQueryError(RetrievalError):
+    """A retrieval query was rejected or failed at the SQL level.
+
+    Covers: malformed SQL, missing ``corpus_child_chunks`` table /
+    ``vector`` extension, a query vector whose dimension does not match
+    the indexed column. Not transient — retrying the same query produces
+    the same failure, so the retry policy excludes this type.
+
+    Args:
+        message: Human-readable description.
+    """
+
+
+class RetrievalDimensionError(RetrievalQueryError):
+    """The query vector dimension does not match the indexed column.
+
+    The ``corpus_child_chunks.embedding`` column is ``halfvec(4000)``;
+    a query vector must be truncatable to exactly that width. Raised
+    before the query is sent so a misconfigured embedding model surfaces
+    as a clear error rather than a Postgres type error.
+
+    Args:
+        message: Human-readable description.
+        expected: The dimension the index expects (4000).
+        actual: The dimension the supplied query vector had.
+
+    Raises:
+        ValueError: If either dimension is negative.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        expected: int,
+        actual: int,
+    ) -> None:
+        if expected < 0 or actual < 0:
+            raise ValueError(
+                f"dimensions must be >= 0, got expected={expected} actual={actual}",
+            )
+        super().__init__(message)
+        self.expected: int = expected
+        self.actual: int = actual
+
+
+class RetrievalRetryExhaustedError(RetrievalError):
+    """All retry attempts against the retrieval backend failed.
+
+    Cause-chained via ``raise ... from``. Same shape as
+    :class:`EmbeddingRetryExhaustedError`.
+
+    Args:
+        message: Human-readable description.
+        attempts: Total number of attempts made. Always ``>= 1``.
+
+    Raises:
+        ValueError: If ``attempts`` is less than 1.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int,
+    ) -> None:
+        if attempts < 1:
+            raise ValueError(
+                f"attempts must be >= 1, got {attempts}",
+            )
+        super().__init__(message)
+        self.attempts: int = attempts

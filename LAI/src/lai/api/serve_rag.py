@@ -52,13 +52,12 @@ LAI_DIR = Path(__file__).resolve().parents[3]
 DB      = LAI_DIR / "processed" / "pipeline_local.db"
 
 from lai.search.eval import (
-    Corpus, load_embeddings, ensure_bm25, embed_query,
-    retrieve_dense, retrieve_bm25, rrf_fuse, Reranker,
-    load_parent_texts, dedupe_by_parent,
+    embed_query, ensure_bm25_fts, retrieve_bm25_ids, rrf_fuse, Reranker,
 )
 from lai.analyzer import pipeline as analyzer_pipeline
 from lai.analyzer import llm_client as analyzer_llm
 from lai.api.metrics import default_metrics as rag_metrics
+from lai.common.retrieval import RetrievalClient, RetrievedChunk
 from lai.common.citation import validate_citations
 from lai.common.exceptions import LlmError
 from lai.common.jurisdiction import check_jurisdiction, detect_bundesland
@@ -89,7 +88,7 @@ _token_issuer: TokenIssuer = TokenIssuer(_auth_config)
 get_current_user = build_get_current_user(_token_issuer)
 
 STATE: dict = {
-    "corpus": None, "conn": None, "parent_text": None,
+    "conn": None, "retrieval_client": None,
     "reranker": None,
     # Local LLM (transformers) — used if LLM_API_URL is unset
     "lm": None, "tok": None,
@@ -137,7 +136,25 @@ RAG_SYSTEM = (
     "Handles, die unten auch tatsächlich erscheinen — erfinde keine "
     "neuen. Wenn die Frage mit den Quellen nicht eindeutig beantwortet "
     "werden kann, gib das ehrlich an und markiere unbelegte Aussagen "
-    "mit \"(unbelegt)\"."
+    "mit \"(unbelegt)\".\n"
+    "\n"
+    # ── Statutory grounding (Phase 2A / S-6) ────────────────────────────
+    # The behavioural shift that turns dead-ends into actionable DD output.
+    # Corpus retrieval ALWAYS fires (the [C-n] statutes are in context even
+    # when the matter docs don't answer), so when the uploaded documents
+    # are silent on a point the model must ground the gap in the law
+    # rather than replying "keine Information".
+    "Gesetzliche Verankerung bei Lücken: Wenn die Mandatsdokumente "
+    "([M-n]) eine Frage NICHT beantworten, aber eine Rechtsquelle "
+    "([C-n]) eine einschlägige Anforderung enthält, antworte NICHT mit "
+    "\"keine Information\". Nenne stattdessen die gesetzliche Anforderung, "
+    "zitiere die Fundstelle [C-n] und weise darauf hin, dass der "
+    "entsprechende Nachweis im Datenraum fehlt und beim Mandanten "
+    "angefordert werden sollte. Beispiel: \"§ 35 Abs. 5 S. 2 BauGB "
+    "verlangt eine Rückbauverpflichtung [C-3]; ein entsprechender "
+    "Nachweis ist in den vorliegenden Unterlagen nicht enthalten und "
+    "sollte beim Mandanten angefordert werden.\" So wird aus einer "
+    "Informationslücke eine konkrete Handlungsempfehlung."
 )
 
 # Per-language answer-directive appended to the system prompt. German is
@@ -1090,14 +1107,30 @@ async def lifespan(app: FastAPI):
     persistence.init(db_path, uploads_dir)
     print(f"[startup]   persistence: db={db_path}  uploads={uploads_dir}", flush=True)
 
-    print("[startup] loading embeddings...", flush=True)
+    # ── Retrieval backend (Track-B pgvector swap, S-1) ──────────────────
+    # The dense corpus retrieval now runs against pgvector
+    # (corpus_child_chunks, HNSW halfvec(4000)) instead of the ~144 GB
+    # in-RAM numpy matrix that load_embeddings() used to hold. The
+    # SQLite connection is kept ONLY for lexical BM25 over the FTS5
+    # index (small) and for parent-text is no longer needed in RAM —
+    # parent passages are fetched from pgvector on demand per query.
+    #
+    # RetrievalClient reads the shared DB_* env (same DB the migration
+    # wrote to). It opens its pool lazily on first query, so startup
+    # stays fast and a transiently-unavailable Postgres doesn't block
+    # boot — the first /query surfaces the connection error cleanly.
+    print("[startup] wiring pgvector retrieval + BM25 FTS5...", flush=True)
     t0 = time.time()
     conn = sqlite3.connect(str(DB), check_same_thread=False)
     conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
-    corpus = load_embeddings(conn)
-    ensure_bm25(corpus, conn)
-    parent_text = load_parent_texts(conn)
-    print(f"[startup]   embeddings + bm25 + parent_text: {time.time()-t0:.1f}s", flush=True)
+    ensure_bm25_fts(conn)
+    retrieval_client = RetrievalClient()
+    if retrieval_client.ping():
+        print("[startup]   pgvector reachable", flush=True)
+    else:
+        print("[startup]   WARNING pgvector not reachable yet — first /query "
+              "will retry/fail cleanly", flush=True)
+    print(f"[startup]   retrieval wiring: {time.time()-t0:.1f}s", flush=True)
 
     t0 = time.time()
     reranker = Reranker("Qwen/Qwen3-Reranker-8B")
@@ -1130,7 +1163,7 @@ async def lifespan(app: FastAPI):
             LLM_LOCAL_PATH, torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True,
         ).eval()
         print(f"[startup]   LLM ready in {time.time()-t0:.1f}s", flush=True)
-        STATE.update(corpus=corpus, conn=conn, parent_text=parent_text,
+        STATE.update(conn=conn, retrieval_client=retrieval_client,
                      reranker=reranker, lm=lm, tok=tok,
                      llm_api_url=None, llm_model_name=LLM_LOCAL_PATH,
                      llm_client=None)
@@ -1156,7 +1189,7 @@ async def lifespan(app: FastAPI):
         llm_client = SyncLlmClient(
             LlmConfig(base_url=f"{LLM_API_URL.rstrip('/')}/v1", model=LLM_MODEL),
         )
-        STATE.update(corpus=corpus, conn=conn, parent_text=parent_text,
+        STATE.update(conn=conn, retrieval_client=retrieval_client,
                      reranker=reranker, lm=None, tok=None,
                      llm_api_url=LLM_API_URL, llm_model_name=LLM_MODEL,
                      llm_client=llm_client)
@@ -1221,8 +1254,12 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # Shutdown — close the asyncpg pool we opened above.
+        # Shutdown — close the asyncpg auth pool and the pgvector
+        # retrieval pool we opened above.
         await auth_pool.close()
+        retrieval = STATE.get("retrieval_client")
+        if retrieval is not None:
+            retrieval.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1230,8 +1267,18 @@ app = FastAPI(lifespan=lifespan)
 # uniform 401s at the app level. APIRouter has no app-scoped
 # exception-handler API, so this lives here, not inside the router.
 register_auth_exception_handlers(app)
+_cors_origins_env = os.getenv("CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] or [
+    "http://192.168.178.82:5173",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ── Prometheus HTTP-level instrumentation (TRACK_B_TIMING §6) ───────────────
@@ -1267,11 +1314,15 @@ except ImportError:
 @app.get("/health")
 def health():
     llm_ready = STATE["lm"] is not None or STATE["llm_api_url"] is not None
+    retrieval = STATE.get("retrieval_client")
+    retrieval_ready = retrieval.ping() if retrieval is not None else False
     return {
         "ok": True,
         "loaded": llm_ready,
         "llm_backend": "remote" if STATE["llm_api_url"] else "local",
         "llm_model": STATE["llm_model_name"],
+        "retrieval_backend": "pgvector",
+        "retrieval_ready": retrieval_ready,
         "n_sessions": persistence.count_sessions(),
     }
 
@@ -1287,53 +1338,111 @@ def _do_rag(
     prompt so the LLM sees and emits the exact handles the UI then
     renders as chips.
     """
-    corpus: Corpus = STATE["corpus"]
-    parent_text = STATE["parent_text"]
+    retrieval: RetrievalClient = STATE["retrieval_client"]
+    bm25_conn = STATE["conn"]
     reranker = STATE["reranker"]
 
+    # ── Embed query ─────────────────────────────────────────────────────
     t0 = time.time()
     qvec = embed_query(question, with_prefix=True)
     embed_s = time.time() - t0
 
+    # ── Hybrid candidate generation (dense pgvector + lexical BM25) ─────
+    # Both rankings live in child_id space (corpus_child_chunks.id ==
+    # FTS5 rowid == legacy child_chunks.id — preserved by the migration),
+    # so RRF fuses them directly with no in-RAM index. The dense side
+    # carries parent_id + content already; BM25-only ids are hydrated
+    # from pgvector in one batch below.
     t0 = time.time()
-    d_idx, _ = retrieve_dense(qvec, corpus, candidate_k)
-    b_idx, _ = retrieve_bm25(question, corpus, candidate_k)
-    fused = rrf_fuse([d_idx, b_idx])[:candidate_k]
-    cand_idx = [c for c, _ in fused]
+    dense_hits = retrieval.dense_search(qvec, top_k=candidate_k)
+    dense_by_child: dict[int, RetrievedChunk] = {h.child_id: h for h in dense_hits}
+    dense_ranking = [h.child_id for h in dense_hits]
+
+    bm25_pairs = retrieve_bm25_ids(question, bm25_conn, candidate_k)
+    bm25_ranking = [cid for cid, _ in bm25_pairs]
+
+    fused = rrf_fuse([dense_ranking, bm25_ranking])[:candidate_k]
+    cand_ids = [cid for cid, _ in fused]
+
+    # Hydrate BM25-only candidates (those the dense query didn't surface)
+    # so every candidate has a parent_id + content for rerank/dedupe.
+    missing = [cid for cid in cand_ids if cid not in dense_by_child]
+    if missing:
+        hydrated = retrieval.fetch_children_by_id(missing)
+        dense_by_child.update(hydrated)
+    # Drop any candidate we still couldn't resolve (e.g. an FTS5 rowid
+    # whose pgvector row hasn't been migrated yet — possible while topup
+    # is mid-stream).
+    cand_ids = [cid for cid in cand_ids if cid in dense_by_child]
     retrieve_s = time.time() - t0
 
+    # ── Parent texts (rerank + prompt context) ─────────────────────────
+    # The reranker scores (query, parent_passage) pairs; the prompt
+    # quotes the parent passage. Both come from pgvector now, fetched in
+    # one batched query keyed by the candidates' parent_ids.
     t0 = time.time()
-    pairs = [(question, parent_text.get(int(corpus.parent_ids[c]), "")[:2000])
-             for c in cand_idx]
-    rerank_scores = reranker.score(pairs)
-    order = np.argsort(-np.asarray(rerank_scores))
-    reranked = [cand_idx[j] for j in order]
-    top_parents = dedupe_by_parent(reranked, corpus, top_k)
+    parent_ids = [
+        dense_by_child[cid].parent_id
+        for cid in cand_ids
+        if dense_by_child[cid].parent_id is not None
+    ]
+    parent_text = retrieval.fetch_parent_texts(parent_ids)
+
+    # Rerank against parent text (falls back to child content for orphan
+    # children whose parent_id is NULL or whose parent text is missing).
+    def _passage_for(cid: int) -> str:
+        chunk = dense_by_child[cid]
+        if chunk.parent_id is not None and chunk.parent_id in parent_text:
+            return parent_text[chunk.parent_id]
+        return chunk.content
+
+    pairs = [(question, _passage_for(cid)[:2000]) for cid in cand_ids]
+    rerank_scores = reranker.score(pairs) if pairs else []
+    order = list(np.argsort(-np.asarray(rerank_scores))) if rerank_scores else []
+    reranked_ids = [cand_ids[j] for j in order]
     rerank_s = time.time() - t0
 
+    # ── Dedupe to top_k unique parents, build outputs ──────────────────
+    dense_id_set = set(dense_by_child) & set(dense_ranking)
+    bm25_id_set = set(bm25_ranking)
     chunks_out: list[ChunkOut] = []
     sources: list[RetrievedSource] = []
-    seen: set[int] = set()
-    for j, idx in enumerate(reranked):
-        pid = int(corpus.parent_ids[idx])
-        if pid in seen or pid not in top_parents:
+    seen_parents: set[int] = set()
+    for rank_pos, cid in enumerate(reranked_ids):
+        chunk = dense_by_child[cid]
+        # Dedupe key: parent_id when present, else the child id itself
+        # (orphan children have no parent to collapse on).
+        dedupe_key = chunk.parent_id if chunk.parent_id is not None else -cid
+        if dedupe_key in seen_parents:
             continue
-        seen.add(pid)
-        text = parent_text.get(pid, "")[:1500]
+        seen_parents.add(dedupe_key)
+
+        passage = _passage_for(cid)[:1500]
+        score = float(rerank_scores[order[rank_pos]])
+        in_dense = cid in dense_id_set
+        in_bm25 = cid in bm25_id_set
+        srcs = (
+            ["dense", "bm25"] if in_dense and in_bm25
+            else ["dense"] if in_dense
+            else ["bm25"]
+        )
+        section = (
+            f"Parent {chunk.parent_id}" if chunk.parent_id is not None
+            else f"Child {cid}"
+        )
         cite_id = _corpus_cite_id(len(chunks_out) + 1)
         chunks_out.append(ChunkOut(
-            text=text, section=f"Parent {pid}", law_refs=[],
-            sources=["dense", "bm25"] if idx in d_idx and idx in b_idx else (
-                ["dense"] if idx in d_idx else ["bm25"]),
-            similarity=float(rerank_scores[order[j]]),
-            rerank_score=float(rerank_scores[order[j]]),
+            text=passage, section=section, law_refs=[],
+            sources=srcs,
+            similarity=score,
+            rerank_score=score,
             cite_id=cite_id,
             source_kind="corpus",
         ))
         sources.append(RetrievedSource(
             cite_id=cite_id,
             source_kind="corpus",
-            text=text,
+            text=passage,
             label="Rechtskorpus",
         ))
         if len(chunks_out) >= top_k:
