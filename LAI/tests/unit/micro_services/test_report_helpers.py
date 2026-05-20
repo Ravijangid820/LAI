@@ -242,6 +242,73 @@ class TestWeaLocationHelpers:
         assert ddiq_report._wea_display_address({}) == ""
 
 
+class TestBackfillWeaOwner:
+    """A6 — per-WEA owner placeholders are filled from the canonical
+    project company so every turbine reports one consistent owner."""
+
+    def _weas(self, owners: list[str]):
+        from ddiq.models import WEAStatus
+        return [
+            WEAStatus(name=f"WEA {i}", ampel="green", owner=o, parcel="", contract="",
+                      lat=53.0, lng=8.0, address="")
+            for i, o in enumerate(owners)
+        ]
+
+    def test_backfills_placeholders(self) -> None:
+        weas = self._weas(["", "Unknown", "See contracts", "Real GmbH"])
+        n = ddiq_report._backfill_wea_owner(weas, "Windpark Lamstedt GmbH & Co. KG")
+        assert n == 3
+        assert weas[0].owner == "Windpark Lamstedt GmbH & Co. KG"
+        assert weas[1].owner == "Windpark Lamstedt GmbH & Co. KG"
+        assert weas[2].owner == "Windpark Lamstedt GmbH & Co. KG"
+        # A real per-row owner is left untouched.
+        assert weas[3].owner == "Real GmbH"
+
+    def test_no_company_is_noop(self) -> None:
+        weas = self._weas(["", "Unknown"])
+        assert ddiq_report._backfill_wea_owner(weas, None) == 0
+        assert weas[0].owner == ""
+
+    def test_placeholder_company_is_noop(self) -> None:
+        weas = self._weas([""])
+        assert ddiq_report._backfill_wea_owner(weas, "Unknown") == 0
+
+    def test_case_insensitive_placeholder_match(self) -> None:
+        weas = self._weas(["UNKNOWN", "  see contracts  "])
+        n = ddiq_report._backfill_wea_owner(weas, "ACME KG")
+        assert n == 2
+
+
+class TestProjectFacts:
+    """A6 — the canonical facts object surfaces the reconciled capacity
+    (which was previously computed but never stored) + identity."""
+
+    def test_construct_and_dump(self) -> None:
+        from ddiq.models import ProjectFacts
+        f = ProjectFacts(
+            projectName="Windpark Lamstedt", preparedFor="Investor AG",
+            projectCompany="Lamstedt GmbH & Co. KG",
+            projectCenter={"lat": 53.62, "lng": 9.15},
+            bundesland="niedersachsen", turbineCount=6, totalCapacityMw=25.2,
+        )
+        d = f.model_dump()
+        assert d["totalCapacityMw"] == 25.2
+        assert d["turbineCount"] == 6
+        assert d["bundesland"] == "niedersachsen"
+        assert d["projectCompany"] == "Lamstedt GmbH & Co. KG"
+
+    def test_unknown_values_stay_none(self) -> None:
+        from ddiq.models import ProjectFacts
+        f = ProjectFacts(
+            projectName="P", preparedFor="C",
+            projectCenter={"lat": 0.0, "lng": 0.0},
+        )
+        assert f.projectCompany is None
+        assert f.bundesland is None
+        assert f.totalCapacityMw is None
+        assert f.turbineCount == 0
+
+
 class TestSectionQuestions:
     def test_has_four_sections(self) -> None:
         assert set(ddiq_report.SECTION_QUESTIONS) == {

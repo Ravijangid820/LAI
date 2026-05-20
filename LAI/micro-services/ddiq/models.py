@@ -240,6 +240,32 @@ class RueckbauBond(BaseModel):
     note: Optional[str] = None
 
 
+# ── Facts ledger (A6) ────────────────────────────────────────────────
+
+
+class ProjectFacts(BaseModel):
+    """Canonical project-level facts, derived ONCE after cross-source
+    reconciliation and referenced by every downstream consumer instead
+    of being re-derived per row/section.
+
+    The smoke test showed the same project rendering four different
+    turbine counts and a paragraph repeated across six WEA rows because
+    each consumer extracted its own copy. This object is the single
+    source of truth: the reconciler (``_reconcile.py``) settles the
+    contested numbers, the identity fields come from the overview
+    section, and the report + findings + cross-doc check all quote
+    these values. ``None`` / 0 means no source produced a value
+    (treated as "unknown", never back-filled with a guess).
+    """
+    projectName: str
+    preparedFor: str
+    projectCompany: Optional[str] = None     # Projektgesellschaft / Pächterin
+    projectCenter: dict
+    bundesland: Optional[str] = None          # lowercase, e.g. "niedersachsen"
+    turbineCount: int = 0
+    totalCapacityMw: Optional[float] = None   # reconciled; was never stored before A6
+
+
 # ── Top-level report data + API bookends ─────────────────────────────
 
 
@@ -277,6 +303,12 @@ class DDiQReportData(BaseModel):
     # reconciliation block in ``_generate_report_core``.
     turbineCount: int = 0
     bundesland: Optional[str] = None             # lowercase, e.g. "niedersachsen"
+    # ── Facts ledger (A6) ───────────────────────────────────────────────
+    # Canonical ProjectFacts (model_dump) — the single source of truth for
+    # project-level identity + reconciled numbers, surfaced so the UI and
+    # downstream consumers quote ONE set of values. ``totalCapacityMw`` in
+    # particular was reconciled but never stored before A6.
+    projectFacts: Optional[dict] = None
     # ── Jurisdiction warnings (H-2) ────────────────────────────────────
     # Populated by the post-guardrail jurisdiction scan in
     # ``_generate_report_core``. Each entry flags a Bundesland-specific
@@ -335,6 +367,7 @@ __all__ = [
     "InfraPoint",
     "ProjectAreaRequest",
     "ProjectAreaResponse",
+    "ProjectFacts",
     "Quantification",
     "RueckbauBond",
     "TimelineEntry",

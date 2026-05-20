@@ -201,6 +201,7 @@ from ddiq.models import (  # noqa: E402 — re-exported for legacy callers
     InfraPoint,
     ProjectAreaRequest,
     ProjectAreaResponse,
+    ProjectFacts,
     Quantification,
     RueckbauBond,
     TimelineEntry,
@@ -765,6 +766,29 @@ green for verified-compliant, null when not enough information.""")
 
 
 _LOC_NULLISH = {"", "null", "none", "unknown", "n/a", "na", "not specified"}
+
+# Per-WEA owner values that mean "no real owner extracted" and should be
+# back-filled from the canonical project company (A6 facts ledger).
+_OWNER_PLACEHOLDERS = {"", "unknown", "see contracts", "not specified", "n/a", "na", "none", "null"}
+
+
+def _backfill_wea_owner(weas: list[WEAStatus], project_company: Optional[str]) -> int:
+    """A6: fill each WEA's ``owner`` from the canonical project company
+    when the per-row value is a placeholder. The smoke test showed
+    per-row owners drifting / repeating; referencing the one reconciled
+    company keeps every turbine consistent. Returns the number of rows
+    back-filled (0 when there's no canonical company to use).
+
+    Pure + in-place — unit-testable without the pipeline.
+    """
+    if not project_company or project_company.strip().lower() in _OWNER_PLACEHOLDERS:
+        return 0
+    n = 0
+    for w in weas:
+        if (w.owner or "").strip().lower() in _OWNER_PLACEHOLDERS:
+            w.owner = project_company
+            n += 1
+    return n
 
 
 def _wea_geocode_query(w: dict) -> str:
@@ -1640,6 +1664,34 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
         "reconciled: total_mw=%s  turbine_count=%s  bundesland=%s",
         total_mw, report.turbineCount, report.bundesland,
     )
+
+    # ── A6: facts ledger ──────────────────────────────────────────────
+    # Bundle the canonical identity + reconciled numbers into ONE
+    # ProjectFacts object that the UI and downstream consumers quote, so
+    # the report can't show divergent names / counts / capacities. Note
+    # ``total_mw`` was reconciled above but, pre-A6, was never stored on
+    # the report — only passed to findings — so the UI had no canonical
+    # capacity to render.
+    project_company = clean_value(
+        get_section_value(sections, "overview", "Project Company"), ""
+    ) or None
+    facts = ProjectFacts(
+        projectName=pname,
+        preparedFor=pfor,
+        projectCompany=project_company,
+        projectCenter=center0,
+        bundesland=report.bundesland,
+        turbineCount=report.turbineCount,
+        totalCapacityMw=total_mw,
+    )
+    report.projectFacts = facts.model_dump()
+
+    # Reference the canonical company for any WEA whose own owner came
+    # back as a placeholder — one source of truth, not a per-row guess.
+    backfilled = _backfill_wea_owner(report.weaStatuses, project_company)
+    if backfilled:
+        logger.info("A6: back-filled owner on %d/%d WEA row(s) from project company",
+                    backfilled, len(report.weaStatuses))
 
     progress("findings", 0.85)
     t = time.time()
