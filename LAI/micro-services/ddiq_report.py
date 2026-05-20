@@ -1189,7 +1189,7 @@ def _persist_report_jsonb(rid: str, project_name: str, doc_ids: list, preset: st
                            document_ids = EXCLUDED.document_ids,
                            preset = EXCLUDED.preset,
                            report_data = EXCLUDED.report_data""",
-                    (rid, str(user_id), project_name, doc_ids, preset, json.dumps(report.dict())),
+                    (rid, str(user_id), project_name, doc_ids, preset, json.dumps(report.model_dump())),
                 )
     except Exception as e:
         # Checkpoint failure shouldn't kill the pipeline — the next checkpoint
@@ -1471,7 +1471,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     report.parcels = parcels
     report.projectArea = project_area_data0
     report.clearanceZones = clearance_data0
-    report.validation = pipeline_result.validation.dict() if pipeline_result.validation else None
+    report.validation = pipeline_result.validation.model_dump() if pipeline_result.validation else None
     report.geojson = pipeline_result.geojson if pipeline_result.geojson else None
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 

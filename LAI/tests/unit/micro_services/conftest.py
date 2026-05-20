@@ -32,6 +32,7 @@ Fixtures provided:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,52 @@ import pytest
 _MICROSERVICES_DIR = Path(__file__).resolve().parents[3] / "micro-services"
 if str(_MICROSERVICES_DIR) not in sys.path:
     sys.path.insert(0, str(_MICROSERVICES_DIR))
+
+
+# ── Import-time env bootstrap ────────────────────────────────────────
+# ``import ddiq_report`` transitively imports ``auth_dep``, which
+# constructs ``AuthConfig()`` at module load. That config has NO
+# default for the JWT secret (the deliberate fail-closed pattern — a
+# missing secret must crash startup, not silently use a dev default)
+# and validates a >=32-char minimum. So any test module that imports
+# ``ddiq_report`` needs these set BEFORE collection.
+#
+# ``setdefault`` so a real env (CI / a developer's shell) is never
+# clobbered. The value here is a throwaway used only to satisfy the
+# constructor — no token is ever issued or verified in these unit
+# tests.
+os.environ.setdefault(
+    "LAI_AUTH_JWT_ACCESS_SECRET",
+    "unit-test-secret-0123456789abcdef0123456789abcdef",
+)
+os.environ.setdefault("DB_PASSWORD", "unit-test-db-password")
+
+
+# ── Pre-import ddiq_report under warning suppression ─────────────────
+# ``ddiq_report`` still registers startup/shutdown hooks via the
+# deprecated ``@router.on_event`` decorator (FastAPI now recommends
+# lifespan handlers — tracked as a follow-up). The decorator emits a
+# DeprecationWarning at IMPORT time, and the project's pytest config
+# promotes warnings to errors, which would fail collection of any test
+# module that does ``import ddiq_report``.
+#
+# We import it once here, under a local warning filter, so the module
+# is cached in ``sys.modules`` before the test modules import it (a
+# cache hit re-runs no decorators, emits no warning). The global
+# ``error`` filter stays fully in force for actual test execution —
+# this only neutralises the one known import-time decorator warning,
+# rather than weakening the gate project-wide.
+import warnings  # noqa: E402
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    try:
+        import ddiq_report  # noqa: F401 — cached for the test modules
+    except Exception:
+        # If the import fails for a real reason (missing dep, etc.),
+        # let the individual test module surface it with a clear error
+        # rather than masking it here.
+        pass
 
 
 # ── Fakes ────────────────────────────────────────────────────────────
@@ -273,3 +320,97 @@ def make_llm_json(monkeypatch: pytest.MonkeyPatch):
         return calls
 
     return patch
+
+
+# ── Fake Postgres for the orchestrator-side helpers (H-6b) ───────────
+# Functions still in ``ddiq_report`` (geocode_address, alkis_query_parcels,
+# _find_existing_report, _update_report_progress, _persist_report_jsonb)
+# all go through ``ddiq_report.get_conn()``. The fakes below let tests
+# stage cursor results + capture the executed SQL without a real
+# Postgres. The cursor supports BOTH call shapes used in the code:
+#   - ``conn = get_conn(); cur = conn.cursor()``  (geocode_address)
+#   - ``with get_conn() as conn: with conn.cursor() as cur:``  (the rest)
+
+
+class FakeCursor:
+    """Minimal psycopg2 cursor double.
+
+    Records every ``execute(sql, params)`` so a test can assert on the
+    SQL + bound params. ``fetchone`` / ``fetchall`` return whatever the
+    test staged. Usable as a context manager (``with conn.cursor()``)
+    and via the plain ``cur = conn.cursor()`` form.
+    """
+
+    def __init__(self, fetchone: Any = None, fetchall: Any = None) -> None:
+        self.executed: list[tuple[str, Any]] = []
+        self._fetchone = fetchone
+        self._fetchall = fetchall
+        self.rowcount = 0
+        self.closed = False
+
+    def execute(self, sql: str, params: Any = None) -> None:
+        self.executed.append((sql, params))
+
+    def fetchone(self) -> Any:
+        return self._fetchone
+
+    def fetchall(self) -> Any:
+        return self._fetchall or []
+
+    def close(self) -> None:
+        self.closed = True
+
+    def __enter__(self) -> FakeCursor:
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+
+class FakeConn:
+    """Minimal psycopg2 connection double. ``cursor()`` ignores the
+    ``cursor_factory`` kwarg (RealDictCursor vs default) since the
+    fake cursor returns whatever shape the test staged."""
+
+    def __init__(self, cursor: FakeCursor) -> None:
+        self._cursor = cursor
+        self.committed = False
+        self.closed = False
+
+    def cursor(self, cursor_factory: Any = None) -> FakeCursor:
+        return self._cursor
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def rollback(self) -> None:  # pragma: no cover — context-manager error path
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+    def __enter__(self) -> FakeConn:
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+
+@pytest.fixture
+def fake_db(monkeypatch):
+    """Patch ``ddiq_report.get_conn`` with a :class:`FakeConn`.
+
+    Returns an ``install(fetchone=..., fetchall=...)`` callable that
+    stages the cursor's return values and returns the
+    ``(conn, cursor)`` pair so the test can assert on
+    ``cursor.executed`` / ``conn.committed``.
+    """
+    import ddiq_report
+
+    def install(fetchone: Any = None, fetchall: Any = None) -> tuple[FakeConn, FakeCursor]:
+        cur = FakeCursor(fetchone=fetchone, fetchall=fetchall)
+        conn = FakeConn(cur)
+        monkeypatch.setattr(ddiq_report, "get_conn", lambda: conn)
+        return conn, cur
+
+    return install
