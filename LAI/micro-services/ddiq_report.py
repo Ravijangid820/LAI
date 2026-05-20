@@ -764,6 +764,48 @@ green for verified-compliant, null when not enough information.""")
 # / check_grundbuch_match — moved to ``ddiq.extractors.*`` (H-5 phase 2).
 
 
+_LOC_NULLISH = {"", "null", "none", "unknown", "n/a", "na", "not specified"}
+
+
+def _wea_geocode_query(w: dict) -> str:
+    """A7: build a clean, geocodable location string from a WEA's
+    STRUCTURED location fields (gemeinde / landkreis / bundesland) — never
+    the freeform paragraph the LLM sometimes returns in ``address``.
+
+    Feeding that paragraph to Nominatim verbatim was the root of the
+    Lamstedt→Bremen failure: the geocoder latched onto an unrelated token.
+    When no structured fields are present we fall back to ``address`` ONLY
+    if it's short enough to plausibly be a place name (≤80 chars, ≤1
+    sentence) — a paragraph is dropped rather than geocoded.
+    """
+    parts = [
+        str(w.get(k, "")).strip()
+        for k in ("gemeinde", "landkreis", "bundesland")
+    ]
+    parts = [p for p in parts if p.lower() not in _LOC_NULLISH]
+    if parts:
+        return ", ".join(parts) + ", Deutschland"
+    addr = str(w.get("address", "")).strip()
+    if addr and len(addr) <= 80 and addr.count(".") <= 1:
+        return addr
+    return ""
+
+
+def _wea_display_address(w: dict) -> str:
+    """A7: short human-readable location for the WEA table — Gemeinde +
+    Bundesland, not the paragraph. Falls back to a truncated ``address``
+    when no structured fields exist."""
+    gem = str(w.get("gemeinde", "")).strip()
+    bl = str(w.get("bundesland", "")).strip()
+    disp = ", ".join(
+        p for p in (gem, bl) if p.lower() not in _LOC_NULLISH
+    )
+    if disp:
+        return disp
+    addr = str(w.get("address", "")).strip()
+    return addr[:80] if addr else ""
+
+
 def extract_wea_statuses(doc_ids, full_text, sections, project_center=None):
     """Extract WEA per-turbine attributes including the technical fields a
     DD lawyer needs: hub height (drives 10H clearance for Bayern/Hessen),
@@ -787,7 +829,9 @@ Return JSON array of turbines. Each turbine:
   "owner":"name or Unknown",
   "parcel":"Flurstücksnummer or empty",
   "contract":"Pachtvertrag-Ref or 'Not specified'",
-  "address":"municipality, state",
+  "gemeinde":"Gemeinde (municipality) name only, or empty — NOT a sentence",
+  "landkreis":"Landkreis (district) name only, or empty",
+  "bundesland":"Bundesland (state) name only, or empty",
   "ampel":"green|yellow|red",
   "hub_height_m":<number or null — Nabenhöhe in metres>,
   "rotor_diameter_m":<number or null — Rotordurchmesser in metres>,
@@ -799,6 +843,9 @@ Return JSON array of turbines. Each turbine:
   "warranty_end":"YYYY-MM-DD or null"}}
 
 Rules:
+- Location: give Gemeinde / Landkreis / Bundesland as bare NAMES, never a
+  sentence or paragraph. These drive geocoding — a paragraph geocodes to
+  the wrong place. Leave a field empty if unknown.
 - Status: errichtet=physically built, genehmigt=permit issued not yet built,
   geplant=planned only, abgenommen=accepted into operation. Be honest about
   ambiguity — set null rather than guessing.
@@ -839,8 +886,10 @@ Rules:
     project_bl = bundesland_from_coords(*project_center) if project_center else None
     statuses = []
     for idx, w in enumerate(weas_raw):
-        addr = str(w.get("address", ""))
-        coords = geocode_address(addr, expected_bundesland=project_bl) if addr else None
+        # A7: geocode from the structured location fields, not a paragraph.
+        geo_query = _wea_geocode_query(w)
+        addr = _wea_display_address(w)
+        coords = geocode_address(geo_query, expected_bundesland=project_bl) if geo_query else None
         if not coords and project_center: coords = project_center
         sc = w.get("status_code")
         if sc not in ("errichtet", "genehmigt", "geplant", "abgenommen"):
@@ -940,12 +989,27 @@ def build_parcels(doc_ids, full_text, wea_statuses, project_center=None, locatio
             for ap in alkis_query_parcels(wea.lat, wea.lng, bundesland, 150):
                 if ap["parcelNumber"] in seen: continue
                 seen.add(ap["parcelNumber"])
-                area_ha = round(ap.get("area_m2",0)/10000, 2) if ap.get("area_m2") else 2.0
-                poly = ap.get("polygon") or make_parcel_polygon(wea.lat, wea.lng, area_ha or 2.5)
+                # A3 — honest provenance. The parcel RECORD comes from
+                # ALKIS, but the GEOMETRY may not: if ALKIS returned a real
+                # polygon we tag it ``alkis_wfs`` with high confidence;
+                # when it didn't, we draw an estimated box and must tag THAT
+                # ``estimated`` — never let a synthetic polygon render as
+                # cadastral truth. Likewise ``area`` is the real ALKIS area
+                # or 0.0 (unknown) — never the old fabricated default.
+                real_polygon = ap.get("polygon")
+                real_area_m2 = ap.get("area_m2")
+                area_ha = round(real_area_m2 / 10000, 2) if real_area_m2 else 0.0
+                if real_polygon:
+                    poly, poly_source, conf = real_polygon, "alkis_wfs", 0.95
+                else:
+                    poly = make_parcel_polygon(wea.lat, wea.lng, area_ha or 2.5)
+                    poly_source, conf = "estimated", 0.3
                 parcels.append(CadastralParcel(id=f"p{len(parcels)+1}", parcelNumber=ap["parcelNumber"],
                     gemarkung=ap.get("gemarkung") or "Unknown", flur=ap.get("flur",0), polygon=poly,
                     status={"green":"secured","yellow":"negotiation","red":"open"}.get(wea.ampel,"open"),
-                    owner=wea.owner, area=area_ha, linkedWEA=wea.name, notes=f"Source: {ap.get('source','ALKIS')}"))
+                    owner=wea.owner, area=area_ha, linkedWEA=wea.name,
+                    polygonSource=poly_source, confidence=conf,
+                    notes=f"Source: {ap.get('source','ALKIS WFS')}"))
             time.sleep(0.5)
 
     # ── Layer 2: Regex from document text ──
@@ -969,9 +1033,14 @@ def build_parcels(doc_ids, full_text, wea_statuses, project_center=None, locatio
             pp = full_text.find(pnum); cp = full_text.find(cr_id)
             if pp >= 0 and cp >= 0 and abs(pp-cp) < 2000: cref = cr_id; break
         poly = make_parcel_polygon(lat, lng) if lat != 0 else []
+        # A3 — parcel parsed from document text: the geometry is an
+        # estimated box (or empty), and we have no cadastral area, so
+        # ``area`` is 0.0 (unknown) rather than the old hash-of-the-
+        # parcel-number fabrication ``round(2.0+(hash(pnum)%20)/10,1)``.
         parcels.append(CadastralParcel(id=f"p{len(parcels)+1}", parcelNumber=pnum,
             gemarkung=str(ref.get("gemarkung","")) or "Unknown", flur=int(ref.get("flur",0)) if ref.get("flur") else 0,
-            polygon=poly, status=status, owner=owner, area=round(2.0+(hash(pnum)%20)/10,1),
+            polygon=poly, status=status, owner=owner, area=0.0,
+            polygonSource="estimated", confidence=0.4 if linked else 0.2,
             contractRef=cref, linkedWEA=linked.name if linked else None, notes="Source: Document text"))
 
     # ── Layer 3: LLM fallback ──
@@ -988,13 +1057,23 @@ def build_parcels(doc_ids, full_text, wea_statuses, project_center=None, locatio
                     if project_center:
                         a = (2*math.pi*len(parcels))/max(len(result),1); lat = project_center[0]+0.004*math.cos(a); lng = project_center[1]+0.004*math.sin(a)
                     poly = make_parcel_polygon(lat, lng) if lat != 0 else []
+                    # A3 — LLM-suggested parcel: estimated geometry, no
+                    # cadastral area (0.0 = unknown), lowest confidence.
                     parcels.append(CadastralParcel(id=f"p{len(parcels)+1}", parcelNumber=pnum,
                         gemarkung=str(ref.get("gemarkung","")) or "Unknown", flur=int(ref.get("flur",0)) if ref.get("flur") else 0,
-                        polygon=poly, status="buffer", owner="", area=2.0, notes="Source: LLM"))
+                        polygon=poly, status="buffer", owner="", area=0.0,
+                        polygonSource="estimated", confidence=0.15, notes="Source: LLM"))
         except Exception as e: logger.warning(f"LLM parcel: {e}")
 
-    alkis_n = sum(1 for p in parcels if p.notes and "ALKIS" in (p.notes or ""))
-    logger.info(f"Parcels: {len(parcels)} total (ALKIS:{alkis_n}, text:{len(text_refs)}, llm:{len(parcels)-alkis_n-len(text_refs)})")
+    # A3 — count by real provenance (polygonSource), not by string-matching
+    # the free-text notes. Only ``alkis_wfs`` polygons are real cadastral
+    # geometry; everything else is an estimated box.
+    alkis_n = sum(1 for p in parcels if p.polygonSource == "alkis_wfs")
+    estimated_n = sum(1 for p in parcels if p.polygonSource == "estimated")
+    logger.info(
+        "Parcels: %d total (alkis_wfs:%d, estimated:%d)",
+        len(parcels), alkis_n, estimated_n,
+    )
     return parcels
 
 

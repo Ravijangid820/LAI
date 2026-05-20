@@ -197,6 +197,51 @@ class TestExtractParcelRefs:
 # ── SECTION_QUESTIONS structure ──────────────────────────────────────
 
 
+class TestWeaLocationHelpers:
+    """A7 — geocode/display strings are built from structured location
+    fields, never the freeform paragraph that caused the Lamstedt→Bremen
+    geocode failure."""
+
+    def test_geocode_query_from_structured_fields(self) -> None:
+        w = {"gemeinde": "Lamstedt", "landkreis": "Cuxhaven", "bundesland": "Niedersachsen"}
+        q = ddiq_report._wea_geocode_query(w)
+        assert q == "Lamstedt, Cuxhaven, Niedersachsen, Deutschland"
+
+    def test_geocode_query_skips_nullish_fields(self) -> None:
+        w = {"gemeinde": "Hude", "landkreis": "", "bundesland": "null"}
+        assert ddiq_report._wea_geocode_query(w) == "Hude, Deutschland"
+
+    def test_geocode_query_falls_back_to_short_address(self) -> None:
+        w = {"address": "Cuxhaven, Niedersachsen"}
+        assert ddiq_report._wea_geocode_query(w) == "Cuxhaven, Niedersachsen"
+
+    def test_geocode_query_drops_paragraph_address(self) -> None:
+        """The failure mode A7 fixes: a multi-sentence paragraph must NOT
+        be fed to the geocoder — return empty so no geocode is attempted
+        (the caller falls back to project_center)."""
+        para = (
+            "Die Windenergieanlage befindet sich im Außenbereich der Gemeinde "
+            "Lamstedt. Sie ist über die Kreisstraße K50 erschlossen. Der "
+            "nächste Ort ist Cuxhaven."
+        )
+        assert ddiq_report._wea_geocode_query({"address": para}) == ""
+
+    def test_geocode_query_empty_when_nothing(self) -> None:
+        assert ddiq_report._wea_geocode_query({}) == ""
+
+    def test_display_address_prefers_structured(self) -> None:
+        w = {"gemeinde": "Lamstedt", "bundesland": "Niedersachsen", "address": "ignored long form"}
+        assert ddiq_report._wea_display_address(w) == "Lamstedt, Niedersachsen"
+
+    def test_display_address_truncates_paragraph_fallback(self) -> None:
+        para = "x" * 200
+        out = ddiq_report._wea_display_address({"address": para})
+        assert len(out) == 80
+
+    def test_display_address_empty(self) -> None:
+        assert ddiq_report._wea_display_address({}) == ""
+
+
 class TestSectionQuestions:
     def test_has_four_sections(self) -> None:
         assert set(ddiq_report.SECTION_QUESTIONS) == {
