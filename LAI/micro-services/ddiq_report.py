@@ -46,7 +46,7 @@ from _reconcile import Candidate, reconcile_categorical, reconcile_numeric
 # Output guardrail: post-LLM cleanup pass that strips defensive-AI
 # paragraphs, removes hedge phrases, and flags mixed-language rows.
 # See ``_guardrail.py`` for the sourced pattern list.
-from _guardrail import apply_to_findings, apply_to_rows
+from _guardrail import apply_to_findings, apply_to_rows, detect_language
 
 # Jurisdiction validator (H-2): scan finalised section / finding text
 # for cross-Bundesland rule citations (e.g. Bayern's 10H BayBO mentioned
@@ -772,6 +772,29 @@ _LOC_NULLISH = {"", "null", "none", "unknown", "n/a", "na", "not specified"}
 _OWNER_PLACEHOLDERS = {"", "unknown", "see contracts", "not specified", "n/a", "na", "none", "null"}
 
 
+def _relanguage_text(text: str, target_language: str = "de") -> str:
+    """A8: re-render a mixed-language string entirely in the target
+    language, preserving every fact, statute reference, number, date and
+    proper noun. Best-effort — returns the original on empty input or any
+    LLM failure, so a re-language miss never blanks a cell.
+    """
+    if not text or not text.strip():
+        return text
+    lang_name = "German" if target_language == "de" else "English"
+    system = (
+        f"You are a legal editor. Rewrite the user's text ENTIRELY in {lang_name}. "
+        f"Preserve every fact, statute reference (e.g. '§6 BImSchG', '§35 Abs. 5 "
+        f"BauGB'), number, date, monetary amount and proper noun EXACTLY as given. "
+        f"Do not add, remove, soften or comment on any content. Output only the "
+        f"rewritten text — no preamble."
+    )
+    try:
+        out = llm_call(system, text, temperature=0.0, max_tokens=1024)
+    except Exception:
+        return text
+    return out.strip() or text
+
+
 def _backfill_wea_owner(weas: list[WEAStatus], project_company: Optional[str]) -> int:
     """A6: fill each WEA's ``owner`` from the canonical project company
     when the per-row value is a placeholder. The smoke test showed
@@ -828,6 +851,75 @@ def _wea_display_address(w: dict) -> str:
         return disp
     addr = str(w.get("address", "")).strip()
     return addr[:80] if addr else ""
+
+
+_WEA_SPECS_QUERY = (
+    "Nabenhöhe Rotordurchmesser Nennleistung Hersteller Typ Typenbezeichnung "
+    "Anlagentyp Gesamthöhe Leistungskurve technische Daten Erläuterungsbericht Typenschild"
+)
+
+
+def extract_wea_specs(doc_ids) -> dict:
+    """A10: dedicated, narrow pass for the turbine TECHNICAL spec table.
+
+    The all-in-one WEA prompt routinely returns null specs because it is
+    simultaneously juggling status + location + ownership; a focused
+    query against the Erläuterungsbericht / datasheet recovers them. A
+    wind park almost always deploys ONE turbine type, so we extract the
+    canonical project-wide spec. Returns ``{}`` on failure (the caller
+    keeps whatever the main pass found).
+    """
+    ctx = rag_context(doc_ids, _WEA_SPECS_QUERY, top_k=6)
+    prompt = f"""Extract the wind-turbine TECHNICAL specification from the datasheet /
+Erläuterungsbericht. Wind parks usually deploy ONE turbine type — return that
+canonical spec. If genuinely multiple types are present, return the dominant one.
+
+Context:
+{ctx}
+
+Return a JSON object (use null for any value not stated — never guess):
+{{"manufacturer":"Vestas|Enercon|Nordex|Siemens Gamesa|GE|... or null",
+  "model":"E-138 EP3|V162|N163|... (Typenbezeichnung) or null",
+  "hub_height_m":<number, Nabenhöhe in metres, or null>,
+  "rotor_diameter_m":<number, Rotordurchmesser in metres, or null>,
+  "rated_power_kw":<number, Nennleistung in kW, or null>}}"""
+    try:
+        result = llm_json(EXTRACTION_SYSTEM, prompt)
+        return result if isinstance(result, dict) else {}
+    except Exception as e:
+        logger.warning(f"WEA specs extraction: {e}")
+        return {}
+
+
+def _apply_canonical_specs(weas: list[WEAStatus], specs: dict) -> int:
+    """A10: back-fill null per-WEA spec fields from the canonical
+    project-wide spec. Only fills a field that is currently ``None`` — a
+    per-turbine value the main pass DID extract is never overwritten.
+    Pure + in-place; returns the number of individual field-fills.
+    """
+    if not specs:
+        return 0
+
+    def _num(v):
+        try:
+            return float(v) if v not in (None, "") else None
+        except Exception:
+            return None
+
+    canon: dict = {
+        "hub_height_m": _num(specs.get("hub_height_m")),
+        "rotor_diameter_m": _num(specs.get("rotor_diameter_m")),
+        "rated_power_kw": _num(specs.get("rated_power_kw")),
+        "manufacturer": (specs.get("manufacturer") or None),
+        "model": (specs.get("model") or None),
+    }
+    fills = 0
+    for w in weas:
+        for field, cval in canon.items():
+            if cval is not None and getattr(w, field) is None:
+                setattr(w, field, cval)
+                fills += 1
+    return fills
 
 
 def extract_wea_statuses(doc_ids, full_text, sections, project_center=None):
@@ -960,6 +1052,18 @@ Rules:
             for j, idx in enumerate(indices):
                 s = statuses[idx]
                 statuses[idx] = s.copy(update={"name": f"WEA {short} {j+1}"})
+
+    # A10: recover specs the kitchen-sink WEA prompt missed. Only fire the
+    # extra (focused) LLM pass when at least one row is still missing a
+    # spec field — no wasted call when the main extraction was complete.
+    if statuses and any(
+        s.hub_height_m is None or s.rotor_diameter_m is None or s.rated_power_kw is None
+        or s.manufacturer is None or s.model is None
+        for s in statuses
+    ):
+        filled = _apply_canonical_specs(statuses, extract_wea_specs(doc_ids))
+        if filled:
+            logger.info("A10: back-filled %d WEA spec field(s) from the datasheet pass", filled)
     return statuses
 
 
@@ -1809,6 +1913,37 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
         finding_counts["defensive"], finding_counts["hedges"],
         cross_doc_counts["defensive"], cross_doc_counts["hedges"],
     )
+
+    # ── A8: single-language enforcement (re-prompt) ───────────────────
+    # The guardrail above only FLAGS mixed-language cells. Here we
+    # actually fix them: any row value/note or finding text the heuristic
+    # tags ``"mixed"`` (German body with an English clause, or vice
+    # versa) is re-rendered in the target language by a focused LLM call.
+    # One call per flagged cell — mixed cells are rare, so the cost is
+    # bounded — and best-effort, so a re-language failure leaves the
+    # original text rather than blanking it. Runs after the guardrail so
+    # it operates on the cleaned text.
+    relang_n = 0
+    for sec in report.sections:
+        for row in sec.rows:
+            if detect_language(row.value) == "mixed":
+                new = _relanguage_text(row.value, section_lang_hint)
+                if new != row.value:
+                    row.value = new
+                    relang_n += 1
+            if row.note and detect_language(row.note) == "mixed":
+                new = _relanguage_text(row.note, section_lang_hint)
+                if new != row.note:
+                    row.note = new
+                    relang_n += 1
+    for f in list(report.findings) + list(report.crossDocFindings):
+        if detect_language(f.text) == "mixed":
+            new = _relanguage_text(f.text, section_lang_hint)
+            if new != f.text:
+                f.text = new
+                relang_n += 1
+    if relang_n:
+        logger.info("A8: re-rendered %d mixed-language cell(s) in '%s'", relang_n, section_lang_hint)
 
     # ── Jurisdiction scan (H-2) ───────────────────────────────────────
     # Cross-Bundesland rule check. For each section row + finding (the

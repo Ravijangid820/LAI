@@ -279,6 +279,101 @@ class TestBackfillWeaOwner:
         assert n == 2
 
 
+class TestApplyCanonicalSpecs:
+    """A10 — null per-WEA spec fields are back-filled from the canonical
+    datasheet spec; a real per-turbine value is never overwritten."""
+
+    def _wea(self, **kw):
+        from ddiq.models import WEAStatus
+        base = dict(name="WEA 1", ampel="green", owner="o", parcel="", contract="",
+                    lat=53.0, lng=8.0, address="")
+        base.update(kw)
+        return WEAStatus(**base)
+
+    def test_fills_null_fields(self) -> None:
+        weas = [self._wea(), self._wea()]
+        specs = {"manufacturer": "Enercon", "model": "E-138 EP3",
+                 "hub_height_m": 131, "rotor_diameter_m": 138.6, "rated_power_kw": 4200}
+        fills = ddiq_report._apply_canonical_specs(weas, specs)
+        # 5 fields × 2 turbines, all null → 10 fills.
+        assert fills == 10
+        assert weas[0].manufacturer == "Enercon"
+        assert weas[0].hub_height_m == 131.0
+        assert weas[1].rated_power_kw == 4200.0
+
+    def test_does_not_overwrite_real_values(self) -> None:
+        weas = [self._wea(manufacturer="Vestas", hub_height_m=149.0)]
+        specs = {"manufacturer": "Enercon", "hub_height_m": 131,
+                 "rotor_diameter_m": 138.6}
+        fills = ddiq_report._apply_canonical_specs(weas, specs)
+        # manufacturer + hub_height already set → not touched; only
+        # rotor_diameter (+ the two still-null fields stay null since
+        # specs has no value for them) gets filled.
+        assert weas[0].manufacturer == "Vestas"
+        assert weas[0].hub_height_m == 149.0
+        assert weas[0].rotor_diameter_m == 138.6
+        assert fills == 1
+
+    def test_empty_specs_is_noop(self) -> None:
+        weas = [self._wea()]
+        assert ddiq_report._apply_canonical_specs(weas, {}) == 0
+        assert weas[0].manufacturer is None
+
+    def test_null_spec_values_skipped(self) -> None:
+        weas = [self._wea()]
+        specs = {"manufacturer": None, "model": "", "hub_height_m": None}
+        assert ddiq_report._apply_canonical_specs(weas, specs) == 0
+
+    def test_unparseable_numeric_skipped(self) -> None:
+        weas = [self._wea()]
+        specs = {"hub_height_m": "tall", "rated_power_kw": 4200}
+        fills = ddiq_report._apply_canonical_specs(weas, specs)
+        assert fills == 1
+        assert weas[0].hub_height_m is None
+        assert weas[0].rated_power_kw == 4200.0
+
+
+class TestRelanguageText:
+    """A8 — mixed-language text is re-rendered in the target language by
+    a focused LLM call; best-effort so failures never blank a cell."""
+
+    def test_returns_llm_output(self, patch_llm_singletons) -> None:
+        patch_llm_singletons.responses = ["Die Genehmigung wurde erteilt."]
+        out = ddiq_report._relanguage_text(
+            "The Genehmigung wurde erteilt.", target_language="de",
+        )
+        assert out == "Die Genehmigung wurde erteilt."
+        # System prompt must name the target language + the preserve rule.
+        sys_, _, _, _ = patch_llm_singletons.calls[0]
+        assert "German" in sys_
+        assert "BImSchG" in sys_  # the preserve-statutes instruction
+
+    def test_english_target(self, patch_llm_singletons) -> None:
+        patch_llm_singletons.responses = ["The permit was granted."]
+        ddiq_report._relanguage_text("Die permit was granted.", target_language="en")
+        sys_, _, _, _ = patch_llm_singletons.calls[0]
+        assert "English" in sys_
+
+    def test_empty_input_is_noop(self, patch_llm_singletons) -> None:
+        assert ddiq_report._relanguage_text("", "de") == ""
+        assert ddiq_report._relanguage_text("   ", "de") == "   "
+        # No LLM call for empty input.
+        assert patch_llm_singletons.calls == []
+
+    def test_llm_failure_returns_original(self, monkeypatch, mock_llm_client) -> None:
+        import ddiq.llm as ddiq_llm
+        mock_llm_client.raise_on_call = True
+        monkeypatch.setattr(ddiq_llm, "_LLM_CLIENT", mock_llm_client)
+        original = "The Genehmigung wurde erteilt."
+        # llm_call swallows LlmError → returns "" → _relanguage_text keeps original.
+        assert ddiq_report._relanguage_text(original, "de") == original
+
+    def test_empty_llm_output_returns_original(self, patch_llm_singletons) -> None:
+        patch_llm_singletons.responses = ["   "]  # whitespace-only
+        original = "Mixed text hier"
+        assert ddiq_report._relanguage_text(original, "de") == original
+
+
 class TestProjectFacts:
     """A6 — the canonical facts object surfaces the reconciled capacity
     (which was previously computed but never stored) + identity."""
