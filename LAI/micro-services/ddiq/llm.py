@@ -86,7 +86,18 @@ RERANKER_URL: str  = os.getenv("RERANKER_URL", "http://localhost:8004")
 # matches the docker-compose envs without touching compose.
 
 
-_LLM_CONFIG = LlmConfig(base_url=LLM_URL, model=LLM_MODEL)
+# thinking_mode_enabled=False (E1): every DDiQ pass is structured JSON
+# extraction (sections, findings, timeline, Rückbau, Grundbuch, WEA,
+# infra, specs, metadata) — none need the Qwen3 <think> reasoning trace,
+# which roughly DOUBLES per-call latency. With thinking on, the live §14
+# re-smoke ran 100-160s per findings call and blew the Celery 120-min
+# hard limit before the report could finish. Disabling it sends
+# ``extra_body={"chat_template_kwargs": {"enable_thinking": False}}``
+# server-side, ~halving every call. The contract analyzer (serve_rag)
+# keeps thinking on via its own client; this flag is DDiQ-local.
+_LLM_CONFIG = LlmConfig(
+    base_url=LLM_URL, model=LLM_MODEL, thinking_mode_enabled=False,
+)
 _LLM_CLIENT: SyncLlmClient = SyncLlmClient(_LLM_CONFIG)
 
 

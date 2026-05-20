@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from ddiq.llm import EXTRACTION_SYSTEM, llm_json
@@ -61,6 +63,31 @@ __all__ = [
 
 
 _log = logging.getLogger("ddiq")
+
+# E1: default fan-out for the per-row findings calls. vLLM batches
+# concurrent requests on the GPU, so issuing them in parallel cuts the
+# findings phase's wall-time well below the sequential sum. 4 is
+# conservative against the analyzer's max-concurrent-sequences; override
+# via env if the serving capacity changes.
+_FINDINGS_DEFAULT_WORKERS = int(os.getenv("DDIQ_FINDINGS_WORKERS", "4"))
+
+
+def _findings_llm_for_issue(
+    issue: dict[str, Any],
+    total_capacity_mw: Optional[float],
+) -> Any:
+    """One findings LLM call → raw obj (``{}`` / dict / list).
+
+    Never raises: ``llm_json`` returns ``{}`` on hard failure, and the
+    transport-crash guard here means one bad row can't kill the thread
+    pool. Pure per-row unit so it can run concurrently over the shared
+    (thread-safe) ``SyncLlmClient``.
+    """
+    try:
+        return llm_json(EXTRACTION_SYSTEM, _findings_prompt_for_issue(issue, total_capacity_mw))
+    except Exception as e:  # pragma: no cover — llm_json already swallows
+        _log.warning("findings: llm_json raised — %s", e)
+        return {}
 
 
 def _findings_prompt_for_issue(
@@ -181,13 +208,24 @@ def generate_findings(
     doc_ids: list[str],  # noqa: ARG001 — kept for signature compatibility
     sections: list[AusgabeblattSection],
     total_capacity_mw: Optional[float] = None,
+    max_workers: Optional[int] = None,
 ) -> list[Finding]:
     """Build evidence-aware findings, one LLM call per flagged row.
 
     ``doc_ids`` is currently unused (evidence comes from the row's
-    ``evidence`` field attached during section analysis,
-    not from a fresh RAG pass) — kept in the signature for
-    backwards compatibility with the orchestrator call site.
+    ``evidence`` field attached during section analysis, not a fresh RAG
+    pass) — kept in the signature for backwards compatibility.
+
+    E1: the per-row LLM calls run CONCURRENTLY over a thread pool
+    (``max_workers``, default :data:`_FINDINGS_DEFAULT_WORKERS`). The
+    shared ``SyncLlmClient``'s ``httpx.Client`` is thread-safe and vLLM
+    batches the concurrent requests on the GPU, so the findings phase no
+    longer costs the sequential sum of ~per-call latency — the bottleneck
+    that blew the Celery hard limit in the §14 re-smoke. Results are
+    assembled in the original flagged-row order (``executor.map``), so the
+    output ordering and per-row placeholder semantics are unchanged.
+    ``max_workers=1`` forces sequential execution (used by tests for
+    deterministic response ordering).
     """
     flagged: list[dict[str, Any]] = []
     for sec in sections:
@@ -216,20 +254,18 @@ def generate_findings(
             kind="section",
         )]
 
+    # Fan the per-row LLM calls out concurrently (order-preserving).
+    workers = max_workers if max_workers is not None else _FINDINGS_DEFAULT_WORKERS
+    workers = max(1, min(workers, len(flagged)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        objs = list(ex.map(
+            lambda issue: _findings_llm_for_issue(issue, total_capacity_mw),
+            flagged,
+        ))
+
     out: list[Finding] = []
     failures = 0
-    for i, issue in enumerate(flagged, start=1):
-        prompt = _findings_prompt_for_issue(issue, total_capacity_mw)
-        try:
-            obj = llm_json(EXTRACTION_SYSTEM, prompt)
-        except Exception as e:
-            # llm_json itself shouldn't raise (returns {} on hard
-            # failure since the SyncLlmClient migration), but a
-            # transport crash mid-call still could. Don't let one
-            # bad row stop the rest.
-            _log.warning(f"findings.issue#{i}: llm_json raised — {e}")
-            obj = {}
-
+    for i, (issue, obj) in enumerate(zip(flagged, objs), start=1):
         finding: Optional[Finding] = None
         if isinstance(obj, dict):
             finding = _finding_from_llm_obj(obj, issue)

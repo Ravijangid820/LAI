@@ -229,7 +229,9 @@ class TestGenerateFindings:
                 _row("c", "v", "green"),  # not flagged → skipped
             ]),
         ]
-        out = generate_findings(doc_ids=["d1"], sections=sections)
+        # max_workers=1: queue-mode responses are popped in call order,
+        # so force sequential execution for a deterministic mapping.
+        out = generate_findings(doc_ids=["d1"], sections=sections, max_workers=1)
         assert len(out) == 2
         assert out[0].text == "first finding"
         assert out[1].text == "second finding"
@@ -244,7 +246,7 @@ class TestGenerateFindings:
                 _row("Permit Status", "v", "red"),
             ]),
         ]
-        out = generate_findings(doc_ids=["d1"], sections=sections)
+        out = generate_findings(doc_ids=["d1"], sections=sections, max_workers=1)
         assert len(out) == 1
         assert "Extraction failed for issue #1" in out[0].text
         assert "Permit Status" in out[0].text
@@ -265,7 +267,7 @@ class TestGenerateFindings:
                 _row("r3", "v", "red"),
             ]),
         ]
-        out = generate_findings(doc_ids=["d1"], sections=sections)
+        out = generate_findings(doc_ids=["d1"], sections=sections, max_workers=1)
         assert len(out) == 3
         assert out[0].text == "good first"
         assert "Extraction failed" in out[1].text
@@ -300,6 +302,21 @@ class TestGenerateFindings:
         sections = [
             AusgabeblattSection(id="s", title="X", rows=[_row("r1", "v", "red")]),
         ]
-        out = generate_findings(doc_ids=["d1"], sections=sections)
+        out = generate_findings(doc_ids=["d1"], sections=sections, max_workers=1)
         assert len(out) == 1
         assert out[0].text == "wrapped in array"
+
+    def test_parallel_default_preserves_order(self, make_llm_json) -> None:
+        """E1: with the default (parallel) executor, every flagged row
+        gets the SAME canned response (non-queue mode), so ordering is
+        deterministic and all rows resolve — proving the concurrent path
+        assembles results in flagged-row order without dropping any."""
+        make_llm_json({"text": "parallel finding", "severity": "yellow"})
+        sections = [
+            AusgabeblattSection(id="s", title="X", rows=[
+                _row(f"r{i}", "v", "red") for i in range(8)
+            ]),
+        ]
+        out = generate_findings(doc_ids=["d1"], sections=sections)  # default workers
+        assert len(out) == 8
+        assert all(f.text == "parallel finding" for f in out)
