@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 import os, re, json, time, uuid, logging, math, hashlib
+from concurrent.futures import ThreadPoolExecutor
 import psycopg2
 import psycopg2.extras
 
@@ -710,20 +711,34 @@ SECTION_QUESTIONS = {
 }
 
 
-def analyze_section(doc_ids, section_id):
-    """Run the section's questions through evidence-aware RAG. Each row
-    carries the chunks the LLM cited so the frontend can show 'click to
-    see source'. Falls back gracefully if a question has no hit."""
-    questions = SECTION_QUESTIONS.get(section_id, [])
-    title_map = {"overview": "Project Overview", "land": "Land Security & Ownership",
-                 "permits": "Permits & Regulatory Conditions", "economics": "Economics & Operations"}
-    rows = []
-    for q in questions:
-        # Backwards-compatible: tuples like ("label","question") still work.
-        if isinstance(q, tuple):
-            label, question = q[0], q[1]; anchor = None
-        else:
-            label, question, anchor = q.get("label"), q.get("question"), q.get("anchor")
+# E1 (sections): fan-out for the per-question RAG+LLM calls within a
+# section. Each question is independent (its own retrieve + extract), so
+# they parallelize cleanly over the thread-safe DB pool + httpx clients;
+# vLLM batches the concurrent requests. The §14 re-smoke proved the 37
+# SEQUENTIAL section calls (~60-75 min at ~75-110s each) were the wall
+# that timed out the report even after the findings phase was fixed.
+_SECTION_WORKERS = int(os.getenv("DDIQ_SECTION_WORKERS", "4"))
+
+_SECTION_TITLES = {
+    "overview": "Project Overview",
+    "land": "Land Security & Ownership",
+    "permits": "Permits & Regulatory Conditions",
+    "economics": "Economics & Operations",
+}
+
+
+def _analyze_one_question(doc_ids, q) -> AusgabeblattRow:
+    """Evidence-aware RAG + extraction for ONE section question → one row.
+
+    Never raises (returns an error row on failure) so a single bad
+    question can't kill the section's thread pool.
+    """
+    # Backwards-compatible: tuples like ("label","question") still work.
+    if isinstance(q, tuple):
+        label, question, anchor = q[0], q[1], None
+    else:
+        label, question, anchor = q.get("label"), q.get("question"), q.get("anchor")
+    try:
         ctx, reranked = rag_context_with_meta(doc_ids, question, top_k=5)
         anchor_hint = f"\nLegal anchor: {anchor}" if anchor else ""
         prompt = (
@@ -739,26 +754,41 @@ Respond JSON: {{"value":"answer as string","ampel":"green"/"yellow"/"red"/null,"
 IMPORTANT: value MUST be a string, never a bare number ("10 contracts" not 10).
 Set ampel=red for material gaps/non-compliance, yellow for risks worth flagging,
 green for verified-compliant, null when not enough information.""")
-        try:
-            result = llm_json(EXTRACTION_SYSTEM, prompt)
-            val = clean_value(result.get("value"), "Information not found in documents")
-            note_raw = result.get("note"); note = clean_value(note_raw, "") if note_raw else None
-            if note == "": note = None
-            # E10: evidence + anchor are real AusgabeblattRow fields now,
-            # so they serialize through model_dump → JSONB + API response
-            # (was a __dict__ shadow attr that was silently dropped).
-            row = AusgabeblattRow(
-                label=label, value=val,
-                ampel=result.get("ampel") if result.get("ampel") in ("green","yellow","red") else None,
-                note=note,
-                evidence=evidence_from_chunks(reranked, result.get("evidence_chunks", [])),
-                anchor=anchor,
-            )
-            rows.append(row)
-        except Exception as e:
-            logger.error(f"Section {section_id}/{label}: {e}")
-            rows.append(AusgabeblattRow(label=label, value="Could not extract", ampel="red", note=f"Error: {str(e)[:80]}"))
-    return AusgabeblattSection(id=section_id, title=title_map.get(section_id, section_id.title()), rows=rows)
+        result = llm_json(EXTRACTION_SYSTEM, prompt)
+        val = clean_value(result.get("value"), "Information not found in documents")
+        note_raw = result.get("note"); note = clean_value(note_raw, "") if note_raw else None
+        if note == "": note = None
+        # E10: evidence + anchor are real AusgabeblattRow fields now, so
+        # they serialize through model_dump → JSONB + API response.
+        return AusgabeblattRow(
+            label=label, value=val,
+            ampel=result.get("ampel") if result.get("ampel") in ("green", "yellow", "red") else None,
+            note=note,
+            evidence=evidence_from_chunks(reranked, result.get("evidence_chunks", [])),
+            anchor=anchor,
+        )
+    except Exception as e:
+        logger.error(f"Section question /{label}: {e}")
+        return AusgabeblattRow(label=label, value="Could not extract", ampel="red", note=f"Error: {str(e)[:80]}")
+
+
+def analyze_section(doc_ids, section_id, max_workers=None):
+    """Run the section's questions through evidence-aware RAG, concurrently.
+
+    Each row carries the chunks the LLM cited so the frontend can show
+    'click to see source'. ``executor.map`` preserves question order, so
+    the row ordering is identical to the old sequential version.
+    ``max_workers=1`` forces sequential (tests / debugging).
+    """
+    questions = SECTION_QUESTIONS.get(section_id, [])
+    title = _SECTION_TITLES.get(section_id, section_id.title())
+    if not questions:
+        return AusgabeblattSection(id=section_id, title=title, rows=[])
+    workers = max_workers if max_workers is not None else _SECTION_WORKERS
+    workers = max(1, min(workers, len(questions)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        rows = list(ex.map(lambda q: _analyze_one_question(doc_ids, q), questions))
+    return AusgabeblattSection(id=section_id, title=title, rows=rows)
 
 
 # extract_timeline / check_cross_doc_consistency / extract_rueckbau_bond
