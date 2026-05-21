@@ -260,7 +260,9 @@ class ProjectFacts(BaseModel):
     projectName: str
     preparedFor: str
     projectCompany: Optional[str] = None     # Projektgesellschaft / Pächterin
-    projectCenter: dict
+    # None when the document gives no determinable location — the UI then
+    # shows "Standort nicht bestimmbar" instead of a fabricated map pin.
+    projectCenter: Optional[dict] = None
     bundesland: Optional[str] = None          # lowercase, e.g. "niedersachsen"
     turbineCount: int = 0
     totalCapacityMw: Optional[float] = None   # reconciled; was never stored before A6
@@ -274,7 +276,9 @@ class DDiQReportData(BaseModel):
     preparedBy: str
     preparedFor: str
     date: str
-    projectCenter: dict
+    # None when no location is determinable from the documents — the UI
+    # renders no map pin rather than a fabricated/placeholder one.
+    projectCenter: Optional[dict] = None
     # Defaults to empty so we can construct the report at the start of the
     # pipeline and fill fields in as each phase completes — supports
     # incremental persistence, so a mid-pipeline crash still leaves a

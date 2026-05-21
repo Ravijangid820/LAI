@@ -1098,7 +1098,15 @@ Rules:
         # A7: geocode from the structured location fields, not a paragraph.
         geo_query = _wea_geocode_query(w)
         addr = _wea_display_address(w)
-        coords = geocode_address(geo_query, expected_bundesland=project_bl) if geo_query else None
+        # Gate the WEA geocode like geocode_project_location: only geocode
+        # when a Bundesland is known — from the project centre, or
+        # detectable in the query itself — so the result can be bbox-
+        # checked. An ungatable bare name (e.g. a WEA whose only location
+        # is "Feldmark") would otherwise land in the wrong region
+        # (Castrop-Rauxel/NRW), so we leave the turbine un-pinned rather
+        # than fabricate coordinates the document doesn't support.
+        wea_bl = project_bl or detect_bundesland(geo_query)
+        coords = geocode_address(geo_query, expected_bundesland=wea_bl) if (geo_query and wea_bl) else None
         if not coords and project_center: coords = project_center
         sc = w.get("status_code")
         if sc not in ("errichtet", "genehmigt", "geplant", "abgenommen"):
@@ -1122,9 +1130,15 @@ Rules:
         ))
 
     # Scatter duplicate coordinates so the map doesn't stack pins.
+    # Skip un-pinned WEAs (lat==lng==0): a no-location turbine has no
+    # coordinates, so it must NOT be scattered around (0,0) — that would
+    # fabricate a cluster of pins on "Null Island" off the African coast.
     if statuses:
         cg = {}
-        for i, s in enumerate(statuses): cg.setdefault(f"{s.lat:.6f},{s.lng:.6f}", []).append(i)
+        for i, s in enumerate(statuses):
+            if s.lat == 0 and s.lng == 0:
+                continue
+            cg.setdefault(f"{s.lat:.6f},{s.lng:.6f}", []).append(i)
         for key, indices in cg.items():
             if len(indices) > 1:
                 clat, clng = statuses[indices[0]].lat, statuses[indices[0]].lng
@@ -1668,7 +1682,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     report = DDiQReportData(
         projectName=pname, preparedBy="LAI Due Diligence System", preparedFor=pfor,
         date=datetime.now().strftime("%d %B %Y"),
-        projectCenter={"lat": 53.0, "lng": 9.0},  # placeholder — overwritten after geocoding
+        projectCenter=None,  # set after geocoding; stays None if no location determinable
         analyzedDocuments=doc_names,
         documentMap=document_map,
     )
@@ -1752,9 +1766,20 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     # this phase is materially complete (parcels + project area + clearance
     # zones + validation + geojson) — even if findings/timeline/etc fail
     # later, the lawyer still gets a usable map from this checkpoint.
+    # projectCenter: average of the REAL WEA coordinates; else the
+    # geocoded project centre; else None. The old code fell back to a
+    # hard-coded (53, 9) placeholder, which (combined with un-pinned WEAs)
+    # rendered a confident-but-fake pin — either at (53, 9) or, after the
+    # geocode-gate fix above left WEAs un-pinned, at (0, 0) Null Island.
+    # When the document gives no location anywhere, the honest output is
+    # NO centre → the UI shows "Standort nicht bestimmbar", not a pin.
     lats0 = [w.lat for w in weas if w.lat != 0]; lngs0 = [w.lng for w in weas if w.lng != 0]
-    center0 = {"lat": sum(lats0)/len(lats0) if lats0 else (pc[0] if pc else 53.0),
-               "lng": sum(lngs0)/len(lngs0) if lngs0 else (pc[1] if pc else 9.0)}
+    if lats0 and lngs0:
+        center0 = {"lat": sum(lats0)/len(lats0), "lng": sum(lngs0)/len(lngs0)}
+    elif pc:
+        center0 = {"lat": pc[0], "lng": pc[1]}
+    else:
+        center0 = None
     clearance_data0 = [
         {"wea_name": z.wea_name, "center_lat": z.center_lat, "center_lng": z.center_lng,
          "radius_m": z.radius_m, "polygon": z.polygon,
