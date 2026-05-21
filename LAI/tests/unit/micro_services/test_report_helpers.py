@@ -374,6 +374,34 @@ class TestRelanguageText:
         assert ddiq_report._relanguage_text(original, "de") == original
 
 
+class TestNeedsRelanguage:
+    """A8 (v3 fix) — re-language is triggered by a WHOLLY wrong-language
+    cell, not just a mid-sentence mix. The §14 v3 run had a fully-English
+    finding slip past the old 'mixed'-only check."""
+
+    def test_wrong_language_triggers(self) -> None:
+        # Pure English in a German report → must re-language.
+        en = "The modification permit was formally granted under the relevant act."
+        assert ddiq_report._needs_relanguage(en, "de") is True
+
+    def test_mixed_triggers(self) -> None:
+        mixed = "Die Genehmigung is not yet bestandskräftig and the operator must renew it before the deadline."
+        assert ddiq_report._needs_relanguage(mixed, "de") is True
+
+    def test_target_language_left_alone(self) -> None:
+        de = "Die BImSchG-Genehmigung wurde am 20.07.2007 erteilt und ist bestandskräftig."
+        assert ddiq_report._needs_relanguage(de, "de") is False
+
+    def test_unknown_left_alone(self) -> None:
+        # Too short / numeric → unknown → don't touch.
+        assert ddiq_report._needs_relanguage("12/4", "de") is False
+        assert ddiq_report._needs_relanguage("", "de") is False
+
+    def test_english_target_flips(self) -> None:
+        de = "Die Genehmigung wurde erteilt und ist seit drei Monaten bestandskräftig."
+        assert ddiq_report._needs_relanguage(de, "en") is True
+
+
 class TestProjectFacts:
     """A6 — the canonical facts object surfaces the reconciled capacity
     (which was previously computed but never stored) + identity."""

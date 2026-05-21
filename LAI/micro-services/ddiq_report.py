@@ -825,6 +825,22 @@ def _relanguage_text(text: str, target_language: str = "de") -> str:
     return out.strip() or text
 
 
+def _needs_relanguage(text: str, target_language: str) -> bool:
+    """A8: should this cell be re-rendered into ``target_language``?
+
+    The §14 v3 run surfaced the gap: the original check only caught
+    ``"mixed"`` (mid-sentence DE/EN switch), so a finding written WHOLLY
+    in the wrong language (e.g. a fully-English finding in a German
+    report) slipped through. We now re-language when the heuristic tags
+    the text as ``"mixed"`` OR as a concrete language different from the
+    target. ``"unknown"`` (too short / numeric) is left alone.
+    """
+    if not text or not text.strip():
+        return False
+    lang = detect_language(text)
+    return lang == "mixed" or (lang in ("de", "en") and lang != target_language)
+
+
 def _backfill_wea_owner(weas: list[WEAStatus], project_company: Optional[str]) -> int:
     """A6: fill each WEA's ``owner`` from the canonical project company
     when the per-row value is a placeholder. The smoke test showed
@@ -1955,35 +1971,36 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     )
 
     # ── A8: single-language enforcement (re-prompt) ───────────────────
-    # The guardrail above only FLAGS mixed-language cells. Here we
-    # actually fix them: any row value/note or finding text the heuristic
-    # tags ``"mixed"`` (German body with an English clause, or vice
-    # versa) is re-rendered in the target language by a focused LLM call.
-    # One call per flagged cell — mixed cells are rare, so the cost is
-    # bounded — and best-effort, so a re-language failure leaves the
-    # original text rather than blanking it. Runs after the guardrail so
-    # it operates on the cleaned text.
+    # The guardrail above only FLAGS off-language cells. Here we actually
+    # fix them: any row value/note or finding text that is "mixed"
+    # (mid-sentence DE/EN switch) OR wholly in the wrong language is
+    # re-rendered into the target by a focused LLM call (see
+    # _needs_relanguage — the §14 v3 run showed wholly-English findings
+    # were slipping past the old "mixed"-only check). One call per flagged
+    # cell — they're rare, so the cost is bounded — and best-effort, so a
+    # re-language failure leaves the original text rather than blanking
+    # it. Runs after the guardrail so it operates on the cleaned text.
     relang_n = 0
     for sec in report.sections:
         for row in sec.rows:
-            if detect_language(row.value) == "mixed":
+            if _needs_relanguage(row.value, section_lang_hint):
                 new = _relanguage_text(row.value, section_lang_hint)
                 if new != row.value:
                     row.value = new
                     relang_n += 1
-            if row.note and detect_language(row.note) == "mixed":
+            if row.note and _needs_relanguage(row.note, section_lang_hint):
                 new = _relanguage_text(row.note, section_lang_hint)
                 if new != row.note:
                     row.note = new
                     relang_n += 1
     for f in list(report.findings) + list(report.crossDocFindings):
-        if detect_language(f.text) == "mixed":
+        if _needs_relanguage(f.text, section_lang_hint):
             new = _relanguage_text(f.text, section_lang_hint)
             if new != f.text:
                 f.text = new
                 relang_n += 1
     if relang_n:
-        logger.info("A8: re-rendered %d mixed-language cell(s) in '%s'", relang_n, section_lang_hint)
+        logger.info("A8: re-rendered %d off-language cell(s) into '%s'", relang_n, section_lang_hint)
 
     # ── Jurisdiction scan (H-2) ───────────────────────────────────────
     # Cross-Bundesland rule check. For each section row + finding (the
