@@ -5,9 +5,9 @@ inspecting the LAI runtime + data pipeline. Each block is self-contained: copy
 the whole block into a terminal (or paste into an SSH session from your phone)
 and it runs.
 
-The actual scripts live alongside this README in `LAI/ops/` and in
-`LAI/scripts/`. New ops scripts go in `LAI/ops/`; legacy ones still live in
-`scripts/`. Both are referenced below by absolute path.
+The actual scripts live alongside this README in `LAI/scripts/ops/` (the v2
+restructure consolidated the old top-level `LAI/ops/` and loose `LAI/scripts/`
+entry points here). Referenced below by absolute path.
 
 > Always run from the LAI repo root or use absolute paths — the scripts use
 > relative paths internally to find `processed/`, `.venv/`, etc.
@@ -22,16 +22,16 @@ These take hours to days; design is "kick off, close terminal, come back later".
 
 ```bash
 # Resume from where it stopped (skips already-embedded child_chunks):
-bash /data/projects/lai/LAI/ops/resume_step6.sh
+bash /data/projects/lai/LAI/scripts/ops/resume_step6.sh
 
 # Show progress without starting anything:
-bash /data/projects/lai/LAI/ops/resume_step6.sh --status
+bash /data/projects/lai/LAI/scripts/ops/resume_step6.sh --status
 
 # Stop Step 6 only, keep the embedding container running:
-bash /data/projects/lai/LAI/ops/resume_step6.sh --stop
+bash /data/projects/lai/LAI/scripts/ops/resume_step6.sh --stop
 
 # Stop Step 6 AND the embedding container:
-bash /data/projects/lai/LAI/ops/resume_step6.sh --stop-all
+bash /data/projects/lai/LAI/scripts/ops/resume_step6.sh --stop-all
 ```
 
 What "resume" means: an automatic SQL filter
@@ -47,10 +47,10 @@ ls -t /data/projects/lai/LAI/logs/pipeline/step6_resume_*.log | head -1 | xargs 
 ### Step 5 — synthetic Q&A generation (Qwen2.5-72B-AWQ)
 
 ```bash
-bash /data/projects/lai/LAI/scripts/resume_step5.sh           # start / resume
-bash /data/projects/lai/LAI/scripts/resume_step5.sh --status  # progress check
-bash /data/projects/lai/LAI/scripts/resume_step5.sh --stop    # stop generation only
-bash /data/projects/lai/LAI/scripts/resume_step5.sh --stop-all # stop + container
+bash /data/projects/lai/LAI/scripts/ops/resume_step5.sh           # start / resume
+bash /data/projects/lai/LAI/scripts/ops/resume_step5.sh --status  # progress check
+bash /data/projects/lai/LAI/scripts/ops/resume_step5.sh --stop    # stop generation only
+bash /data/projects/lai/LAI/scripts/ops/resume_step5.sh --stop-all # stop + container
 ```
 
 > **GPU contention warning.** Both Step 5 and Step 6 want a GPU. If the
@@ -64,31 +64,39 @@ bash /data/projects/lai/LAI/scripts/resume_step5.sh --stop-all # stop + containe
 
 ```bash
 # Start everything (Docker services + serve_rag + Vite UI):
-bash /data/projects/lai/LAI/scripts/start.sh
+bash /data/projects/lai/LAI/scripts/ops/start.sh
 
 # Stop everything:
-bash /data/projects/lai/LAI/scripts/stop.sh
+bash /data/projects/lai/LAI/scripts/ops/stop.sh
 
 # Stop only host processes (serve_rag + Vite), keep Docker:
-bash /data/projects/lai/LAI/scripts/stop.sh --keep-docker
+bash /data/projects/lai/LAI/scripts/ops/stop.sh --keep-docker
 
 # Stop only Docker, keep host processes:
-bash /data/projects/lai/LAI/scripts/stop.sh --keep-host
+bash /data/projects/lai/LAI/scripts/ops/stop.sh --keep-host
 
 # Health snapshot:
-bash /data/projects/lai/LAI/scripts/status.sh
+bash /data/projects/lai/LAI/scripts/ops/status.sh
 ```
 
-> **Restart caveat.** When restarting `serve_rag` manually (without `start.sh`),
-> always pass the env vars or it'll bind to `127.0.0.1` and your LAN browser
-> sees "Failed to fetch":
->
-> ```bash
-> LAI_BIND_HOST=0.0.0.0 CUDA_VISIBLE_DEVICES=1 \
->   /data/projects/lai/LAI/.venv/bin/python \
->   -m lai.api.serve_rag --host 0.0.0.0 --port 18000 \
->   > /data/projects/lai/LAI/logs/tmp/serve_rag.log 2>&1 &
-> ```
+### Restart just serve_rag (the chat backend)
+
+```bash
+bash /data/projects/lai/LAI/scripts/ops/restart-serve_rag.sh
+```
+
+This is the safe one-command restart. It gracefully stops serve_rag, **waits
+for the GPU memory to actually release** (a fast kill+relaunch races the dying
+process for VRAM and crashes the new one with CUDA OOM), relaunches via
+`start.sh` (so the `.env.auth` secret + 27B-remote + `LAI_BIND_HOST=0.0.0.0` +
+`CUDA_VISIBLE_DEVICES=1` env all come from one place), and waits for `/health`
+to return 200. It does **not** touch Docker, the Vite UI, or the running
+pipeline / migration jobs.
+
+> If you ever launch serve_rag by hand instead, you must pass the env or it
+> binds to `127.0.0.1` and LAN browsers see "Failed to fetch":
+> `LAI_BIND_HOST=0.0.0.0 CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m lai.api.serve_rag --port 18000`
+> — but prefer the restart script above.
 
 ---
 
@@ -169,6 +177,7 @@ docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'lai_|d
 
 ## Recent ops history (rolling, last 5)
 
+- 2026-05-21 — `scripts/ops/restart-serve_rag.sh` added — safe one-command serve_rag restart (graceful stop → wait for GPU release → relaunch → health-check). Replaces the manual restart snippet.
 - 2026-04-30 — `ops/resume_step6.sh` written (resume embeddings, 16.6% done at last check, ~41.6 M child chunks remaining).
 - 2026-04-30 — `LAI-UI/` directory rename (was `lai-ui/`); all references in scripts + docs flipped uppercase.
 - 2026-04-30 — `serve_rag` LAN bind hardened — restart pattern now in `feedback_serve_rag_restart` memory.
