@@ -97,10 +97,16 @@ app.conf.update(
 
     # ── Time limits ──────────────────────────────────────────────
     # Soft: the task gets a SoftTimeLimitExceeded exception and can
-    # clean up. Hard: the worker process is SIGKILLed. Both above
-    # the observed worst-case 60-min report runtime.
-    task_soft_time_limit=90 * 60,
-    task_time_limit=120 * 60,
+    # clean up. Hard: the worker process is SIGKILLed.
+    #
+    # With thinking-mode now actually disabled (the lai.common.llm
+    # ``chat_template_kwargs`` top-level fix), per-call latency roughly
+    # halves and the full report runs in ~85 min. These limits sit a
+    # safe margin above that so a slow-LLM day can't SIGKILL a report
+    # that is nearly done (the prior failures all died ~88% complete).
+    # Overridable via env for operators tuning a constrained box.
+    task_soft_time_limit=int(os.getenv("DDIQ_SOFT_TIME_LIMIT_S", str(120 * 60))),
+    task_time_limit=int(os.getenv("DDIQ_HARD_TIME_LIMIT_S", str(150 * 60))),
 
     # ── Result backend off ───────────────────────────────────────
     # The report writes its result into ddiq_reports.report_data

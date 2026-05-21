@@ -253,7 +253,12 @@ class TestBuildRequestBody:
             json_object_mode=False,
             keep_thinking=False,
         )
-        assert body["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+        # ``chat_template_kwargs`` MUST be top-level — vLLM ignores it when
+        # nested under ``extra_body`` on a raw httpx POST (that nesting left
+        # thinking mode silently ON, doubling latency / emptying short
+        # responses). Regression guard for that fix.
+        assert body["chat_template_kwargs"]["enable_thinking"] is False
+        assert "extra_body" not in body
 
     @pytest.mark.unit
     def test_keep_thinking_is_response_side_only(self, config: LlmConfig) -> None:

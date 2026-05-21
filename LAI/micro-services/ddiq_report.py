@@ -568,6 +568,28 @@ def get_section_value(sections, section_id, label):
 def parse_wea_count(value):
     m = re.search(r"(\d+)", value); return int(m.group(1)) if m else 0
 
+def _parse_location_fields(location: str) -> dict:
+    """Pull Gemeinde / Landkreis / Bundesland / Gemarkung out of the
+    section's Location value.
+
+    The overview "Location" row is produced in a labelled form, e.g.
+    ``"Bundesland: Niedersachsen; Landkreis: Cuxhaven; Gemeinde:
+    Lamstedt; Gemarkung: Lamstedt"``. Parsing the structured fields lets
+    us geocode most-specific-first (Gemeinde + Landkreis + Bundesland)
+    instead of throwing the whole noisy string — or, worse, a single
+    token — at Nominatim. Returns whatever labels are present; missing
+    ones are simply absent.
+    """
+    fields: dict[str, str] = {}
+    for label in ("Gemeinde", "Landkreis", "Bundesland", "Gemarkung"):
+        m = re.search(rf"{label}\s*[:=]\s*([^;,\n]+)", location, re.IGNORECASE)
+        if m:
+            val = m.group(1).strip()
+            if val and val.lower() not in _LOC_NULLISH:
+                fields[label.lower()] = val
+    return fields
+
+
 def geocode_project_location(sections):
     location = get_section_value(sections, "overview", "Location")
     # Detect the project's Bundesland from the same location string we're
@@ -576,11 +598,30 @@ def geocode_project_location(sections):
     # through to ``None`` (no gate) when location doesn't name a state.
     expected_bl = detect_bundesland(location) if location else None
     if location:
-        coords = geocode_address(location, expected_bundesland=expected_bl)
-        if coords:
-            return coords
-        for part in [p.strip() for p in location.replace(",", " ").split() if len(p.strip()) > 2]:
-            coords = geocode_address(f"{part}, Germany", expected_bundesland=expected_bl)
+        f = _parse_location_fields(location)
+        gem, lk, bl, gemk = (f.get("gemeinde"), f.get("landkreis"),
+                             f.get("bundesland"), f.get("gemarkung"))
+        # Most-specific-first candidate queries. We deliberately do NOT
+        # fall back to a bare single token (e.g. just "Niedersachsen"),
+        # which previously geocoded to the STATE CENTROID ~80 km from the
+        # real site (the Lamstedt→Lüneburg-Heath miss). Every candidate
+        # carries at least the municipality or Gemarkung so the gate is
+        # meaningful.
+        candidates = [
+            ", ".join([p for p in (gem, lk, bl) if p] + ["Germany"]) if gem else None,
+            ", ".join([p for p in (gem, bl) if p] + ["Germany"]) if gem and bl else None,
+            ", ".join([p for p in (gemk, lk, bl) if p] + ["Germany"]) if gemk else None,
+            ", ".join([p for p in (lk, bl) if p] + ["Germany"]) if lk and bl else None,
+        ]
+        # If the location wasn't in the labelled form, fall back to the
+        # whole string once (still gated by Bundesland) — but never the
+        # destructive per-token split.
+        if not any(candidates):
+            candidates = [location]
+        for q in candidates:
+            if not q:
+                continue
+            coords = geocode_address(q, expected_bundesland=expected_bl)
             if coords:
                 return coords
     name = get_section_value(sections, "overview", "Project Name")
@@ -588,7 +629,7 @@ def geocode_project_location(sections):
         clean = re.sub(r"(?i)windpark|windenergie|wind\s*farm", "", name).strip()
         if clean:
             # The project name may itself name a Bundesland we missed in
-            # the location string ("Windpark Lamstedt Bayern e.g.).
+            # the location string ("Windpark Lamstedt Bayern" e.g.).
             name_bl = expected_bl or detect_bundesland(clean)
             coords = geocode_address(f"{clean}, Germany", expected_bundesland=name_bl)
             if coords:
@@ -1860,35 +1901,28 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     report.findings = findings  # may be augmented with deadline/rueckbau/grundbuch findings later
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
-    # P0 #2: Timeline / deadline pass
-    progress("timeline", 0.88)
+    # E1b: the four "extras" passes — timeline (P0 #2), cross-document
+    # consistency (P0 #3), Rückbaubürgschaft (P1 #9), Grundbuch (P1 #6) —
+    # are mutually independent: each consumes only the already-computed
+    # sections / weas / parcels. The §14 runs showed them running
+    # sequentially as part of the tail that hit the time limit. Run them
+    # concurrently (each owns its try/except + safe-default return, so a
+    # failure can't crash the pool), then persist once.
+    progress("extras", 0.88)
     t = time.time()
-    timeline = extract_timeline(req.document_ids, full_text)
-    T["timeline_s"] = round(time.time()-t, 2)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fut_timeline = ex.submit(extract_timeline, req.document_ids, full_text)
+        fut_crossdoc = ex.submit(check_cross_doc_consistency, sections, weas, parcels, total_mw)
+        fut_rueckbau = ex.submit(extract_rueckbau_bond, req.document_ids)
+        fut_grundbuch = ex.submit(check_grundbuch_match, req.document_ids, parcels)
+        timeline = fut_timeline.result()
+        cross_doc_findings = fut_crossdoc.result()
+        rueckbau = fut_rueckbau.result()
+        grundbuch_checks = fut_grundbuch.result()
+    T["extras_s"] = round(time.time()-t, 2)
     report.timeline = timeline
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
-
-    # P0 #3: Cross-document consistency check
-    progress("cross_doc", 0.91)
-    t = time.time()
-    cross_doc_findings = check_cross_doc_consistency(sections, weas, parcels, total_capacity_mw=total_mw)
-    T["cross_doc_s"] = round(time.time()-t, 2)
     report.crossDocFindings = cross_doc_findings
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
-
-    # P1 #9: Rückbaubürgschaft extraction
-    progress("rueckbau", 0.93)
-    t = time.time()
-    rueckbau = extract_rueckbau_bond(req.document_ids)
-    T["rueckbau_s"] = round(time.time()-t, 2)
     report.rueckbauBond = rueckbau
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
-
-    # P1 #6: Grundbuch lessor-vs-owner check on secured parcels
-    progress("grundbuch", 0.95)
-    t = time.time()
-    grundbuch_checks = check_grundbuch_match(req.document_ids, parcels)
-    T["grundbuch_s"] = round(time.time()-t, 2)
     report.grundbuchChecks = grundbuch_checks
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 

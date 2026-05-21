@@ -166,7 +166,17 @@ def _build_request_body(
     # special-case it.
     _ = keep_thinking
     if not config.thinking_mode_enabled:
-        body["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        # ``chat_template_kwargs`` MUST sit at the top level of the
+        # request body. vLLM's OpenAI-compatible endpoint reads it there;
+        # ``extra_body`` is an OpenAI *Python SDK* concept the SDK
+        # flattens into the top level client-side. We POST the body
+        # verbatim with httpx (no SDK), so an ``extra_body`` wrapper is
+        # sent literally and silently ignored — leaving thinking mode ON.
+        # With Qwen3 that doubles latency and, on short token budgets,
+        # returns an empty answer (the whole budget is spent inside
+        # ``<think>``). Sending it top-level actually disables the trace.
+        # Verified against the live vLLM build.
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     return body
 
 
