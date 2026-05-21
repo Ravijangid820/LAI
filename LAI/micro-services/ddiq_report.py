@@ -627,10 +627,16 @@ def geocode_project_location(sections):
     name = get_section_value(sections, "overview", "Project Name")
     if name:
         clean = re.sub(r"(?i)windpark|windenergie|wind\s*farm", "", name).strip()
-        if clean:
-            # The project name may itself name a Bundesland we missed in
-            # the location string ("Windpark Lamstedt Bayern" e.g.).
-            name_bl = expected_bl or detect_bundesland(clean)
+        # Only geocode the project NAME when we can gate it to a known
+        # Bundesland (from the location text or the name itself). A bare
+        # name with no detectable state is the destructive guess that
+        # lands in the wrong region — e.g. "Windpark Feldmark" → "Feldmark"
+        # → a Castrop-Rauxel district in NRW, ~300 km from a Niedersachsen
+        # site. When the document gives no usable location AND the name
+        # carries no state, we return no pin rather than fabricate one the
+        # document doesn't support.
+        name_bl = expected_bl or detect_bundesland(clean)
+        if clean and name_bl:
             coords = geocode_address(f"{clean}, Germany", expected_bundesland=name_bl)
             if coords:
                 return coords
@@ -1837,7 +1843,15 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     # from the geocoded project_center. The bbox derivation is grounded
     # in real coordinates from Nominatim, so it gets the "cadastral"
     # precedence; the keyword scan is the regex layer.
-    bl_from_keyword: Optional[str] = detect_bundesland(ploc) if ploc else None
+    # bl_from_keyword: derive ONLY from an explicit structured
+    # "Bundesland: X" field, not a keyword scan of the free Location
+    # narrative. Scanning the narrative false-positives on defensive
+    # "keine Angaben zum Bundesland, Landkreis, Gemeinde …" text that
+    # names a state as an example — which is how a no-location contract
+    # wrongly got bundesland=niedersachsen. Grounded coordinates
+    # (bl_from_coords) stay the primary, higher-precedence source.
+    _loc_bl = _parse_location_fields(ploc).get("bundesland") if ploc else None
+    bl_from_keyword: Optional[str] = detect_bundesland(_loc_bl) if _loc_bl else None
     bl_from_coords: Optional[str] = bundesland_from_coords(*pc) if pc else None
 
     bundesland_reconciled = reconcile_categorical(

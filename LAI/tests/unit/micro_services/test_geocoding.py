@@ -215,6 +215,45 @@ class TestGeocodeProjectLocation:
         # "Windpark" prefix is stripped before geocoding the name.
         assert any("Lamstedt" in a and "Windpark" not in a for a in attempts)
 
+    def test_no_phantom_pin_when_doc_silent_and_name_ambiguous(self, monkeypatch) -> None:
+        """Feldmark regression: the contract gives no location and the
+        project name ('Feldmark') resolves to no Bundesland. The
+        name-fallback geocode must NOT fire (it would land in NRW,
+        ~300 km off), so no pin is fabricated → None. detect_bundesland
+        is real here; only geocode_address is faked."""
+        attempts: list[str] = []
+
+        def fake_geocode(address, expected_bundesland=None):
+            attempts.append(address)
+            # Simulate Nominatim: a defensive sentence resolves to nothing,
+            # but a bare "Feldmark, Germany" WOULD match (the old bug).
+            if address.strip().lower().startswith("feldmark"):
+                return (51.51, 7.07)  # NRW — the wrong guess we must avoid
+            return None
+
+        monkeypatch.setattr(ddiq_report, "geocode_address", fake_geocode)
+        out = ddiq_report.geocode_project_location(
+            self._sections(
+                location="Keine Angaben zum Standort in den vorgelegten Unterlagen.",
+                name="Windpark Feldmark",
+            ),
+        )
+        assert out is None
+        # The ambiguous name must never have been geocoded.
+        assert not any(a.strip().lower().startswith("feldmark") for a in attempts)
+
+    def test_name_fallback_still_fires_for_known_municipality(self, monkeypatch) -> None:
+        """Counterpart: 'Lamstedt' IS a known Niedersachsen municipality
+        (detect_bundesland resolves it), so the gated name fallback still
+        works — the fix is surgical, not a blanket disable."""
+        def fake_geocode(address, expected_bundesland=None):
+            return (53.62, 9.14) if "Lamstedt" in address else None
+        monkeypatch.setattr(ddiq_report, "geocode_address", fake_geocode)
+        out = ddiq_report.geocode_project_location(
+            self._sections(location="", name="Windpark Lamstedt"),
+        )
+        assert out == (53.62, 9.14)
+
     def test_returns_none_when_nothing_resolves(self, monkeypatch) -> None:
         monkeypatch.setattr(
             ddiq_report, "geocode_address",
