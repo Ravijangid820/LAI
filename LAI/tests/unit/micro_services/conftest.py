@@ -309,6 +309,10 @@ def make_llm_json(monkeypatch: pytest.MonkeyPatch):
             "ddiq.extractors.rueckbau",
             "ddiq.extractors.grundbuch",
             "ddiq.extractors.findings",
+            # ddiq_report binds llm_json too (analyze_section,
+            # _generate_report_core metadata pass, etc.) — patch it so a
+            # test exercising those never hits the real analyzer LLM.
+            "ddiq_report",
         ):
             try:
                 mod = __import__(modname, fromlist=["llm_json"])

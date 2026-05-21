@@ -159,23 +159,46 @@ class TestGeocodeProjectLocation:
         assert calls[0][0] == "Cuxhaven, Niedersachsen"
         assert calls[0][1] == "niedersachsen"
 
-    def test_falls_back_to_tokens(self, monkeypatch) -> None:
-        """When the full location string doesn't geocode, the shim
-        retries with individual tokens (+ ', Germany')."""
+    def test_structured_fields_most_specific_first(self, monkeypatch) -> None:
+        """8d9c3e5: a labelled Location is parsed into Gemeinde/Landkreis/
+        Bundesland and queried most-specific-first (Gemeinde+Landkreis+
+        Bundesland), so the first attempt is the precise site — not the
+        noisy whole string."""
         attempts: list[str] = []
 
         def fake_geocode(address, expected_bundesland=None):
             attempts.append(address)
-            # Only succeed on a token-level query.
-            return (53.0, 8.0) if address.endswith(", Germany") else None
+            return (53.636, 9.098)  # the real Lamstedt site
 
         monkeypatch.setattr(ddiq_report, "geocode_address", fake_geocode)
         out = ddiq_report.geocode_project_location(
-            self._sections(location="Obscure Hamlet, Niedersachsen"),
+            self._sections(location="Bundesland: Niedersachsen; Landkreis: Cuxhaven; Gemeinde: Lamstedt"),
         )
-        assert out == (53.0, 8.0)
-        assert len(attempts) > 1
-        assert any(a.endswith(", Germany") for a in attempts)
+        assert out == (53.636, 9.098)
+        # First (and winning) attempt carries Gemeinde + Landkreis + Bundesland.
+        assert "Lamstedt" in attempts[0]
+        assert "Cuxhaven" in attempts[0]
+        assert "Niedersachsen" in attempts[0]
+
+    def test_no_destructive_single_token_fallback(self, monkeypatch) -> None:
+        """8d9c3e5 deliberately DROPPED the per-token fallback: a bare
+        'Niedersachsen' geocoded to the state centroid (~80 km off — the
+        Lamstedt→Lüneburg-Heath miss). When nothing resolves, no candidate
+        is ever a lone Bundesland token."""
+        attempts: list[str] = []
+
+        def fake_geocode(address, expected_bundesland=None):
+            attempts.append(address)
+            return None  # nothing resolves
+
+        monkeypatch.setattr(ddiq_report, "geocode_address", fake_geocode)
+        out = ddiq_report.geocode_project_location(
+            self._sections(location="Bundesland: Niedersachsen; Landkreis: Cuxhaven; Gemeinde: Lamstedt"),
+        )
+        assert out is None
+        # Every attempt is multi-part; none is a bare state name.
+        assert all(a.strip().rstrip(", Germany").strip() != "Niedersachsen" for a in attempts)
+        assert all("Lamstedt" in a or "Cuxhaven" in a for a in attempts)
 
     def test_falls_back_to_project_name(self, monkeypatch) -> None:
         attempts: list[str] = []

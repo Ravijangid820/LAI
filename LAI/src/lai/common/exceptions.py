@@ -55,6 +55,11 @@ __all__ = [
     "RerankerError",
     "RerankerInvalidResponseError",
     "RerankerRetryExhaustedError",
+    "RetrievalConnectionError",
+    "RetrievalDimensionError",
+    "RetrievalError",
+    "RetrievalQueryError",
+    "RetrievalRetryExhaustedError",
 ]
 
 
