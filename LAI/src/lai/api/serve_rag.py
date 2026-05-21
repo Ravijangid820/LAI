@@ -699,6 +699,74 @@ def _matter_cite_id(n: int) -> str:
     return f"M-{n}"
 
 
+def _build_matter_context(
+    sid: str, uid: str, use_contract: bool,
+) -> tuple[list["RetrievedSource"], list["ChunkOut"], str]:
+    """Assemble the matter side of a chat turn across ALL documents in the
+    session ("Matter"), one ``[M-n]`` handle per document.
+
+    Returns ``(matter_sources, matter_chunks, combined_text)``:
+      * ``matter_sources`` — prompt sources, ``[M-1]..[M-n]`` in upload
+        order (stable ``doc_index``).
+      * ``matter_chunks`` — the same documents as UI chunks so each
+        ``[M-n]`` chip has a render target.
+      * ``combined_text`` — all matter text concatenated, used only for
+        Bundesland detection in the jurisdiction check.
+
+    Backward compatible: when a session predates ``matter_documents``
+    (older single-upload sessions), it falls back to the session's inline
+    ``contract_text`` as ``[M-1]``.
+    """
+    matter_sources: list[RetrievedSource] = []
+    matter_chunks: list[ChunkOut] = []
+    combined_parts: list[str] = []
+    if not use_contract:
+        return matter_sources, matter_chunks, ""
+
+    docs = persistence.list_matter_documents(sid, user_id=uid, include_text=True)
+
+    if not docs:
+        # Legacy path: session has an inline contract_text but no
+        # matter_documents rows (uploaded before the Matter feature).
+        sess = persistence.load_session(sid, user_id=uid)
+        if sess and (sess.get("contract_text") or ""):
+            text = (sess.get("contract_text") or "")[:8000]
+            fname = sess.get("filename") or ""
+            label = f"Hochgeladenes Dokument — {fname}" if fname else "Hochgeladenes Dokument"
+            cite = _matter_cite_id(1)
+            matter_sources.append(RetrievedSource(
+                cite_id=cite, source_kind="matter", text=text, label=label,
+            ))
+            matter_chunks.append(ChunkOut(
+                text=text[:1500], section=label, law_refs=[], sources=["upload"],
+                similarity=1.0, rerank_score=1.0, cite_id=cite, source_kind="matter",
+            ))
+            combined_parts.append(text)
+        return matter_sources, matter_chunks, "\n\n".join(combined_parts)
+
+    # Multi-document matter: one [M-n] per document, n == doc_index.
+    # Per-document budget shrinks as the matter grows so a many-document
+    # matter doesn't blow the prompt window; floor keeps each document
+    # meaningfully represented.
+    per_doc_budget = max(1500, 8000 // max(1, len(docs)))
+    for d in docs:
+        text = (d.get("doc_text") or "")[:per_doc_budget]
+        if not text:
+            continue
+        fname = d.get("filename") or ""
+        label = f"[M-{d['doc_index']}] {fname}" if fname else f"Dokument M-{d['doc_index']}"
+        cite = _matter_cite_id(d["doc_index"])
+        matter_sources.append(RetrievedSource(
+            cite_id=cite, source_kind="matter", text=text, label=label,
+        ))
+        matter_chunks.append(ChunkOut(
+            text=text[:1500], section=label, law_refs=[], sources=["upload"],
+            similarity=1.0, rerank_score=1.0, cite_id=cite, source_kind="matter",
+        ))
+        combined_parts.append(text)
+    return matter_sources, matter_chunks, "\n\n".join(combined_parts)
+
+
 def needs_rag(question: str) -> bool:
     """Decide whether to retrieve. Heuristic-first; LLM classifier as fallback
     for ambiguous middle-length queries.
@@ -1500,41 +1568,12 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         timings.retrieve_s = t.retrieve_s
         timings.rerank_s = t.rerank_s
 
-    # Pull the uploaded contract text (if any) so we can attach it as a
-    # [M-1] matter source. v1 has one upload per session, so a single
-    # M-1 handle is sufficient; the v1.1 Matter workspace will fan this
-    # out to [M-1]..[M-n] per uploaded document.
-    contract_text = ""
-    contract_filename = ""
-    if use_contract:
-        contract_sess = persistence.load_session(sid, user_id=uid)
-        if contract_sess:
-            contract_text = (contract_sess.get("contract_text") or "")[:8000]
-            contract_filename = contract_sess.get("filename") or ""
-
-    matter_sources: list[RetrievedSource] = []
-    matter_chunks: list[ChunkOut] = []
-    if use_contract and contract_text:
-        m_cite = _matter_cite_id(1)
-        matter_label = f"Hochgeladener Vertrag — {contract_filename}" if contract_filename else "Hochgeladener Vertrag"
-        matter_sources.append(RetrievedSource(
-            cite_id=m_cite,
-            source_kind="matter",
-            text=contract_text,
-            label=matter_label,
-        ))
-        # Also surface the matter document to the UI as a chunk so the
-        # frontend has a stable target to render the [M-1] chip against.
-        # Excerpt only; the full text is already cached server-side in
-        # the session and the side panel fetches it on click.
-        matter_chunks.append(ChunkOut(
-            text=contract_text[:1500],
-            section=matter_label,
-            law_refs=[], sources=["upload"],
-            similarity=1.0, rerank_score=1.0,
-            cite_id=m_cite,
-            source_kind="matter",
-        ))
+    # Matter side: fan out [M-1]..[M-n] across EVERY document in the
+    # session ("Matter"), not just one. ``combined_text`` is the
+    # concatenation used only for Bundesland detection below.
+    matter_sources, matter_chunks, contract_text = _build_matter_context(
+        sid, uid, use_contract,
+    )
 
     # Prior chat turns for the same session — gives the model conversational
     # memory across requests. Without this, every turn is stateless and
@@ -1919,32 +1958,10 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         timings.retrieve_s = t.retrieve_s
         timings.rerank_s = t.rerank_s
 
-    contract_text = ""
-    contract_filename = ""
-    if use_contract:
-        contract_sess = persistence.load_session(sid, user_id=uid)
-        if contract_sess:
-            contract_text = (contract_sess.get("contract_text") or "")[:8000]
-            contract_filename = contract_sess.get("filename") or ""
-
-    matter_sources: list[RetrievedSource] = []
-    matter_chunks: list[ChunkOut] = []
-    if use_contract and contract_text:
-        m_cite = _matter_cite_id(1)
-        matter_label = (
-            f"Hochgeladener Vertrag — {contract_filename}"
-            if contract_filename else "Hochgeladener Vertrag"
-        )
-        matter_sources.append(RetrievedSource(
-            cite_id=m_cite, source_kind="matter",
-            text=contract_text, label=matter_label,
-        ))
-        matter_chunks.append(ChunkOut(
-            text=contract_text[:1500], section=matter_label,
-            law_refs=[], sources=["upload"],
-            similarity=1.0, rerank_score=1.0,
-            cite_id=m_cite, source_kind="matter",
-        ))
+    # Matter side: [M-1]..[M-n] across every document in the session.
+    matter_sources, matter_chunks, contract_text = _build_matter_context(
+        sid, uid, use_contract,
+    )
 
     history = _load_history(sid, user_id=uid)
     meta_prefix = _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
@@ -2130,24 +2147,59 @@ async def upload(
     except Exception as e:
         raise HTTPException(422, f"Could not parse document: {e}")
 
-    # Keep the original file on disk for audit / re-OCR / later re-render
-    upload_ext = persistence.save_upload(sid, contents, fname)
+    # ── Matter model: a session holds MANY documents ────────────────────
+    # Whether this is the first upload or the eighth, the session row must
+    # exist first so the matter_documents FK resolves. The FIRST document
+    # also mirrors into sessions.contract_text / upload_ext so the
+    # single-document paths (analyze-contract, the legacy
+    # /sessions/{id}/document preview) keep working unchanged. Subsequent
+    # documents live only in matter_documents and are addressed as [M-2],
+    # [M-3], …
+    existing = persistence.list_matter_documents(sid, user_id=uid) if persistence.session_exists(sid, user_id=uid) else []
+    is_first = len(existing) == 0
 
-    persistence.save_session(sid, {
-        "user_id": uid,
-        "filename": fname,
-        "contract_text": md,
-        "n_pages": num_pages,
-        "tables": tables,    # used by analyzer V2
-        "uploaded_at": time.time(),
-        "clauses": None,     # filled by /analyze-contract
-        "analysis": None,
-        "upload_ext": upload_ext,
-    })
+    # Legacy single-file blob on disk (first doc only — preserves the old
+    # <sid><ext> path the existing preview endpoint reads).
+    upload_ext = persistence.save_upload(sid, contents, fname) if is_first else (
+        Path(fname).suffix.lower() or ".bin"
+    )
+
+    if is_first:
+        persistence.save_session(sid, {
+            "user_id": uid,
+            "filename": fname,
+            "contract_text": md,
+            "n_pages": num_pages,
+            "tables": tables,    # used by analyzer V2
+            "uploaded_at": time.time(),
+            "clauses": None,     # filled by /analyze-contract
+            "analysis": None,
+            "upload_ext": upload_ext,
+        })
+    elif not persistence.session_exists(sid, user_id=uid):
+        # Defensive: shouldn't happen (is_first would be True), but never
+        # orphan a matter_documents row.
+        raise HTTPException(404, "session_id not found")
+
+    doc = persistence.add_matter_document(
+        sid, filename=fname, doc_text=md, n_pages=num_pages,
+        upload_ext=upload_ext, user_id=uid,
+    )
+    if doc is None:
+        raise HTTPException(404, "session_id not found")
+    # Persist this document's own file copy under the per-doc path so
+    # every [M-n] has a previewable original (the first doc also has the
+    # legacy <sid><ext> copy; harmless duplication, keeps both readers
+    # working).
+    persistence.save_matter_upload(sid, doc["id"], contents, fname)
+
     return UploadResp(
         session_id=sid, filename=fname, pages=num_pages,
         chunks=md.count("\n\n") + 1,  # rough paragraph count
-        message=f"Vertrag eingelesen ({len(md):,} Zeichen, {num_pages} Seiten).",
+        message=(
+            f"Dokument [M-{doc['doc_index']}] eingelesen "
+            f"({len(md):,} Zeichen, {num_pages} Seiten)."
+        ),
     )
 
 
@@ -2633,6 +2685,81 @@ def get_session_document(
         media_type=media_type,
         # ``inline`` lets the browser render in-page rather than
         # forcing a download; the frontend wants this.
+        headers={"Content-Disposition": f'inline; filename="{display_name}"'},
+    )
+
+
+_MEDIA_TYPES = {
+    ".pdf":  "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc":  "application/msword",
+    ".txt":  "text/plain; charset=utf-8",
+    ".md":   "text/markdown; charset=utf-8",
+}
+
+
+class MatterDocumentOut(BaseModel):
+    """One document in a Matter, as the UI document list renders it."""
+    doc_index: int           # the n in [M-n]
+    cite_id: str             # "M-1", "M-2", …
+    filename: str
+    n_pages: int
+    created_at: float
+
+
+@app.get("/sessions/{session_id}/documents")
+def list_matter_documents_endpoint(
+    session_id: str, user: CurrentUser = Depends(get_current_user),
+):
+    """Every document attached to a Matter, ordered by ``[M-n]``.
+
+    Drives the workspace Documents tab + the chat's matter chip legend.
+    Returns ``{"documents": [...]}``. Cross-tenant sessions 404.
+    """
+    uid = str(user.id)
+    if not persistence.session_exists(session_id, user_id=uid):
+        raise HTTPException(404, "session_id not found")
+    docs = persistence.list_matter_documents(session_id, user_id=uid)
+    out = [
+        MatterDocumentOut(
+            doc_index=d["doc_index"],
+            cite_id=_matter_cite_id(d["doc_index"]),
+            filename=d["filename"] or f"Dokument M-{d['doc_index']}",
+            n_pages=d["n_pages"],
+            created_at=d["created_at"],
+        )
+        for d in docs
+    ]
+    return {"documents": [o.model_dump() for o in out]}
+
+
+@app.get("/sessions/{session_id}/documents/{doc_index}")
+def get_matter_document_endpoint(
+    session_id: str, doc_index: int,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Stream one Matter document's bytes by its ``[M-n]`` index.
+
+    The multi-document companion to ``/sessions/{id}/document``: clicking
+    an ``[M-3]`` chip fetches ``/sessions/{id}/documents/3``. Inline
+    disposition so the browser previews it. 404 on cross-tenant, unknown
+    index, or a file GC'd from disk.
+    """
+    uid = str(user.id)
+    if not persistence.session_exists(session_id, user_id=uid):
+        raise HTTPException(404, "session_id not found")
+    doc = persistence.get_matter_document(session_id, doc_index, user_id=uid)
+    if not doc:
+        raise HTTPException(404, "document index not found in this matter")
+    ext = doc.get("upload_ext")
+    path = persistence.matter_document_path(session_id, doc["id"], ext)
+    if path is None or not path.exists():
+        raise HTTPException(404, "document file no longer available")
+    media_type = _MEDIA_TYPES.get(ext, "application/octet-stream")
+    display_name = doc.get("filename") or f"{session_id}_m{doc['id']}{ext}"
+    return FileResponse(
+        path=path,
+        media_type=media_type,
         headers={"Content-Disposition": f'inline; filename="{display_name}"'},
     )
 

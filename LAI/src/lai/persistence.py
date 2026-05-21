@@ -79,6 +79,28 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_session
     ON messages(session_id, created_at);
 
+-- Matter documents: a session ("matter") can hold MANY uploaded
+-- documents, each addressable as a [M-n] citation handle in chat.
+-- ``doc_index`` is the stable 1-based n in [M-n] — assigned at upload
+-- time in ascending id order so the handle for a document never shifts
+-- when another is added. The first upload also mirrors into
+-- ``sessions.contract_text`` (see upload()) so the single-document
+-- analyze-contract path and older clients keep working unchanged.
+CREATE TABLE IF NOT EXISTS matter_documents (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    doc_index   INTEGER NOT NULL,      -- the n in [M-n], 1-based, stable
+    filename    TEXT,
+    doc_text    TEXT,                  -- extracted markdown/text
+    n_pages     INTEGER,
+    upload_ext  TEXT,                  -- ".pdf" / ".docx" — file on disk
+    created_at  REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_matter_docs_session
+    ON matter_documents(session_id, doc_index);
+
 -- Lawyer-supplied feedback on an assistant turn. One row per
 -- (user_id, session_id, message_id) — re-submitting from the UI
 -- overwrites via INSERT OR REPLACE so toggling thumbs-up → thumbs-down
@@ -139,6 +161,14 @@ def init(db_path: Path, uploads_dir: Path) -> None:
         """
         CREATE UNIQUE INDEX IF NOT EXISTS uq_feedback_user_session_msg
             ON feedback(user_id, session_id, COALESCE(message_id, 0))
+        """
+    )
+    # matter_documents was added with the Matter-workspace feature; the
+    # executescript above creates it on fresh DBs, this guards older ones.
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_matter_docs_session
+            ON matter_documents(session_id, doc_index)
         """
     )
 
@@ -558,6 +588,136 @@ def message_belongs_to_session(message_id: int, session_id: str) -> bool:
         (message_id, session_id),
     ).fetchone()
     return row is not None
+
+
+# ---------------------------------------------------------------------------
+# matter documents (multiple uploads per session = a "Matter")
+# ---------------------------------------------------------------------------
+
+def add_matter_document(
+    session_id: str,
+    *,
+    filename: str,
+    doc_text: str,
+    n_pages: int,
+    upload_ext: str,
+    user_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Append one uploaded document to a matter. Returns the new row as a
+    dict (incl. its stable ``doc_index`` = the n in [M-n]), or ``None`` if
+    the session isn't owned by ``user_id``.
+
+    ``doc_index`` is ``max(existing)+1`` so handles never shift when more
+    documents are added later.
+    """
+    if user_id is not None and not session_exists(session_id, user_id=user_id):
+        return None
+    with _STATE["lock"]:
+        row = _conn().execute(
+            "SELECT COALESCE(MAX(doc_index), 0) AS mx FROM matter_documents WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        next_index = int(row["mx"]) + 1
+        ts = time.time()
+        cur = _conn().execute(
+            """
+            INSERT INTO matter_documents
+                (session_id, doc_index, filename, doc_text, n_pages, upload_ext, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, next_index, filename, doc_text, n_pages, upload_ext, ts),
+        )
+        return {
+            "id": int(cur.lastrowid or 0),
+            "session_id": session_id,
+            "doc_index": next_index,
+            "filename": filename,
+            "n_pages": n_pages,
+            "upload_ext": upload_ext,
+            "created_at": ts,
+        }
+
+
+def list_matter_documents(
+    session_id: str, user_id: Optional[str] = None, *, include_text: bool = False,
+) -> list[dict]:
+    """All documents attached to a matter, ordered by ``doc_index`` (= [M-n]).
+
+    ``include_text=False`` (default) omits the heavy ``doc_text`` blob —
+    the UI document list doesn't need it. The chat path passes
+    ``include_text=True`` to build the [M-n] prompt sources.
+    Filtered by ``user_id`` when supplied (no cross-tenant leakage).
+    """
+    if user_id is not None and not session_exists(session_id, user_id=user_id):
+        return []
+    cols = "id, doc_index, filename, n_pages, upload_ext, created_at"
+    if include_text:
+        cols += ", doc_text"
+    rows = _conn().execute(
+        f"SELECT {cols} FROM matter_documents WHERE session_id = ? ORDER BY doc_index ASC",
+        (session_id,),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = {
+            "id": int(r["id"]),
+            "doc_index": int(r["doc_index"]),
+            "filename": r["filename"],
+            "n_pages": int(r["n_pages"]) if r["n_pages"] is not None else 0,
+            "upload_ext": r["upload_ext"],
+            "created_at": float(r["created_at"]),
+        }
+        if include_text:
+            d["doc_text"] = r["doc_text"] or ""
+        out.append(d)
+    return out
+
+
+def get_matter_document(
+    session_id: str, doc_index: int, user_id: Optional[str] = None,
+) -> Optional[dict]:
+    """One matter document by its [M-n] index, or None. Used by the
+    per-document preview endpoint."""
+    if user_id is not None and not session_exists(session_id, user_id=user_id):
+        return None
+    r = _conn().execute(
+        "SELECT id, doc_index, filename, n_pages, upload_ext, created_at "
+        "FROM matter_documents WHERE session_id = ? AND doc_index = ?",
+        (session_id, doc_index),
+    ).fetchone()
+    if not r:
+        return None
+    return {
+        "id": int(r["id"]),
+        "doc_index": int(r["doc_index"]),
+        "filename": r["filename"],
+        "n_pages": int(r["n_pages"]) if r["n_pages"] is not None else 0,
+        "upload_ext": r["upload_ext"],
+        "created_at": float(r["created_at"]),
+    }
+
+
+def matter_document_path(session_id: str, doc_id: int, ext: Optional[str] = None) -> Optional[Path]:
+    """Disk path of a matter document's original file. Files are stored as
+    ``<session_id>_m<doc_id><ext>`` to keep many docs per session distinct."""
+    base = Path(_STATE["uploads_dir"])
+    if ext:
+        p = base / f"{session_id}_m{doc_id}{ext}"
+        return p if p.exists() else None
+    for candidate in (".pdf", ".docx", ".doc", ".txt", ".md", ".bin"):
+        p = base / f"{session_id}_m{doc_id}{candidate}"
+        if p.exists():
+            return p
+    return None
+
+
+def save_matter_upload(session_id: str, doc_id: int, content: bytes, filename: str) -> str:
+    """Write a matter document's bytes to ``<session_id>_m<doc_id><ext>``.
+    Returns the extension stored."""
+    suffix = Path(filename).suffix.lower() or ".bin"
+    target = Path(_STATE["uploads_dir"]) / f"{session_id}_m{doc_id}{suffix}"
+    target.write_bytes(content)
+    return suffix
 
 
 # ---------------------------------------------------------------------------
