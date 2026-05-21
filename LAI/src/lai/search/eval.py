@@ -358,14 +358,23 @@ class Reranker:
         self.model_id = model_id
         self.is_qwen3 = "Qwen3-Reranker" in model_id
 
-        print(f"Loading reranker {model_id}...")
+        # Pick the CUDA device with the most FREE memory rather than
+        # hard-coding cuda:0. serve_rag shares its GPUs with the analyzer
+        # vLLM + the Step-6 embedding job; cuda:0 is routinely saturated,
+        # which made the reranker OOM on a tiny working allocation and
+        # silently killed corpus retrieval. Auto-selecting the freest
+        # device lands the reranker where there's room (no dependence on
+        # a CUDA_VISIBLE_DEVICES launch flag that may not be applied).
+        # Override with LAI_RERANK_DEVICE (e.g. "cuda:1" / "cpu").
+        self.device = self._pick_device()
+        print(f"Loading reranker {model_id} on {self.device}...")
         if self.is_qwen3:
             from transformers import AutoModelForCausalLM, AutoTokenizer
             self.tok = AutoTokenizer.from_pretrained(
                 model_id, padding_side="left", trust_remote_code=True,
             )
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_id, torch_dtype=torch.float16, device_map="cuda",
+                model_id, torch_dtype=torch.float16, device_map={"": self.device},
                 trust_remote_code=True,
             ).eval()
             self.token_yes = self.tok.convert_tokens_to_ids("yes")
@@ -386,8 +395,29 @@ class Reranker:
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
             self.tok = AutoTokenizer.from_pretrained(model_id)
             self.model = AutoModelForSequenceClassification.from_pretrained(
-                model_id, torch_dtype=torch.float16, device_map="cuda",
+                model_id, torch_dtype=torch.float16, device_map={"": self.device},
             ).eval()
+
+    @staticmethod
+    def _pick_device() -> str:
+        """Return the CUDA device with the most free memory, or an
+        ``LAI_RERANK_DEVICE`` override, or ``"cpu"`` if no GPU."""
+        import os
+        override = os.getenv("LAI_RERANK_DEVICE")
+        if override:
+            return override
+        import torch
+        if not torch.cuda.is_available():
+            return "cpu"
+        best_idx, best_free = 0, -1
+        for i in range(torch.cuda.device_count()):
+            try:
+                free, _ = torch.cuda.mem_get_info(i)
+            except Exception:
+                free = 0
+            if free > best_free:
+                best_idx, best_free = i, free
+        return f"cuda:{best_idx}"
 
     def _score_qwen3(self, pairs: list[tuple[str, str]]) -> list[float]:
         """For Qwen3-Reranker, score = P(yes) - P(no) over the next-token logits."""
@@ -404,7 +434,7 @@ class Reranker:
             enc = self.tok(
                 texts, padding=True, truncation=True, max_length=8192,
                 return_tensors="pt",
-            ).to("cuda")
+            ).to(self.device)
             with torch.no_grad():
                 logits = self.model(**enc).logits[:, -1, :]  # next-token dist
             yes = logits[:, self.token_yes]
@@ -422,7 +452,7 @@ class Reranker:
             b = pairs[i:i+batch]
             enc = self.tok([p[0] for p in b], [p[1] for p in b],
                             padding=True, truncation=True, max_length=512,
-                            return_tensors="pt").to("cuda")
+                            return_tensors="pt").to(self.device)
             with torch.no_grad():
                 logits = self.model(**enc).logits.view(-1).float().cpu().numpy()
             all_scores.extend(logits.tolist())
