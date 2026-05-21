@@ -201,9 +201,15 @@ launch reranker 8004 \
   --gpu-memory-utilization 0.02 --host $MODEL_BIND --port 8004"
 
 # ── 4. serve_rag (chat backend) ──────────────────────────────────────────
+# CORS_ORIGINS: on-prem frontend origins (LAN IP + localhost, :3000 build
+# server + :5173 vite dev). Without it serve_rag falls back to a default
+# list that omits the LAN-IP :3000, CORS-blocking the browser there.
+# Kept in sync with the DDiQ backend's CORS_ORIGINS (micro-services/.env
+# + docker-compose.yml). Override via the CORS_ORIGINS env if set.
 launch serve_rag 18000 \
 "cd '$LAI_DIR' && exec env CUDA_VISIBLE_DEVICES=1 LAI_BIND_HOST='$LAI_BIND_HOST' \
 LLM_API_URL=http://localhost:8005 LLM_MODEL=qwen3.6-27b \
+CORS_ORIGINS='${CORS_ORIGINS:-http://192.168.178.82:3000,http://192.168.178.82:5173,http://localhost:3000,http://localhost:5173}' \
 '$VENV_PY' -m lai.api.serve_rag --port 18000"
 
 # ── 5. DDiQ backend (uvicorn) ────────────────────────────────────────────
