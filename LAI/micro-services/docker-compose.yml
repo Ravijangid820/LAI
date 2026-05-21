@@ -44,6 +44,21 @@ services:
       # Host port 18001 (next to serve_rag's 18000); 8000 is held on this
       # box by a sibling tenant. Override with BACKEND_PORT env var.
       - "${BACKEND_BIND_HOST:-127.0.0.1}:${BACKEND_PORT:-18001}:8000"
+    # JWT-secret single source (auth-bug hardening). serve_rag (the token
+    # ISSUER, host process) sources ../.env.auth; DDiQ (the token VERIFIER)
+    # now reads the SAME file here, listed LAST so it is authoritative. This
+    # makes the two backends structurally share LAI_AUTH_JWT_ACCESS_SECRET —
+    # the divergence that produced "invalid access token" on the DDiQ tab
+    # can no longer happen. ../.env.auth holds only LAI_AUTH_* + LAI_EMAIL_*
+    # (no DB vars), so it can't clobber the DB settings in `environment:`
+    # below. Crucially, the explicit LAI_AUTH_JWT_ACCESS_SECRET line was
+    # REMOVED from `environment:` — an environment value would override
+    # env_file and re-introduce the drift.
+    env_file:
+      - path: .env
+        required: false
+      - path: ../.env.auth
+        required: false
     environment:
       # LLM — Qwen3.6-27B analyzer from LAI runtime stack
       - LLM_URL=http://lai_analyzer_llm:8000/v1
@@ -58,12 +73,10 @@ services:
       - DB_NAME=${DB_NAME:-lai_db}
       - DB_USER=${DB_USER:-lai_user}
       - DB_PASSWORD=${DB_PASSWORD:?Set DB_PASSWORD in .env}
-      # Auth subsystem (lai.common.auth) — secret comes from .env in
-      # production. A dev-only placeholder lets the container start when
-      # the operator hasn't configured a real secret yet; using the
-      # placeholder for actually-issued tokens is unsafe and the
-      # AUTH_PLAN.md §8.1 deployment checklist requires overriding it.
-      - LAI_AUTH_JWT_ACCESS_SECRET=${LAI_AUTH_JWT_ACCESS_SECRET:?Set LAI_AUTH_JWT_ACCESS_SECRET in .env}
+      # LAI_AUTH_JWT_ACCESS_SECRET is intentionally NOT set here — it comes
+      # from the shared ../.env.auth via env_file above (single source with
+      # serve_rag). Setting it in `environment:` would override env_file and
+      # re-open the drift that broke the DDiQ tab.
       # Application config
       - ENVIRONMENT=${ENVIRONMENT:-production}
       # On-prem frontend origins (LAN IP + localhost), both the :3000
@@ -111,6 +124,15 @@ services:
         "--concurrency=2",
         "--loglevel=INFO",
       ]
+    # Same shared-auth single source as the backend service (see the note
+    # there). The worker doesn't verify JWTs, but importing ddiq_report
+    # constructs AuthConfig() at module load, so it needs a valid secret —
+    # and reading the SAME ../.env.auth keeps it from drifting too.
+    env_file:
+      - path: .env
+        required: false
+      - path: ../.env.auth
+        required: false
     environment:
       # Identical to the backend service: the report job uses the same
       # LLM / embedding / reranker / DB / auth env. Keep these in sync
@@ -124,7 +146,8 @@ services:
       - DB_NAME=${DB_NAME:-lai_db}
       - DB_USER=${DB_USER:-lai_user}
       - DB_PASSWORD=${DB_PASSWORD:?Set DB_PASSWORD in .env}
-      - LAI_AUTH_JWT_ACCESS_SECRET=${LAI_AUTH_JWT_ACCESS_SECRET:?Set LAI_AUTH_JWT_ACCESS_SECRET in .env}
+      # LAI_AUTH_JWT_ACCESS_SECRET comes from ../.env.auth (env_file above),
+      # not here — see the backend service note.
       - ENVIRONMENT=${ENVIRONMENT:-production}
       # Celery broker — runtime-stack Redis. Override only if pointing
       # at a different Redis (staging vs prod, off-box queue, etc.).
