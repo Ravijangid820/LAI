@@ -1213,28 +1213,64 @@ def _empty_grounding_guard(
         docs = persistence.list_matter_documents(sid, user_id=uid)
     except Exception:
         docs = []
-    # Still-ingesting docs: not yet 'done', or no searchable chunks yet.
-    pending = [
+
+    def _status(d) -> str:
+        return (d.get("status") or "").lower()
+
+    def _chunks(d) -> int:
+        return int(d.get("n_chunks") or 0)
+
+    # Partition the matter's documents by ingestion state. Statuses are
+    # set by persistence: 'queued' -> 'processing' -> 'done' | 'failed'.
+    # A 'done' doc with 0 chunks extracted nothing searchable, so it is
+    # effectively a failure (the live "ALT F III" case).
+    still_processing = [d for d in docs if _status(d) in ("queued", "processing", "uploading")]
+    usable = [d for d in docs if _status(d) in ("done", "ready") and _chunks(d) > 0]
+    failed = [
         d for d in docs
-        if (d.get("status") not in ("done", "ready"))
-        or (d.get("n_chunks") or 0) == 0
+        if _status(d) == "failed"
+        or (_status(d) in ("done", "ready") and _chunks(d) == 0)
     ]
-    if pending:
-        done = sum(int(d.get("pages_done") or 0) for d in pending)
-        total = sum(int(d.get("pages_total") or 0) for d in pending)
+
+    # 1. Something is still ingesting → tell the user to wait, with the live
+    #    page count. Scanned PDFs are OCR'd page-by-page (slow), so this is
+    #    expected, not an error. (The frontend additionally holds the question
+    #    and re-runs it automatically once ingestion completes.)
+    if still_processing:
+        done = sum(int(d.get("pages_done") or 0) for d in still_processing)
+        total = sum(int(d.get("pages_total") or 0) for d in still_processing)
         if en:
             prog = f" (page {done}/{total})" if total else ""
             return (
-                f"Your document is still being processed{prog}. I’ll be able to "
-                "answer from it once indexing finishes — please try again in a moment."
+                f"Your document is still being processed{prog} — scanned PDFs are "
+                "transcribed page by page, which takes a moment. Please ask again shortly."
             )
         prog = f" (Seite {done}/{total})" if total else ""
         return (
-            f"Ihr Dokument wird noch verarbeitet{prog}. Sobald die Indexierung "
-            "abgeschlossen ist, kann ich es beantworten — bitte versuchen Sie es "
-            "in Kürze erneut."
+            f"Ihr Dokument wird gerade verarbeitet{prog} — gescannte PDFs werden Seite "
+            "für Seite per OCR erfasst, das dauert einen Moment. Bitte stellen Sie Ihre "
+            "Frage gleich noch einmal."
         )
-    # Docs are indexed, but retrieval found nothing relevant to this question.
+
+    # 2. Ingestion FAILED and nothing usable exists → say so honestly (the old
+    #    message wrongly implied "still processing" forever). Surface the reason.
+    if failed and not usable:
+        why = next((d.get("error") for d in failed if (d.get("error") or "").strip()), "")
+        if en:
+            tail = f" (reason: {str(why).strip()})" if why else ""
+            return (
+                "I couldn’t process your document — text extraction produced nothing"
+                f"{tail}. Please re-upload it (a text-based PDF or a clearer scan)."
+            )
+        tail = f" (Grund: {str(why).strip()})" if why else ""
+        return (
+            "Ihr Dokument konnte nicht verarbeitet werden — die Textextraktion war leer"
+            f"{tail}. Bitte laden Sie es erneut hoch (ein textbasiertes PDF oder einen "
+            "besseren Scan)."
+        )
+
+    # 3. Documents are indexed with content, but retrieval found nothing
+    #    relevant to THIS question → refuse rather than answer ungrounded.
     if en:
         return (
             "I couldn’t find any relevant passage for this question in your uploaded "
@@ -1246,6 +1282,55 @@ def _empty_grounding_guard(
         "Textstelle. Ich antworte hier bewusst nicht aus allgemeinem Wissen — bitte "
         "formulieren Sie die Frage um oder prüfen Sie, ob das Dokument diese "
         "Information enthält."
+    )
+
+
+# Max time a doc-scoped chat turn will wait for a still-OCR'ing upload to
+# finish indexing before it answers, instead of refusing with "still
+# processing". A 10-page scan parallel-OCRs in ~90s; 180s covers larger
+# scans with margin. Override with LAI_MATTER_WAIT_S; 0 disables the wait
+# (revert to immediate refusal).
+_MATTER_WAIT_S = float(os.environ.get("LAI_MATTER_WAIT_S", "180"))
+_MATTER_WAIT_POLL_S = 1.5
+
+
+def _matter_is_processing(sid: str, uid: str) -> bool:
+    """True if any document in the session is still being ingested
+    (queued/processing) — i.e. its searchable chunks don't exist yet."""
+    try:
+        docs = persistence.list_matter_documents(sid, user_id=uid)
+    except Exception:
+        return False
+    return any(
+        (d.get("status") or "").lower() in ("queued", "processing", "uploading")
+        for d in docs
+    )
+
+
+def _await_matter_ready(sid: str, uid: str, timeout_s: float) -> bool:
+    """Block (in this sync, threadpool-run request) until no document in the
+    session is still ingesting, or ``timeout_s`` elapses. Returns True if,
+    afterwards, at least one document is ``done`` with searchable chunks (so
+    re-retrieval will find content); False on timeout or all-failed.
+
+    Endpoints are sync ``def`` (FastAPI runs them in a threadpool), so a
+    blocking ``time.sleep`` here does not stall the event loop.
+    """
+    if timeout_s <= 0:
+        return False
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not _matter_is_processing(sid, uid):
+            break
+        time.sleep(_MATTER_WAIT_POLL_S)
+    try:
+        docs = persistence.list_matter_documents(sid, user_id=uid)
+    except Exception:
+        docs = []
+    return any(
+        (d.get("status") or "").lower() in ("done", "ready")
+        and (d.get("n_chunks") or 0) > 0
+        for d in docs
     )
 
 
@@ -2594,6 +2679,20 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         sid, uid, use_contract, req.question,
     )
 
+    # Wait-and-answer: a doc-scoped turn with no matter content yet because the
+    # upload is still being OCR'd → wait (bounded) for ingestion to finish and
+    # re-retrieve, so we answer automatically instead of refusing with "still
+    # processing". A scanned PDF OCRs in ~90s. If it never becomes ready
+    # (timeout/failure), the empty-retrieval guard below gives the honest
+    # message. (Endpoints are sync/threadpool, so the blocking wait is safe.)
+    if use_contract and not matter_sources and _matter_is_processing(sid, uid):
+        print(f"[wait] session={sid} doc still ingesting — waiting up to "
+              f"{int(_MATTER_WAIT_S)}s before answering", flush=True)
+        if _await_matter_ready(sid, uid, _MATTER_WAIT_S):
+            matter_sources, matter_chunks, contract_text = _build_matter_context(
+                sid, uid, use_contract, req.question,
+            )
+
     # Prior chat turns for the same session — gives the model conversational
     # memory across requests. Without this, every turn is stateless and
     # follow-ups like "tell me more about it" or "answer in English from now on"
@@ -3009,6 +3108,18 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     matter_sources, matter_chunks, contract_text = _build_matter_context(
         sid, uid, use_contract, req.question,
     )
+
+    # Wait-and-answer (same as /query): wait for a still-OCR'ing upload to
+    # finish, then re-retrieve, so the streamed turn answers automatically
+    # instead of refusing. The client shows its typing indicator during the
+    # wait; the answer then streams in. Guard handles timeout/failure.
+    if use_contract and not matter_sources and _matter_is_processing(sid, uid):
+        print(f"[wait] session={sid} stream=1 doc still ingesting — waiting up to "
+              f"{int(_MATTER_WAIT_S)}s before answering", flush=True)
+        if _await_matter_ready(sid, uid, _MATTER_WAIT_S):
+            matter_sources, matter_chunks, contract_text = _build_matter_context(
+                sid, uid, use_contract, req.question,
+            )
 
     history = _load_history(sid, user_id=uid)
     meta_prefix = _matter_manifest_prefix(sid, uid) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
