@@ -13,6 +13,7 @@ collection time; the package conftest handles that.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import ddiq_report
 
@@ -526,3 +527,39 @@ class TestSectionQuestions:
         for section, questions in ddiq_report.SECTION_QUESTIONS.items():
             labels = [q["label"] for q in questions]
             assert len(labels) == len(set(labels)), f"dup label in {section}"
+
+
+class TestDropGeocodeOutlierWeas:
+    """A4: count/capacity must use the real WEA cluster, not turbines a ruling
+    cites from other cases that geocoded far away. The helper only reads
+    ``.lat``/``.lng``, so lightweight stubs suffice."""
+
+    @staticmethod
+    def _w(lat: float, lng: float):
+        return SimpleNamespace(lat=lat, lng=lng)
+
+    def _cluster(self, n: int):
+        # Tight Lamstedt cluster (~1 km spread, well within 25 km).
+        return [self._w(53.63 + 0.001 * i, 9.10 + 0.001 * i) for i in range(n)]
+
+    def test_drops_far_outliers(self) -> None:
+        weas = self._cluster(8) + [self._w(53.09, 8.78),   # Bremen ~60 km
+                                   self._w(48.14, 11.58),   # Munich
+                                   self._w(52.52, 13.40)]   # Berlin
+        kept = ddiq_report._drop_geocode_outlier_weas(weas)
+        assert len(kept) == 8
+
+    def test_keeps_ungeocoded_drops_outlier(self) -> None:
+        weas = self._cluster(5) + [self._w(48.14, 11.58)] + [self._w(0.0, 0.0)]
+        kept = ddiq_report._drop_geocode_outlier_weas(weas)
+        assert len(kept) == 6                                 # 5 cluster + ungeocoded
+        assert any(w.lat == 0 for w in kept)                  # ungeocoded kept
+        assert not any(abs(w.lat - 48.14) < 0.01 for w in kept)  # Munich dropped
+
+    def test_two_or_fewer_geocoded_unchanged(self) -> None:
+        weas = [self._w(53.63, 9.10), self._w(48.14, 11.58)]  # 2 geocoded, far apart
+        assert len(ddiq_report._drop_geocode_outlier_weas(weas)) == 2
+
+    def test_tight_cluster_keeps_all(self) -> None:
+        weas = self._cluster(10)
+        assert len(ddiq_report._drop_geocode_outlier_weas(weas)) == 10

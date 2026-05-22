@@ -117,6 +117,7 @@ from cadastral_pipeline import (
     ParcelClassification, generate_geojson, validate_results,
     normalize_parcel_number, normalize_parcel_id,
     build_clearance_zones, make_circle_polygon,
+    filter_outlier_points, _MAX_WEA_SPREAD_KM,
 )
 
 logger = logging.getLogger("ddiq")
@@ -1115,6 +1116,44 @@ def _apply_canonical_specs(weas: list[WEAStatus], specs: dict) -> int:
     return fills
 
 
+def _drop_geocode_outlier_weas(weas: list) -> list:
+    """A4 — keep the turbine COUNT and CAPACITY honest by dropping WEA whose
+    geocode is a far outlier from the main cluster.
+
+    An onshore wind park spans a few km; a WEA geocoded >``_MAX_WEA_SPREAD_KM``
+    (25 km) from the cluster is extraction noise — e.g. a turbine designation an
+    OVG ruling cites from an *unrelated* case, or a badly mis-geocoded name.
+    Left in, these inflate ``turbineCount`` and ``totalCapacityMw`` (the live
+    Lamstedt run extracted 23 WEA / 46 MW; 15 were >25 km outliers, true park
+    ≈8). The cadastral project-area step already drops them via
+    :func:`filter_outlier_points`; this applies the SAME filter to the WEA list
+    so the count, capacity, area and map all agree on one canonical set.
+
+    Safe by construction: WEA without a geocode are kept (no distance to judge);
+    with ≤2 geocoded WEA there's no cluster, so nothing is dropped; and if the
+    filter would drop everything, the original list is returned unchanged.
+    """
+    geocoded_pts = [(w.lat, w.lng) for w in weas if w.lat != 0 or w.lng != 0]
+    if len(geocoded_pts) <= 2:
+        return weas
+    kept = set(filter_outlier_points(geocoded_pts))
+    if len(kept) >= len(geocoded_pts):
+        return weas  # nothing was an outlier
+    out = [
+        w for w in weas
+        if (w.lat == 0 and w.lng == 0) or (w.lat, w.lng) in kept
+    ]
+    if not out:
+        return weas  # never drop everything
+    if len(out) < len(weas):
+        logger.info(
+            "A4: dropped %d/%d geocode-outlier WEA (>%.0f km from cluster) so "
+            "count/capacity match the real park",
+            len(weas) - len(out), len(weas), _MAX_WEA_SPREAD_KM,
+        )
+    return out
+
+
 def extract_wea_statuses(doc_ids, full_text, sections, project_center=None):
     """Extract WEA per-turbine attributes including the technical fields a
     DD lawyer needs: hub height (drives 10H clearance for Bayern/Hessen),
@@ -1877,6 +1916,9 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
 
     progress("wea_extraction", 0.58)
     t = time.time(); weas = extract_wea_statuses(req.document_ids, full_text, sections, pc); T["wea_s"] = round(time.time()-t, 2)
+    # A4: drop geocode-outlier WEA before they reach the count/capacity
+    # reconciler (and the map), so one canonical turbine set is used everywhere.
+    weas = _drop_geocode_outlier_weas(weas)
     report.weaStatuses = weas
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
