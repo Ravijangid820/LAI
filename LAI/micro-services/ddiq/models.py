@@ -266,6 +266,12 @@ class ProjectFacts(BaseModel):
     bundesland: Optional[str] = None          # lowercase, e.g. "niedersachsen"
     turbineCount: int = 0
     totalCapacityMw: Optional[float] = None   # reconciled; was never stored before A6
+    # WEA the extraction evidences as physically built / commissioned
+    # (status_code errichtet|abgenommen). Lets the permit-framed "Project
+    # Status" cell reflect proven operational status instead of saying
+    # "not contained" when only a maintenance contract was provided.
+    # (MaStR — §5.3, Phase 2B — will later confirm this externally.)
+    commissionedWeaCount: int = 0
 
 
 # ── Top-level report data + API bookends ─────────────────────────────

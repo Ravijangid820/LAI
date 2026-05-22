@@ -563,3 +563,34 @@ class TestDropGeocodeOutlierWeas:
     def test_tight_cluster_keeps_all(self) -> None:
         weas = self._cluster(10)
         assert len(ddiq_report._drop_geocode_outlier_weas(weas)) == 10
+
+
+class TestSetSectionValue:
+    """A6/§5.4: the reconciler renders a canonical fact back into an overview
+    cell. The setter matches get_section_value (by id + label)."""
+
+    @staticmethod
+    def _sections():
+        return [SimpleNamespace(id="overview", rows=[
+            SimpleNamespace(label="Project Status", value="old"),
+            SimpleNamespace(label="Number of WEA", value="8"),
+        ])]
+
+    def test_sets_existing_cell(self) -> None:
+        secs = self._sections()
+        assert ddiq_report._set_section_value(secs, "overview", "Project Status", "new") is True
+        assert ddiq_report.get_section_value(secs, "overview", "Project Status") == "new"
+
+    def test_missing_label_or_section_returns_false(self) -> None:
+        secs = self._sections()
+        assert ddiq_report._set_section_value(secs, "overview", "Nope", "x") is False
+        assert ddiq_report._set_section_value(secs, "nosec", "Project Status", "x") is False
+        # untouched
+        assert ddiq_report.get_section_value(secs, "overview", "Project Status") == "old"
+
+    def test_commissioned_field_on_facts_ledger(self) -> None:
+        from ddiq.models import ProjectFacts
+        f = ProjectFacts(projectName="Windpark X", preparedFor="Client")
+        assert f.commissionedWeaCount == 0  # defaults to 0 (unknown)
+        f2 = ProjectFacts(projectName="X", preparedFor="C", commissionedWeaCount=8)
+        assert f2.commissionedWeaCount == 8

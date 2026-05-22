@@ -47,7 +47,7 @@ from _reconcile import Candidate, reconcile_categorical, reconcile_numeric
 # Output guardrail: post-LLM cleanup pass that strips defensive-AI
 # paragraphs, removes hedge phrases, and flags mixed-language rows.
 # See ``_guardrail.py`` for the sourced pattern list.
-from _guardrail import apply_to_findings, apply_to_rows, detect_language
+from _guardrail import apply_to_findings, apply_to_rows, detect_defensive_ai, detect_language
 
 # Jurisdiction validator (H-2): scan finalised section / finding text
 # for cross-Bundesland rule citations (e.g. Bayern's 10H BayBO mentioned
@@ -645,6 +645,21 @@ def get_section_value(sections, section_id, label):
             for row in sec.rows:
                 if row.label == label: return row.value
     return ""
+
+
+def _set_section_value(sections, section_id, label, value) -> bool:
+    """Set an existing section cell's value (matched by id + label). Returns
+    True if a matching row was found and updated. Used by the deterministic
+    reconciler to render a canonical ``ProjectFacts`` fact back into the
+    overview row (the §5.4 facts-ledger pattern — same as forcing the
+    turbine count into the cell), never to create a new row."""
+    for sec in sections:
+        if sec.id == section_id:
+            for row in sec.rows:
+                if row.label == label:
+                    row.value = value
+                    return True
+    return False
 
 _WEA_COUNT_RE = re.compile(
     r"(\d+)\s*(?:WEA|WKA|Windenergieanlagen?|Windkraftanlagen?|Anlagen|Turbines?)\b",
@@ -2119,6 +2134,12 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     project_company = clean_value(
         get_section_value(sections, "overview", "Project Company"), ""
     ) or None
+    # Operational evidence as a canonical fact: WEA the extraction proves are
+    # physically built / commissioned (status_code errichtet|abgenommen).
+    commissioned_wea = sum(
+        1 for w in report.weaStatuses
+        if getattr(w, "status_code", None) in ("errichtet", "abgenommen")
+    )
     facts = ProjectFacts(
         projectName=pname,
         preparedFor=pfor,
@@ -2127,8 +2148,34 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
         bundesland=report.bundesland,
         turbineCount=report.turbineCount,
         totalCapacityMw=total_mw,
+        commissionedWeaCount=commissioned_wea,
     )
     report.projectFacts = facts.model_dump()
+
+    # Render the "Project Status" overview cell FROM the canonical fact (§5.4
+    # facts-ledger / A4 "force the fact into the overview row"). The cell's
+    # question is permit-framed, so answered in isolation it can say "nicht
+    # enthalten" even when the documents (e.g. a maintenance contract with
+    # serial numbers + commissioning dates) prove operation. When the ledger
+    # knows WEA are commissioned but the cell is empty/defensive, synthesize an
+    # honest operational status while keeping the permit caveat — no guess.
+    if commissioned_wea > 0:
+        _status_cell = clean_value(
+            get_section_value(sections, "overview", "Project Status"), ""
+        )
+        if not _status_cell.strip() or detect_defensive_ai(_status_cell):
+            _synth = (
+                f"Operativ belegt: {commissioned_wea} WEA als errichtet / in "
+                f"Betrieb genommen nachgewiesen (aus den vorgelegten Unterlagen, "
+                f"z. B. Seriennummern / Inbetriebnahmedaten). Der formale "
+                f"BImSchG-Genehmigungsstatus (§ 6 / § 15) ist aus den vorgelegten "
+                f"Unterlagen nicht verifizierbar."
+            )
+            if _set_section_value(sections, "overview", "Project Status", _synth):
+                logger.info(
+                    "A6: Project Status reconciled from %d commissioned WEA",
+                    commissioned_wea,
+                )
 
     # Reference the canonical company for any WEA whose own owner came
     # back as a placeholder — one source of truth, not a per-row guess.
