@@ -93,8 +93,78 @@ class TestParseWeaCount:
         assert ddiq_report.parse_wea_count("") == 0
 
     def test_first_number_wins(self) -> None:
-        # The regex grabs the first run of digits.
+        # No turbine-count keyword follows either number, so it falls back
+        # to the leading bare integer.
         assert ddiq_report.parse_wea_count("3 errichtet, 4 geplant") == 3
+
+    def test_prefers_count_phrase_over_leading_date(self) -> None:
+        # The real Lamstedt "Number of WEA" cell opens with prose and a
+        # date; the old first-digit grab returned a date fragment. We must
+        # latch onto the explicit "10 Anlagen" total instead.
+        cell = (
+            "Aus der Änderungsgenehmigung vom 06.04.2005 geht hervor, dass "
+            "für die Anlagen L 1 bis L 7, L 9, L 15 und L 16 (insgesamt 10 "
+            "Anlagen) Auflagen erteilt wurden."
+        )
+        assert ddiq_report.parse_wea_count(cell) == 10
+
+    def test_count_phrase_variants(self) -> None:
+        assert ddiq_report.parse_wea_count("10 Windenergieanlagen") == 10
+        assert ddiq_report.parse_wea_count("7 WKA errichtet") == 7
+        assert ddiq_report.parse_wea_count("vorgesehen sind 5 Anlagen") == 5
+
+
+# ── _looks_like_address ──────────────────────────────────────────────
+
+
+class TestLooksLikeAddress:
+    def test_applicant_address_line_is_rejected(self) -> None:
+        # The exact smoke-test bug: the metadata LLM returned the
+        # applicant's street line as the project name.
+        assert ddiq_report._looks_like_address("Sönke-Nissen-Koog 58") is True
+
+    def test_street_suffix_is_an_address(self) -> None:
+        assert ddiq_report._looks_like_address("Vincent-Lübeck-Str.") is True
+        assert ddiq_report._looks_like_address("Hauptstraße") is True
+
+    def test_windpark_name_is_never_an_address(self) -> None:
+        assert ddiq_report._looks_like_address("Windpark Lamstedt") is False
+        # A park name with a number in it is still a project name.
+        assert ddiq_report._looks_like_address("Windpark Nordsee 2") is False
+
+    def test_plain_project_name(self) -> None:
+        assert ddiq_report._looks_like_address("Lamstedt") is False
+
+    def test_empty_is_not_an_address(self) -> None:
+        assert ddiq_report._looks_like_address("") is False
+        assert ddiq_report._looks_like_address(None) is False
+
+
+# ── _plausible_rated_kw ──────────────────────────────────────────────
+
+
+class TestPlausibleRatedKw:
+    def test_realistic_value_passes(self) -> None:
+        assert ddiq_report._plausible_rated_kw(2300) == 2300.0
+        assert ddiq_report._plausible_rated_kw("4200") == 4200.0
+
+    def test_order_of_magnitude_error_rejected(self) -> None:
+        # The Lamstedt bug: E-70 (really 2300 kW) extracted as 22000 kW,
+        # which made 8 turbines sum to a phantom 176 MW.
+        assert ddiq_report._plausible_rated_kw(22000) is None
+
+    def test_zero_and_negative_rejected(self) -> None:
+        assert ddiq_report._plausible_rated_kw(0) is None
+        assert ddiq_report._plausible_rated_kw(-5) is None
+
+    def test_none_and_junk_become_none(self) -> None:
+        assert ddiq_report._plausible_rated_kw(None) is None
+        assert ddiq_report._plausible_rated_kw("") is None
+        assert ddiq_report._plausible_rated_kw("n/a") is None
+
+    def test_ceiling_is_inclusive(self) -> None:
+        assert ddiq_report._plausible_rated_kw(10000) == 10000.0
+        assert ddiq_report._plausible_rated_kw(10000.01) is None
 
 
 # ── make_parcel_polygon ──────────────────────────────────────────────

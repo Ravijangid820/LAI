@@ -267,6 +267,58 @@ def clean_value(val, fallback: str = "Not specified in documents") -> str:
     s = str(val).strip()
     return fallback if s.lower() in ("null", "none", "n/a", "na", "nil", "undefined", "") else s
 
+
+# ── Header-fact guards ───────────────────────────────────────────────
+# Small, deterministic sanity checks that keep an extraction slip from
+# reaching the report header — the first thing a partner reads.
+
+# A name carrying a wind/solar-park token is a project name even if it
+# contains a number; without one, a trailing house number or a
+# street-suffix marks it as a street address.
+_PROJECT_NAME_TOKENS = re.compile(
+    r"(?i)\b(windpark|windenergie\w*|wind\s*farm|b[üu]rgerwindpark|solarpark)\b"
+)
+_ADDRESS_TAIL = re.compile(r"\d{1,4}\s*[a-z]?$")
+
+
+def _looks_like_address(name: Optional[str]) -> bool:
+    """True when ``name`` looks like a street address, not a project name.
+
+    The lightweight metadata-extraction LLM occasionally returns the
+    applicant's address line as the projectName — the real
+    "Sönke-Nissen-Koog 58" smoke-test bug. A "Windpark…/Windenergie…"
+    token always means project name; otherwise a trailing house number
+    or a street suffix ("straße"/"str.") marks it as an address.
+    """
+    if not name:
+        return False
+    s = str(name).strip()
+    if _PROJECT_NAME_TOKENS.search(s):
+        return False
+    low = s.lower()
+    return bool(_ADDRESS_TAIL.search(s)) or "straße" in low or low.endswith("str.")
+
+
+# Onshore WEA rated power tops out near 7 MW in this corpus; an order of
+# magnitude above (e.g. 22000 kW reported for an Enercon E-70, which is
+# really ~2300 kW) is an extraction error. Letting it through made 8
+# turbines sum to a phantom 176 MW total in the Lamstedt smoke test.
+_MAX_PLAUSIBLE_WEA_KW = 10000.0  # 10 MW — generous ceiling for onshore WEA
+
+
+def _plausible_rated_kw(v) -> Optional[float]:
+    """Rated power in kW if physically plausible for an onshore WEA, else
+    ``None`` — so an order-of-magnitude misextraction can't drive the
+    reconciled total capacity (the reconciler then falls back to the
+    document-stated total)."""
+    try:
+        n = float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+    if n is None:
+        return None
+    return n if 0 < n <= _MAX_PLAUSIBLE_WEA_KW else None
+
 def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
     """Extract joined text + page count from a PDF.
 
@@ -565,8 +617,28 @@ def get_section_value(sections, section_id, label):
                 if row.label == label: return row.value
     return ""
 
+_WEA_COUNT_RE = re.compile(
+    r"(\d+)\s*(?:WEA|WKA|Windenergieanlagen?|Windkraftanlagen?|Anlagen|Turbines?)\b",
+    re.IGNORECASE,
+)
+
+
 def parse_wea_count(value):
-    m = re.search(r"(\d+)", value); return int(m.group(1)) if m else 0
+    """Best-effort turbine count from a free-text cell.
+
+    The cell is often prose ("… insgesamt 10 Anlagen …"), not a bare
+    number, so grabbing the first integer is wrong — it can latch onto a
+    date ("06.04.2005" → 6) or a parcel number. Prefer an explicit
+    turbine-count phrase ("10 Anlagen", "10 WEA", "10 Windenergieanlagen"),
+    then fall back to a leading bare integer, else 0.
+    """
+    if not value:
+        return 0
+    m = _WEA_COUNT_RE.search(value)
+    if m:
+        return int(m.group(1))
+    m = re.match(r"\s*(\d+)\b", value)
+    return int(m.group(1)) if m else 0
 
 def _parse_location_fields(location: str) -> dict:
     """Pull Gemeinde / Landkreis / Bundesland / Gemarkung out of the
@@ -1002,7 +1074,7 @@ def _apply_canonical_specs(weas: list[WEAStatus], specs: dict) -> int:
     canon: dict = {
         "hub_height_m": _num(specs.get("hub_height_m")),
         "rotor_diameter_m": _num(specs.get("rotor_diameter_m")),
-        "rated_power_kw": _num(specs.get("rated_power_kw")),
+        "rated_power_kw": _plausible_rated_kw(specs.get("rated_power_kw")),
         "manufacturer": (specs.get("manufacturer") or None),
         "model": (specs.get("model") or None),
     }
@@ -1121,7 +1193,7 @@ Rules:
             address=addr,
             hub_height_m=_num(w.get("hub_height_m")),
             rotor_diameter_m=_num(w.get("rotor_diameter_m")),
-            rated_power_kw=_num(w.get("rated_power_kw")),
+            rated_power_kw=_plausible_rated_kw(w.get("rated_power_kw")),
             manufacturer=w.get("manufacturer") or None,
             model=w.get("model") or None,
             status_code=sc,
@@ -1701,6 +1773,32 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     T["sections_s"] = round(time.time()-t, 2)
     progress("sections_done", 0.55)
     report.sections = sections
+
+    # ── Reconcile the project NAME against the section evidence ─────────
+    # ``pname`` was set early (above) from a lightweight metadata call over
+    # only three chunks, which sometimes returns the applicant's address
+    # line ("Sönke-Nissen-Koog 58") instead of the project's name. The
+    # overview "Project Name" cell is a stronger, evidence-anchored source
+    # produced by the full section analysis. When the caller gave no
+    # explicit name, prefer the section cell, then the early metadata
+    # value — skipping any address-shaped or placeholder candidate.
+    if not req.project_name:
+        _section_pname = clean_value(get_section_value(sections, "overview", "Project Name"), "")
+
+        def _usable_name(n: Optional[str]) -> bool:
+            return bool(n) and n not in ("Wind Energy Project", "Not specified in documents") \
+                and not _looks_like_address(n)
+
+        if _usable_name(_section_pname):
+            new_pname = _section_pname
+        elif _usable_name(meta.get("projectName")):
+            new_pname = meta.get("projectName")
+        else:
+            new_pname = pname if _usable_name(pname) else "Wind Energy Project"
+        if new_pname != pname:
+            logger.info("projectName reconciled: %r → %r", pname, new_pname)
+            pname = new_pname
+    report.projectName = pname
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     t = time.time()
