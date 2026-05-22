@@ -168,6 +168,79 @@ class TestPlausibleRatedKw:
         assert ddiq_report._plausible_rated_kw(10000.01) is None
 
 
+# ── header honesty: undeterminable + explicit park size ──────────────
+
+
+class TestSignalsUndeterminable:
+    def test_real_lamstedt_capacity_cell(self) -> None:
+        cell = ("Unbekannt (unzureichende Daten im Kontext, um die gesamte MW "
+                "zu summieren; teilweiser Verweis auf 2 MW pro Einheit für 10 "
+                "Einheiten in der Änderung von 2007)")
+        assert ddiq_report._signals_undeterminable(cell) is True
+
+    def test_real_lamstedt_count_cell(self) -> None:
+        cell = ("Die vorliegenden Dokumente erlauben keine vollständige "
+                "Aufstellung aller Windenergieanlagen des Projekts.")
+        assert ddiq_report._signals_undeterminable(cell) is True
+
+    def test_clean_cell_is_determinable(self) -> None:
+        assert ddiq_report._signals_undeterminable("Gesamtleistung ca. 16 MW (8 WEA).") is False
+        assert ddiq_report._signals_undeterminable("") is False
+
+
+class TestParseExplicitParkSize:
+    def test_per_unit_times_count(self) -> None:
+        # The real Lamstedt capacity cell: 2 MW × 10 Einheiten = 20 MW, count 10.
+        cell = "… teilweiser Verweis auf 2 MW pro Einheit für 10 Einheiten …"
+        count, total = ddiq_report._parse_explicit_park_size(cell)
+        assert count == 10 and total == 20.0
+
+    def test_explicit_total(self) -> None:
+        count, total = ddiq_report._parse_explicit_park_size("20 MW Gesamtleistung")
+        assert total == 20.0
+
+    def test_nothing_explicit(self) -> None:
+        count, total = ddiq_report._parse_explicit_park_size("Status unklar.")
+        assert count is None and total is None
+
+    def test_count_only(self) -> None:
+        count, total = ddiq_report._parse_explicit_park_size("10 Anlagen")
+        assert count == 10 and total is None
+
+
+# ── timeline severity calibration ────────────────────────────────────
+
+
+class TestDeadlineKindGate:
+    def test_genuine_deadline_kinds_promote(self) -> None:
+        for kind in ("permit_expiry", "renewal_deadline", "objection_window",
+                     "lease_term_end", "bond_validity", "warranty_end"):
+            assert ddiq_report._DEADLINE_KIND_RE.search(kind), kind
+
+    def test_informational_kinds_do_not_promote(self) -> None:
+        # These were marked RED as "expired" historical dates — the bug.
+        for kind in ("sonstiges", "other", "bauabschnitt", "construction_milestone"):
+            assert not ddiq_report._DEADLINE_KIND_RE.search(kind), kind
+
+
+# ── content-less finding filter ──────────────────────────────────────
+
+
+class TestContentlessFinding:
+    def test_bare_not_in_documents_is_dropped(self) -> None:
+        for txt in ("Nicht in den vorgelegten Dokumenten enthalten.",
+                    "Nicht enthalten", "Keine Angaben", "N/A", "", "   "):
+            assert ddiq_report._is_contentless_finding(SimpleNamespace(text=txt)) is True
+
+    def test_real_findings_are_kept(self) -> None:
+        keep = [
+            "Keine Rückbaubürgschaft in den vorgelegten Unterlagen gefunden – erforderlich gemäß §35 Abs. 5 BauGB.",
+            "Das OVG Niedersachsen hat die Genehmigung für L 6 aufgehoben.",
+        ]
+        for txt in keep:
+            assert ddiq_report._is_contentless_finding(SimpleNamespace(text=txt)) is False
+
+
 # ── make_parcel_polygon ──────────────────────────────────────────────
 
 

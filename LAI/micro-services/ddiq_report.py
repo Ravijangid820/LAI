@@ -684,6 +684,91 @@ def parse_wea_count(value):
     m = re.match(r"\s*(\d+)\b", value)
     return int(m.group(1)) if m else 0
 
+
+# A section cell that explicitly disclaims a determinable figure. When the
+# analysis itself says the number can't be established (often because the
+# documents cover more than one wind park), the header must NOT then assert a
+# confident count/capacity — it should show "unknown", matching the prose.
+_UNDETERMINABLE_RE = re.compile(
+    r"(?i)(unbekannt|unbestimmbar|nicht\s+eindeutig|keine\s+vollständige|"
+    r"nicht\s+ableitbar|nicht\s+bestimmbar|lässt\s+sich\s+nicht|"
+    r"nicht\s+eindeutig\s+hervor|unzureichende?\s+Daten)"
+)
+
+
+def _signals_undeterminable(cell: str) -> bool:
+    """True when a section cell explicitly says the figure can't be
+    determined from the documents."""
+    return bool(cell) and bool(_UNDETERMINABLE_RE.search(cell))
+
+
+# Timeline kinds that represent a genuine deadline/obligation whose expiry is
+# an ongoing risk — only these are promoted to RED/YELLOW findings. An
+# informational historical milestone (``other``/``sonstiges``,
+# ``construction_milestone``/``bauabschnitt``) is not promoted.
+_DEADLINE_KIND_RE = re.compile(
+    r"(?i)(permit|genehmigung|expir|ablauf|frist|renewal|verläng|lease|pacht|"
+    r"objection|widerspruch|bond|bürgschaft|warranty|gewährleist|deadline)"
+)
+
+# A finding whose entire text is a bare "not in the documents" stub, with no
+# stated subject. A genuine missing-document finding names what's missing and
+# is longer than this; a stub is noise that erodes trust.
+_CONTENTLESS_FINDING_RE = re.compile(
+    r"(?i)^\W*(nicht\s+(in\s+den\s+)?(vorgelegten|vorliegenden)\s+(dokumenten|unterlagen)\s+"
+    r"(enthalten|gefunden|vorhanden)|nicht\s+enthalten|keine\s+angaben|"
+    r"not\s+(found|in\s+(the\s+)?documents)|n/?a)\W*$"
+)
+
+
+def _is_contentless_finding(f) -> bool:
+    """True for a finding that says nothing actionable — empty text, or a bare
+    'not in the documents' stub with no stated subject."""
+    text = (getattr(f, "text", "") or "").strip()
+    if len(text) < 12:
+        return True
+    return bool(_CONTENTLESS_FINDING_RE.match(text))
+
+
+_PER_UNIT_MW_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*MW\s*(?:pro|je|/)\s*(?:Einheit|Anlage|WEA|Turbine)",
+    re.IGNORECASE,
+)
+_UNIT_COUNT_RE = re.compile(
+    r"(\d+)\s*(?:Einheiten|Einheit|Anlagen|WEA|Windenergieanlagen?|Turbinen)\b",
+    re.IGNORECASE,
+)
+_TOTAL_MW_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*MW\s*(?:gesamt|insgesamt|Gesamtleistung)",
+    re.IGNORECASE,
+)
+
+
+def _parse_explicit_park_size(*cells: str) -> tuple[Optional[int], Optional[float]]:
+    """Pull an explicit, document-stated park size out of the section cells.
+
+    Recognises the deliberate figures a permit states — e.g. "2 MW pro Einheit
+    für 10 Einheiten", "10 Anlagen … je 2 MW", or "20 MW Gesamtleistung" — and
+    returns ``(turbine_count, total_mw)``. These are far more trustworthy than
+    counting extracted per-WEA rows, which can merge a neighbouring park's
+    turbines or duplicates. Either element is ``None`` when not stated.
+    """
+    text = " ".join(c for c in cells if c)
+    if not text:
+        return None, None
+    cnt_m = _UNIT_COUNT_RE.search(text)
+    per_m = _PER_UNIT_MW_RE.search(text)
+    tot_m = _TOTAL_MW_RE.search(text)
+    count = int(cnt_m.group(1)) if cnt_m else None
+    per_mw = float(per_m.group(1).replace(",", ".")) if per_m else None
+    if tot_m:
+        total = round(float(tot_m.group(1).replace(",", ".")), 3)
+    elif count and per_mw:
+        total = round(count * per_mw, 3)
+    else:
+        total = None
+    return count, total
+
 def _parse_location_fields(location: str) -> dict:
     """Pull Gemeinde / Landkreis / Bundesland / Gemarkung out of the
     section's Location value.
@@ -2037,61 +2122,53 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     # different sections. Precedence: cadastral > llm > regex > fallback.
     # See ``_reconcile.py`` for the rationale.
 
-    # total_capacity_mw: the overview section's typed cell is a regex hit;
-    # sum(WEA.rated_power_kw) is an LLM-extracted derived value. We take
-    # the LLM-derived sum first when present, falling back to the regex.
+    # Header capacity + turbine count. Precedence, in order of trust:
+    #   1. an explicit document-stated park size ("2 MW pro Einheit für 10
+    #      Einheiten" → 10 / 20 MW) — a deliberate figure in the permit;
+    #   2. honest "unknown" when the cell itself disclaims a determinable
+    #      number (often because the documents cover two wind parks) — we must
+    #      NOT then assert the raw per-WEA row count, which merges the
+    #      neighbouring park's turbines and duplicates (the "23 turbines /
+    #      46 MW" smoke-test bug);
+    #   3. only as a last resort, the extracted per-WEA figures.
     cap_str = get_section_value(sections, "overview", "Total Capacity")
-    regex_total_mw: Optional[float] = None
-    try:
-        m = re.search(r"([\d,.]+)\s*MW", cap_str or "", re.IGNORECASE)
-        if m:
-            regex_total_mw = float(m.group(1).replace(",", "."))
-    except Exception:
-        regex_total_mw = None
+    woa_str = get_section_value(sections, "overview", "Number of WEA")
+    explicit_count, explicit_total_mw = _parse_explicit_park_size(cap_str, woa_str)
 
     wea_capacities_kw = [w.rated_power_kw for w in weas if w.rated_power_kw]
     sum_total_mw: Optional[float] = (
         round(sum(wea_capacities_kw) / 1000.0, 3) if wea_capacities_kw else None
     )
-
-    total_mw_reconciled = reconcile_numeric(
-        "total_capacity_mw",
-        [
-            Candidate(value=sum_total_mw, provenance="llm",
-                      source="sum(weas.rated_power_kw)/1000"),
-            Candidate(value=regex_total_mw, provenance="regex",
-                      source="overview.Total Capacity"),
-        ],
-    )
-    total_mw: Optional[float] = total_mw_reconciled.value if total_mw_reconciled else None
-
-    # turbine_count: parse_wea_count(overview cell) is regex; len(weas) is
-    # the LLM extraction. When the LLM successfully extracted per-WEA
-    # rows, that count is more trustworthy than a regex on a single cell.
-    regex_wea_count: Optional[int] = None
-    try:
-        rc = parse_wea_count(get_section_value(sections, "overview", "Number of WEA"))
-        regex_wea_count = rc if rc > 0 else None
-    except Exception:
-        regex_wea_count = None
     llm_wea_count: Optional[int] = len(weas) if weas else None
 
-    turbine_count_reconciled = reconcile_numeric(
-        "turbine_count",
-        [
-            Candidate(value=llm_wea_count, provenance="llm",
-                      source="len(weas) — extract_wea_statuses"),
-            Candidate(value=regex_wea_count, provenance="regex",
-                      source="overview.Number of WEA"),
-        ],
-    )
-    # Stash the reconciled count on the report so the UI and the cross-doc
-    # consistency check both quote the same number.
-    report.turbineCount = (
-        int(turbine_count_reconciled.value)
-        if turbine_count_reconciled and turbine_count_reconciled.value is not None
-        else 0
-    )
+    # ── total capacity ──
+    if explicit_total_mw is not None:
+        total_mw = explicit_total_mw
+        logger.info("total_capacity_mw: %.1f from explicit document figure", total_mw)
+    elif _signals_undeterminable(cap_str):
+        total_mw = None
+        logger.warning("total_capacity_mw: cell disclaims a figure → header 'unknown' "
+                       "(per-WEA sum was %s)", sum_total_mw)
+    else:
+        total_mw = sum_total_mw
+    total_mw: Optional[float] = total_mw
+
+    # ── turbine count ──
+    doc_count = parse_wea_count(woa_str) or None
+    if explicit_count is not None:
+        turbine_count = explicit_count
+        logger.info("turbine_count: %d from explicit document figure", turbine_count)
+    elif _signals_undeterminable(woa_str) and not doc_count:
+        turbine_count = 0  # 0 == unknown (ProjectFacts contract)
+        logger.warning("turbine_count: cell disclaims a figure → header 'unknown' "
+                       "(extracted %s rows)", llm_wea_count)
+    elif doc_count and llm_wea_count and abs(llm_wea_count - doc_count) > max(2, round(0.25 * doc_count)):
+        turbine_count = doc_count  # explicit doc total beats a divergent row count
+        logger.warning("turbine_count: extracted rows (%d) diverge from document count "
+                       "(%d); trusting the document", llm_wea_count, doc_count)
+    else:
+        turbine_count = llm_wea_count or doc_count or 0
+    report.turbineCount = int(turbine_count or 0)
 
     # bundesland: keyword scan on the location string vs. bbox derivation
     # from the geocoded project_center. The bbox derivation is grounded
@@ -2228,10 +2305,14 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
 
     # Promote material timeline events (urgent / expired) into Findings so
     # the lawyer's findings list reflects deadline pressure, not just
-    # section issues.
+    # section issues. ONLY genuine deadline/obligation kinds qualify — an
+    # informational historical milestone ("Sonstiges: date of the original
+    # 2005 permit", "Bauabschnitt: …") is not a risk and must not surface as
+    # a RED finding; doing so over-inflates the red count and erodes trust in
+    # the rubric. Those entries still appear in the timeline view.
     deadline_findings: list[Finding] = []
     for te in timeline:
-        if te.urgency in ("expired", "urgent"):
+        if te.urgency in ("expired", "urgent") and _DEADLINE_KIND_RE.search(te.kind or ""):
             sev = "red" if te.urgency == "expired" else "yellow"
             deadline_findings.append(Finding(
                 domain="Regulatory" if "permit" in te.kind or "objection" in te.kind else "General",
@@ -2272,6 +2353,15 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
 
     # Combine all findings; section findings stay first, then derived.
     all_findings = list(findings) + deadline_findings
+    # Drop content-less placeholder findings — a row whose entire text is a
+    # bare "Nicht in den vorgelegten Dokumenten enthalten" with no stated
+    # subject says nothing a lawyer can act on and reads as a stub. A real
+    # "missing document" finding names WHAT is missing (those are kept).
+    _kept = [f for f in all_findings if not _is_contentless_finding(f)]
+    if len(_kept) < len(all_findings):
+        logger.info("findings: dropped %d content-less placeholder finding(s)",
+                    len(all_findings) - len(_kept))
+    all_findings = _kept
     report.findings = all_findings
 
     # ── Output guardrail pass (Track A item 5) ────────────────────────
