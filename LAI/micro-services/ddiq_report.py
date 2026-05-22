@@ -1454,6 +1454,32 @@ def upload_document(
     return UploadDocResponse(id=did, filename=file.filename, pages=pages, chunks=len(chunks), status="analyzed",
         message=f"{file.filename}: {pages} pages, {len(chunks)} chunks")
 
+
+@router.delete("/documents/{doc_id}")
+def delete_document(doc_id: str, user: CurrentUser = Depends(get_current_user)):
+    """Hard-delete an uploaded document and its chunks. Idempotent — returns
+    404 if the id is unknown OR owned by a different user.
+
+    ``ddiq_doc_chunks.doc_id`` has ON DELETE CASCADE, so removing the
+    document row drops its chunks automatically. AUTH_PLAN G2: the user
+    filter is on both the ownership check and the DELETE, so a cross-tenant
+    delete is structurally impossible.
+    """
+    uid = str(user.id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM ddiq_documents WHERE id = %s AND user_id = %s",
+                (doc_id, uid),
+            )
+            if not cur.fetchone():
+                raise HTTPException(404, "Document not found")
+            cur.execute(
+                "DELETE FROM ddiq_documents WHERE id = %s AND user_id = %s",
+                (doc_id, uid),
+            )
+    return {"deleted": True, "document_id": doc_id}
+
 # ─── Request dedup ────────────────────────────────────────────────────────
 # A 30-60 min pipeline run is too expensive to repeat for the same input.
 # We fingerprint (sorted doc_ids, preset, project_name) and look up
