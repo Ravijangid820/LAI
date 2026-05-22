@@ -73,6 +73,12 @@ __all__ = [
 
 Language = Literal["de", "en", "mixed", "unknown"]
 
+# Evidence-chunk indices the analyzer LLM is told to cite (``[#1]``, ``[#3]``,
+# ``[#1, 3]``). They belong in the structured ``evidence_chunks`` array, not in
+# the prose a partner reads — strip them from rendered values / notes / finding
+# text. (See ddiq/rag.py for where the ``[#n]`` numbering is introduced.)
+_CHUNK_REF_RE = re.compile(r"\s*\[#\s*\d+(?:\s*,\s*\d+)*\s*\]")
+
 # Canonical replacement strings for defensive-AI paragraphs. Short, clear,
 # language-matched so the rest of the report stays consistent.
 MISSING_VALUE_DE = "Nicht in den vorgelegten Dokumenten enthalten."
@@ -263,18 +269,22 @@ def scrub_row_value(value: str, target_language: Language = "de") -> ScrubReport
          marker in ``target_language``; mark ``was_defensive``.
       3. If not defensive: strip hedges in the row's language.
     """
-    if not value or not value.strip():
+    original = value or ""
+    # Strip leaked [#n] evidence-chunk indices first so they never reach the
+    # rendered cell; ``original`` is preserved for audit.
+    work = _CHUNK_REF_RE.sub("", original)
+    if not work.strip():
         return ScrubReport(
-            original=value or "",
-            cleaned=value or "",
+            original=original,
+            cleaned=work,
             was_defensive=False,
             hedges_stripped=0,
             language="unknown",
         )
-    language = detect_language(value)
-    if detect_defensive_ai(value):
+    language = detect_language(work)
+    if detect_defensive_ai(work):
         return ScrubReport(
-            original=value,
+            original=original,
             cleaned=(
                 MISSING_VALUE_DE if target_language == "de" else MISSING_VALUE_EN
             ),
@@ -282,9 +292,9 @@ def scrub_row_value(value: str, target_language: Language = "de") -> ScrubReport
             hedges_stripped=0,
             language=language,
         )
-    cleaned, n = strip_hedges(value, language)
+    cleaned, n = strip_hedges(work, language)
     return ScrubReport(
-        original=value,
+        original=original,
         cleaned=cleaned,
         was_defensive=False,
         hedges_stripped=n,
@@ -349,16 +359,21 @@ def apply_to_rows(
             if getattr(row, "ampel", "") == "green":
                 row.ampel = "yellow"
         counts["hedges"] += report.hedges_stripped
-        # Mixed-language flag: append to note (don't overwrite).
+        # Mixed-language: count for logging only. We no longer surface a
+        # "[Sprache: …]" marker in the client deliverable — A8 single-language
+        # re-prompting (ddiq_report) fixes wholly-wrong-language cells, and a
+        # bracketed debug tag in a partner-facing report reads as a defect.
         if (
             section_language_hint is not None
             and report.language not in ("unknown", section_language_hint)
         ):
             counts["mixed_lang"] += 1
-            mark = f"[Sprache: {report.language}; Abschnitt: {section_language_hint}]"
-            existing = getattr(row, "note", "") or ""
-            if mark not in existing:
-                row.note = f"{existing} {mark}".strip()
+        # Strip any leaked [#n] evidence-chunk indices from the note too.
+        _note = getattr(row, "note", None)
+        if _note:
+            _clean_note = _CHUNK_REF_RE.sub("", _note).strip()
+            if _clean_note != _note:
+                row.note = _clean_note or None
     return counts
 
 
