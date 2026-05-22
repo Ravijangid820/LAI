@@ -316,8 +316,12 @@ _MAX_WEA_SPREAD_KM = 25.0
 # bad area can never explode the grid.
 _MAX_ALKIS_GRID_POINTS = 400
 # Stop hammering ALKIS once it's clearly down (e.g. HTTP 530) rather than
-# grinding every grid point × its internal retries.
+# grinding every grid point × its internal retries. ``CONSECUTIVE`` catches a
+# hard outage fast; ``TOTAL`` is a defence-in-depth budget for a FLAKY WFS that
+# alternates success/failure (which would keep resetting the consecutive
+# counter). Either tripping aborts the lookup → estimated parcels downstream.
 _MAX_ALKIS_CONSECUTIVE_FAILURES = 8
+_MAX_ALKIS_TOTAL_FAILURES = 20
 
 
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -1071,6 +1075,7 @@ class CadastralPipeline:
         logger.info(f"Step 2: Querying ALKIS at {len(unique_points)} points ({bundesland})")
 
         consecutive_failures = 0
+        total_failures = 0
         for lat, lng in unique_points:
             try:
                 alkis_results = self.alkis_query(lat, lng, bundesland, 200)
@@ -1093,15 +1098,19 @@ class CadastralPipeline:
                 time.sleep(0.3)
             except Exception as e:
                 consecutive_failures += 1
+                total_failures += 1
                 logger.warning(f"ALKIS query at ({lat:.5f},{lng:.5f}) failed: {e}")
-                # ALKIS clearly unreachable (e.g. HTTP 530) — stop rather than
-                # grinding every remaining grid point × its internal retries.
-                # The pipeline falls back to estimated parcels downstream.
-                if consecutive_failures >= _MAX_ALKIS_CONSECUTIVE_FAILURES:
+                # ALKIS clearly unreachable (e.g. HTTP 530) or persistently
+                # flaky — stop rather than grinding every remaining grid point ×
+                # its internal retries. The pipeline falls back to estimated
+                # parcels downstream.
+                if (consecutive_failures >= _MAX_ALKIS_CONSECUTIVE_FAILURES
+                        or total_failures >= _MAX_ALKIS_TOTAL_FAILURES):
                     logger.warning(
-                        "Step 2: ALKIS unreachable (%d consecutive failures) — "
-                        "aborting cadastral lookup after %d collected parcel(s)",
-                        consecutive_failures, len(parcels),
+                        "Step 2: ALKIS unreachable/flaky (%d consecutive, %d "
+                        "total failures) — aborting cadastral lookup after %d "
+                        "collected parcel(s)",
+                        consecutive_failures, total_failures, len(parcels),
                     )
                     break
 

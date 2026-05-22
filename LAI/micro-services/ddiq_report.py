@@ -68,6 +68,7 @@ from lai.common.jurisdiction import (
 from lai.common.connectors import (
     AlkisClient,
     AlkisError,
+    AlkisRetryExhaustedError,
     NominatimClient,
     NominatimError,
 )
@@ -589,7 +590,19 @@ def alkis_query_parcels(
         parcels = _ALKIS_CLIENT.query_parcels(
             lat=lat, lng=lng, bundesland=bundesland, radius_m=radius_m,
         )
+    except AlkisRetryExhaustedError as e:
+        # WFS is unreachable (transport / 5xx exhausted — e.g. HTTP 530). Do
+        # NOT swallow this as an empty result: that hides a systemic outage as
+        # "no parcels here", resetting the pipeline's circuit-breaker on every
+        # point so it grinds all ~hundreds of grid points (each with its own
+        # retries) for hours. Propagate so _step2_collect_parcels' breaker
+        # trips, aborts the cadastral lookup, and degrades to estimated parcels.
+        logger.warning("ALKIS WFS unreachable for %s: %s — aborting lookup", bundesland, e)
+        raise
     except AlkisError as e:
+        # Non-systemic: unsupported Bundesland (city-states), a 4xx for this
+        # point, or a parse miss = "no data here", not an outage. Swallow and
+        # continue to the next point.
         logger.warning("ALKIS WFS failed for %s: %s", bundesland, e)
         return []
 

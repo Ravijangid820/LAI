@@ -69,3 +69,52 @@ class TestGuardConstants:
         # A real wind park spans a few km; the limit must be generous enough
         # to keep a real park whole but tight enough to catch a wrong-town pin.
         assert 5 <= cp._MAX_WEA_SPREAD_KM <= 50
+
+    def test_total_failure_budget_is_bounded(self) -> None:
+        assert cp._MAX_ALKIS_TOTAL_FAILURES >= cp._MAX_ALKIS_CONSECUTIVE_FAILURES
+        assert cp._MAX_ALKIS_TOTAL_FAILURES <= 100
+
+
+class TestAlkisCircuitBreaker:
+    """When the WFS is unreachable (the wrapper now propagates the failure
+    instead of swallowing it as []), the loop must abort after the breaker
+    threshold — NOT grind every grid point. This is the bug that left reports
+    'running' for hours."""
+
+    @staticmethod
+    def _park_area() -> "cp.ProjectArea":
+        # ~2 km box → a 300 m grid yields far more points than the breaker
+        # threshold, so a non-tripping loop would call alkis_query many times.
+        lat, lng = 53.636, 9.098
+        d = 0.02
+        poly = [(lat - d, lng - d), (lat - d, lng + d),
+                (lat + d, lng + d), (lat + d, lng - d)]
+        return cp.ProjectArea(
+            name="t", polygon=poly, centroid_lat=lat, centroid_lng=lng,
+            area_km2=16.0, source="test",
+        )
+
+    def test_breaker_trips_and_does_not_grind_all_points(self) -> None:
+        calls = {"n": 0}
+
+        def failing(lat: float, lng: float, bundesland: str, radius: int):
+            calls["n"] += 1
+            raise RuntimeError("HTTP 530")  # WFS unreachable (propagated)
+
+        pipe = cp.CadastralPipeline(alkis_query_fn=failing)
+        parcels = pipe._step2_collect_parcels(self._park_area(), "niedersachsen", [])
+
+        # Aborted after the breaker threshold instead of hitting every point.
+        assert calls["n"] <= cp._MAX_ALKIS_CONSECUTIVE_FAILURES
+        assert parcels == []
+
+    def test_no_query_when_no_bundesland(self) -> None:
+        calls = {"n": 0}
+
+        def failing(*_a, **_k):
+            calls["n"] += 1
+            raise RuntimeError("should not be called")
+
+        pipe = cp.CadastralPipeline(alkis_query_fn=failing)
+        parcels = pipe._step2_collect_parcels(self._park_area(), "", [])
+        assert calls["n"] == 0 and parcels == []
