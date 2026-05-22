@@ -88,3 +88,32 @@ def test_await_ready_false_when_done_but_zero_chunks(monkeypatch):
 def test_await_ready_zero_timeout_disables_wait(monkeypatch):
     # 0 (or negative) timeout → no wait, returns False immediately.
     assert sr._await_matter_ready("s", "u", 0) is False
+
+
+def test_matter_progress_sums_ingesting_docs(monkeypatch):
+    _docs(monkeypatch, [
+        {"status": "processing", "pages_done": 4, "pages_total": 10},
+        {"status": "queued", "pages_done": 0, "pages_total": 6},
+        {"status": "done", "pages_done": 12, "pages_total": 12},  # excluded
+    ])
+    assert sr._matter_progress("s", "u") == (4, 16)
+
+
+def test_matter_progress_no_docs(monkeypatch):
+    _docs(monkeypatch, [])
+    assert sr._matter_progress("s", "u") == (0, 0)
+
+
+def test_build_turn_msgs_modes():
+    # mode selection is the contract that must not drift between /query and
+    # /query/stream (and the in-stream rebuild). msgs just needs to be built.
+    for use_rag, use_contract, expected in [
+        (True, True, "rag+contract"),
+        (True, False, "rag"),
+        (False, True, "contract"),
+        (False, False, "chat"),
+    ]:
+        mode, msgs = sr._build_turn_msgs(
+            use_rag, use_contract, "Was gilt?", [], [], [], "", "de")
+        assert mode == expected
+        assert isinstance(msgs, list) and msgs

@@ -1334,6 +1334,46 @@ def _await_matter_ready(sid: str, uid: str, timeout_s: float) -> bool:
     )
 
 
+def _matter_progress(sid: str, uid: str) -> tuple[int, int]:
+    """(pages_done, pages_total) summed over the session's still-ingesting
+    documents — drives the live "Seite X/Y" progress shown while waiting."""
+    try:
+        docs = persistence.list_matter_documents(sid, user_id=uid)
+    except Exception:
+        return 0, 0
+    proc = [
+        d for d in docs
+        if (d.get("status") or "").lower() in ("queued", "processing", "uploading")
+    ]
+    return (
+        sum(int(d.get("pages_done") or 0) for d in proc),
+        sum(int(d.get("pages_total") or 0) for d in proc),
+    )
+
+
+def _build_turn_msgs(
+    use_rag: bool, use_contract: bool, question: str,
+    rag_sources: list, matter_sources: list, history, meta_prefix, answer_lang,
+) -> tuple[str, list]:
+    """Pick the chat mode and assemble the LLM messages for one turn. Shared
+    by /query and /query/stream (and re-used after an in-stream OCR wait) so
+    the two paths can't drift."""
+    if use_rag and use_contract:
+        return "rag+contract", build_rag_messages(
+            question, rag_sources, history=history, meta_prefix=meta_prefix,
+            target_language=answer_lang)
+    if use_rag:
+        return "rag", build_rag_messages(
+            question, rag_sources, history=history, meta_prefix=meta_prefix,
+            target_language=answer_lang)
+    if use_contract:
+        return "contract", build_rag_messages(
+            question, matter_sources, history=history, meta_prefix=meta_prefix,
+            target_language=answer_lang, system=RAG_SYSTEM_DOC_ONLY)
+    return "chat", build_chat_messages(
+        question, history=history, meta_prefix=meta_prefix, target_language=answer_lang)
+
+
 def _build_matter_context(
     sid: str, uid: str, use_contract: bool, question: str = "",
 ) -> tuple[list["RetrievedSource"], list["ChunkOut"], str]:
@@ -3109,43 +3149,17 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         sid, uid, use_contract, req.question,
     )
 
-    # Wait-and-answer (same as /query): wait for a still-OCR'ing upload to
-    # finish, then re-retrieve, so the streamed turn answers automatically
-    # instead of refusing. The client shows its typing indicator during the
-    # wait; the answer then streams in. Guard handles timeout/failure.
-    if use_contract and not matter_sources and _matter_is_processing(sid, uid):
-        print(f"[wait] session={sid} stream=1 doc still ingesting — waiting up to "
-              f"{int(_MATTER_WAIT_S)}s before answering", flush=True)
-        if _await_matter_ready(sid, uid, _MATTER_WAIT_S):
-            matter_sources, matter_chunks, contract_text = _build_matter_context(
-                sid, uid, use_contract, req.question,
-            )
+    # NOTE: the wait-for-OCR happens INSIDE the generator below (not here), so
+    # it can stream live progress + heartbeats while waiting (proxy-safe).
 
     history = _load_history(sid, user_id=uid)
     meta_prefix = _matter_manifest_prefix(sid, uid) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
     rag_sources = matter_sources + corpus_sources
 
-    if use_rag and use_contract:
-        mode = "rag+contract"
-        msgs = build_rag_messages(req.question, rag_sources,
-                                  history=history, meta_prefix=meta_prefix,
-                                  target_language=answer_lang)
-    elif use_rag:
-        mode = "rag"
-        msgs = build_rag_messages(req.question, rag_sources,
-                                  history=history, meta_prefix=meta_prefix,
-                                  target_language=answer_lang)
-    elif use_contract:
-        mode = "contract"
-        msgs = build_rag_messages(req.question, matter_sources,
-                                  history=history, meta_prefix=meta_prefix,
-                                  target_language=answer_lang,
-                                  system=RAG_SYSTEM_DOC_ONLY)
-    else:
-        mode = "chat"
-        msgs = build_chat_messages(req.question, history=history,
-                                   meta_prefix=meta_prefix,
-                                   target_language=answer_lang)
+    mode, msgs = _build_turn_msgs(
+        use_rag, use_contract, req.question, rag_sources, matter_sources,
+        history, meta_prefix, answer_lang,
+    )
 
     chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
     max_new_tokens = 1800 if (use_rag or use_contract) else 1024
@@ -3159,8 +3173,61 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
 
     def _generator():
         """Yield SSE bytes for the lifetime of the request."""
+        # Rebound after an in-stream OCR wait so the rest of the generator
+        # (stream, citation/jurisdiction checks, persist, complete) uses the
+        # freshly-retrieved sources.
+        nonlocal matter_sources, matter_chunks, contract_text
+        nonlocal rag_sources, mode, msgs, chunks_out, guard_msg
         t0 = time.time()
         accumulated: list[str] = []
+
+        # In-stream wait-and-answer: if a doc-scoped turn has no matter content
+        # yet because the upload is still being OCR'd, emit a ``status`` event
+        # each poll — it carries the live "Seite X/Y" page progress AND, being
+        # a real SSE frame, doubles as a heartbeat so a reverse proxy / client
+        # doesn't time out the wait. Then re-retrieve + reassemble the turn so
+        # the answer streams in automatically. Guard handles timeout/failure.
+        if use_contract and not matter_sources and _matter_is_processing(sid, uid):
+            print(f"[wait] session={sid} stream=1 doc ingesting — streaming progress "
+                  f"up to {int(_MATTER_WAIT_S)}s", flush=True)
+            deadline = time.time() + _MATTER_WAIT_S
+            _notice_sent = False
+            while time.time() < deadline and _matter_is_processing(sid, uid):
+                pdone, ptotal = _matter_progress(sid, uid)
+                # 'status' event: live page progress (rendered once the client
+                # handles 'status') AND a real SSE frame that keeps a reverse
+                # proxy from timing out the wait.
+                yield _sse_event("status", {
+                    "state": "processing",
+                    "pages_done": pdone,
+                    "pages_total": ptotal,
+                    "message": (f"Dokument wird verarbeitet… Seite {pdone}/{ptotal}"
+                                if ptotal else "Dokument wird verarbeitet…"),
+                })
+                # The client's 60s stall-watchdog is re-armed only on 'token'
+                # events, so emit one here too. The first carries a visible
+                # notice; the rest are empty (re-arm only). These are streamed
+                # but NOT added to ``accumulated`` — the saved/validated answer
+                # stays clean (the client replaces the bubble on 'complete').
+                if not _notice_sent:
+                    yield _sse_event("token", {"delta": (
+                        "⏳ *Ihr Dokument wird noch verarbeitet — einen Moment, "
+                        "ich beantworte Ihre Frage automatisch, sobald es bereit ist.*\n\n"
+                    )})
+                    _notice_sent = True
+                else:
+                    yield _sse_event("token", {"delta": ""})
+                time.sleep(_MATTER_WAIT_POLL_S)
+            matter_sources, matter_chunks, contract_text = _build_matter_context(
+                sid, uid, use_contract, req.question)
+            rag_sources = matter_sources + corpus_sources
+            mode, msgs = _build_turn_msgs(
+                use_rag, use_contract, req.question, rag_sources, matter_sources,
+                history, meta_prefix, answer_lang)
+            chunks_out = matter_chunks + corpus_chunks
+            guard_msg = _empty_grounding_guard(
+                mode, matter_sources, rag_sources, sid, uid, answer_lang)
+
         if guard_msg is not None:
             print(f"[guard] session={sid} mode={mode} stream=1 empty-retrieval → "
                   "honest refusal (no LLM call)", flush=True)
