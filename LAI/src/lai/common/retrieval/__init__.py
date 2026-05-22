@@ -18,7 +18,11 @@ DDiQ engine + the statutory-grounding path.
 
 from __future__ import annotations
 
-from lai.common.retrieval.client import RetrievalClient, RetrievedChunk
+from lai.common.retrieval.client import (
+    RetrievalClient,
+    RetrievedChunk,
+    RetrievedMatterChunk,
+)
 from lai.common.retrieval.config import INDEX_DIM, RetrievalConfig
 from lai.common.retrieval.metrics import RetrievalMetrics, default_retrieval_metrics
 
@@ -28,5 +32,6 @@ __all__ = [
     "RetrievalConfig",
     "RetrievalMetrics",
     "RetrievedChunk",
+    "RetrievedMatterChunk",
     "default_retrieval_metrics",
 ]

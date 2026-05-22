@@ -87,14 +87,24 @@ CREATE INDEX IF NOT EXISTS idx_messages_session
 -- ``sessions.contract_text`` (see upload()) so the single-document
 -- analyze-contract path and older clients keep working unchanged.
 CREATE TABLE IF NOT EXISTS matter_documents (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id  TEXT NOT NULL,
-    doc_index   INTEGER NOT NULL,      -- the n in [M-n], 1-based, stable
-    filename    TEXT,
-    doc_text    TEXT,                  -- extracted markdown/text
-    n_pages     INTEGER,
-    upload_ext  TEXT,                  -- ".pdf" / ".docx" — file on disk
-    created_at  REAL NOT NULL,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT NOT NULL,
+    doc_index    INTEGER NOT NULL,      -- the n in [M-n], 1-based, stable
+    filename     TEXT,
+    doc_text     TEXT,                  -- extracted markdown/text (filled by worker)
+    n_pages      INTEGER,
+    upload_ext   TEXT,                  -- ".pdf" / ".docx" — file on disk
+    created_at   REAL NOT NULL,
+    -- Async ingestion status: a document is queued the instant it's
+    -- uploaded (so the UI never blocks), then a background worker walks it
+    -- through processing → done|failed. ``pages_done``/``pages_total``
+    -- drive the live progress bar; ``n_chunks`` is how many passages were
+    -- indexed into pgvector; ``error`` carries the failure reason.
+    status       TEXT NOT NULL DEFAULT 'done',  -- queued|processing|done|failed
+    pages_done   INTEGER NOT NULL DEFAULT 0,
+    pages_total  INTEGER NOT NULL DEFAULT 0,
+    n_chunks     INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
@@ -153,6 +163,28 @@ def init(db_path: Path, uploads_dir: Path) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
     if "session_meta_json" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN session_meta_json TEXT")
+
+    # ``chunks_json`` holds the retrieval chunks ([M-n]/[C-n] sources) that
+    # backed an assistant message, so citation chips still resolve to their
+    # source after a page reload / conversation switch (the chunks otherwise
+    # live only in the in-memory SSE response and vanish on rehydrate).
+    msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "chunks_json" not in msg_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN chunks_json TEXT")
+
+    # Async-ingestion status columns on matter_documents (added with the
+    # background-indexing feature). Older rows default to 'done' so existing
+    # uploads keep working; new uploads start 'queued'.
+    md_cols = {r["name"] for r in conn.execute("PRAGMA table_info(matter_documents)")}
+    for col, ddl in (
+        ("status", "ALTER TABLE matter_documents ADD COLUMN status TEXT NOT NULL DEFAULT 'done'"),
+        ("pages_done", "ALTER TABLE matter_documents ADD COLUMN pages_done INTEGER NOT NULL DEFAULT 0"),
+        ("pages_total", "ALTER TABLE matter_documents ADD COLUMN pages_total INTEGER NOT NULL DEFAULT 0"),
+        ("n_chunks", "ALTER TABLE matter_documents ADD COLUMN n_chunks INTEGER NOT NULL DEFAULT 0"),
+        ("error", "ALTER TABLE matter_documents ADD COLUMN error TEXT"),
+    ):
+        if col not in md_cols:
+            conn.execute(ddl)
 
     # The feedback table + its unique index were added late; older DBs
     # predate the unique index even when they have the table. Re-running
@@ -292,6 +324,21 @@ def save_session(sid: str, data: dict) -> None:
         )
 
 
+def set_session_contract(sid: str, contract_text: str, n_pages: int) -> None:
+    """Fill a session's ``contract_text`` / ``n_pages`` after async ingestion.
+
+    The first uploaded document mirrors into these columns so the legacy
+    single-document paths (analyze-contract, the old document preview)
+    keep working. Done from the background worker once OCR finishes —
+    upload() now creates the session row with empty contract_text so it can
+    return immediately."""
+    with _STATE["lock"]:
+        _conn().execute(
+            "UPDATE sessions SET contract_text = ?, n_pages = ?, updated_at = ? WHERE id = ?",
+            (contract_text, n_pages, time.time(), sid),
+        )
+
+
 def update_session_title(sid: str, title: str, user_id: Optional[str] = None) -> bool:
     """Set the user-facing title for a session. Pass an empty string to
     clear (which falls back to the COALESCE chain in list_sessions).
@@ -315,8 +362,32 @@ def update_session_title(sid: str, title: str, user_id: Optional[str] = None) ->
         return cur.rowcount > 0
 
 
+def _delete_session_files(sid: str) -> None:
+    """Remove every uploaded blob on disk that belongs to a session.
+
+    Files are named ``<sid><ext>`` (legacy single upload) and
+    ``<sid>_m<doc_id><ext>`` (matter documents). Session ids are
+    fixed-length UUIDs, so the single glob ``<sid>*`` matches exactly
+    this session's files — one UUID can't be a prefix of another — and
+    never another session's. Best-effort: a missing file or unlink error
+    must not block the DB delete.
+    """
+    base = _STATE.get("uploads_dir")
+    if not base:
+        return
+    try:
+        for p in Path(base).glob(f"{sid}*"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def delete_session(sid: str, user_id: Optional[str] = None) -> bool:
-    """Delete a session and its messages.
+    """Delete a session, its messages, matter documents, feedback, AND the
+    uploaded files on disk.
 
     Returns ``True`` when a session row was actually deleted (caller
     maps a ``False`` return to 404 — never 403 — to avoid leaking
@@ -334,7 +405,13 @@ def delete_session(sid: str, user_id: Optional[str] = None) -> bool:
             # Foreign-keys ON CASCADE was added to the schema, but
             # historical DBs may predate that; clean up messages
             # explicitly to keep the contract identical across schemas.
+            # (matter_documents / feedback rely on the FK cascade, which
+            # is enforced because init() sets PRAGMA foreign_keys=ON.)
             _conn().execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+            # The cascade only clears DB rows — the uploaded PDF/DOCX
+            # bytes live on disk and would otherwise be orphaned forever
+            # (a confidentiality / retention problem for a legal product).
+            _delete_session_files(sid)
         return deleted
 
 
@@ -403,22 +480,28 @@ def add_message(
     content: str,
     mode: Optional[str] = None,
     user_id: Optional[str] = None,
+    chunks: Optional[list] = None,
 ) -> int:
     """Append a message. Returns the new row id (or 0 on insert failure).
 
     When ``user_id`` is provided we verify ownership before writing —
     a foreign caller cannot inject messages into someone else's chat
     history (AUTH_PLAN G3).
+
+    ``chunks`` (assistant turns only) are the citation sources behind the
+    answer; stored as JSON so the citation panel still resolves [M-n]/
+    [C-n] handles after the conversation is reloaded from the DB.
     """
     if user_id is not None and not session_exists(session_id, user_id=user_id):
         return 0
+    chunks_json = json.dumps(chunks) if chunks else None
     with _STATE["lock"]:
         cur = _conn().execute(
             """
-            INSERT INTO messages (session_id, role, content, mode, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO messages (session_id, role, content, mode, created_at, chunks_json)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (session_id, role, content, mode, time.time()),
+            (session_id, role, content, mode, time.time(), chunks_json),
         )
         return int(cur.lastrowid or 0)
 
@@ -435,7 +518,7 @@ def list_messages(session_id: str, user_id: Optional[str] = None) -> list[dict]:
         return []
     rows = _conn().execute(
         """
-        SELECT id, role, content, mode, created_at
+        SELECT id, role, content, mode, created_at, chunks_json
         FROM messages
         WHERE session_id = ?
         ORDER BY created_at ASC, id ASC
@@ -449,6 +532,7 @@ def list_messages(session_id: str, user_id: Optional[str] = None) -> list[dict]:
             "content": r["content"],
             "mode": r["mode"],
             "created_at": r["created_at"],
+            "chunks": json.loads(r["chunks_json"]) if r["chunks_json"] else [],
         }
         for r in rows
     ]
@@ -602,13 +686,16 @@ def add_matter_document(
     n_pages: int,
     upload_ext: str,
     user_id: Optional[str] = None,
+    status: str = "done",
 ) -> Optional[dict]:
     """Append one uploaded document to a matter. Returns the new row as a
     dict (incl. its stable ``doc_index`` = the n in [M-n]), or ``None`` if
     the session isn't owned by ``user_id``.
 
     ``doc_index`` is ``max(existing)+1`` so handles never shift when more
-    documents are added later.
+    documents are added later. ``status`` is ``'queued'`` for async
+    ingestion (the worker fills ``doc_text``/``n_pages`` later) or the
+    default ``'done'`` for synchronous callers/tests.
     """
     if user_id is not None and not session_exists(session_id, user_id=user_id):
         return None
@@ -622,10 +709,10 @@ def add_matter_document(
         cur = _conn().execute(
             """
             INSERT INTO matter_documents
-                (session_id, doc_index, filename, doc_text, n_pages, upload_ext, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (session_id, doc_index, filename, doc_text, n_pages, upload_ext, created_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, next_index, filename, doc_text, n_pages, upload_ext, ts),
+            (session_id, next_index, filename, doc_text, n_pages, upload_ext, ts, status),
         )
         return {
             "id": int(cur.lastrowid or 0),
@@ -635,7 +722,69 @@ def add_matter_document(
             "n_pages": n_pages,
             "upload_ext": upload_ext,
             "created_at": ts,
+            "status": status,
         }
+
+
+def update_matter_progress(
+    doc_id: int, *, status: Optional[str] = None,
+    pages_done: Optional[int] = None, pages_total: Optional[int] = None,
+) -> None:
+    """Update a document's ingestion status / progress (called by the
+    background worker as it processes pages). Any field left ``None`` is
+    untouched."""
+    sets, params = [], []
+    if status is not None:
+        sets.append("status = ?"); params.append(status)
+    if pages_done is not None:
+        sets.append("pages_done = ?"); params.append(int(pages_done))
+    if pages_total is not None:
+        sets.append("pages_total = ?"); params.append(int(pages_total))
+    if not sets:
+        return
+    params.append(doc_id)
+    with _STATE["lock"]:
+        _conn().execute(
+            f"UPDATE matter_documents SET {', '.join(sets)} WHERE id = ?", params,
+        )
+
+
+def finalize_matter_document(
+    doc_id: int, *, doc_text: str, n_pages: int, n_chunks: int,
+) -> None:
+    """Mark a document done and store its extracted text + chunk count."""
+    with _STATE["lock"]:
+        _conn().execute(
+            "UPDATE matter_documents SET status='done', doc_text=?, n_pages=?, "
+            "n_chunks=?, pages_done=?, pages_total=?, error=NULL WHERE id = ?",
+            (doc_text, n_pages, n_chunks, n_pages, n_pages, doc_id),
+        )
+
+
+def fail_matter_document(doc_id: int, error: str) -> None:
+    """Mark a document's ingestion failed with a reason (shown in the UI)."""
+    with _STATE["lock"]:
+        _conn().execute(
+            "UPDATE matter_documents SET status='failed', error=? WHERE id = ?",
+            (error[:500], doc_id),
+        )
+
+
+def list_unfinished_matter_documents() -> list[dict]:
+    """All documents still queued/processing across every session — used at
+    startup to re-enqueue work that an interrupted process left mid-flight."""
+    rows = _conn().execute(
+        "SELECT id, session_id, doc_index, filename, upload_ext "
+        "FROM matter_documents WHERE status IN ('queued', 'processing')",
+    ).fetchall()
+    return [
+        {
+            "id": int(r["id"]), "session_id": r["session_id"],
+            "doc_index": int(r["doc_index"]), "filename": r["filename"],
+            "upload_ext": r["upload_ext"],
+        }
+        for r in rows
+    ]
 
 
 def list_matter_documents(
@@ -650,7 +799,8 @@ def list_matter_documents(
     """
     if user_id is not None and not session_exists(session_id, user_id=user_id):
         return []
-    cols = "id, doc_index, filename, n_pages, upload_ext, created_at"
+    cols = ("id, doc_index, filename, n_pages, upload_ext, created_at, "
+            "status, pages_done, pages_total, n_chunks, error")
     if include_text:
         cols += ", doc_text"
     rows = _conn().execute(
@@ -666,6 +816,11 @@ def list_matter_documents(
             "n_pages": int(r["n_pages"]) if r["n_pages"] is not None else 0,
             "upload_ext": r["upload_ext"],
             "created_at": float(r["created_at"]),
+            "status": r["status"] or "done",
+            "pages_done": int(r["pages_done"] or 0),
+            "pages_total": int(r["pages_total"] or 0),
+            "n_chunks": int(r["n_chunks"] or 0),
+            "error": r["error"],
         }
         if include_text:
             d["doc_text"] = r["doc_text"] or ""

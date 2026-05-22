@@ -46,7 +46,25 @@ from lai.common.exceptions import (
 from lai.common.retrieval.config import RetrievalConfig
 from lai.common.retrieval.metrics import RetrievalMetrics, default_retrieval_metrics
 
-__all__ = ["RetrievalClient", "RetrievedChunk"]
+__all__ = ["RetrievalClient", "RetrievedChunk", "RetrievedMatterChunk"]
+
+
+class RetrievedMatterChunk(BaseModel):
+    """One passage retrieved from a Matter's uploaded documents.
+
+    Unlike :class:`RetrievedChunk` (the shared legal corpus), matter
+    chunks are scoped to a single session ("Matter") and carry the
+    provenance the citation UI needs: which uploaded document
+    (``doc_index`` → the ``[M-n]`` document, openable as a PDF) and which
+    page the passage was OCR'd from.
+    """
+
+    id: int
+    doc_index: int
+    filename: str
+    page: int | None
+    content: str
+    similarity: float
 
 
 class RetrievedChunk(BaseModel):
@@ -499,3 +517,212 @@ class RetrievalClient:
                 f"pgvector parent fetch failed: {exc}",
             ) from exc
         return {int(r[0]): (r[1] or "") for r in fetched}
+
+    # ── Matter (per-session uploaded-document) index ─────────────────────
+    #
+    # A "data room" is just a small private corpus scoped to one session.
+    # We store its passages in ``matter_chunks`` and retrieve with EXACT
+    # KNN filtered by ``session_id`` — not the shared HNSW index the corpus
+    # uses. Rationale: a single Matter holds at most a few thousand chunks,
+    # so an exact scan over just that session's rows is both fast (<50 ms)
+    # and perfect-recall, whereas an HNSW index shared across all sessions
+    # would post-filter by session_id and silently lose recall. The btree
+    # on ``session_id`` keeps each query's scan confined to one Matter.
+
+    def ensure_matter_table(self) -> None:
+        """Create ``matter_chunks`` and its session index if absent.
+
+        Idempotent; safe to call at every startup (mirrors the corpus
+        migration's CREATE ... IF NOT EXISTS pattern)."""
+        ddl = (
+            "CREATE TABLE IF NOT EXISTS matter_chunks ("
+            "  id          BIGSERIAL PRIMARY KEY,"
+            "  session_id  TEXT NOT NULL,"
+            "  doc_index   INT  NOT NULL,"
+            "  filename    TEXT,"
+            "  page        INT,"
+            "  ord         INT  NOT NULL,"
+            "  content     TEXT NOT NULL,"
+            "  embedding   halfvec(4000) NOT NULL,"
+            "  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ");",
+            "CREATE INDEX IF NOT EXISTS idx_matter_chunks_session "
+            "  ON matter_chunks(session_id);",
+        )
+        try:
+            with self._borrow() as conn:
+                with conn.cursor() as cur:
+                    for stmt in ddl:
+                        cur.execute(stmt)
+                conn.commit()
+        except psycopg2.OperationalError as exc:
+            raise RetrievalConnectionError(
+                f"ensure_matter_table connection error: {exc}",
+            ) from exc
+        except psycopg2.Error as exc:
+            raise RetrievalQueryError(
+                f"ensure_matter_table failed: {exc}",
+            ) from exc
+
+    def index_matter_document(
+        self,
+        session_id: str,
+        doc_index: int,
+        filename: str,
+        passages: Sequence[tuple[int | None, str, Sequence[float]]],
+    ) -> int:
+        """(Re)index one uploaded document's passages for a Matter.
+
+        ``passages`` is ``[(page, content, embedding), ...]`` in document
+        order. Any existing rows for this ``(session_id, doc_index)`` are
+        deleted first, so re-uploading a document is idempotent. Embeddings
+        are truncated to the index dimension (Matryoshka prefix) to match
+        the corpus write path. Returns the number of rows inserted.
+        """
+        cfg = self._config
+        rows = [
+            (
+                session_id,
+                doc_index,
+                filename,
+                page,
+                ordinal,
+                content,
+                _format_halfvec_literal(emb, cfg.index_dim),
+            )
+            for ordinal, (page, content, emb) in enumerate(passages)
+        ]
+        try:
+            with self._borrow() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM matter_chunks WHERE session_id = %s AND doc_index = %s",
+                        (session_id, doc_index),
+                    )
+                    if rows:
+                        cur.executemany(
+                            "INSERT INTO matter_chunks "
+                            "(session_id, doc_index, filename, page, ord, content, embedding) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s::halfvec)",
+                            rows,
+                        )
+                conn.commit()
+        except psycopg2.OperationalError as exc:
+            raise RetrievalConnectionError(
+                f"index_matter_document connection error: {exc}",
+            ) from exc
+        except psycopg2.Error as exc:
+            raise RetrievalQueryError(
+                f"index_matter_document failed: {exc}",
+            ) from exc
+        return len(rows)
+
+    def matter_dense_search(
+        self,
+        session_id: str,
+        query_vector: Sequence[float],
+        *,
+        top_k: int | None = None,
+    ) -> list[RetrievedMatterChunk]:
+        """Exact-KNN search over ONE Matter's uploaded passages.
+
+        Scoped to ``session_id`` so a query never leaks across matters.
+        Returns passages ordered by descending cosine similarity.
+        """
+        cfg = self._config
+        k = top_k if top_k is not None else cfg.default_top_k
+        if k < 1:
+            raise RetrievalQueryError(f"top_k must be >= 1, got {k}")
+        vec_literal = _format_halfvec_literal(query_vector, cfg.index_dim)
+
+        attempt = 0
+        last_exc: Exception | None = None
+        while attempt <= self._max_retries:
+            attempt += 1
+            if attempt > 1:
+                self._metrics.retries_total.inc()
+            try:
+                return self._run_matter_query(session_id, vec_literal, k)
+            except RetrievalConnectionError as exc:
+                last_exc = exc
+                continue
+            except RetrievalQueryError:
+                raise
+        raise RetrievalRetryExhaustedError(
+            f"matter_dense_search failed after {attempt} attempt(s): {last_exc}",
+            attempts=attempt,
+        ) from last_exc
+
+    def _run_matter_query(
+        self, session_id: str, vec_literal: str, k: int,
+    ) -> list[RetrievedMatterChunk]:
+        cfg = self._config
+        try:
+            with self._borrow() as conn:
+                with conn.cursor() as cur:
+                    if cfg.statement_timeout_ms > 0:
+                        cur.execute(
+                            "SET LOCAL statement_timeout = %s",
+                            (cfg.statement_timeout_ms,),
+                        )
+                    cur.execute(
+                        "SELECT id, doc_index, filename, page, content, "
+                        "       1 - (embedding <=> %s::halfvec) AS similarity "
+                        "FROM matter_chunks "
+                        "WHERE session_id = %s "
+                        "ORDER BY embedding <=> %s::halfvec "
+                        "LIMIT %s",
+                        (vec_literal, session_id, vec_literal, k),
+                    )
+                    fetched = cur.fetchall()
+        except psycopg2.OperationalError as exc:
+            raise RetrievalConnectionError(
+                f"matter query connection error: {exc}",
+            ) from exc
+        except psycopg2.Error as exc:
+            raise RetrievalQueryError(
+                f"matter query failed: {exc}",
+            ) from exc
+        return [
+            RetrievedMatterChunk(
+                id=int(r[0]),
+                doc_index=int(r[1]),
+                filename=r[2] or "",
+                page=int(r[3]) if r[3] is not None else None,
+                content=r[4] or "",
+                similarity=float(r[5]),
+            )
+            for r in fetched
+        ]
+
+    def delete_matter_chunks(
+        self, session_id: str, doc_index: int | None = None,
+    ) -> int:
+        """Delete a Matter's indexed passages (whole session, or one doc).
+
+        Called when a document or session is deleted so the pgvector index
+        doesn't outlive the source files. Returns rows deleted."""
+        try:
+            with self._borrow() as conn:
+                with conn.cursor() as cur:
+                    if doc_index is None:
+                        cur.execute(
+                            "DELETE FROM matter_chunks WHERE session_id = %s",
+                            (session_id,),
+                        )
+                    else:
+                        cur.execute(
+                            "DELETE FROM matter_chunks WHERE session_id = %s AND doc_index = %s",
+                            (session_id, doc_index),
+                        )
+                    deleted = cur.rowcount
+                conn.commit()
+        except psycopg2.OperationalError as exc:
+            raise RetrievalConnectionError(
+                f"delete_matter_chunks connection error: {exc}",
+            ) from exc
+        except psycopg2.Error as exc:
+            raise RetrievalQueryError(
+                f"delete_matter_chunks failed: {exc}",
+            ) from exc
+        return int(deleted)

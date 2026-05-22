@@ -157,39 +157,237 @@ RAG_SYSTEM = (
     "Informationslücke eine konkrete Handlungsempfehlung."
 )
 
-# Per-language answer-directive appended to the system prompt. German is
-# the default (the prompts above are already in German and most demo
-# corpora are German), so ``de`` and ``None`` return the empty string —
-# adding a "Antworte auf Deutsch" line on top of an already-German prompt
-# wastes tokens and risks confusing the model. ``en`` switches the model
-# to English but explicitly keeps statute / contract quotations verbatim
-# in German: the lawyer's #1 trust requirement (UI_GUIDE.md §7.4) is
-# that the cited text in the answer matches the source preview in the
-# side panel; translating quoted German would break that match.
+# Answer-language behaviour.
 #
-# Unknown codes (e.g. ``fr``) fall back to German rather than crashing —
-# the frontend toggle only emits ``de``/``en`` today, so anything else
-# is a forward-compat surprise we shouldn't dignify with a half-broken
-# response.
+# The default (``None`` — what the frontend now always sends, having
+# dropped the manual DE/EN toggle) tells the model to MIRROR the
+# language of the user's question: ask in German → German answer, ask
+# in English → English answer. LLMs do this reliably; a toggle was
+# redundant ceremony. The directive is appended on every turn because
+# the base prompt is written in German and would otherwise bias every
+# answer toward German regardless of how the question was phrased.
+#
+# In all languages we keep statute / contract / judgment quotations
+# VERBATIM in the German original: the lawyer's #1 trust requirement
+# (UI_GUIDE.md §7.4) is that the cited text in the answer matches the
+# source preview in the side panel; translating quoted German would
+# break that match.
+#
+# Explicit ``de`` / ``en`` codes are still honoured as a hard override
+# (kept for the API contract / tests and any programmatic caller), but
+# the UI no longer emits them.
+_MIRROR_DIRECTIVE = (
+    "\n\nAntworte in derselben Sprache, in der die Nutzerfrage gestellt "
+    "ist (Deutsch auf eine deutsche Frage, Englisch auf eine englische "
+    "Frage). Zitiere Gesetzestexte, Vertragsklauseln und Urteile jedoch "
+    "stets wörtlich im deutschen Original — übersetze Zitate nicht. "
+    "Behalte die [M-n] und [C-n] Zitations-Handles unverändert bei."
+)
+
 _LANGUAGE_DIRECTIVES: dict[str, str] = {
+    "de": (
+        "\n\n### ANTWORTSPRACHE (zwingend)\n"
+        "Antworte AUSSCHLIESSLICH auf DEUTSCH. Behalte die [M-n] und [C-n] "
+        "Zitations-Handles unverändert bei."
+    ),
     "en": (
-        "\n\nAntworte auf Englisch. Zitiere die deutschen Originalstellen "
-        "(Gesetzestexte, Vertragsklauseln, Urteile) wörtlich und ohne "
-        "Übersetzung — gib die englische Erklärung danach. Behalte die "
-        "[M-n] und [C-n] Zitations-Handles unverändert bei."
+        "\n\n### RESPONSE LANGUAGE (mandatory)\n"
+        "Write your ENTIRE answer in ENGLISH, regardless of the language of "
+        "the sources, document names, or these instructions. The explanatory "
+        "prose MUST be English. Quote statutes / contract clauses / rulings "
+        "verbatim in the original German (do not translate the quote), then "
+        "explain in English. Keep the [M-n] and [C-n] citation handles "
+        "unchanged."
     ),
 }
 
 
 def _language_directive(target_language: Optional[str]) -> str:
-    """Return the system-prompt suffix that switches answer language.
+    """Return the system-prompt suffix that controls answer language.
 
-    Empty string for the default German path so we don't bloat the
-    prompt on every German turn.
+    With no explicit ``target_language`` (the default now the UI toggle
+    is gone) the model is told to mirror the question's language. An
+    explicit ``de`` / ``en`` is honoured as a hard override; anything
+    else falls back to the mirror directive.
     """
     if not target_language:
-        return ""
-    return _LANGUAGE_DIRECTIVES.get(target_language.lower(), "")
+        return _MIRROR_DIRECTIVE
+    return _LANGUAGE_DIRECTIVES.get(target_language.lower(), _MIRROR_DIRECTIVE)
+
+
+# Function words that reliably separate English from German. Used to detect
+# the question's language SERVER-SIDE and emit an explicit "answer in X"
+# directive — far more reliable than asking the model to "mirror" the
+# question, which loses when the surrounding prompt (German system prompt,
+# German document manifest, German filenames) drowns out the cue. That is
+# exactly why an English "all the pdfs uploaded?" was answered in German.
+_EN_HINT_WORDS = frozenset((
+    "the", "is", "are", "was", "were", "what", "which", "who", "whom", "how",
+    "when", "where", "why", "and", "or", "of", "to", "in", "for", "on", "do",
+    "does", "did", "you", "your", "this", "that", "these", "those", "all",
+    "any", "please", "can", "could", "would", "should", "show", "list", "give",
+    "tell", "explain", "uploaded", "upload", "document", "documents", "file",
+    "files", "contract", "permit", "turbine", "with", "from", "about",
+))
+_DE_HINT_WORDS = frozenset((
+    "der", "die", "das", "und", "oder", "ist", "sind", "war", "waren",
+    "welche", "welcher", "welches", "wie", "wann", "wo", "warum", "wer",
+    "ein", "eine", "einen", "einem", "einer", "den", "dem", "des", "für",
+    "von", "mit", "auf", "nicht", "auch", "sich", "wird", "werden", "haben",
+    "hochgeladen", "dokument", "dokumente", "datei", "dateien", "vertrag",
+    "bitte", "zeige", "liste", "alle", "habe", "ich", "bin", "über",
+))
+
+
+def _detect_question_language(question: str) -> Optional[str]:
+    """Best-effort detect ``"en"`` / ``"de"`` from a question, or ``None``
+    when the signal is too weak to be sure (caller then falls back to the
+    soft mirror directive).
+
+    Cheap and dependency-free: count distinctive function words on each
+    side, with umlauts/ß as a strong German signal. Only commits to a
+    language on a clear margin; ties / no-signal return ``None``.
+    """
+    q = question.lower()
+    toks = re.findall(r"[a-zäöüß]+", q)
+    if not toks:
+        return None
+    de = sum(1 for t in toks if t in _DE_HINT_WORDS)
+    en = sum(1 for t in toks if t in _EN_HINT_WORDS)
+    if re.search(r"[äöüß]", q):
+        de += 2  # umlaut/ß is almost never English
+    if de > en and de >= 1:
+        return "de"
+    if en > de and en >= 1:
+        return "en"
+    return None
+
+
+def _effective_language(req_lang: Optional[str], question: str) -> Optional[str]:
+    """Pick the answer language: an explicit client override wins, else the
+    detected question language, else ``None`` (soft mirror directive)."""
+    if req_lang:
+        return req_lang
+    return _detect_question_language(question)
+
+# Document-only system prompt. Used when a document is uploaded and the
+# user has NOT asked to look beyond it (the default once a Matter exists).
+# Hard rule: answer STRICTLY from the uploaded [M-n] documents and, when
+# they are silent, say so plainly — never paper over the gap with the
+# legal corpus or general knowledge. The previous behaviour (always
+# firing corpus retrieval whenever a document was present) produced
+# actively misleading answers: a "What lease term is agreed?" question on
+# an immission-control permit was answered "20 years [C-1]" by pulling a
+# lease term out of an UNRELATED corpus contract. For a lawyer that is
+# worse than "not in the document" — it invents a fact about their file.
+RAG_SYSTEM_DOC_ONLY = (
+    "Du bist ein juristischer KI-Assistent für deutsches Windenergie- und "
+    "Due-Diligence-Recht. Beantworte die Nutzerfrage AUSSCHLIESSLICH auf "
+    "Grundlage der unten bereitgestellten hochgeladenen Dokumente.\n"
+    "\n"
+    "Jede Quelle trägt ein stabiles Zitations-Handle [M-n] (= ein vom "
+    "Nutzer hochgeladenes Dokument des Mandats). Zitiere bei JEDER "
+    "inhaltlichen Aussage das passende Handle, z.B. \"§ 7 des Vertrags "
+    "[M-1]\". Verwende AUSSCHLIESSLICH Handles, die unten tatsächlich "
+    "erscheinen — erfinde keine neuen.\n"
+    "\n"
+    "Wenn die hochgeladenen Dokumente die Frage NICHT beantworten, sage "
+    "das klar und unmissverständlich, z.B. \"Diese Information ist in den "
+    "hochgeladenen Unterlagen nicht enthalten.\" Greife NICHT auf externe "
+    "Rechtsquellen, Gesetzeskommentare, Rechtsprechung oder allgemeines "
+    "Wissen zurück und nenne KEINE Zahlen, Fristen oder Klauseln aus "
+    "anderen Dokumenten — es sei denn, der Nutzer fragt ausdrücklich "
+    "danach. Lieber ehrlich \"nicht enthalten\" als eine erfundene oder "
+    "aus fremden Quellen übernommene Antwort."
+)
+
+
+# Words that signal the user explicitly wants to go BEYOND the uploaded
+# document — into the legal corpus, statutes, case law, market practice
+# or a comparison with other contracts. Only then do we fire corpus
+# retrieval on top of the matter documents. Default (no match) stays
+# document-only. Conservative on purpose: a missed keyword just means a
+# document-grounded answer, which is the safe failure.
+_CORPUS_REQUEST_KEYWORDS = (
+    # German
+    "korpus", "rechtsprechung", "gesetzeslage", "gesetzlich vorgeschrieben",
+    "üblich", "marktüblich", "branchenüblich", "im allgemeinen", "allgemein",
+    "generell", "vergleich", "verglichen", "andere verträge", "anderen verträgen",
+    "vergleichbare", "datenbank", "wissensdatenbank", "wissensbasis",
+    "außerhalb", "über das dokument hinaus", "deiner kenntnis", "deinem wissen",
+    "rechtslage", "was sagt das gesetz",
+    # English
+    "corpus", "case law", "case-law", "statute", "statutory", "market standard",
+    "market practice", "usually", "in general", "generally", "compare",
+    "comparable", "other contracts", "knowledge base", "your knowledge",
+    "beyond the document", "outside the document", "what does the law",
+    "legal requirement", "required by law",
+)
+
+
+def wants_corpus(question: str) -> bool:
+    """Did the user explicitly ask to consult the legal corpus / law /
+    market practice, rather than just the uploaded document?
+
+    Used only when a document is in the session. When ``False`` (the
+    default) the answer stays document-only; when ``True`` we add the
+    corpus [C-n] sources and switch to the statutory-grounding prompt.
+    """
+    q = question.lower()
+    return any(k in q for k in _CORPUS_REQUEST_KEYWORDS)
+
+
+# Statute / regulation references — a German legal citation in the
+# question is a strong signal the user wants the LAW, not just the
+# contract. Matches a bare "§" or any of the common abbreviations.
+_STATUTE_RE = re.compile(
+    r"§|\b("
+    r"bimschg|bimschv|baugb|baynbo|baybo|bnatschg|eeg|enwg|uvpg|vwgo|bgb|"
+    r"whg|ta\s*lärm|ta\s*laerm|avv|dibt|grundbuchordnung|gewstg|ustg"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Legal-doctrine / applicability terms. A contract-extraction question
+# ("Wie lange läuft der Vertrag?", "Welche Pacht?") needs only the
+# matter [M-n]; a legal-knowledge question ("Gilt die 10H-Regelung?",
+# "Welche Rückbaupflicht besteht?", "Ist die Anlage genehmigungs-
+# pflichtig?") needs the corpus [C-n]. These tokens flag the latter.
+_LEGAL_KNOWLEDGE_KEYWORDS = (
+    "10h", "10-h", "abstandsregel", "abstandsfläche", "abstandsflaeche",
+    "mindestabstand", "rückbauverpflichtung", "rueckbauverpflichtung",
+    "rückbaupflicht", "rueckbaupflicht", "genehmigungspflicht",
+    "genehmigungsbedürftig", "genehmigungsbeduerftig", "genehmigungspflichtig",
+    "artenschutz", "immissionsschutz", "privilegiert", "privilegierung",
+    "außenbereich", "aussenbereich", "zulässigkeit", "zulaessigkeit",
+    "vorgeschrieben", "gesetzlich", "rechtlich", "vorschrift", "verordnung",
+    "immissionsrichtwert", "richtwert", "schallschutz", "naturschutz",
+    "umweltverträglichkeit", "umweltvertraeglichkeit", "bestandskraft",
+    "widerspruchsfrist", "einschlägig", "einschlaegig",
+    # English
+    "setback rule", "permit requirement", "required by law", "species protection",
+    "noise limit", "decommissioning obligation", "legally required",
+)
+
+
+def is_legal_knowledge_question(question: str) -> bool:
+    """Option B routing: in a contract session, should we ALSO consult
+    the legal corpus ([C-n])?
+
+    True for questions that seek the LAW / regulations / jurisdiction /
+    market practice — statute references, legal doctrine, or
+    applicability ("does X rule apply?", "is a permit required?"). False
+    for pure contract-extraction ("what does clause X say?"), which stays
+    matter-only to avoid quoting an unrelated corpus contract at a
+    document-specific question (see the routing comment at the call site).
+    """
+    q = question.lower()
+    if wants_corpus(question):
+        return True
+    if _STATUTE_RE.search(question):
+        return True
+    return any(k in q for k in _LEGAL_KNOWLEDGE_KEYWORDS)
+
 
 CHAT_SYSTEM = (
     "Du bist ein freundlicher KI-Assistent für deutsche Anwälte, die mit "
@@ -473,7 +671,8 @@ def _render_sources_block(sources: list[RetrievedSource]) -> str:
 def build_rag_messages(question: str, sources: list[RetrievedSource],
                        history: list[dict] | None = None,
                        meta_prefix: str = "",
-                       target_language: Optional[str] = None) -> list[dict]:
+                       target_language: Optional[str] = None,
+                       system: str = RAG_SYSTEM) -> list[dict]:
     """Build the chat-completion message list for a RAG turn.
 
     ``sources`` carries the retrieved chunks already tagged with stable
@@ -483,12 +682,17 @@ def build_rag_messages(question: str, sources: list[RetrievedSource],
 
     ``target_language`` (``None`` / ``"de"`` / ``"en"``) appends a
     language-switch directive — see :func:`_language_directive`.
+
+    ``system`` selects the system prompt: :data:`RAG_SYSTEM` (corpus +
+    matter, with statutory grounding) or :data:`RAG_SYSTEM_DOC_ONLY`
+    (uploaded documents only — the default once a Matter exists and the
+    user hasn't asked to look beyond it).
     """
     src_block = _render_sources_block(sources)
     user = f"Quellen:\n{src_block}\n\nFrage: {question}"
     return [
         {"role": "system",
-         "content": meta_prefix + RAG_SYSTEM + _language_directive(target_language)},
+         "content": meta_prefix + system + _language_directive(target_language)},
         *(history or []),
         {"role": "user",   "content": user},
     ]
@@ -699,23 +903,366 @@ def _matter_cite_id(n: int) -> str:
     return f"M-{n}"
 
 
+def _split_into_pages(doc_text: str) -> list[tuple[int | None, str]]:
+    """Split ingestion text on ``<!-- Seite N -->`` markers into
+    ``[(page, text)]``. Text without markers (docling / legacy uploads)
+    returns a single ``(None, whole_text)`` entry."""
+    markers = list(_PAGE_MARKER_RE.finditer(doc_text))
+    if not markers:
+        return [(None, doc_text)]
+    pages: list[tuple[int | None, str]] = []
+    for i, m in enumerate(markers):
+        start = m.end()
+        end = markers[i + 1].start() if i + 1 < len(markers) else len(doc_text)
+        pages.append((int(m.group(1)), doc_text[start:end].strip()))
+    return pages
+
+
+def _split_into_passages(doc_text: str) -> list[tuple[int | None, str]]:
+    """Page-tagged paragraph-ish passages: ``[(page, passage_text)]``.
+
+    Splits each page on blank lines. Tiny fragments (table rules, stray
+    glyphs) are dropped; if a page yields nothing substantial its whole
+    text is kept so no content is lost."""
+    out: list[tuple[int | None, str]] = []
+    for page, page_text in _split_into_pages(doc_text):
+        kept_any = False
+        for para in re.split(r"\n\s*\n", page_text):
+            para = para.strip()
+            if len(para) >= 40:
+                out.append((page, para))
+                kept_any = True
+        if not kept_any and page_text.strip():
+            out.append((page, page_text.strip()))
+    return out or [(None, doc_text.strip())]
+
+
+_WORD_RE = re.compile(r"\w{3,}", re.UNICODE)
+
+
+def _score_passage_lexical(q_tokens: set[str], passage: str) -> int:
+    """Lexical fallback used only when the embedding service is down:
+    distinct query content-words present in the passage. Note this scores
+    0 across languages (English question vs German doc) — which is exactly
+    why the primary ranker is embedding-based."""
+    if not q_tokens:
+        return 0
+    return len(q_tokens & {t.lower() for t in _WORD_RE.findall(passage)})
+
+
+# Cap how many passages we embed per document per turn (keeps the
+# query-time embedding batch bounded for very long uploads).
+_MAX_PASSAGES_RANKED = 60
+
+
+def _rank_passages(
+    question: str, passages: list[tuple[int | None, str]],
+) -> list[tuple[float, int, int | None, str]]:
+    """Rank ``passages`` ([(page, text)]) by relevance to ``question``.
+
+    Primary: semantic similarity via the multilingual embedding service —
+    this is what lets an ENGLISH question ("which turbine type?") surface
+    the right GERMAN passage ("neuer Anlagentyp: Enercon E-70 …"), which a
+    keyword match never could. Falls back to lexical, then document order,
+    if the embedding service is unavailable. Returns
+    ``[(score, idx, page, text)]`` sorted best-first.
+    """
+    capped = passages[:_MAX_PASSAGES_RANKED]
+    if not question.strip() or not capped:
+        return [(0.0, i, p, t) for i, (p, t) in enumerate(capped)]
+    try:
+        from lai.search.eval import _get_embedding_client, embed_query
+        qvec = embed_query(question, with_prefix=True)
+        results = _get_embedding_client().embed([t for _, t in capped])
+        scored: list[tuple[float, int, int | None, str]] = []
+        for i, ((page, t), r) in enumerate(zip(capped, results)):
+            pv = np.asarray(r.embedding, dtype=np.float32)
+            n = np.linalg.norm(pv)
+            if n > 0:
+                pv = pv / n
+            scored.append((float(qvec @ pv), i, page, t))
+        return sorted(scored, key=lambda x: (-x[0], x[1]))
+    except Exception as e:  # noqa: BLE001 — degrade, never fail the turn
+        print(f"[matter] embedding passage-rank failed ({e}); lexical fallback", flush=True)
+        q_tokens = {t.lower() for t in _WORD_RE.findall(question)}
+        scored = [
+            (float(_score_passage_lexical(q_tokens, t)), i, page, t)
+            for i, (page, t) in enumerate(capped)
+        ]
+        return sorted(scored, key=lambda x: (-x[0], x[1]))
+
+
+def _select_relevant_passages(
+    question: str, doc_text: str, budget: int,
+) -> tuple[str, int | None, str]:
+    """Choose what the model reads and what the citation panel shows.
+
+    Returns ``(prompt_text, best_page, display_text)``:
+      * ``prompt_text`` — the document for the LLM. If it fits the budget
+        it's included WHOLE (page-tagged) so the answer is never starved
+        of context; only over-budget documents are reduced to their
+        most-relevant passages.
+      * ``best_page`` — page of the single most-relevant passage, so the
+        citation panel scrolls the PDF preview to the cited page.
+      * ``display_text`` — the top few most-relevant passages (page-tagged)
+        for the citation panel, i.e. "the lines this answer rests on".
+    """
+    passages = _split_into_passages(doc_text)
+    if not passages:
+        head = doc_text[:budget]
+        return head, None, head
+
+    def tag(page: int | None, t: str) -> str:
+        return f"(S. {page}) {t}" if page else t
+
+    full_tagged = "\n\n".join(tag(p, t) for p, t in passages)
+    ranked = _rank_passages(question, passages)
+    best_page = ranked[0][2] if ranked else None
+
+    if len(full_tagged) <= budget:
+        prompt_text = full_tagged
+    else:
+        selected: list[tuple[int, int | None, str]] = []
+        total = 0
+        for _score, i, page, t in ranked:
+            if total >= budget:
+                break
+            snippet = t[:budget] if len(t) > budget else t
+            selected.append((i, page, snippet))
+            total += len(snippet)
+        selected.sort(key=lambda x: x[0])
+        prompt_text = "\n\n".join(tag(p, t) for _, p, t in selected)
+
+    display = "\n\n".join(tag(page, t) for _s, _i, page, t in ranked[:3])
+    return prompt_text, best_page, display
+
+
+# Matter retrieval tuning. ``candidate_k`` passages are pulled by dense
+# KNN, reranked, then the top ``final_k`` are kept and grouped by document.
+# Bounded regardless of data-room size — this is what lets a Matter scale
+# from 3 PDFs to a 300-document VDR with the same prompt budget.
+_MATTER_CANDIDATE_K = 40
+_MATTER_FINAL_K = 12
+
+
+def _matter_pgvector_context(
+    sid: str, question: str,
+    candidate_k: int = _MATTER_CANDIDATE_K, final_k: int = _MATTER_FINAL_K,
+) -> tuple[list["RetrievedSource"], list["ChunkOut"], str] | None:
+    """Scalable matter retrieval: dense KNN over the per-session pgvector
+    index + rerank, grouped back into one ``[M-doc_index]`` source per
+    document so a data room of any size yields a bounded, citation-ready
+    prompt.
+
+    Returns ``None`` to signal "no indexed passages for this session" so
+    the caller falls back to the legacy whole-document path (sessions
+    uploaded before per-Matter indexing existed).
+    """
+    rc = STATE.get("retrieval_client")
+    if rc is None or not question.strip():
+        return None
+    try:
+        qvec = embed_query(question, with_prefix=True)
+        hits = rc.matter_dense_search(sid, qvec, top_k=candidate_k)
+    except Exception as e:  # noqa: BLE001 — fall back, never fail the turn
+        print(f"[matter] pgvector search failed ({e}); using fallback", flush=True)
+        return None
+    if not hits:
+        return None
+
+    # Rerank (query, passage) pairs — same cross-encoder the corpus uses.
+    reranker = STATE.get("reranker")
+    pairs = [(question, h.content[:2000]) for h in hits]
+    try:
+        scores = reranker.score(pairs) if (reranker is not None and pairs) else []
+        if scores:
+            order = list(np.argsort(-np.asarray(scores)))
+            hits = [hits[j] for j in order]
+            rscores = [float(scores[j]) for j in order]
+        else:
+            rscores = [h.similarity for h in hits]
+    except Exception as exc:  # noqa: BLE001 — degrade to dense order
+        print(f"[matter] rerank failed ({exc}); dense order", flush=True)
+        rscores = [h.similarity for h in hits]
+    hits = hits[:final_k]
+    rscores = rscores[:final_k]
+
+    # Group the retrieved passages back under their document so the handle
+    # stays ``[M-doc_index]`` — consistent with the document list and the
+    # citation panel's ``fetchMatterDocument(n)`` mapping.
+    def _tag(pg: int | None, t: str) -> str:
+        return f"(S. {pg}) {t}" if pg else t
+
+    by_doc: dict[int, dict] = {}
+    for rank, (h, rs) in enumerate(zip(hits, rscores)):
+        info = by_doc.setdefault(h.doc_index, {
+            "filename": h.filename, "best_rank": rank,
+            "best_sim": h.similarity, "best_rerank": rs, "best_page": h.page,
+            "passages": [],
+        })
+        info["passages"].append(_tag(h.page, h.content))
+
+    matter_sources: list[RetrievedSource] = []
+    matter_chunks: list[ChunkOut] = []
+    combined_parts: list[str] = []
+    for doc_index in sorted(by_doc, key=lambda di: by_doc[di]["best_rank"]):
+        info = by_doc[doc_index]
+        cite = _matter_cite_id(doc_index)
+        prompt_text = "\n\n".join(info["passages"])
+        label = f"[M-{doc_index}] {info['filename']}" if info["filename"] else f"Dokument M-{doc_index}"
+        matter_sources.append(RetrievedSource(
+            cite_id=cite, source_kind="matter", text=prompt_text, label=label,
+        ))
+        matter_chunks.append(ChunkOut(
+            text=prompt_text[:2500], section=info["filename"] or label,
+            law_refs=[], sources=["upload"], similarity=info["best_sim"],
+            rerank_score=info["best_rerank"], cite_id=cite, source_kind="matter",
+            page=info["best_page"],
+        ))
+        combined_parts.append(prompt_text)
+
+    # Baseline chunks for EVERY other document in the matter (those with no
+    # retrieved passage this turn). The model may cite any [M-n] — especially
+    # from the manifest, e.g. answering "are all PDFs uploaded?" by listing
+    # all five. Without a chunk those handles render "not available" and the
+    # panel can't open the PDF. These go ONLY into the frontend chunk set,
+    # not the prompt sources (the prompt stays bounded to relevant passages).
+    try:
+        for d in persistence.list_matter_documents(sid):
+            di = d["doc_index"]
+            if di in by_doc:
+                continue
+            fname = d.get("filename") or ""
+            matter_chunks.append(ChunkOut(
+                text=(f"{fname} — für diese Frage wurde keine spezifische "
+                      "Textstelle gefunden. Klicken Sie, um das Dokument zu öffnen."),
+                section=fname or f"Dokument M-{di}", law_refs=[], sources=["upload"],
+                similarity=0.0, rerank_score=0.0, cite_id=_matter_cite_id(di),
+                source_kind="matter", page=1,
+            ))
+    except Exception as e:  # noqa: BLE001
+        print(f"[matter] baseline chunk fill failed ({e})", flush=True)
+
+    return matter_sources, matter_chunks, "\n\n".join(combined_parts)
+
+
+def _matter_manifest_prefix(sid: str, uid: str) -> str:
+    """A short list of the documents in this Matter, prepended to the system
+    prompt so the model ALWAYS knows what the user has uploaded — even for
+    meta-questions ("are the PDFs uploaded?", "which documents do I have?",
+    "list my files") that retrieve no passages. Without this the model has
+    only the retrieved snippets to go on and wrongly answers "no documents
+    are uploaded". Documents still ingesting are flagged so the model can
+    say a file is still being processed rather than that it's missing.
+    """
+    docs = persistence.list_matter_documents(sid, user_id=uid)
+    if not docs:
+        return ""
+    # Cap the listed documents so a large data room (hundreds of files)
+    # doesn't bloat every prompt; the count line still tells the model the
+    # true total.
+    cap = 40
+    lines = []
+    for d in docs[:cap]:
+        status = d.get("status", "done")
+        note = "" if status == "done" else " (wird gerade verarbeitet)"
+        if status == "failed":
+            note = " (Verarbeitung fehlgeschlagen)"
+        lines.append(f"- [M-{d['doc_index']}] {d.get('filename') or ''}{note}")
+    extra = len(docs) - cap
+    if extra > 0:
+        lines.append(f"- … und {extra} weitere Dokumente")
+    return (
+        f"Der Nutzer hat {len(docs)} Dokument(e) in dieses Mandat (Matter) "
+        "hochgeladen; sie sind durchsuchbar und per [M-n] zitierbar:\n"
+        + "\n".join(lines)
+        + "\n\n"
+    )
+
+
+def _empty_grounding_guard(
+    mode: str,
+    matter_sources: list,
+    rag_sources: list,
+    sid: str,
+    uid: str,
+    lang: str | None,
+) -> str | None:
+    """Empty-retrieval guard for doc-scoped chat turns.
+
+    A ``contract`` / ``rag+contract`` turn whose grounded source set is
+    EMPTY must NOT be answered from the model's parametric knowledge —
+    that is the "confident generic boilerplate on a freshly-uploaded
+    document" failure: the user uploaded a scanned PDF, asked about it
+    before OCR/indexing finished (so ``matter_chunks`` had no rows yet),
+    and the model invented plausible contract terms. Verified live: the
+    first answer preceded chunk creation by ~2 minutes.
+
+    Returns an honest message to send INSTEAD of generating, or ``None``
+    when generation should proceed normally. Scoped to Matter turns only
+    — pure ``rag`` (corpus) and ``chat`` turns are left untouched.
+    """
+    if mode not in ("contract", "rag+contract"):
+        return None
+    sources = rag_sources if mode == "rag+contract" else matter_sources
+    if sources:
+        return None  # we have grounded content — generate normally
+
+    en = (lang == "en")
+    try:
+        docs = persistence.list_matter_documents(sid, user_id=uid)
+    except Exception:
+        docs = []
+    # Still-ingesting docs: not yet 'done', or no searchable chunks yet.
+    pending = [
+        d for d in docs
+        if (d.get("status") not in ("done", "ready"))
+        or (d.get("n_chunks") or 0) == 0
+    ]
+    if pending:
+        done = sum(int(d.get("pages_done") or 0) for d in pending)
+        total = sum(int(d.get("pages_total") or 0) for d in pending)
+        if en:
+            prog = f" (page {done}/{total})" if total else ""
+            return (
+                f"Your document is still being processed{prog}. I’ll be able to "
+                "answer from it once indexing finishes — please try again in a moment."
+            )
+        prog = f" (Seite {done}/{total})" if total else ""
+        return (
+            f"Ihr Dokument wird noch verarbeitet{prog}. Sobald die Indexierung "
+            "abgeschlossen ist, kann ich es beantworten — bitte versuchen Sie es "
+            "in Kürze erneut."
+        )
+    # Docs are indexed, but retrieval found nothing relevant to this question.
+    if en:
+        return (
+            "I couldn’t find any relevant passage for this question in your uploaded "
+            "documents. I won’t answer from general knowledge — please rephrase, or "
+            "confirm the document contains this information."
+        )
+    return (
+        "Zu Ihrer Frage finde ich in den hochgeladenen Dokumenten keine relevante "
+        "Textstelle. Ich antworte hier bewusst nicht aus allgemeinem Wissen — bitte "
+        "formulieren Sie die Frage um oder prüfen Sie, ob das Dokument diese "
+        "Information enthält."
+    )
+
+
 def _build_matter_context(
-    sid: str, uid: str, use_contract: bool,
+    sid: str, uid: str, use_contract: bool, question: str = "",
 ) -> tuple[list["RetrievedSource"], list["ChunkOut"], str]:
-    """Assemble the matter side of a chat turn across ALL documents in the
-    session ("Matter"), one ``[M-n]`` handle per document.
+    """Assemble the matter side of a chat turn.
 
-    Returns ``(matter_sources, matter_chunks, combined_text)``:
-      * ``matter_sources`` — prompt sources, ``[M-1]..[M-n]`` in upload
-        order (stable ``doc_index``).
-      * ``matter_chunks`` — the same documents as UI chunks so each
-        ``[M-n]`` chip has a render target.
-      * ``combined_text`` — all matter text concatenated, used only for
-        Bundesland detection in the jurisdiction check.
+    Primary path: :func:`_matter_pgvector_context` — dense retrieval over
+    the per-session index, which scales to a real data room. Fallback (for
+    sessions uploaded before per-Matter indexing): select the most
+    relevant passages from each document's stored text, one ``[M-n]`` per
+    document.
 
-    Backward compatible: when a session predates ``matter_documents``
-    (older single-upload sessions), it falls back to the session's inline
-    ``contract_text`` as ``[M-1]``.
+    Returns ``(matter_sources, matter_chunks, combined_text)``; the third
+    value is concatenated matter text used only for Bundesland detection in
+    the jurisdiction check.
     """
     matter_sources: list[RetrievedSource] = []
     matter_chunks: list[ChunkOut] = []
@@ -723,6 +1270,12 @@ def _build_matter_context(
     if not use_contract:
         return matter_sources, matter_chunks, ""
 
+    # Primary: scalable pgvector retrieval across the indexed data room.
+    pg = _matter_pgvector_context(sid, question)
+    if pg is not None:
+        return pg
+
+    # ── Fallback: legacy whole-document selection (unindexed sessions) ──
     docs = persistence.list_matter_documents(sid, user_id=uid, include_text=True)
 
     if not docs:
@@ -730,40 +1283,44 @@ def _build_matter_context(
         # matter_documents rows (uploaded before the Matter feature).
         sess = persistence.load_session(sid, user_id=uid)
         if sess and (sess.get("contract_text") or ""):
-            text = (sess.get("contract_text") or "")[:8000]
+            full = sess.get("contract_text") or ""
             fname = sess.get("filename") or ""
             label = f"Hochgeladenes Dokument — {fname}" if fname else "Hochgeladenes Dokument"
             cite = _matter_cite_id(1)
+            prompt_text, page, display = _select_relevant_passages(question, full, 16000)
             matter_sources.append(RetrievedSource(
-                cite_id=cite, source_kind="matter", text=text, label=label,
+                cite_id=cite, source_kind="matter", text=prompt_text, label=label,
             ))
             matter_chunks.append(ChunkOut(
-                text=text[:1500], section=label, law_refs=[], sources=["upload"],
+                text=display[:2500], section=label, law_refs=[], sources=["upload"],
                 similarity=1.0, rerank_score=1.0, cite_id=cite, source_kind="matter",
+                page=page,
             ))
-            combined_parts.append(text)
+            combined_parts.append(full)
         return matter_sources, matter_chunks, "\n\n".join(combined_parts)
 
     # Multi-document matter: one [M-n] per document, n == doc_index.
     # Per-document budget shrinks as the matter grows so a many-document
     # matter doesn't blow the prompt window; floor keeps each document
     # meaningfully represented.
-    per_doc_budget = max(1500, 8000 // max(1, len(docs)))
+    per_doc_budget = max(4000, 16000 // max(1, len(docs)))
     for d in docs:
-        text = (d.get("doc_text") or "")[:per_doc_budget]
-        if not text:
+        full = d.get("doc_text") or ""
+        if not full.strip():
             continue
         fname = d.get("filename") or ""
         label = f"[M-{d['doc_index']}] {fname}" if fname else f"Dokument M-{d['doc_index']}"
         cite = _matter_cite_id(d["doc_index"])
+        prompt_text, page, display = _select_relevant_passages(question, full, per_doc_budget)
         matter_sources.append(RetrievedSource(
-            cite_id=cite, source_kind="matter", text=text, label=label,
+            cite_id=cite, source_kind="matter", text=prompt_text, label=label,
         ))
         matter_chunks.append(ChunkOut(
-            text=text[:1500], section=label, law_refs=[], sources=["upload"],
+            text=display[:2500], section=label, law_refs=[], sources=["upload"],
             similarity=1.0, rerank_score=1.0, cite_id=cite, source_kind="matter",
+            page=page,
         ))
-        combined_parts.append(text)
+        combined_parts.append(full)
     return matter_sources, matter_chunks, "\n\n".join(combined_parts)
 
 
@@ -795,33 +1352,198 @@ def needs_rag(question: str) -> bool:
 
 
 def session_uses_contract(session_id: str | None, question: str) -> bool:
-    """If a contract was uploaded in this session AND the question mentions
-    'Vertrag', 'Klausel', 'Pacht', 'Rückbau' etc., or directly references it,
-    we should pull the contract text into the prompt context.
+    """Whether to pull the session's uploaded document(s) into the prompt.
+
+    The core use case is "upload a PDF, then ask about it", so the rule is
+    deliberately inclusive: if the session HAS any uploaded document we
+    inject it for every substantive question — in ANY language. We only
+    skip it for pure greetings / smalltalk, where adding ~8k chars of
+    contract text is wasted budget.
+
+    This replaces an earlier German-keyword + LLM-classifier gate that
+    silently dropped the uploaded document on English questions ("how
+    many turbines does the permit cover?", "which turbine type is
+    stated?"). That was the worst possible failure for this product: the
+    model answered from the corpus only and told the user the uploaded
+    PDF "is not in the provided context". When in doubt, include the
+    user's own document — the model simply won't cite [M-n] if it's
+    irrelevant.
     """
     if not session_id:
         return False
-    sess = persistence.load_session(session_id)
-    if not sess or not sess.get("contract_text"):
+    # A document is present if there's a matter_documents row OR the
+    # legacy inline contract_text (the first upload mirrors into it).
+    has_docs = bool(persistence.list_matter_documents(session_id))
+    if not has_docs:
+        sess = persistence.load_session(session_id)
+        has_docs = bool(sess and sess.get("contract_text"))
+    if not has_docs:
         return False
-    q = question.lower()
-    contract_keywords = ("vertrag", "klausel", "pacht", "rückbau", "kündigung",
-                         "abschnitt", "paragraf", "ziffer", "absatz", "vereinbarung",
-                         "im dokument", "im upload", "hochgeladen", "this contract",
-                         "the contract", "the document", "the agreement")
-    if any(k in q for k in contract_keywords):
-        return True
-    # Ambiguous — ask LLM
+    # Pure greeting / smalltalk needs no document context.
+    q = question.strip()
+    if len(q) < 4 or CONVERSATIONAL.match(q):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Document ingestion
+# ---------------------------------------------------------------------------
+#
+# Two paths:
+#   • Vision-LLM OCR (default for scanned PDFs) — renders each page to an
+#     image and transcribes it with the on-prem multimodal model. Classic
+#     OCR (Tesseract) misreads degraded glyphs on old German scans — e.g.
+#     "Enercon E-70 E4" came out "E-79" at every DPI/preprocessing combo,
+#     because the scanned "0" is closed at the top. A vision model reads
+#     the same pixels in context (it knows E-79 isn't a real model) and
+#     gets it right. Page markers (``<!-- Seite N -->``) are embedded in
+#     the output so citations can resolve to a page (see _matter passages).
+#   • Docling — used for text-layer PDFs (fast, no OCR needed) and all
+#     non-PDF formats (DOCX, HTML, …).
+
+import base64 as _base64
+import subprocess as _subprocess
+
+# Page marker embedded between pages of VLM-OCR output. Parsed back out
+# when building per-page matter passages; harmless if the model sees it.
+_PAGE_MARKER_RE = re.compile(r"<!--\s*Seite\s+(\d+)\s*-->")
+
+# Toggle: set LAI_VLM_OCR=0 to force the legacy docling/Tesseract path.
+_VLM_OCR_ENABLED = os.environ.get("LAI_VLM_OCR", "1") not in ("0", "false", "False")
+# Render DPI for VLM OCR — 200 is plenty for the model and keeps the
+# image token count modest. Override with LAI_VLM_OCR_DPI.
+_VLM_OCR_DPI = int(os.environ.get("LAI_VLM_OCR_DPI", "200"))
+# Pages are transcribed concurrently — each page is one independent vision-LLM
+# call, and the remote vLLM batches them, so a 10-page scan that took ~2 min/page
+# sequentially (the "stuck for 40 min" report) finishes in a fraction of the wall
+# time. Bounded so a 196-page manual can't flood the shared analyzer endpoint.
+# Override with LAI_VLM_OCR_WORKERS.
+_VLM_OCR_WORKERS = max(1, int(os.environ.get("LAI_VLM_OCR_WORKERS", "5")))
+
+_VLM_OCR_PROMPT = (
+    "Du bist ein präzises OCR-System für gescannte deutsche Rechts- und "
+    "Behördendokumente. Transkribiere den GESAMTEN sichtbaren Text dieses "
+    "Seitenbildes exakt und vollständig.\n"
+    "- Gib die Struktur als Markdown wieder (Überschriften, Absätze, Listen; "
+    "Tabellen als Markdown-Tabellen).\n"
+    "- Wenn ein Zeichen durch die Scan-Qualität mehrdeutig ist, wähle die "
+    "anhand des Kontexts plausibelste Lesart (z.B. Typenbezeichnungen, "
+    "Eigennamen, Gesetzeszitate, Zahlen). Erfinde aber KEINEN Inhalt.\n"
+    "- Übersetze nicht, fasse nicht zusammen, kommentiere nicht.\n"
+    "Gib ausschließlich die reine Transkription aus."
+)
+
+
+def _pdf_has_text_layer(file_bytes: bytes) -> bool:
+    """True if the PDF carries an extractable text layer (i.e. it is NOT a
+    pure scan). Such PDFs go to docling directly — no OCR needed and far
+    faster. A scan returns near-empty text here and is routed to VLM OCR.
+    """
     try:
-        ans, _, _ = llm_generate(build_contract_uses_messages(question), max_new_tokens=4)
-        return "YES" in ans.upper()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            out = _subprocess.run(
+                ["pdftotext", "-q", tmp_path, "-"],
+                capture_output=True, timeout=60,
+            )
+            text = out.stdout.decode("utf-8", errors="replace")
+            # A real text layer yields hundreds of chars; a scan yields a
+            # handful of stray glyphs at most.
+            return len(text.strip()) >= 200
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
     except Exception:
+        # If pdftotext is missing / errors, assume scan and let VLM handle it.
         return False
 
 
-# ---------------------------------------------------------------------------
-# Document ingestion (Docling)
-# ---------------------------------------------------------------------------
+def _render_pdf_to_images(file_bytes: bytes, dpi: int = _VLM_OCR_DPI) -> list[bytes]:
+    """Render every PDF page to a PNG (via poppler's pdftoppm). Returns the
+    page images as PNG bytes, in page order."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "in.pdf"
+        pdf_path.write_bytes(file_bytes)
+        prefix = Path(tmpdir) / "pg"
+        _subprocess.run(
+            ["pdftoppm", "-png", "-r", str(dpi), str(pdf_path), str(prefix)],
+            capture_output=True, timeout=600, check=True,
+        )
+        pngs = sorted(Path(tmpdir).glob("pg*.png"))
+        return [p.read_bytes() for p in pngs]
+
+
+def _vlm_ocr_image(png_bytes: bytes) -> str:
+    """Transcribe one page image with the on-prem vision LLM. Returns the
+    page's text as Markdown. Raises on transport / HTTP error so the caller
+    can fall back to docling."""
+    if STATE["llm_api_url"] is None:
+        raise RuntimeError("VLM OCR requires the remote vLLM endpoint")
+    url = STATE["llm_api_url"].rstrip("/") + "/v1/chat/completions"
+    b64 = _base64.b64encode(png_bytes).decode()
+    body = {
+        "model": STATE["llm_model_name"],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _VLM_OCR_PROMPT},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ],
+        }],
+        "max_tokens": 4096,
+        "temperature": 0.0,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    r = httpx.post(url, json=body, timeout=300.0)
+    r.raise_for_status()
+    obj = r.json()
+    return (obj["choices"][0]["message"]["content"] or "").strip()
+
+
+def _vlm_ocr_pdf(file_bytes: bytes, on_progress=None) -> tuple[str, int, list[dict]]:
+    """OCR a scanned PDF page-by-page with the vision LLM.
+
+    Returns ``(markdown, num_pages, tables)``. Pages are joined with
+    ``<!-- Seite N -->`` markers so downstream passage-building can attach
+    a page number to each [M-n] citation. Tables are left to the analyzer
+    (the OCR markdown already contains Markdown tables inline).
+
+    ``on_progress(done, total)`` — if given, called once the page count is
+    known (``0, total``) and after each page completes, driving the UI
+    progress bar. Pages are OCR'd concurrently (``_VLM_OCR_WORKERS``), so
+    ``done`` counts *completions* (which may finish out of page order); the
+    final markdown is still assembled in page order.
+
+    Any page's failure propagates so the caller (``convert_document``) can
+    fall back to docling for the whole document — same contract as before.
+    """
+    images = _render_pdf_to_images(file_bytes)
+    total = len(images)
+    if on_progress is not None:
+        on_progress(0, total)
+    parts: list[str] = [""] * total
+    workers = min(_VLM_OCR_WORKERS, total) if total else 1
+    done = 0
+    # The as_completed loop runs in this (calling) thread, so ``done`` and
+    # ``on_progress`` need no lock — only ``_vlm_ocr_image`` runs on workers.
+    with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        fut_to_idx = {
+            ex.submit(_vlm_ocr_image, png): idx
+            for idx, png in enumerate(images)
+        }
+        for fut in _futures.as_completed(fut_to_idx):
+            idx = fut_to_idx[fut]
+            page_text = fut.result()  # raises → caller degrades to docling
+            parts[idx] = f"<!-- Seite {idx + 1} -->\n{page_text}"
+            done += 1
+            if on_progress is not None:
+                on_progress(done, total)
+    md = "\n\n".join(parts)
+    return md, total, []
+
 
 _DOCLING_CONVERTER = None  # lazy
 
@@ -885,6 +1607,173 @@ def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int, list[di
         return md, num_pages, tables
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def convert_document(
+    file_bytes: bytes, filename: str, on_progress=None,
+) -> tuple[str, int, list[dict]]:
+    """Top-level ingestion entry point. Routes scanned PDFs through the
+    vision-LLM OCR path (accurate on degraded German scans where Tesseract
+    fails) and everything else through docling.
+
+    Returns ``(markdown, num_pages, tables)`` — same contract as
+    :func:`docling_convert`, so callers are unaffected. ``on_progress(done,
+    total)`` is forwarded to the page-by-page OCR loop when the scanned-PDF
+    path is taken (the docling path has no per-page hook).
+    """
+    suffix = Path(filename).suffix.lower()
+    if (
+        _VLM_OCR_ENABLED
+        and suffix == ".pdf"
+        and STATE["llm_api_url"] is not None
+        and not _pdf_has_text_layer(file_bytes)
+    ):
+        try:
+            md, num_pages, tables = _vlm_ocr_pdf(file_bytes, on_progress=on_progress)
+            if md.strip():
+                print(f"[ingest] VLM OCR: {num_pages} page(s) transcribed for "
+                      f"{filename!r}", flush=True)
+                return md, num_pages, tables
+            print(f"[ingest] VLM OCR returned empty for {filename!r} — "
+                  "falling back to docling", flush=True)
+        except Exception as e:  # noqa: BLE001 — degrade to docling, never fail upload
+            print(f"[ingest] VLM OCR failed for {filename!r} ({e}) — "
+                  "falling back to docling", flush=True)
+    return docling_convert(file_bytes, filename)
+
+
+# Max chars per passage we embed/store in the matter index. Paragraph-sized
+# passages are almost always shorter; this just bounds a pathological wall
+# of text (e.g. a giant OCR'd table) so one passage can't dominate.
+_PASSAGE_EMBED_MAXLEN = 2000
+
+
+def index_matter_document(sid: str, doc_index: int, filename: str, md: str) -> int:
+    """Chunk a document into page-tagged passages, embed them, and store
+    them in the per-Matter pgvector index.
+
+    This is what makes a Matter scale to a real data room: questions
+    retrieve the most relevant passages across ALL uploaded documents
+    (dense KNN scoped to the session) instead of stuffing every document
+    into the prompt. Best-effort — on any failure we log and return 0; the
+    chat path still has a whole-document fallback so the upload is never
+    blocked. Returns the number of passages indexed.
+    """
+    rc = STATE.get("retrieval_client")
+    if rc is None:
+        return 0
+    passages = _split_into_passages(md)
+    rows: list[tuple[int | None, str]] = [
+        (page, text[:_PASSAGE_EMBED_MAXLEN])
+        for page, text in passages
+        if text.strip()
+    ]
+    if not rows:
+        return 0
+    try:
+        from lai.search.eval import _get_embedding_client
+        results = _get_embedding_client().embed([t for _, t in rows])
+        indexed = rc.index_matter_document(
+            sid, doc_index, filename,
+            [(page, text, r.embedding) for (page, text), r in zip(rows, results)],
+        )
+        print(f"[ingest] indexed {indexed} passage(s) for [M-{doc_index}] "
+              f"{filename!r} in session {sid}", flush=True)
+        return indexed
+    except Exception as e:  # noqa: BLE001
+        print(f"[ingest] matter indexing failed for {filename!r} ({e})", flush=True)
+        return 0
+
+
+# ── Background ingestion queue ───────────────────────────────────────────
+#
+# Uploads return the instant the bytes are on disk; the slow work (OCR +
+# embed + pgvector index) runs here so the UI never blocks. A bounded
+# thread pool gives controlled concurrency — multiple pages/documents OCR
+# at once and vLLM batches the concurrent vision requests on the GPU, so a
+# big data room ingests as fast as the GPU allows without a queue of one.
+# Threads (not processes) are right: every step is I/O-bound (HTTP to the
+# vision model + embedding service, Postgres) so the GIL is released
+# throughout. Status/progress live in ``matter_documents`` so the client
+# just polls — no websocket to babysit, and progress survives a refresh.
+_INGEST_WORKERS = int(os.environ.get("LAI_INGEST_WORKERS", "4"))
+import concurrent.futures as _futures
+
+_INGEST_EXECUTOR = _futures.ThreadPoolExecutor(
+    max_workers=_INGEST_WORKERS, thread_name_prefix="ingest",
+)
+
+
+def _ingest_document_job(
+    sid: str, doc_id: int, doc_index: int, filename: str, is_first: bool,
+) -> None:
+    """Background job: OCR (with live progress) → store text → embed+index.
+
+    Walks the document through ``processing`` → ``done`` (or ``failed``),
+    writing progress to ``matter_documents`` so the UI's poll sees a live
+    page counter and a final checkmark. Never raises — a failure is
+    recorded on the row so the user can retry that one document without the
+    upload (or the rest of the data room) being affected.
+    """
+    try:
+        persistence.update_matter_progress(doc_id, status="processing")
+        path = persistence.matter_document_path(sid, doc_id)
+        if path is None:
+            raise RuntimeError("uploaded file not found on disk")
+        contents = path.read_bytes()
+
+        def _on_page(done: int, total: int) -> None:
+            persistence.update_matter_progress(doc_id, pages_done=done, pages_total=total)
+
+        md, num_pages, _tables = convert_document(contents, filename, on_progress=_on_page)
+        # First document mirrors into sessions.contract_text for the legacy
+        # single-document paths (analyze-contract, old preview).
+        if is_first:
+            try:
+                persistence.set_session_contract(sid, md, num_pages)
+            except Exception as e:  # noqa: BLE001
+                print(f"[ingest] contract mirror failed for {sid}: {e}", flush=True)
+        n_chunks = index_matter_document(sid, doc_index, filename, md)
+        persistence.finalize_matter_document(
+            doc_id, doc_text=md, n_pages=num_pages, n_chunks=n_chunks,
+        )
+        print(f"[ingest] done [M-{doc_index}] {filename!r} session={sid}: "
+              f"{num_pages} page(s), {n_chunks} chunk(s)", flush=True)
+    except Exception as e:  # noqa: BLE001 — record on the row, never crash the worker
+        print(f"[ingest] FAILED [M-{doc_index}] {filename!r} session={sid}: {e}", flush=True)
+        try:
+            persistence.fail_matter_document(doc_id, str(e))
+        except Exception:
+            pass
+
+
+def _enqueue_ingestion(
+    sid: str, doc_id: int, doc_index: int, filename: str, is_first: bool,
+) -> None:
+    """Submit a document to the background ingestion pool."""
+    _INGEST_EXECUTOR.submit(
+        _ingest_document_job, sid, doc_id, doc_index, filename, is_first,
+    )
+
+
+def _recover_unfinished_ingestion() -> None:
+    """Re-enqueue documents an interrupted process left queued/processing.
+
+    Called at startup so a restart mid-ingestion doesn't strand documents
+    in a spinner forever. ``is_first`` is treated as False on recovery (the
+    session's contract_text was already set on the original first pass, or
+    will be harmlessly re-set)."""
+    try:
+        pending = persistence.list_unfinished_matter_documents()
+    except Exception as e:  # noqa: BLE001
+        print(f"[ingest] recovery scan failed: {e}", flush=True)
+        return
+    for d in pending:
+        print(f"[ingest] recovering [M-{d['doc_index']}] {d['filename']!r} "
+              f"session={d['session_id']}", flush=True)
+        _enqueue_ingestion(
+            d["session_id"], d["id"], d["doc_index"], d["filename"] or "", False,
+        )
 
 
 def _extract_docling_tables(doc) -> list[dict]:
@@ -1033,6 +1922,11 @@ class ChunkOut(BaseModel):
     # any older client that doesn't ask for citations yet.
     cite_id: str = ""
     source_kind: str = "corpus"  # "corpus" | "matter"
+    # 1-based page number this chunk's text was OCR'd from, when known
+    # (matter documents transcribed by the VLM-OCR path). Lets the
+    # citation panel scroll the PDF preview to the cited page. 0/None when
+    # unknown (corpus chunks, text-layer PDFs, legacy uploads).
+    page: int | None = None
 
 
 class TimingsOut(BaseModel):
@@ -1195,6 +2089,13 @@ async def lifespan(app: FastAPI):
     retrieval_client = RetrievalClient()
     if retrieval_client.ping():
         print("[startup]   pgvector reachable", flush=True)
+        # Per-Matter (data-room) document index lives in the same pgvector
+        # DB as the corpus. Ensure the table exists so uploads can index.
+        try:
+            retrieval_client.ensure_matter_table()
+            print("[startup]   matter_chunks table ready", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[startup]   WARNING matter_chunks ensure failed: {e}", flush=True)
     else:
         print("[startup]   WARNING pgvector not reachable yet — first /query "
               "will retry/fail cleanly", flush=True)
@@ -1254,8 +2155,20 @@ async def lifespan(app: FastAPI):
         # ``LAI_LLM_*`` env vars if the operator wants to tune them;
         # the defaults match the previous hand-rolled ``httpx.post``
         # behaviour closely enough for drop-in compatibility.
+        # thinking_mode_enabled=False: the non-streaming /query path goes
+        # through this client (llm_generate → client.generate). Without it
+        # the Qwen3.x analyzer runs in thinking mode and returns
+        # content=null (the whole token budget is spent on the <think>
+        # trace), so llm_generate sees empty output, exhausts its retries,
+        # and /query returns HTTP 500. The streaming + analyzer paths
+        # already disable thinking (see the chat_template_kwargs blocks);
+        # this path was the gap. Mirrors the DDiQ fix in 8d9c3e5.
         llm_client = SyncLlmClient(
-            LlmConfig(base_url=f"{LLM_API_URL.rstrip('/')}/v1", model=LLM_MODEL),
+            LlmConfig(
+                base_url=f"{LLM_API_URL.rstrip('/')}/v1",
+                model=LLM_MODEL,
+                thinking_mode_enabled=False,
+            ),
         )
         STATE.update(conn=conn, retrieval_client=retrieval_client,
                      reranker=reranker, lm=None, tok=None,
@@ -1289,6 +2202,11 @@ async def lifespan(app: FastAPI):
         print(f"[startup]   LLM warmup: {time.time()-t0:.1f}s", flush=True)
     except Exception as e:
         print(f"[startup]   LLM warmup failed (non-fatal): {e}", flush=True)
+
+    # Re-enqueue any document ingestion a previous process left mid-flight,
+    # now that STATE (retrieval client, LLM url) is fully wired so the
+    # background worker has everything it needs.
+    _recover_unfinished_ingestion()
 
     # ── Auth subsystem (AUTH_PLAN §9 step 1-3) ──────────────────────────
     # Reuses the module-level :data:`_auth_config` and
@@ -1395,6 +2313,49 @@ def health():
     }
 
 
+# Glyph-garbage markers from failed PDF text extraction: PostScript glyph
+# names ("/a214"), runs of dingbats/symbols ("✗✘✙"), the U+FFFD
+# replacement char. Used to drop unreadable corpus chunks at retrieval.
+_GARBLE_RE = re.compile(r"/a\d{2,}|[✀-➿←-⇿⌀-⏿]{3,}|�")
+
+
+_COMMON_WORDS_RE = re.compile(
+    r"\b(der|die|das|und|von|für|fuer|ist|nicht|den|dem|des|ein|eine|einen|mit|"
+    r"auf|im|zu|nach|bei|durch|werden|wird|sind|the|and|of|in|to|is|for|with|on)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_readable_passage(text: str) -> bool:
+    """True if a corpus passage looks like real prose rather than PDF-
+    extraction garbage.
+
+    Two failure modes seen in the embedded corpus:
+      1. Glyph-name / symbol-run / replacement-char garbage ("/a214",
+         "✗✘✙", "�") — caught by ``_GARBLE_RE`` + the char-ratio check.
+      2. Letter-salad OCR scramble — looks letter-like ("deUNJeND
+         Weyseyr|sseqy Bunsynisny…") so it passes the ratio check, but is
+         meaningless. Real DE/EN prose of any non-trivial length always
+         contains common function words (der/die/und/the/of/…); scrambled
+         text essentially never does, so we require at least one.
+    """
+    if not text or not text.strip():
+        return False
+    if _GARBLE_RE.search(text):
+        return False
+    readable = sum(
+        1 for ch in text
+        if ch.isalnum() or ch.isspace() or ch in ".,;:!?()[]{}§%-–/€$\"'„“”’"
+    )
+    if readable / len(text) < 0.7:
+        return False
+    # Letter-salad guard: a passage long enough to be a real chunk must
+    # contain at least one common German/English function word.
+    if len(text) > 120 and not _COMMON_WORDS_RE.search(text):
+        return False
+    return True
+
+
 def _do_rag(
     question: str, top_k: int, candidate_k: int,
 ) -> tuple[list[ChunkOut], list[RetrievedSource], TimingsOut]:
@@ -1464,10 +2425,54 @@ def _do_rag(
             return parent_text[chunk.parent_id]
         return chunk.content
 
+    # Drop candidates whose text is PDF-extraction garbage (glyph names
+    # like "/a214", dingbat/symbol runs "✗✘✙", replacement chars). ~0.75%
+    # of the embedded corpus is such garbage, and when a query happens to
+    # retrieve it the model can only say "the sources are unintelligible
+    # symbols" — a useless non-answer. Filtering here keeps the reranker
+    # and the prompt clean. If EVERY candidate is garbage we keep them
+    # (the model then honestly refuses rather than us returning nothing).
+    _readable = [cid for cid in cand_ids if _is_readable_passage(_passage_for(cid))]
+    if _readable:
+        cand_ids = _readable
+
     pairs = [(question, _passage_for(cid)[:2000]) for cid in cand_ids]
-    rerank_scores = reranker.score(pairs) if pairs else []
-    order = list(np.argsort(-np.asarray(rerank_scores))) if rerank_scores else []
-    reranked_ids = [cand_ids[j] for j in order]
+    # ``reranked_ids`` + ``reranked_scores`` are kept aligned (one score
+    # per id, in final rank order) so the output loop never has to index
+    # back through ``order`` — that indexing is what made the fallback
+    # path crash with UnboundLocalError.
+    try:
+        rerank_scores = reranker.score(pairs) if (reranker is not None and pairs) else []
+        if rerank_scores:
+            order = list(np.argsort(-np.asarray(rerank_scores)))
+            reranked_ids = [cand_ids[j] for j in order]
+            reranked_scores = [float(rerank_scores[j]) for j in order]
+        else:
+            reranked_ids = list(cand_ids)
+            reranked_scores = [0.0] * len(cand_ids)
+    except Exception as exc:  # noqa: BLE001 — graceful degradation, see below
+        # If the reranker fails — most commonly a CUDA OutOfMemoryError
+        # when this in-process reranker shares a GPU with the analyzer
+        # vLLM + the Step-6 embedding job — DO NOT let corpus retrieval
+        # die. Killing it here silently turns LAI from a legal agent into
+        # a document-only Q&A (every corpus question degrades to "not in
+        # the uploaded documents", no [C-n]). Fall back to the hybrid RRF
+        # order (dense + BM25), which is already a sound ranking; the
+        # lawyer still gets cited [C-n] corpus passages, just without the
+        # reranker's final re-ordering. Free the CUDA cache so a transient
+        # spike doesn't wedge subsequent queries.
+        print(f"[_do_rag] reranker.score failed ({type(exc).__name__}: {exc}); "
+              f"falling back to RRF order — corpus retrieval continues", flush=True)
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+        reranked_ids = list(cand_ids)
+        # Descending RRF-position proxy so the score field still carries
+        # a sensible ordering signal when the reranker is unavailable.
+        reranked_scores = [1.0 / (i + 1) for i in range(len(reranked_ids))]
     rerank_s = time.time() - t0
 
     # ── Dedupe to top_k unique parents, build outputs ──────────────────
@@ -1486,7 +2491,7 @@ def _do_rag(
         seen_parents.add(dedupe_key)
 
         passage = _passage_for(cid)[:1500]
-        score = float(rerank_scores[order[rank_pos]])
+        score = reranked_scores[rank_pos]
         in_dense = cid in dense_id_set
         in_bm25 = cid in bm25_id_set
         srcs = (
@@ -1539,19 +2544,33 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
 
     # Decide mode.
     #
-    # Strategy doc Day 1: when an uploaded document is in session, always
-    # fire RAG against the corpus too. The previous EXTERNAL_LAW_REFS
-    # regex gate silently dropped retrieval for English questions
-    # ("cross-check this with your database") and German conversational
-    # phrasings that didn't mention §/BImSchG/BauGB — the corpus was
-    # there but unused. Defaulting RAG on whenever a contract exists is
-    # what turns the chat from "GPT with a German glossary" into
-    # "answers grounded in both your contract and the law".
+    # Document-first: once a document is uploaded, every question is
+    # answered from the uploaded document(s) ALONE — the corpus stays
+    # silent unless the user explicitly asks to look beyond their file
+    # (``wants_corpus``: "compare with…", "what does the law require",
+    # "is this market standard", "rechtsprechung", etc.). The corpus is
+    # ready and one phrase away, but volunteering it produces misleading
+    # answers — e.g. answering a lease-term question on a permit by
+    # quoting an UNRELATED corpus contract. For a lawyer "not in the
+    # document" beats a confidently wrong cross-source figure.
     use_contract = session_uses_contract(sid, req.question)
+    # Answer language: explicit client override → detected question
+    # language → soft mirror. Detecting server-side and emitting an
+    # explicit directive is what stops an English question being
+    # answered in German under a heavily-German prompt/manifest.
+    answer_lang = _effective_language(req.target_language, req.question)
     if req.force_mode in ("rag", "chat"):
         use_rag = req.force_mode == "rag"
     elif use_contract:
-        use_rag = True
+        # Option B: a contract is in session, so the matter [M-n] is
+        # always available (built below). Additionally consult the legal
+        # corpus [C-n] when the question seeks legal/statutory knowledge
+        # (statute refs, doctrine, applicability) — that's what makes LAI
+        # a legal agent rather than a document-only Q&A. Pure
+        # contract-extraction questions stay matter-only (corpus off) so
+        # we don't answer a "what does this clause say?" with an
+        # unrelated corpus contract.
+        use_rag = is_legal_knowledge_question(req.question)
     else:
         use_rag = needs_rag(req.question)
 
@@ -1572,7 +2591,7 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # session ("Matter"), not just one. ``combined_text`` is the
     # concatenation used only for Bundesland detection below.
     matter_sources, matter_chunks, contract_text = _build_matter_context(
-        sid, uid, use_contract,
+        sid, uid, use_contract, req.question,
     )
 
     # Prior chat turns for the same session — gives the model conversational
@@ -1587,7 +2606,7 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # rolling window. Cheap when the session is short or when the previous
     # extraction is still fresh; the refresh fires AFTER persisting the new
     # turn (below) so the freshly stated facts make it into the next refresh.
-    meta_prefix = _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
+    meta_prefix = _matter_manifest_prefix(sid, uid) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
 
     # Matter sources come first so the LLM sees the user's own document
     # before the supporting corpus excerpts — and so the [M-n] handles
@@ -1598,29 +2617,43 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         mode = "rag+contract"
         msgs = build_rag_messages(req.question, rag_sources,
                                   history=history, meta_prefix=meta_prefix,
-                                  target_language=req.target_language)
+                                  target_language=answer_lang)
     elif use_rag:
         mode = "rag"
         msgs = build_rag_messages(req.question, rag_sources,
                                   history=history, meta_prefix=meta_prefix,
-                                  target_language=req.target_language)
+                                  target_language=answer_lang)
     elif use_contract:
         mode = "contract"
         msgs = build_rag_messages(req.question, matter_sources,
                                   history=history, meta_prefix=meta_prefix,
-                                  target_language=req.target_language)
+                                  target_language=answer_lang,
+                                  system=RAG_SYSTEM_DOC_ONLY)
     else:
         mode = "chat"
         msgs = build_chat_messages(req.question, history=history,
                                    meta_prefix=meta_prefix,
-                                   target_language=req.target_language)
+                                   target_language=answer_lang)
 
     chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
 
-    t0 = time.time()
-    answer, prompt_tokens, completion_tokens = llm_generate(
-        msgs, max_new_tokens=600 if (use_rag or use_contract) else 200
+    # Empty-retrieval guard: a doc-scoped turn with zero grounded sources
+    # gets an honest "still processing / nothing relevant" message instead
+    # of an LLM answer fabricated from general knowledge. See
+    # :func:`_empty_grounding_guard`.
+    guard_msg = _empty_grounding_guard(
+        mode, matter_sources, rag_sources, sid, uid, answer_lang,
     )
+
+    t0 = time.time()
+    if guard_msg is not None:
+        print(f"[guard] session={sid} mode={mode} empty-retrieval → honest "
+              "refusal (no LLM call)", flush=True)
+        answer, prompt_tokens, completion_tokens = guard_msg, 0, 0
+    else:
+        answer, prompt_tokens, completion_tokens = llm_generate(
+            msgs, max_new_tokens=1800 if (use_rag or use_contract) else 1024
+        )
     timings.generate_s = round(time.time() - t0, 3)
 
     # Day-4 server-side citation validator. Strip any [C-n]/[M-n] handles
@@ -1628,9 +2661,10 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # sources (i.e. fabricated handles), and mark the surrounding
     # sentence ``(unbelegt)`` so the reader knows the claim has no
     # underlying source. Only runs on grounded-mode turns (chat-only
-    # has no sources to validate against, so nothing to strip).
+    # has no sources to validate against, so nothing to strip); skipped
+    # for a guard message (no LLM output, no sources).
     citation_validation_out: CitationValidationOut | None = None
-    if rag_sources:
+    if guard_msg is None and rag_sources:
         allowed_handles = {src.cite_id for src in rag_sources}
         validation = validate_citations(answer, allowed_handles)
         if validation.fabricated:
@@ -1656,8 +2690,9 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # a Niedersachsen project" failure family — independent of the
     # citation validator above (a citation can be perfectly resolved
     # against an [C-n] in the prompt and still be JURISDICTIONALLY
-    # wrong if the cited statute is from the wrong Bundesland).
-    jurisdiction_warnings = _run_jurisdiction_check(
+    # wrong if the cited statute is from the wrong Bundesland). Skipped
+    # for a guard message (deterministic text, no statutes to check).
+    jurisdiction_warnings = [] if guard_msg is not None else _run_jurisdiction_check(
         answer=answer, contract_text=contract_text, question=req.question,
         mode=mode, sid=sid,
     )
@@ -1687,7 +2722,8 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         # UI for POST /feedback wiring. ``add_message`` returns 0 only
         # on the ownership-check failure path (shouldn't fire here —
         # we just save_session'd above) which we map to None.
-        _aid = persistence.add_message(sid, "assistant", answer, mode=mode, user_id=uid)
+        _aid = persistence.add_message(sid, "assistant", answer, mode=mode, user_id=uid,
+                                       chunks=[c.model_dump() for c in chunks_out])
         assistant_message_id = _aid if _aid > 0 else None
     except Exception as e:
         print(f"[warn] failed to persist messages for {sid}: {e}", flush=True)
@@ -1705,7 +2741,7 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # here). Status is therefore always ``success`` at this point.
     _emit_query_metrics(
         mode=mode,
-        language=req.target_language or "de",
+        language=answer_lang or "de",
         latency_s=timings.total_s,
         chunks_returned=len(chunks_out),
         citation_validation=citation_validation_out,
@@ -1938,11 +2974,22 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
 
     # ── Same retrieval + matter assembly as /query ──────────────────────
     t_total0 = time.time()
+    # Document-first (mirrors /query): doc-only by default once a Matter
+    # exists; corpus [C-n] only when the user explicitly asks for it.
     use_contract = session_uses_contract(sid, req.question)
+    # Answer language: explicit client override → detected question
+    # language → soft mirror. Detecting server-side and emitting an
+    # explicit directive is what stops an English question being
+    # answered in German under a heavily-German prompt/manifest.
+    answer_lang = _effective_language(req.target_language, req.question)
     if req.force_mode in ("rag", "chat"):
         use_rag = req.force_mode == "rag"
     elif use_contract:
-        use_rag = True
+        # Match /query: consult the corpus for any legal-knowledge question
+        # (statute refs, legal doctrine, "what does X mean legally / is it
+        # gesetzlich geregelt", market practice), not only the narrow
+        # explicit-corpus phrases. Pure contract-extraction stays doc-only.
+        use_rag = is_legal_knowledge_question(req.question)
     else:
         use_rag = needs_rag(req.question)
 
@@ -1960,62 +3007,76 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
 
     # Matter side: [M-1]..[M-n] across every document in the session.
     matter_sources, matter_chunks, contract_text = _build_matter_context(
-        sid, uid, use_contract,
+        sid, uid, use_contract, req.question,
     )
 
     history = _load_history(sid, user_id=uid)
-    meta_prefix = _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
+    meta_prefix = _matter_manifest_prefix(sid, uid) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
     rag_sources = matter_sources + corpus_sources
 
     if use_rag and use_contract:
         mode = "rag+contract"
         msgs = build_rag_messages(req.question, rag_sources,
                                   history=history, meta_prefix=meta_prefix,
-                                  target_language=req.target_language)
+                                  target_language=answer_lang)
     elif use_rag:
         mode = "rag"
         msgs = build_rag_messages(req.question, rag_sources,
                                   history=history, meta_prefix=meta_prefix,
-                                  target_language=req.target_language)
+                                  target_language=answer_lang)
     elif use_contract:
         mode = "contract"
         msgs = build_rag_messages(req.question, matter_sources,
                                   history=history, meta_prefix=meta_prefix,
-                                  target_language=req.target_language)
+                                  target_language=answer_lang,
+                                  system=RAG_SYSTEM_DOC_ONLY)
     else:
         mode = "chat"
         msgs = build_chat_messages(req.question, history=history,
                                    meta_prefix=meta_prefix,
-                                   target_language=req.target_language)
+                                   target_language=answer_lang)
 
     chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
-    max_new_tokens = 600 if (use_rag or use_contract) else 200
+    max_new_tokens = 1800 if (use_rag or use_contract) else 1024
+
+    # Empty-retrieval guard (same as /query): a doc-scoped turn with no
+    # grounded sources is answered with an honest message, not an LLM
+    # fabrication. Computed here so the generator can short-circuit.
+    guard_msg = _empty_grounding_guard(
+        mode, matter_sources, rag_sources, sid, uid, answer_lang,
+    )
 
     def _generator():
         """Yield SSE bytes for the lifetime of the request."""
         t0 = time.time()
         accumulated: list[str] = []
-        try:
-            for delta in _stream_vllm_chat(msgs, max_new_tokens):
-                # ``<think>`` traces only appear when thinking mode is
-                # ON; we explicitly disable it above so streaming
-                # output is the user-facing answer directly. As a
-                # belt-and-braces measure the post-stream strip below
-                # still applies ``strip_think`` so a stray trace
-                # survived in the recorded answer wouldn't leak.
-                accumulated.append(delta)
-                yield _sse_event("token", {"delta": delta})
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            yield _sse_event("error", {"detail": f"transport: {exc}"})
-            return
-        except httpx.HTTPStatusError as exc:
-            yield _sse_event("error", {
-                "detail": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
-            })
-            return
-        except Exception as exc:  # noqa: BLE001 — last-line defence; surface anything else cleanly
-            yield _sse_event("error", {"detail": str(exc)})
-            return
+        if guard_msg is not None:
+            print(f"[guard] session={sid} mode={mode} stream=1 empty-retrieval → "
+                  "honest refusal (no LLM call)", flush=True)
+            accumulated.append(guard_msg)
+            yield _sse_event("token", {"delta": guard_msg})
+        else:
+            try:
+                for delta in _stream_vllm_chat(msgs, max_new_tokens):
+                    # ``<think>`` traces only appear when thinking mode is
+                    # ON; we explicitly disable it above so streaming
+                    # output is the user-facing answer directly. As a
+                    # belt-and-braces measure the post-stream strip below
+                    # still applies ``strip_think`` so a stray trace
+                    # survived in the recorded answer wouldn't leak.
+                    accumulated.append(delta)
+                    yield _sse_event("token", {"delta": delta})
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                yield _sse_event("error", {"detail": f"transport: {exc}"})
+                return
+            except httpx.HTTPStatusError as exc:
+                yield _sse_event("error", {
+                    "detail": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+                })
+                return
+            except Exception as exc:  # noqa: BLE001 — last-line defence; surface anything else cleanly
+                yield _sse_event("error", {"detail": str(exc)})
+                return
 
         # ── Post-stream: validate, persist, emit terminal event ──────
         raw_answer = "".join(accumulated)
@@ -2026,7 +3087,7 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         timings.generate_s = round(time.time() - t0, 3)
 
         citation_validation_out: CitationValidationOut | None = None
-        if rag_sources:
+        if guard_msg is None and rag_sources:
             allowed = {src.cite_id for src in rag_sources}
             validation = validate_citations(answer, allowed)
             if validation.fabricated:
@@ -2044,7 +3105,7 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
                 sentences_flagged=validation.sentences_flagged,
             )
 
-        jurisdiction_warnings = _run_jurisdiction_check(
+        jurisdiction_warnings = [] if guard_msg is not None else _run_jurisdiction_check(
             answer=answer, contract_text=contract_text, question=req.question,
             mode=mode, sid=sid,
         )
@@ -2066,7 +3127,8 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
                     "clauses": None, "analysis": None,
                 })
             persistence.add_message(sid, "user", req.question, mode=mode, user_id=uid)
-            _aid = persistence.add_message(sid, "assistant", answer, mode=mode, user_id=uid)
+            _aid = persistence.add_message(sid, "assistant", answer, mode=mode, user_id=uid,
+                                       chunks=[c.model_dump() for c in chunks_out])
             assistant_message_id = _aid if _aid > 0 else None
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] stream: failed to persist messages for {sid}: {exc}", flush=True)
@@ -2078,7 +3140,7 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         # /query/stream sees one coherent number.
         _emit_query_metrics(
             mode=mode,
-            language=req.target_language or "de",
+            language=answer_lang or "de",
             latency_s=timings.total_s,
             chunks_returned=len(chunks_out),
             citation_validation=citation_validation_out,
@@ -2140,21 +3202,12 @@ async def upload(
         raise HTTPException(413, "File too large (max 50 MB)")
     fname = file.filename or "uploaded.pdf"
 
-    # Run Docling in a thread to avoid blocking the event loop
-    loop = asyncio.get_running_loop()
-    try:
-        md, num_pages, tables = await loop.run_in_executor(None, docling_convert, contents, fname)
-    except Exception as e:
-        raise HTTPException(422, f"Could not parse document: {e}")
-
-    # ── Matter model: a session holds MANY documents ────────────────────
-    # Whether this is the first upload or the eighth, the session row must
-    # exist first so the matter_documents FK resolves. The FIRST document
-    # also mirrors into sessions.contract_text / upload_ext so the
-    # single-document paths (analyze-contract, the legacy
-    # /sessions/{id}/document preview) keep working unchanged. Subsequent
-    # documents live only in matter_documents and are addressed as [M-2],
-    # [M-3], …
+    # ── Non-blocking ingestion ──────────────────────────────────────────
+    # We do ONLY the fast, synchronous work here (save bytes, create the
+    # session + a 'queued' matter_documents row) and return immediately.
+    # The slow OCR + embed + index runs in the background pool so a single
+    # upload — or 2000 of them — never hangs the UI. The client polls
+    # GET /sessions/{id}/documents for per-document status + progress.
     existing = persistence.list_matter_documents(sid, user_id=uid) if persistence.session_exists(sid, user_id=uid) else []
     is_first = len(existing) == 0
 
@@ -2165,40 +3218,39 @@ async def upload(
     )
 
     if is_first:
+        # Session created with empty contract_text; the worker fills it
+        # from the first document once OCR completes.
         persistence.save_session(sid, {
             "user_id": uid,
             "filename": fname,
-            "contract_text": md,
-            "n_pages": num_pages,
-            "tables": tables,    # used by analyzer V2
+            "contract_text": None,
+            "n_pages": 0,
+            "tables": [],
             "uploaded_at": time.time(),
-            "clauses": None,     # filled by /analyze-contract
+            "clauses": None,
             "analysis": None,
             "upload_ext": upload_ext,
         })
     elif not persistence.session_exists(sid, user_id=uid):
-        # Defensive: shouldn't happen (is_first would be True), but never
-        # orphan a matter_documents row.
         raise HTTPException(404, "session_id not found")
 
     doc = persistence.add_matter_document(
-        sid, filename=fname, doc_text=md, n_pages=num_pages,
-        upload_ext=upload_ext, user_id=uid,
+        sid, filename=fname, doc_text="", n_pages=0,
+        upload_ext=upload_ext, user_id=uid, status="queued",
     )
     if doc is None:
         raise HTTPException(404, "session_id not found")
-    # Persist this document's own file copy under the per-doc path so
-    # every [M-n] has a previewable original (the first doc also has the
-    # legacy <sid><ext> copy; harmless duplication, keeps both readers
-    # working).
+    # Per-document file copy on disk — the worker reads this back for OCR,
+    # and every [M-n] has a previewable original.
     persistence.save_matter_upload(sid, doc["id"], contents, fname)
 
+    # Hand off to the background pool and return at once.
+    _enqueue_ingestion(sid, doc["id"], doc["doc_index"], fname, is_first)
+
     return UploadResp(
-        session_id=sid, filename=fname, pages=num_pages,
-        chunks=md.count("\n\n") + 1,  # rough paragraph count
+        session_id=sid, filename=fname, pages=0, chunks=0,
         message=(
-            f"Dokument [M-{doc['doc_index']}] eingelesen "
-            f"({len(md):,} Zeichen, {num_pages} Seiten)."
+            f"Dokument [M-{doc['doc_index']}] hochgeladen — wird verarbeitet…"
         ),
     )
 
@@ -2705,6 +3757,13 @@ class MatterDocumentOut(BaseModel):
     filename: str
     n_pages: int
     created_at: float
+    # Async-ingestion status so the UI can show a live progress bar while a
+    # document is OCR'd/indexed and a checkmark when it's ready.
+    status: str = "done"     # queued | processing | done | failed
+    pages_done: int = 0
+    pages_total: int = 0
+    n_chunks: int = 0
+    error: str | None = None
 
 
 @app.get("/sessions/{session_id}/documents")
@@ -2714,7 +3773,9 @@ def list_matter_documents_endpoint(
     """Every document attached to a Matter, ordered by ``[M-n]``.
 
     Drives the workspace Documents tab + the chat's matter chip legend.
-    Returns ``{"documents": [...]}``. Cross-tenant sessions 404.
+    The client polls this while documents ingest — each carries a
+    ``status`` + page progress so the UI renders a spinner/bar then a
+    checkmark. Returns ``{"documents": [...]}``. Cross-tenant sessions 404.
     """
     uid = str(user.id)
     if not persistence.session_exists(session_id, user_id=uid):
@@ -2727,6 +3788,11 @@ def list_matter_documents_endpoint(
             filename=d["filename"] or f"Dokument M-{d['doc_index']}",
             n_pages=d["n_pages"],
             created_at=d["created_at"],
+            status=d.get("status", "done"),
+            pages_done=d.get("pages_done", 0),
+            pages_total=d.get("pages_total", 0),
+            n_chunks=d.get("n_chunks", 0),
+            error=d.get("error"),
         )
         for d in docs
     ]
@@ -2769,6 +3835,17 @@ def delete_session_endpoint(session_id: str, user: CurrentUser = Depends(get_cur
     uid = str(user.id)
     if not persistence.delete_session(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
+    # Drop the Matter's pgvector index too — it lives in Postgres, which
+    # persistence.delete_session (SQLite + files) doesn't touch. Best-effort:
+    # the SQLite delete already succeeded, so a pgvector hiccup shouldn't
+    # 500 the request; orphaned vectors are scoped to a now-dead session id
+    # and never retrieved.
+    rc = STATE.get("retrieval_client")
+    if rc is not None:
+        try:
+            rc.delete_matter_chunks(session_id)
+        except Exception as e:  # noqa: BLE001
+            print(f"[delete] matter_chunks cleanup failed for {session_id}: {e}", flush=True)
     return {"ok": True}
 
 
