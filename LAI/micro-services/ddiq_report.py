@@ -1689,10 +1689,17 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
     t = time.time()
-    progress("sections", 0.07)
-    sections = [analyze_section(req.document_ids, s) for s in ["overview","land","permits","economics"]]
+    # Sections are the bulk (~80% of wall time). Report progress AFTER each
+    # of the four sections so the UI bar visibly advances (0.07 → 0.55)
+    # instead of sitting flat at 7% for ~10 min and looking hung — the
+    # "stuck at 5%" report. Percent is interpolated across the four steps.
+    _section_ids = ["overview", "land", "permits", "economics"]
+    sections = []
+    for _i, _sid in enumerate(_section_ids):
+        progress(f"sections:{_sid}", round(0.07 + (0.55 - 0.07) * _i / len(_section_ids), 3))
+        sections.append(analyze_section(req.document_ids, _sid))
     T["sections_s"] = round(time.time()-t, 2)
-    progress("sections_done", 0.55)  # sections is the bulk (~80% of wall time)
+    progress("sections_done", 0.55)
     report.sections = sections
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
 
