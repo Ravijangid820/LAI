@@ -1321,7 +1321,20 @@ def build_parcels(doc_ids, full_text, wea_statuses, project_center=None, locatio
         logger.info(f"ALKIS WFS query: {bundesland} for {len(wea_statuses)} WEAs")
         for wea in wea_statuses:
             if wea.lat == 0: continue
-            for ap in alkis_query_parcels(wea.lat, wea.lng, bundesland, 150):
+            try:
+                ap_list = alkis_query_parcels(wea.lat, wea.lng, bundesland, 150)
+            except AlkisError as e:
+                # WFS unreachable (e.g. HTTP 530, propagated by the wrapper) —
+                # abandon the cadastral layer rather than failing the whole
+                # report. Layers 2 (regex) + 3 (LLM) + estimated polygons below
+                # still produce parcels; they're tagged non-ALKIS provenance.
+                logger.warning(
+                    "ALKIS WFS unavailable in build_parcels (%s) — skipping "
+                    "cadastral layer, degrading to regex/LLM/estimated: %s",
+                    bundesland, e,
+                )
+                break
+            for ap in ap_list:
                 if ap["parcelNumber"] in seen: continue
                 seen.add(ap["parcelNumber"])
                 # A3 — honest provenance. The parcel RECORD comes from

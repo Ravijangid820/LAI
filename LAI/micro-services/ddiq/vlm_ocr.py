@@ -24,6 +24,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -40,6 +41,10 @@ _ENABLED = os.environ.get("LAI_VLM_OCR", "1") not in ("0", "false", "False")
 _DPI = int(os.environ.get("LAI_VLM_OCR_DPI", "200"))
 # Per-page LLM timeout (seconds). A dense scanned page can take a while.
 _PAGE_TIMEOUT = float(os.environ.get("LAI_VLM_OCR_PAGE_TIMEOUT", "300"))
+# Pages transcribe concurrently — each is one independent vision-LLM call and
+# the remote vLLM batches them, so a multi-page scan ingests far faster than
+# one page at a time. Bounded so a 196-page manual can't flood the analyzer.
+_OCR_WORKERS = max(1, int(os.environ.get("LAI_VLM_OCR_WORKERS", "5")))
 
 _PROMPT = (
     "Du bist ein präzises OCR-System für gescannte deutsche Rechts- und "
@@ -132,12 +137,19 @@ def vlm_ocr_pdf(file_bytes: bytes) -> tuple[str, int]:
     images = _render_pages(file_bytes)
     if not images:
         raise RuntimeError("pdftoppm produced no page images")
-    parts: list[str] = []
-    for i, png in enumerate(images, start=1):
-        try:
-            parts.append(_ocr_image(png))
-        except Exception as e:  # noqa: BLE001 — one bad page must not abort
-            _log.warning("VLM OCR: page %d/%d failed: %s", i, len(images), e)
+    total = len(images)
+    # Transcribe pages concurrently; reassemble in page order. A single bad
+    # page is skipped (left empty), not fatal — same contract as before.
+    parts: list[str] = [""] * total
+    workers = min(_OCR_WORKERS, total)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fut_to_idx = {ex.submit(_ocr_image, png): i for i, png in enumerate(images)}
+        for fut in as_completed(fut_to_idx):
+            idx = fut_to_idx[fut]
+            try:
+                parts[idx] = fut.result()
+            except Exception as e:  # noqa: BLE001 — one bad page must not abort
+                _log.warning("VLM OCR: page %d/%d failed: %s", idx + 1, total, e)
     if not any(p.strip() for p in parts):
         raise RuntimeError("VLM OCR produced no text on any page")
-    return "\n\n".join(parts), len(images)
+    return "\n\n".join(parts), total
