@@ -254,6 +254,7 @@ from ddiq.extractors import (  # noqa: E402 — re-exported for legacy callers
     extract_timeline,
     generate_findings,
 )
+from ddiq import vlm_ocr  # noqa: E402 — scanned-PDF OCR via the vision LLM
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -334,7 +335,21 @@ def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
       - Quality gate via ``min_page_text_chars`` — same 50-char threshold
         the legacy code used.
       - Bounded ``max_pages`` so a 10k-page PDF can't OOM the worker.
+
+    Scanned PDFs (no text layer) are first routed through the vision LLM
+    (:mod:`ddiq.vlm_ocr`) because Tesseract misreads turbine type designations
+    on noisy scans — it read an Enercon **E-70** as **E-79** on the Lamstedt
+    Änderungsgenehmigung. Any VLM failure falls back to the Tesseract path so
+    ingestion never crashes on a bad page.
     """
+    if vlm_ocr.vlm_ocr_enabled():
+        try:
+            if not vlm_ocr.pdf_has_text_layer(file_bytes):
+                text, pages = vlm_ocr.vlm_ocr_pdf(file_bytes)
+                logger.info("extract_pdf_text: VLM OCR transcribed %d page(s)", pages)
+                return text, pages
+        except Exception as e:  # noqa: BLE001 — degrade to Tesseract, never crash ingestion
+            logger.warning("extract_pdf_text: VLM OCR failed (%s); falling back to Tesseract", e)
     result = _PDF_EXTRACTOR.extract_bytes(file_bytes)
     return result.text, result.page_count
 

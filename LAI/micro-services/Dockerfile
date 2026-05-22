@@ -4,11 +4,13 @@ WORKDIR /app
 
 # System dependencies:
 #   tesseract-ocr + deu/eng  — OCR fallback for scanned PDFs
+#   poppler-utils            — pdftoppm/pdftotext for vision-LLM OCR (ddiq.vlm_ocr)
 #   libgeos-dev              — C library for Shapely spatial operations (polygon intersection)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-deu \
     tesseract-ocr-eng \
+    poppler-utils \
     libgeos-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
