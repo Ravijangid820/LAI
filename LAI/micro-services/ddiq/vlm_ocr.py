@@ -24,6 +24,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -42,9 +43,14 @@ _DPI = int(os.environ.get("LAI_VLM_OCR_DPI", "200"))
 # Per-page LLM timeout (seconds). A dense scanned page can take a while.
 _PAGE_TIMEOUT = float(os.environ.get("LAI_VLM_OCR_PAGE_TIMEOUT", "300"))
 # Pages transcribe concurrently — each is one independent vision-LLM call and
-# the remote vLLM batches them, so a multi-page scan ingests far faster than
-# one page at a time. Bounded so a 196-page manual can't flood the analyzer.
-_OCR_WORKERS = max(1, int(os.environ.get("LAI_VLM_OCR_WORKERS", "5")))
+# the remote vLLM batches them, so a multi-page scan ingests faster than one
+# page at a time. Kept LOW (3): the analyzer LLM is shared with the corpus
+# migration / embedding / chat, and firing too many concurrent OCR requests
+# made individual pages time out and get silently dropped (truncated docs).
+_OCR_WORKERS = max(1, int(os.environ.get("LAI_VLM_OCR_WORKERS", "3")))
+# Per-page retry budget. A page that times out under transient contention is
+# retried (sequentially, to let the LLM drain) before the whole OCR gives up.
+_OCR_PAGE_ATTEMPTS = max(1, int(os.environ.get("LAI_VLM_OCR_PAGE_ATTEMPTS", "3")))
 
 _PROMPT = (
     "Du bist ein präzises OCR-System für gescannte deutsche Rechts- und "
@@ -128,28 +134,54 @@ def _ocr_image(png_bytes: bytes) -> str:
 
 
 def vlm_ocr_pdf(file_bytes: bytes) -> tuple[str, int]:
-    """OCR a scanned PDF page-by-page with the vision LLM.
+    """OCR a scanned PDF with the vision LLM, pages transcribed concurrently.
 
-    Returns ``(text, num_pages)`` — pages joined with blank lines. Raises if
-    rendering fails or no page transcribes (so the caller falls back to the
-    Tesseract path); a single failed page is skipped, not fatal.
+    Returns ``(text, num_pages)`` — pages joined with blank lines, in page
+    order. RAISES (so the caller falls back to Tesseract for a COMPLETE
+    document) if rendering fails, if no page transcribes, or if any page still
+    fails after retries — we must never persist a silently TRUNCATED document.
+
+    A page that times out under transient LLM contention is retried up to
+    ``_OCR_PAGE_ATTEMPTS`` times; retry passes run sequentially so they don't
+    re-induce the contention that caused the timeout. A page that returns empty
+    CONTENT (no error — a genuinely blank page) is accepted, not retried.
     """
     images = _render_pages(file_bytes)
     if not images:
         raise RuntimeError("pdftoppm produced no page images")
     total = len(images)
-    # Transcribe pages concurrently; reassemble in page order. A single bad
-    # page is skipped (left empty), not fatal — same contract as before.
     parts: list[str] = [""] * total
-    workers = min(_OCR_WORKERS, total)
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        fut_to_idx = {ex.submit(_ocr_image, png): i for i, png in enumerate(images)}
-        for fut in as_completed(fut_to_idx):
-            idx = fut_to_idx[fut]
-            try:
-                parts[idx] = fut.result()
-            except Exception as e:  # noqa: BLE001 — one bad page must not abort
-                _log.warning("VLM OCR: page %d/%d failed: %s", idx + 1, total, e)
+    pending = list(range(total))  # page indices still needing a result
+    for attempt in range(1, _OCR_PAGE_ATTEMPTS + 1):
+        if not pending:
+            break
+        # Full concurrency on the first pass; serialize retries to let the
+        # shared analyzer LLM drain instead of hammering it again.
+        workers = min(_OCR_WORKERS, len(pending)) if attempt == 1 else 1
+        failed: list[int] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_to_idx = {ex.submit(_ocr_image, images[i]): i for i in pending}
+            for fut in as_completed(fut_to_idx):
+                idx = fut_to_idx[fut]
+                try:
+                    parts[idx] = fut.result()
+                except Exception as e:  # noqa: BLE001 — transient; retried below
+                    failed.append(idx)
+                    _log.warning("VLM OCR: page %d/%d attempt %d failed: %s",
+                                 idx + 1, total, attempt, e)
+        pending = failed
+        if pending and attempt < _OCR_PAGE_ATTEMPTS:
+            time.sleep(2.0 * attempt)  # back off before retrying
+
+    if pending:
+        # Pages still unrecovered → returning now would TRUNCATE the document.
+        # Raise so convert_document degrades to Tesseract, which transcribes
+        # every page (lower quality, but COMPLETE — not silently missing pages).
+        raise RuntimeError(
+            f"VLM OCR: {len(pending)} of {total} page(s) failed after "
+            f"{_OCR_PAGE_ATTEMPTS} attempts ({sorted(p + 1 for p in pending)}) "
+            "— refusing to return a truncated transcription"
+        )
     if not any(p.strip() for p in parts):
         raise RuntimeError("VLM OCR produced no text on any page")
     return "\n\n".join(parts), total

@@ -1540,11 +1540,14 @@ _VLM_OCR_ENABLED = os.environ.get("LAI_VLM_OCR", "1") not in ("0", "false", "Fal
 # image token count modest. Override with LAI_VLM_OCR_DPI.
 _VLM_OCR_DPI = int(os.environ.get("LAI_VLM_OCR_DPI", "200"))
 # Pages are transcribed concurrently — each page is one independent vision-LLM
-# call, and the remote vLLM batches them, so a 10-page scan that took ~2 min/page
-# sequentially (the "stuck for 40 min" report) finishes in a fraction of the wall
-# time. Bounded so a 196-page manual can't flood the shared analyzer endpoint.
+# call. Kept LOW (3): the analyzer LLM is shared with the corpus migration /
+# embedding / chat, and firing too many concurrent OCR requests made individual
+# pages time out (Read timed out) and forced a docling fallback / truncation.
 # Override with LAI_VLM_OCR_WORKERS.
-_VLM_OCR_WORKERS = max(1, int(os.environ.get("LAI_VLM_OCR_WORKERS", "5")))
+_VLM_OCR_WORKERS = max(1, int(os.environ.get("LAI_VLM_OCR_WORKERS", "3")))
+# Per-page retry budget: a page that times out under transient contention is
+# retried (serialized) before the whole OCR degrades to docling.
+_VLM_OCR_PAGE_ATTEMPTS = max(1, int(os.environ.get("LAI_VLM_OCR_PAGE_ATTEMPTS", "3")))
 
 _VLM_OCR_PROMPT = (
     "Du bist ein präzises OCR-System für gescannte deutsche Rechts- und "
@@ -1642,30 +1645,50 @@ def _vlm_ocr_pdf(file_bytes: bytes, on_progress=None) -> tuple[str, int, list[di
     ``done`` counts *completions* (which may finish out of page order); the
     final markdown is still assembled in page order.
 
-    Any page's failure propagates so the caller (``convert_document``) can
-    fall back to docling for the whole document — same contract as before.
+    A page that fails (e.g. a Read timeout under contention) is retried up to
+    ``_VLM_OCR_PAGE_ATTEMPTS`` times — retry passes run serialized so they don't
+    re-induce the contention. Only if a page STILL fails after retries does the
+    failure propagate so ``convert_document`` degrades to docling for the WHOLE
+    document — we never return a transcription silently missing pages.
     """
     images = _render_pdf_to_images(file_bytes)
     total = len(images)
     if on_progress is not None:
         on_progress(0, total)
     parts: list[str] = [""] * total
-    workers = min(_VLM_OCR_WORKERS, total) if total else 1
+    pending = list(range(total))  # page indices still needing a result
     done = 0
-    # The as_completed loop runs in this (calling) thread, so ``done`` and
-    # ``on_progress`` need no lock — only ``_vlm_ocr_image`` runs on workers.
-    with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        fut_to_idx = {
-            ex.submit(_vlm_ocr_image, png): idx
-            for idx, png in enumerate(images)
-        }
-        for fut in _futures.as_completed(fut_to_idx):
-            idx = fut_to_idx[fut]
-            page_text = fut.result()  # raises → caller degrades to docling
-            parts[idx] = f"<!-- Seite {idx + 1} -->\n{page_text}"
-            done += 1
-            if on_progress is not None:
-                on_progress(done, total)
+    for attempt in range(1, _VLM_OCR_PAGE_ATTEMPTS + 1):
+        if not pending:
+            break
+        workers = (min(_VLM_OCR_WORKERS, len(pending)) if attempt == 1 else 1)
+        failed: list[int] = []
+        # The as_completed loop runs in this (calling) thread, so ``done`` and
+        # ``on_progress`` need no lock — only ``_vlm_ocr_image`` runs on workers.
+        with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_to_idx = {ex.submit(_vlm_ocr_image, images[i]): i for i in pending}
+            for fut in _futures.as_completed(fut_to_idx):
+                idx = fut_to_idx[fut]
+                try:
+                    page_text = fut.result()
+                except Exception as exc:  # noqa: BLE001 — transient; retried below
+                    failed.append(idx)
+                    print(f"[ingest] VLM OCR page {idx + 1}/{total} attempt "
+                          f"{attempt} failed: {exc}", flush=True)
+                    continue
+                parts[idx] = f"<!-- Seite {idx + 1} -->\n{page_text}"
+                done += 1
+                if on_progress is not None:
+                    on_progress(done, total)
+        pending = failed
+        if pending and attempt < _VLM_OCR_PAGE_ATTEMPTS:
+            time.sleep(2.0 * attempt)  # back off so the analyzer can drain
+    if pending:
+        # Unrecovered pages → returning now would silently truncate the doc.
+        raise RuntimeError(
+            f"VLM OCR: {len(pending)} of {total} page(s) failed after "
+            f"{_VLM_OCR_PAGE_ATTEMPTS} attempts ({sorted(p + 1 for p in pending)})"
+        )
     md = "\n\n".join(parts)
     return md, total, []
 

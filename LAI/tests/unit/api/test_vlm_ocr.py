@@ -52,14 +52,40 @@ def test_page_order_preserved_when_completion_is_out_of_order(monkeypatch):
     assert all(t == 5 for _, t in seen)
 
 
-def test_page_failure_propagates_for_docling_fallback(monkeypatch):
+def test_unrecovered_pages_raise_for_docling_fallback(monkeypatch):
+    # A page that fails on EVERY attempt must make the whole OCR raise (so the
+    # caller degrades to docling for a COMPLETE doc) — never return a partial.
     monkeypatch.setattr(sr, "_render_pdf_to_images", lambda _b: [b"a", b"b"])
-
-    def boom(_png: bytes) -> str:
-        raise RuntimeError("vlm down")
-
-    monkeypatch.setattr(sr, "_vlm_ocr_image", boom)
+    monkeypatch.setattr(sr, "_vlm_ocr_image", lambda _p: (_ for _ in ()).throw(RuntimeError("timeout")))
     monkeypatch.setattr(sr, "_VLM_OCR_WORKERS", 2)
+    monkeypatch.setattr(sr, "_VLM_OCR_PAGE_ATTEMPTS", 2)
+    monkeypatch.setattr(sr.time, "sleep", lambda _s: None)  # no real backoff
 
-    with pytest.raises(RuntimeError, match="vlm down"):
+    with pytest.raises(RuntimeError, match=r"failed after 2 attempts"):
         sr._vlm_ocr_pdf(b"x")
+
+
+def test_transient_page_failure_is_retried_and_recovered(monkeypatch):
+    # A page that times out once then succeeds must be RECOVERED (no truncation,
+    # no docling fallback) — this is the fix for the silently-dropped pages.
+    monkeypatch.setattr(sr, "_render_pdf_to_images", lambda _b: [f"PNG{i}".encode() for i in range(3)])
+    monkeypatch.setattr(sr, "_VLM_OCR_WORKERS", 3)
+    monkeypatch.setattr(sr, "_VLM_OCR_PAGE_ATTEMPTS", 3)
+    monkeypatch.setattr(sr.time, "sleep", lambda _s: None)
+    calls: dict[int, int] = {}
+
+    def flaky(png: bytes) -> str:
+        idx = int(png.decode().removeprefix("PNG"))
+        calls[idx] = calls.get(idx, 0) + 1
+        if idx == 1 and calls[idx] == 1:      # page 1 times out on first try
+            raise RuntimeError("Read timed out")
+        return f"text-of-page-{idx}"
+
+    monkeypatch.setattr(sr, "_vlm_ocr_image", flaky)
+    md, n, _ = sr._vlm_ocr_pdf(b"x")
+    assert n == 3
+    # all three pages present (page 1 recovered on retry) — nothing dropped
+    for i in range(1, 4):
+        assert f"<!-- Seite {i} -->" in md
+    assert "text-of-page-1" in md
+    assert calls[1] == 2                       # page 1 was retried once
