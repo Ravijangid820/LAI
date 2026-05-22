@@ -306,6 +306,46 @@ def convex_hull_from_points(points: list[tuple[float, float]], buffer_deg: float
     ]
 
 
+# A real wind park spans a few km; a turbine that geocodes tens of km from the
+# cluster is a geocode error (e.g. the applicant's HQ address resolving to a
+# different town), not a real site. Left unchecked, one such outlier inflates
+# the convex-hull project area to hundreds of km² → a 300 m ALKIS sampling grid
+# explodes to tens of thousands of points (the "35,627 points / 1321 km²" jam).
+_MAX_WEA_SPREAD_KM = 25.0
+# Hard ceiling on ALKIS sampling points regardless of area — a safety net so a
+# bad area can never explode the grid.
+_MAX_ALKIS_GRID_POINTS = 400
+# Stop hammering ALKIS once it's clearly down (e.g. HTTP 530) rather than
+# grinding every grid point × its internal retries.
+_MAX_ALKIS_CONSECUTIVE_FAILURES = 8
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Great-circle distance in km between two (lat, lng) points."""
+    r = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.sin(dlng / 2) ** 2)
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def filter_outlier_points(
+    points: list[tuple[float, float]], max_km: float = _MAX_WEA_SPREAD_KM
+) -> list[tuple[float, float]]:
+    """Drop points more than ``max_km`` from the cluster centre (the median
+    lat/lng, which is robust to outliers). Keeps a single mis-geocoded turbine
+    from inflating the project area. With ≤2 points there's no cluster to judge
+    against, so they're returned unchanged."""
+    if len(points) <= 2:
+        return points
+    med_lat = sorted(p[0] for p in points)[len(points) // 2]
+    med_lng = sorted(p[1] for p in points)[len(points) // 2]
+    kept = [p for p in points if _haversine_km(p[0], p[1], med_lat, med_lng) <= max_km]
+    return kept if kept else points
+
+
 def make_circle_polygon(lat: float, lng: float, radius_m: float, num_points: int = 64) -> list[list[float]]:
     """Create a circle approximation as a polygon."""
     points = []
@@ -934,7 +974,14 @@ class CadastralPipeline:
             )
 
         # Option B: Convex hull from WEA locations + buffer
-        wea_points = [(w.lat, w.lng) for w in wea_statuses if w.lat != 0 and w.lng != 0]
+        all_wea_points = [(w.lat, w.lng) for w in wea_statuses if w.lat != 0 and w.lng != 0]
+        wea_points = filter_outlier_points(all_wea_points)
+        if len(wea_points) < len(all_wea_points):
+            logger.warning(
+                "Step 1: dropped %d/%d WEA point(s) >%.0f km from the cluster "
+                "(geocode outliers) before computing project area",
+                len(all_wea_points) - len(wea_points), len(all_wea_points), _MAX_WEA_SPREAD_KM,
+            )
         if wea_points:
             hull = convex_hull_from_points(wea_points, buffer_deg=0.005)
             centroid = compute_centroid(hull)
@@ -979,15 +1026,30 @@ class CadastralPipeline:
             if wea.lat != 0 and wea.lng != 0:
                 query_points.append((wea.lat, wea.lng))
 
-        # Grid points covering project area bounding box
+        # Grid points covering project area bounding box. Base resolution is
+        # 300 m, but if the area is large enough that a 300 m mesh would exceed
+        # the hard cap, coarsen the step so the grid stays bounded — a big area
+        # must never explode into tens of thousands of ALKIS calls.
         if project_area.polygon:
             lats = [p[0] for p in project_area.polygon]
             lngs = [p[1] for p in project_area.polygon]
             min_lat, max_lat = min(lats), max(lats)
             min_lng, max_lng = min(lngs), max(lngs)
-            lat_step = 300 / 111000
             lng_scale = math.cos(math.radians((min_lat + max_lat) / 2))
+            lat_step = 300 / 111000
             lng_step = 300 / (111000 * lng_scale) if lng_scale > 0 else 0.003
+
+            n_lat = max(1, int((max_lat - min_lat) / lat_step) + 1)
+            n_lng = max(1, int((max_lng - min_lng) / lng_step) + 1)
+            if n_lat * n_lng > _MAX_ALKIS_GRID_POINTS:
+                factor = math.sqrt((n_lat * n_lng) / _MAX_ALKIS_GRID_POINTS)
+                lat_step *= factor
+                lng_step *= factor
+                logger.warning(
+                    "Step 2: project area is %.0f km² — coarsening ALKIS grid "
+                    "from ~%d to ~%d points",
+                    project_area.area_km2, n_lat * n_lng, _MAX_ALKIS_GRID_POINTS,
+                )
 
             lat = min_lat
             while lat <= max_lat:
@@ -1008,9 +1070,11 @@ class CadastralPipeline:
 
         logger.info(f"Step 2: Querying ALKIS at {len(unique_points)} points ({bundesland})")
 
+        consecutive_failures = 0
         for lat, lng in unique_points:
             try:
                 alkis_results = self.alkis_query(lat, lng, bundesland, 200)
+                consecutive_failures = 0
                 for ap in alkis_results:
                     pnum = normalize_parcel_number(ap.get("parcelNumber", ""))
                     if not pnum or pnum in seen:
@@ -1028,7 +1092,18 @@ class CadastralPipeline:
                     ))
                 time.sleep(0.3)
             except Exception as e:
+                consecutive_failures += 1
                 logger.warning(f"ALKIS query at ({lat:.5f},{lng:.5f}) failed: {e}")
+                # ALKIS clearly unreachable (e.g. HTTP 530) — stop rather than
+                # grinding every remaining grid point × its internal retries.
+                # The pipeline falls back to estimated parcels downstream.
+                if consecutive_failures >= _MAX_ALKIS_CONSECUTIVE_FAILURES:
+                    logger.warning(
+                        "Step 2: ALKIS unreachable (%d consecutive failures) — "
+                        "aborting cadastral lookup after %d collected parcel(s)",
+                        consecutive_failures, len(parcels),
+                    )
+                    break
 
         return parcels
 
