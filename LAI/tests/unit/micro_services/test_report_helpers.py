@@ -241,6 +241,61 @@ class TestContentlessFinding:
             assert ddiq_report._is_contentless_finding(SimpleNamespace(text=txt)) is False
 
 
+# ── Path B: per-park breakdown ───────────────────────────────────────
+
+
+class TestDetectParksInText:
+    def test_finds_two_parks(self) -> None:
+        got = ddiq_report._detect_parks_in_text(
+            "Anlagen L 1 bis L 16 — Windpark Lamstedt",
+            "Errichtet: 8; Geplant: 3 (Windpark Zodel II, Flur 1)",
+        )
+        assert "Windpark Lamstedt" in got and "Windpark Zodel II" in got
+
+    def test_no_park_returns_empty(self) -> None:
+        assert ddiq_report._detect_parks_in_text("kein Windpark hier", "") == set()
+
+
+class TestBuildParkFacts:
+    def _wea(self, name: str, park: str | None, **kw):
+        from ddiq.models import WEAStatus
+        return WEAStatus(
+            name=name, ampel="green", owner=kw.get("owner", "DWP GmbH"),
+            parcel="", contract="Not specified",
+            lat=0.0, lng=0.0, address="Lamstedt",
+            rated_power_kw=kw.get("kw", 2000.0),
+            model=kw.get("model", "E-70 E4"),
+            status_code=kw.get("status", "errichtet"),
+            park=park,
+        )
+
+    def test_groups_two_parks_with_primary_by_name_match(self) -> None:
+        weas = [self._wea(f"WEA L {i}", "Windpark Lamstedt")
+                for i in (1, 2, 3, 4, 5, 6, 7, 9, 15, 16)] + [
+            self._wea(f"WEA Zodel {i}", "Windpark Zodel", owner="ZWP", kw=None)
+            for i in range(1, 9)
+        ]
+        parks = ddiq_report._build_park_facts(weas, "Windpark Zodel")
+        assert [p.name for p in parks] == ["Windpark Zodel", "Windpark Lamstedt"]
+        assert parks[0].isPrimary and not parks[1].isPrimary
+        assert parks[0].turbineCount == 8 and parks[1].turbineCount == 10
+        # Lamstedt capacity = 10 × 2 MW; Zodel = None (no kw)
+        assert parks[1].totalCapacityMw == 20.0
+        assert parks[0].totalCapacityMw is None
+
+    def test_untagged_returns_empty_so_legacy_reconciler_owns_it(self) -> None:
+        # No ``park`` tags → empty list; caller's existing reconciler handles it.
+        weas = [self._wea("WEA 1", None)]
+        assert ddiq_report._build_park_facts(weas, "Windpark Lamstedt") == []
+
+    def test_no_name_match_marks_largest_as_primary(self) -> None:
+        weas = [self._wea(f"WEA L {i}", "Windpark Lamstedt") for i in (1, 2, 3)] + [
+            self._wea("WEA M 1", "Windpark Mittelstenahe")
+        ]
+        parks = ddiq_report._build_park_facts(weas, "Windpark Unknownsite")
+        assert parks[0].name == "Windpark Lamstedt" and parks[0].isPrimary
+
+
 # ── make_parcel_polygon ──────────────────────────────────────────────
 
 

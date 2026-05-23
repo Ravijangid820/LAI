@@ -130,6 +130,31 @@ class WEAStatus(BaseModel):
     status_code: Optional[str] = None
     permit_ref: Optional[str] = None      # Aktenzeichen of the BImSchG Bescheid
     warranty_end: Optional[str] = None    # ISO date or free text
+    # Path B: which wind park this turbine belongs to (e.g. "Windpark Zodel"
+    # vs "Windpark Lamstedt"). Set by the extractor; None when the documents
+    # don't make the assignment clear. Lets us group + report per park so a
+    # data room covering several neighbouring sites doesn't get its facts
+    # merged into one false-precise total.
+    park: Optional[str] = None
+
+
+class ParkFacts(BaseModel):
+    """Per-windpark breakdown — populated when the documents cover more than
+    one wind park (a court judgment that names a neighbouring site, an
+    easement bundle, a multi-site Regionalplan). The legacy single-project
+    ``projectFacts`` keeps reporting the primary subject; ``parks`` carries
+    the full breakdown so the UI can show each park separately."""
+    name: str
+    projectCompany: Optional[str] = None
+    bundesland: Optional[str] = None
+    location: Optional[str] = None
+    turbineCount: int = 0
+    totalCapacityMw: Optional[float] = None
+    models: list[str] = []
+    statusCounts: dict[str, int] = {}      # {"errichtet": n, "genehmigt": n, …}
+    turbineNames: list[str] = []
+    # True for the park that matches the report's projectName (the subject).
+    isPrimary: bool = False
 
 
 class InfraPoint(BaseModel):
@@ -319,6 +344,14 @@ class DDiQReportData(BaseModel):
     # downstream consumers quote ONE set of values. ``totalCapacityMw`` in
     # particular was reconciled but never stored before A6.
     projectFacts: Optional[dict] = None
+    # ── Per-park breakdown (Path B) ─────────────────────────────────────
+    # Populated when the documents name more than one wind park. The legacy
+    # ``projectFacts`` keeps reporting the primary subject (the park the
+    # report is about); ``parks`` carries the full breakdown so the UI can
+    # render each park separately and a lawyer never sees Lamstedt turbines
+    # attributed to a Zodel header. Empty/single-entry on a clean room.
+    parks: list[ParkFacts] = []
+    multiParkDetected: bool = False
     # ── Jurisdiction warnings (H-2) ────────────────────────────────────
     # Populated by the post-guardrail jurisdiction scan in
     # ``_generate_report_core``. Each entry flags a Bundesland-specific

@@ -204,6 +204,7 @@ from ddiq.models import (  # noqa: E402 — re-exported for legacy callers
     InfraPoint,
     ProjectAreaRequest,
     ProjectAreaResponse,
+    ParkFacts,
     ProjectFacts,
     Quantification,
     RueckbauBond,
@@ -1288,7 +1289,8 @@ Return JSON array of turbines. Each turbine:
   "model":"E-138 EP3|V126|N163|... (Typenbezeichnung) or null",
   "status_code":"errichtet|genehmigt|geplant|abgenommen|null",
   "permit_ref":"BImSchG-Aktenzeichen or null",
-  "warranty_end":"YYYY-MM-DD or null"}}
+  "warranty_end":"YYYY-MM-DD or null",
+  "park":"the wind park this turbine belongs to (e.g. 'Windpark Lamstedt', 'Windpark Zodel'), or null"}}
 
 Rules:
 - Location: give Gemeinde / Landkreis / Bundesland as bare NAMES, never a
@@ -1300,7 +1302,13 @@ Rules:
 - If "7 WEA in Hude" create WEA Hude 1 through WEA Hude 7 with shared attrs.
 - Hub height matters: 10H rule means a 200m turbine in Bayern needs 2km clearance.
   Pull this from the Erläuterungsbericht / Genehmigungsbescheid wherever possible.
-- Use "yellow" ampel for pre-check docs where status is unknown."""
+- Use "yellow" ampel for pre-check docs where status is unknown.
+- ``park``: when the documents cover more than one wind park (e.g. a court
+  judgment that names a neighbouring site, an easement bundle, or a
+  Regionalplan referencing several sites), TAG EACH TURBINE WITH ITS PARK so
+  the report can list them separately. Use the exact "Windpark X" name as it
+  appears in the source. Set ``null`` only when the documents genuinely do
+  not state which park a turbine belongs to — never guess."""
 
     weas_raw = []
     try:
@@ -1366,6 +1374,7 @@ Rules:
             status_code=sc,
             permit_ref=w.get("permit_ref") or None,
             warranty_end=w.get("warranty_end") or None,
+            park=(str(w.get("park")).strip() or None) if w.get("park") else None,
         ))
 
     # Scatter duplicate coordinates so the map doesn't stack pins.
@@ -1411,6 +1420,93 @@ Rules:
         if filled:
             logger.info("A10: back-filled %d WEA spec field(s) from the datasheet pass", filled)
     return statuses
+
+
+# ── Path B: per-park breakdown ─────────────────────────────────────────────
+# When a data room covers more than one wind park (a court judgment naming a
+# neighbouring site, an easement bundle, a Regionalplan referencing several
+# sites), the legacy "one project = one header" assumption produces a
+# false-precise composite — e.g. a "Windpark Zodel" report carrying Lamstedt's
+# turbines and applicant. The two helpers below group turbines by their
+# ``park`` tag (set by the extractor) so the report can render each park
+# separately, and detect a multi-park context for the header-honesty guard.
+
+_PARK_NAME_RE = re.compile(
+    r"\bWindpark[s]?\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-/]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-/]+)?)",
+)
+
+
+def _detect_parks_in_text(*texts: str) -> set[str]:
+    """Distinct park names appearing as 'Windpark X' in the given texts.
+    Falls back signal when the extractor didn't tag ``park`` on each turbine."""
+    found: set[str] = set()
+    for t in texts:
+        if not t:
+            continue
+        for m in _PARK_NAME_RE.finditer(t):
+            name = m.group(1).strip().rstrip(",.;:")
+            if name:
+                found.add(f"Windpark {name}")
+    return found
+
+
+def _build_park_facts(weas: list, project_name: str) -> list:
+    """Group turbines by their ``park`` tag and compute per-park aggregates.
+
+    Returns a (possibly empty) list of :class:`ParkFacts`, sorted with the
+    primary park (best name-match against ``project_name``) first. Turbines
+    without a park tag are skipped — the goal is *honest grouping*, not
+    forcing every row into a bucket. Single-park rooms typically return a
+    one-element list (or [] when the extractor didn't tag park, which is
+    fine — the legacy projectFacts still describes that park).
+    """
+    if not weas:
+        return []
+    grouped: dict[str, list] = {}
+    for w in weas:
+        key = (w.park or "").strip()
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(w)
+    if not grouped:
+        return []
+
+    primary_lc = (project_name or "").strip().lower()
+    _PLACEHOLDER_OWNERS = {"unknown", "see contracts", "not specified",
+                           "not specified in documents", ""}
+    parks: list = []
+    for name, ts in grouped.items():
+        kws = [w.rated_power_kw for w in ts if w.rated_power_kw]
+        total_mw = round(sum(kws) / 1000.0, 3) if kws else None
+        models = sorted({w.model for w in ts if w.model})
+        status_counts: dict[str, int] = {}
+        for w in ts:
+            if w.status_code:
+                status_counts[w.status_code] = status_counts.get(w.status_code, 0) + 1
+        owners = [w.owner for w in ts
+                  if w.owner and w.owner.strip().lower() not in _PLACEHOLDER_OWNERS]
+        company = owners[0] if owners else None
+        location = next((w.address for w in ts if w.address), None)
+        nl = name.lower()
+        is_primary = bool(primary_lc) and (nl in primary_lc or primary_lc in nl)
+        parks.append(ParkFacts(
+            name=name,
+            projectCompany=company,
+            location=location,
+            turbineCount=len(ts),
+            totalCapacityMw=total_mw,
+            models=models,
+            statusCounts=status_counts,
+            turbineNames=[w.name for w in ts],
+            isPrimary=is_primary,
+        ))
+    # Primary first, then by turbine count desc.
+    parks.sort(key=lambda p: (not p.isPrimary, -p.turbineCount, p.name))
+    # If project_name is set but nothing matched, mark the largest group primary
+    # so the report still has a stated subject.
+    if primary_lc and not any(p.isPrimary for p in parks):
+        parks[0].isPrimary = True
+    return parks
 
 
 def extract_infrastructure(doc_ids, sections, project_center=None):
@@ -2217,6 +2313,52 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
         1 for w in report.weaStatuses
         if getattr(w, "status_code", None) in ("errichtet", "abgenommen")
     )
+
+    # ── Path B: per-park breakdown + multi-park header honesty ─────────
+    # Group turbines by their ``park`` tag (set by the extractor). When the
+    # documents cover more than one wind park, also catch it via section/
+    # cell text as a fallback signal — and either reassign the top-level
+    # header to the SUBJECT park (primary, by projectName match) only, or
+    # degrade it to honest "unknown" rather than asserting a false-precise
+    # composite that merges two parks' specs. Single-park rooms are
+    # unaffected: park_facts_list is empty or one entry, multi_park is
+    # False, the existing reconciler stands.
+    park_facts_list = _build_park_facts(report.weaStatuses, pname)
+    text_parks = _detect_parks_in_text(
+        get_section_value(sections, "overview", "Project Name"),
+        get_section_value(sections, "overview", "Number of WEA"),
+        get_section_value(sections, "overview", "Location"),
+        woa_str, cap_str,
+    )
+    distinct_parks = {p.name for p in park_facts_list} | text_parks
+    multi_park = len(distinct_parks) >= 2
+    report.parks = park_facts_list
+    report.multiParkDetected = multi_park
+    if multi_park:
+        logger.warning(
+            "Path B: multi-park context — distinct parks: %s; per-WEA tagged: %s",
+            sorted(distinct_parks), [p.name for p in park_facts_list],
+        )
+        primary = next((p for p in park_facts_list if p.isPrimary), None)
+        if primary and primary.turbineCount > 0:
+            # Header speaks for the primary subject park ONLY (not a mix).
+            report.turbineCount = primary.turbineCount
+            total_mw = primary.totalCapacityMw
+            if primary.projectCompany:
+                project_company = primary.projectCompany
+            logger.info(
+                "Path B: header retargeted to primary park '%s' (count=%d, mw=%s)",
+                primary.name, primary.turbineCount, primary.totalCapacityMw,
+            )
+        else:
+            # Multi-park context but no clean primary — honest unknown beats
+            # a confident wrong number.
+            report.turbineCount = 0
+            total_mw = None
+            logger.warning(
+                "Path B: multi-park with no isolatable primary — header set to unknown",
+            )
+
     facts = ProjectFacts(
         projectName=pname,
         preparedFor=pfor,
