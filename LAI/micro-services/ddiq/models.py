@@ -297,6 +297,15 @@ class ProjectFacts(BaseModel):
     # "not contained" when only a maintenance contract was provided.
     # (MaStR — §5.3, Phase 2B — will later confirm this externally.)
     commissionedWeaCount: int = 0
+    # ── Contextual notes for "unknown" fields ──────────────────────────
+    # Path B: when a header field is honestly "unknown" because the documents
+    # don't state it for the SUBJECT park, an empty value alone reads as
+    # "we don't know" — bad impression. Carry a per-field note that explains
+    # WHY it's unknown and, where applicable, surfaces what the documents do
+    # say (e.g. a capacity stated for a NEIGHBOURING park in the same room,
+    # clearly attributed and labelled as "not the subject of this report").
+    # Map of field name → human-readable note (German, lawyer-facing).
+    notes: Optional[dict[str, str]] = None
 
 
 # ── Top-level report data + API bookends ─────────────────────────────

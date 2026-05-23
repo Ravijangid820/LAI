@@ -2336,6 +2336,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     multi_park = len(distinct_parks) >= 2
     report.parks = park_facts_list
     report.multiParkDetected = multi_park
+    multi_park_notes: dict[str, str] = {}
     if multi_park:
         logger.warning(
             "Path B: multi-park context — distinct parks: %s; per-WEA tagged: %s",
@@ -2359,9 +2360,69 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
             # a confident wrong number.
             report.turbineCount = 0
             total_mw = None
+            primary = None
             logger.warning(
                 "Path B: multi-park with no isolatable primary — header set to unknown",
             )
+        # Contextual notes: an empty value reads "we don't know" — bad
+        # impression. For every field we degraded, attach a German,
+        # lawyer-facing note that explains WHY it's unknown for the subject
+        # AND surfaces what the documents say for the OTHER parks in the
+        # room, clearly attributed and flagged as "nicht Gegenstand dieses
+        # Berichts". Transparency, not silence.
+        subject = primary.name if primary else pname
+        other_parks = [p for p in park_facts_list if p is not primary]
+
+        def _peers_with(attr: str, fmt) -> list[str]:
+            out = []
+            for op in other_parks:
+                v = getattr(op, attr, None)
+                if v:
+                    out.append(fmt(op, v))
+            return out
+
+        if total_mw is None:
+            peers = _peers_with(
+                "totalCapacityMw", lambda op, v: f"{op.name}: ~{v} MW"
+            )
+            base = f"Für „{subject}“ in den vorliegenden Dokumenten nicht angegeben."
+            if peers:
+                multi_park_notes["totalCapacityMw"] = (
+                    base + " Andere im Datenraum genannte Parks: "
+                    + "; ".join(peers)
+                    + " — nicht Gegenstand dieses Berichts."
+                )
+            else:
+                multi_park_notes["totalCapacityMw"] = base
+        if not project_company:
+            peers = _peers_with(
+                "projectCompany", lambda op, v: f"{op.name}: {v}"
+            )
+            base = (
+                f"Projektgesellschaft für „{subject}“ in den vorliegenden "
+                f"Dokumenten nicht angegeben."
+            )
+            if peers:
+                multi_park_notes["projectCompany"] = (
+                    base + " Andere im Datenraum genannte Parks: "
+                    + "; ".join(peers)
+                    + " — nicht Gegenstand dieses Berichts."
+                )
+            else:
+                multi_park_notes["projectCompany"] = base
+        if report.turbineCount == 0:
+            peers = _peers_with(
+                "turbineCount", lambda op, v: f"{op.name}: {v} WEA"
+            )
+            base = f"Turbinenzahl für „{subject}“ aus den Dokumenten nicht eindeutig ableitbar."
+            if peers:
+                multi_park_notes["turbineCount"] = (
+                    base + " Andere im Datenraum genannte Parks: "
+                    + "; ".join(peers)
+                    + " — nicht Gegenstand dieses Berichts."
+                )
+            else:
+                multi_park_notes["turbineCount"] = base
 
     facts = ProjectFacts(
         projectName=pname,
@@ -2372,6 +2433,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
         turbineCount=report.turbineCount,
         totalCapacityMw=total_mw,
         commissionedWeaCount=commissioned_wea,
+        notes=multi_park_notes or None,
     )
     report.projectFacts = facts.model_dump()
 
