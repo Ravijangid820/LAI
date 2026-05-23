@@ -288,12 +288,22 @@ class TestBuildParkFacts:
         weas = [self._wea("WEA 1", None)]
         assert ddiq_report._build_park_facts(weas, "Windpark Lamstedt") == []
 
-    def test_no_name_match_marks_largest_as_primary(self) -> None:
+    def test_multi_park_no_match_leaves_no_primary(self) -> None:
+        # Refuses to mark a best-effort primary when 2+ parks are present and
+        # none matches the project name — the caller's multi-park guard then
+        # degrades the header to honest "unknown" rather than asserting a
+        # false-confident composite (the Zodel/Lamstedt smoke-test failure).
         weas = [self._wea(f"WEA L {i}", "Windpark Lamstedt") for i in (1, 2, 3)] + [
             self._wea("WEA M 1", "Windpark Mittelstenahe")
         ]
         parks = ddiq_report._build_park_facts(weas, "Windpark Unknownsite")
-        assert parks[0].name == "Windpark Lamstedt" and parks[0].isPrimary
+        assert not any(p.isPrimary for p in parks)
+
+    def test_single_park_is_primary_regardless_of_name_match(self) -> None:
+        parks = ddiq_report._build_park_facts(
+            [self._wea("WEA Z 1", "Windpark Zodel")], "Windpark Lamstedt"
+        )
+        assert len(parks) == 1 and parks[0].isPrimary
 
 
 # ── make_parcel_polygon ──────────────────────────────────────────────

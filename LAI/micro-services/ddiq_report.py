@@ -1502,9 +1502,11 @@ def _build_park_facts(weas: list, project_name: str) -> list:
         ))
     # Primary first, then by turbine count desc.
     parks.sort(key=lambda p: (not p.isPrimary, -p.turbineCount, p.name))
-    # If project_name is set but nothing matched, mark the largest group primary
-    # so the report still has a stated subject.
-    if primary_lc and not any(p.isPrimary for p in parks):
+    # A single extracted park IS the primary (there's no ambiguity to flag).
+    # For 2+ parks with NO name match, refuse to mark a "best-effort" primary —
+    # auto-largest would carry the false-confidence we just fixed. The caller's
+    # multi-park guard then degrades the top header to honest "unknown".
+    if len(parks) == 1:
         parks[0].isPrimary = True
     return parks
 
