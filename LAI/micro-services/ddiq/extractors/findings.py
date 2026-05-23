@@ -117,7 +117,13 @@ For the single material issue below, produce ONE Finding with:
   with bank guarantee letter before 2027-06-30").
 - quantification: object with mw_affected (number, null if unknown), eur_impact_estimate
   (number in EUR, null if unknown), days_until_deadline (integer, null if no
-  date-bound deadline), rationale (one short sentence justifying the numbers).{capacity_hint}
+  date-bound deadline), rationale (one short sentence justifying the numbers).
+- park: when the issue applies to a SPECIFIC wind park named in the documents
+  (e.g. "Windpark Lamstedt" vs "Windpark Zodel"), put that exact name here.
+  Use null only when the issue is generic to any park or the documents don't
+  attribute it. NEVER guess. This lets a Zodel-subject report flag a Lamstedt-
+  about finding as "nicht Gegenstand dieses Berichts" instead of mis-applying
+  it to the subject.{capacity_hint}
 
 Issue to draft for:
 {issue_json}
@@ -166,6 +172,9 @@ def _finding_from_llm_obj(
             rationale=q_raw.get("rationale"),
         )
 
+    park = obj.get("park")
+    if park is not None:
+        park = str(park).strip() or None
     return Finding(
         domain=str(obj.get("domain", "General")),
         severity=sev,
@@ -175,6 +184,7 @@ def _finding_from_llm_obj(
         legal_basis=obj.get("legal_basis"),
         recommended_action=obj.get("recommended_action"),
         kind="section",
+        park=park,
     )
 
 

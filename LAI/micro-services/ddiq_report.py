@@ -386,22 +386,34 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[di
 # embed_texts() / embed_single() moved to ``ddiq.llm`` (H-5 phase 2).
 
 
-def _assert_owns_documents(doc_ids, user_id) -> None:
-    """Raise 404 if ``user_id`` does not own every document in ``doc_ids``.
+def _org_str(user) -> Optional[str]:
+    """Phase B scope helper — stringified ``org_id`` for the DDiQ visibility
+    filters, or ``None`` for an org-less user whose reads return empty and
+    whose creates are 403-blocked (MULTIUSER_PLAN §5)."""
+    return str(user.org_id) if getattr(user, "org_id", None) else None
 
-    Single ownership check used at the boundary of every endpoint that
-    takes a list of doc IDs. Returning 404 (not 403) matches AUTH_PLAN
-    §6 rule 4 — never leak the existence of another tenant's row.
+
+def _assert_in_org(doc_ids, org_id) -> None:
+    """Raise 404 if ``org_id`` does not own every document in ``doc_ids``.
+
+    Phase B: ownership is firm-scoped — every member of the firm sees the
+    same documents. Used at the boundary of every endpoint that takes a
+    list of doc IDs. Returning 404 (not 403) matches AUTH_PLAN §6 rule 4
+    — never leak the existence of another firm's row.
     """
     if not doc_ids:
         return
+    if not org_id:
+        # Org-less caller: no document belongs to "no org", so the count
+        # mismatch below would raise anyway. Make the intent explicit.
+        raise HTTPException(status_code=404, detail="documents not found")
     conn = get_conn(); cur = conn.cursor()
     try:
         ph = ",".join(["%s"] * len(doc_ids))
         cur.execute(
             f"SELECT COUNT(*) FROM ddiq_documents "
-            f"WHERE id::text IN ({ph}) AND user_id = %s",
-            (*doc_ids, str(user_id)),
+            f"WHERE id::text IN ({ph}) AND org_id = %s",
+            (*doc_ids, str(org_id)),
         )
         n = cur.fetchone()[0]
     finally:
@@ -1710,12 +1722,19 @@ def build_parcels(doc_ids, full_text, wea_statuses, project_center=None, locatio
 
 @router.get("/documents", response_model=DocumentListResponse)
 def list_documents(user: CurrentUser = Depends(get_current_user)):
-    """List the caller's documents only. AUTH_PLAN G1."""
+    """List the caller's firm's documents (MULTIUSER_PLAN §5 / Phase B).
+
+    Firm-scoped: every member of the same org sees the same documents —
+    that's the multi-user point. An org-less user (open-signup landing
+    state) sees an empty list."""
+    org_id = _org_str(user)
+    if not org_id:
+        return DocumentListResponse(documents=[], total=0)
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
         "SELECT id, filename, size_bytes, upload_date, status, category "
-        "FROM ddiq_documents WHERE user_id = %s ORDER BY upload_date DESC",
-        (str(user.id),),
+        "FROM ddiq_documents WHERE org_id = %s ORDER BY upload_date DESC",
+        (org_id,),
     )
     rows = cur.fetchall(); cur.close(); conn.close()
     return DocumentListResponse(documents=[DocumentOut(id=str(r["id"]), name=r["filename"],
@@ -1732,7 +1751,14 @@ def upload_document(
 ):
     # Sync handler — runs in FastAPI's threadpool. Use file.file.read()
     # (the underlying SpooledTemporaryFile) instead of `await file.read()`.
-    # user_id comes from the JWT (AUTH_PLAN G3) — never from the body.
+    # user_id (created_by) AND org_id (firm-tenant visibility) come from
+    # the JWT (AUTH_PLAN G3) — never from the body.
+    org_id = _org_str(user)
+    if not org_id:
+        # Phase B create-guard: org-less users can't create — without an
+        # org_id the new doc would be invisible (and the lockdown migration
+        # would reject the insert anyway once it lands).
+        raise HTTPException(403, "join a firm to upload documents — ask your admin to add you")
     if not file.filename.lower().endswith(".pdf"): raise HTTPException(400, "Only PDF")
     fb = file.file.read()
     if len(fb) > MAX_FILE_SIZE: raise HTTPException(400, "Too large")
@@ -1743,9 +1769,9 @@ def upload_document(
     embs = embed_texts([c["text"] for c in chunks])
     conn = get_conn(); cur = conn.cursor(); did = str(uuid.uuid4())
     cur.execute(
-        "INSERT INTO ddiq_documents (id,user_id,filename,size_bytes,status,category,full_text,chunk_count,session_id) "
-        "VALUES (%s,%s,%s,%s,'analyzed',%s,%s,%s,%s)",
-        (did, str(user.id), file.filename, len(fb), category, full_text, len(chunks), session_id),
+        "INSERT INTO ddiq_documents (id,user_id,org_id,filename,size_bytes,status,category,full_text,chunk_count,session_id) "
+        "VALUES (%s,%s,%s,%s,%s,'analyzed',%s,%s,%s,%s)",
+        (did, str(user.id), org_id, file.filename, len(fb), category, full_text, len(chunks), session_id),
     )
     for c, e in zip(chunks, embs):
         cur.execute("INSERT INTO ddiq_doc_chunks (doc_id,chunk_idx,text,embedding) VALUES (%s,%s,%s,%s::vector)",
@@ -1758,25 +1784,27 @@ def upload_document(
 @router.delete("/documents/{doc_id}")
 def delete_document(doc_id: str, user: CurrentUser = Depends(get_current_user)):
     """Hard-delete an uploaded document and its chunks. Idempotent — returns
-    404 if the id is unknown OR owned by a different user.
+    404 if the id is unknown OR belongs to a different firm.
 
     ``ddiq_doc_chunks.doc_id`` has ON DELETE CASCADE, so removing the
-    document row drops its chunks automatically. AUTH_PLAN G2: the user
-    filter is on both the ownership check and the DELETE, so a cross-tenant
+    document row drops its chunks automatically. Phase B: the firm-tenant
+    filter is on both the existence check and the DELETE, so a cross-firm
     delete is structurally impossible.
     """
-    uid = str(user.id)
+    org_id = _org_str(user)
+    if not org_id:
+        raise HTTPException(404, "Document not found")
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM ddiq_documents WHERE id = %s AND user_id = %s",
-                (doc_id, uid),
+                "SELECT 1 FROM ddiq_documents WHERE id = %s AND org_id = %s",
+                (doc_id, org_id),
             )
             if not cur.fetchone():
                 raise HTTPException(404, "Document not found")
             cur.execute(
-                "DELETE FROM ddiq_documents WHERE id = %s AND user_id = %s",
-                (doc_id, uid),
+                "DELETE FROM ddiq_documents WHERE id = %s AND org_id = %s",
+                (doc_id, org_id),
             )
     return {"deleted": True, "document_id": doc_id}
 
@@ -1791,15 +1819,16 @@ def delete_document(doc_id: str, user: CurrentUser = Depends(get_current_user)):
 _INFLIGHT_TTL = "2 hours"  # reuse window for queued/running rows
 
 
-def _compute_fingerprint(doc_ids, preset, project_name, user_id) -> str:
+def _compute_fingerprint(doc_ids, preset, project_name, org_id) -> str:
     """Cache key for report-generation requests.
 
-    Scoped by ``user_id`` so two tenants requesting the same documents
-    do not collide — and so the cache lookup cannot return another
-    user's row.
+    Phase B: scoped by ``org_id`` so two firms requesting the same
+    documents do not collide, and so two members of the SAME firm
+    requesting the identical report dedup to ONE job (the explicit win
+    that motivated firm-tenancy in the first place).
     """
     parts = [
-        str(user_id),
+        str(org_id) if org_id else "",
         ",".join(sorted(doc_ids or [])),
         (preset or "").strip().lower(),
         (project_name or "").strip().lower(),
@@ -1807,20 +1836,23 @@ def _compute_fingerprint(doc_ids, preset, project_name, user_id) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
-def _find_existing_report(fp: str, user_id) -> Optional[dict]:
-    """Most recent reusable row for this fingerprint owned by ``user_id``.
+def _find_existing_report(fp: str, org_id) -> Optional[dict]:
+    """Most recent reusable row for this fingerprint visible to ``org_id``.
 
-    The fingerprint alone already includes the user_id, but the WHERE
+    Phase B: the fingerprint already includes the org_id, but the WHERE
     clause filters explicitly — defense in depth: if a future change
-    drops user_id from the fingerprint, the SQL still refuses to leak.
+    drops org_id from the fingerprint, the SQL still refuses to leak
+    across firms.
     """
+    if not org_id:
+        return None
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 f"""SELECT id, status, created_at, started_at
                     FROM ddiq_reports
                     WHERE request_fingerprint = %s
-                      AND user_id = %s
+                      AND org_id = %s
                       AND (
                         status = 'done'
                         OR (status IN ('queued','running')
@@ -1828,7 +1860,7 @@ def _find_existing_report(fp: str, user_id) -> Optional[dict]:
                       )
                     ORDER BY created_at DESC
                     LIMIT 1""",
-                (fp, str(user_id)),
+                (fp, str(org_id)),
             )
             return cur.fetchone()
 
@@ -1858,10 +1890,15 @@ def _update_report_progress(report_id: str, step: Optional[str] = None,
                             user_id=None) -> None:
     """Patch a row in ddiq_reports without touching report_data. Best-effort.
 
-    When ``user_id`` is supplied, the UPDATE is scoped — a teammate's
-    background worker (or a stray retry) can never tamper with another
-    user's report row.
+    Phase B note: ``user_id`` is accepted for caller-compat but no longer
+    used as a scope guard — that was per-user defense-in-depth which made
+    sense for single-user ownership but is wrong for firm-shared reports
+    (a teammate must also be able to nudge progress on the SAME row).
+    The ``report_id`` is a UUID — uniqueness alone makes a cross-row
+    update vanishingly improbable, and the row's ``org_id`` (set at
+    INSERT in ``_persist_report_jsonb``) is what gates visibility.
     """
+    del user_id  # accepted but unused — see docstring
     sets, params = [], []
     if step is not None:    sets.append("progress_step = %s");    params.append(step)
     if percent is not None: sets.append("progress_percent = %s"); params.append(percent)
@@ -1875,9 +1912,6 @@ def _update_report_progress(report_id: str, step: Optional[str] = None,
         sets.append("finished_at = NOW()")
     where = "WHERE id = %s"
     params.append(report_id)
-    if user_id is not None:
-        where += " AND user_id = %s"
-        params.append(str(user_id))
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -1890,7 +1924,7 @@ def _update_report_progress(report_id: str, step: Optional[str] = None,
 
 
 def _persist_report_jsonb(rid: str, project_name: str, doc_ids: list, preset: str,
-                          report: "DDiQReportData", user_id) -> None:
+                          report: "DDiQReportData", user_id, org_id=None) -> None:
     """Best-effort UPSERT of just the report_data JSONB. Used as a checkpoint
     after each major pipeline phase — if a later phase crashes, the row
     still has the partial report from the last successful checkpoint
@@ -1902,21 +1936,22 @@ def _persist_report_jsonb(rid: str, project_name: str, doc_ids: list, preset: st
     deliberately NOT done here — those are write-once-at-end to avoid
     duplicate rows from re-running.
 
-    ``user_id`` is set on initial INSERT only; the ON CONFLICT branch
-    leaves it untouched so a stray re-call cannot reassign ownership.
+    Phase B: ``user_id`` (created_by) AND ``org_id`` (firm-tenant
+    visibility) are both set on initial INSERT; the ON CONFLICT branch
+    leaves them untouched so a stray re-call cannot reassign ownership.
     """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO ddiq_reports (id, user_id, project_name, document_ids, preset, report_data)
-                       VALUES (%s, %s, %s, %s::uuid[], %s, %s)
+                    """INSERT INTO ddiq_reports (id, user_id, org_id, project_name, document_ids, preset, report_data)
+                       VALUES (%s, %s, %s, %s, %s::uuid[], %s, %s)
                        ON CONFLICT (id) DO UPDATE SET
                            project_name = EXCLUDED.project_name,
                            document_ids = EXCLUDED.document_ids,
                            preset = EXCLUDED.preset,
                            report_data = EXCLUDED.report_data""",
-                    (rid, str(user_id), project_name, doc_ids, preset, json.dumps(report.model_dump())),
+                    (rid, str(user_id), str(org_id) if org_id else None, project_name, doc_ids, preset, json.dumps(report.model_dump())),
                 )
     except Exception as e:
         # Checkpoint failure shouldn't kill the pipeline — the next checkpoint
@@ -2394,12 +2429,13 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
             )
         else:
             # Multi-park context but no clean primary — honest unknown beats
-            # a confident wrong number. Clear projectCompany too (the section
-            # extractor's value can come from either park, so it's just as
-            # contaminated as the count/capacity).
+            # a confident wrong number. Clear projectCompany AND bundesland too
+            # (the section extractor's bundesland can come from either park,
+            # so it's as contaminated as the count/capacity/company).
             report.turbineCount = 0
             total_mw = None
             project_company = None
+            report.bundesland = None
             primary = None
             logger.warning(
                 "Path B: multi-park with no isolatable primary — header set to unknown",

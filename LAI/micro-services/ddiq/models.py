@@ -205,6 +205,15 @@ class Finding(BaseModel):
     recommended_action: Optional[str] = None
     # section | cross_document | deadline | grundbuch | rueckbau | regulatory
     kind: str = "section"
+    # Path B: which wind park this finding pertains to (e.g. "Windpark Zodel"
+    # vs "Windpark Lamstedt"). When the documents cover more than one park a
+    # finding might describe Lamstedt while the report's subject is Zodel —
+    # carrying the park lets the UI surface it as "(über Windpark Lamstedt —
+    # nicht Gegenstand dieses Berichts)" instead of letting it read as a fact
+    # about the subject. ``None`` when the finding isn't park-specific (e.g.
+    # a generic legal-basis observation that applies to any park) or the LLM
+    # couldn't tell.
+    park: Optional[str] = None
 
 
 # ── Timeline (P0 #2) ─────────────────────────────────────────────────
