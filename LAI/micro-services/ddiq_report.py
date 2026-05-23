@@ -2372,6 +2372,15 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
         # Berichts". Transparency, not silence.
         subject = primary.name if primary else pname
         other_parks = [p for p in park_facts_list if p is not primary]
+        # Parks named in section text but NOT extracted into ParkFacts — when
+        # only the subject was extracted, we still want the lawyer to know
+        # which OTHER parks are mentioned in the room (e.g. a court judgment
+        # referencing a neighbouring site), so the unknown carries context
+        # rather than reading as ignorance.
+        text_only_parks = sorted(
+            n for n in distinct_parks
+            if n not in {p.name for p in park_facts_list}
+        )
 
         def _peers_with(attr: str, fmt) -> list[str]:
             out = []
@@ -2381,48 +2390,50 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
                     out.append(fmt(op, v))
             return out
 
+        def _peer_tail(peers: list[str]) -> str:
+            """Tail of the note that surfaces what the documents say about
+            the OTHER parks in the room — specific figures when we have them,
+            else at least the names so the unknown isn't context-less."""
+            if peers:
+                return (
+                    " Andere im Datenraum genannte Parks: "
+                    + "; ".join(peers)
+                    + " — nicht Gegenstand dieses Berichts."
+                )
+            if text_only_parks:
+                return (
+                    " Die Dokumente erwähnen weitere Parks im Datenraum ("
+                    + ", ".join(text_only_parks)
+                    + ") — deren Daten sind nicht Gegenstand dieses Berichts."
+                )
+            return ""
+
         if total_mw is None:
             peers = _peers_with(
                 "totalCapacityMw", lambda op, v: f"{op.name}: ~{v} MW"
             )
-            base = f"Für „{subject}“ in den vorliegenden Dokumenten nicht angegeben."
-            if peers:
-                multi_park_notes["totalCapacityMw"] = (
-                    base + " Andere im Datenraum genannte Parks: "
-                    + "; ".join(peers)
-                    + " — nicht Gegenstand dieses Berichts."
-                )
-            else:
-                multi_park_notes["totalCapacityMw"] = base
+            multi_park_notes["totalCapacityMw"] = (
+                f"Für „{subject}“ in den vorliegenden Dokumenten nicht angegeben."
+                + _peer_tail(peers)
+            )
         if not project_company:
             peers = _peers_with(
                 "projectCompany", lambda op, v: f"{op.name}: {v}"
             )
-            base = (
+            multi_park_notes["projectCompany"] = (
                 f"Projektgesellschaft für „{subject}“ in den vorliegenden "
                 f"Dokumenten nicht angegeben."
+                + _peer_tail(peers)
             )
-            if peers:
-                multi_park_notes["projectCompany"] = (
-                    base + " Andere im Datenraum genannte Parks: "
-                    + "; ".join(peers)
-                    + " — nicht Gegenstand dieses Berichts."
-                )
-            else:
-                multi_park_notes["projectCompany"] = base
         if report.turbineCount == 0:
             peers = _peers_with(
                 "turbineCount", lambda op, v: f"{op.name}: {v} WEA"
             )
-            base = f"Turbinenzahl für „{subject}“ aus den Dokumenten nicht eindeutig ableitbar."
-            if peers:
-                multi_park_notes["turbineCount"] = (
-                    base + " Andere im Datenraum genannte Parks: "
-                    + "; ".join(peers)
-                    + " — nicht Gegenstand dieses Berichts."
-                )
-            else:
-                multi_park_notes["turbineCount"] = base
+            multi_park_notes["turbineCount"] = (
+                f"Turbinenzahl für „{subject}“ aus den Dokumenten nicht "
+                f"eindeutig ableitbar."
+                + _peer_tail(peers)
+            )
 
     facts = ProjectFacts(
         projectName=pname,
