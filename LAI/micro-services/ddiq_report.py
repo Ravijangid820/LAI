@@ -2394,9 +2394,12 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
             )
         else:
             # Multi-park context but no clean primary — honest unknown beats
-            # a confident wrong number.
+            # a confident wrong number. Clear projectCompany too (the section
+            # extractor's value can come from either park, so it's just as
+            # contaminated as the count/capacity).
             report.turbineCount = 0
             total_mw = None
+            project_company = None
             primary = None
             logger.warning(
                 "Path B: multi-park with no isolatable primary — header set to unknown",
