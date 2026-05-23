@@ -2343,14 +2343,16 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
         )
         primary = next((p for p in park_facts_list if p.isPrimary), None)
         if primary and primary.turbineCount > 0:
-            # Header speaks for the primary subject park ONLY (not a mix).
+            # Header speaks for the primary subject park ONLY (not a mix). If
+            # the primary park's company isn't determinable, the header must
+            # NOT silently keep the section-extracted value (which can come
+            # from the OTHER park) — degrade to None alongside capacity.
             report.turbineCount = primary.turbineCount
             total_mw = primary.totalCapacityMw
-            if primary.projectCompany:
-                project_company = primary.projectCompany
+            project_company = primary.projectCompany
             logger.info(
-                "Path B: header retargeted to primary park '%s' (count=%d, mw=%s)",
-                primary.name, primary.turbineCount, primary.totalCapacityMw,
+                "Path B: header retargeted to primary park '%s' (count=%d, mw=%s, company=%s)",
+                primary.name, primary.turbineCount, primary.totalCapacityMw, project_company,
             )
         else:
             # Multi-park context but no clean primary — honest unknown beats
