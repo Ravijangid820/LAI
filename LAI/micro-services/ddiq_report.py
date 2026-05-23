@@ -1463,11 +1463,19 @@ def _build_park_facts(weas: list, project_name: str) -> list:
     if not weas:
         return []
     grouped: dict[str, list] = {}
+    untagged: list = []
     for w in weas:
         key = (w.park or "").strip()
-        if not key:
-            continue
-        grouped.setdefault(key, []).append(w)
+        if key:
+            grouped.setdefault(key, []).append(w)
+        else:
+            untagged.append(w)
+    # All-untagged → legacy reconciler owns this (single-park clean case).
+    # When SOME turbines are tagged and others aren't, we surface the untagged
+    # ones as a synthetic "nicht zugeordnet" group so they (a) trigger the
+    # multi-park guard and (b) appear in the contextual notes — instead of
+    # silently joining the subject park's totals (the failure mode that left
+    # 10 Lamstedt L-series turbines invisible on a Windpark-Zodel report).
     if not grouped:
         return []
 
@@ -1500,6 +1508,35 @@ def _build_park_facts(weas: list, project_name: str) -> list:
             turbineNames=[w.name for w in ts],
             isPrimary=is_primary,
         ))
+    # Synthetic group for the untagged-but-extracted turbines, so they
+    # trigger the multi-park guard and surface in the contextual notes (a
+    # lawyer reading 'WEA L 1…L 16' under "(Park nicht zugeordnet)" will
+    # immediately recognise the Lamstedt-series contamination on a
+    # Windpark-Zodel report). Never primary by definition.
+    if untagged:
+        kws = [w.rated_power_kw for w in untagged if w.rated_power_kw]
+        un_total_mw = round(sum(kws) / 1000.0, 3) if kws else None
+        un_models = sorted({w.model for w in untagged if w.model})
+        un_status: dict[str, int] = {}
+        for w in untagged:
+            if w.status_code:
+                un_status[w.status_code] = un_status.get(w.status_code, 0) + 1
+        un_owners = [
+            w.owner for w in untagged
+            if w.owner and w.owner.strip().lower() not in _PLACEHOLDER_OWNERS
+        ]
+        parks.append(ParkFacts(
+            name="(Park nicht zugeordnet)",
+            projectCompany=un_owners[0] if un_owners else None,
+            location=None,
+            turbineCount=len(untagged),
+            totalCapacityMw=un_total_mw,
+            models=un_models,
+            statusCounts=un_status,
+            turbineNames=[w.name for w in untagged],
+            isPrimary=False,
+        ))
+
     # Primary first, then by turbine count desc.
     parks.sort(key=lambda p: (not p.isPrimary, -p.turbineCount, p.name))
     # A single extracted park IS the primary (there's no ambiguity to flag).
