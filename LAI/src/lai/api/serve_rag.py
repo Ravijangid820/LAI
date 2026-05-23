@@ -79,7 +79,9 @@ from lai.common.auth import (
     build_get_current_user,
 )
 from lai.common.auth.db import create_pool as _create_auth_pool
+from lai.api.admin_router import build_admin_router
 from lai.api.auth_router import AuthDeps, build_auth_router, register_auth_exception_handlers
+from lai.api.share_router import build_share_router
 from lai.api.email import EmailConfig as _EmailConfig
 from fastapi import Depends
 
@@ -298,7 +300,26 @@ RAG_SYSTEM_DOC_ONLY = (
     "Wissen zurück und nenne KEINE Zahlen, Fristen oder Klauseln aus "
     "anderen Dokumenten — es sei denn, der Nutzer fragt ausdrücklich "
     "danach. Lieber ehrlich \"nicht enthalten\" als eine erfundene oder "
-    "aus fremden Quellen übernommene Antwort."
+    "aus fremden Quellen übernommene Antwort.\n"
+    "\n"
+    "Formatierungsregeln: Strukturiere die Antwort mit Markdown — Überschriften "
+    "(##), Aufzählungen, Fettdruck für Schlüsselbegriffe. Wenn der Nutzer "
+    "tabellarische Daten verlangt (\"als Tabelle\", \"in Tabellenform\", "
+    "\"Übersicht\", \"vergleiche … in einer Tabelle\") oder die Daten von Natur "
+    "aus tabellarisch sind (mehrere Parzellen, mehrere Vertragspartner, mehrere "
+    "Fristen, mehrere Kennzahlen), gib eine GitHub-Flavored-Markdown-Tabelle "
+    "aus. Beispiel:\n"
+    "| Flurstück | Eigentümer | Vermerk |\n"
+    "|---|---|---|\n"
+    "| 1505 | Diedrich Söhl | Vormerkung Abt. II Nr. 14 [M-1] |\n"
+    "Setze NIE umschließende ``**`` Fettmarker direkt um ein Zitations-Handle "
+    "([M-n] / [C-n]) — das Handle erhält bereits eine eigene Hervorhebung.\n"
+    "\n"
+    "Bei nummerierten Listen schreibe Nummer UND Inhalt in EINE Zeile: "
+    "``1. **Überschrift** Begleitext mit [M-n].`` — NIE die Nummer auf eine "
+    "eigene Zeile setzen (``1.\\nÜberschrift``), das bricht das Listen-Rendering "
+    "und führt zu wiederholten Nummerierungen (1, 1, 2 statt 1, 2, 3). "
+    "Zwischen zwei Listenpunkten steht eine Leerzeile."
 )
 
 
@@ -549,19 +570,21 @@ def _maybe_refresh_session_metadata(session_id: str, user_id: str | None = None)
     turns since last extraction). Best-effort: any failure is logged and
     swallowed — chat must never break because the meta layer hiccuped.
 
-    The ``user_id`` scopes every persistence call so the meta refresh
-    cannot read or write rows owned by a different tenant.
+    Phase B: ``org_id`` scopes every persistence call to the caller's firm
+    so the meta refresh cannot read or write rows owned by a different
+    firm (and so meta refresh works for any firm member, not just the
+    session's original creator).
     """
     if not session_id:
         return
     try:
-        msgs = persistence.list_messages(session_id, user_id=user_id)
+        msgs = persistence.list_messages(session_id, user_id=uid)
     except Exception:
         return
     user_turn_count = sum(1 for m in msgs if m.get("role") == "user")
     if user_turn_count < 1:
         return
-    existing = persistence.get_session_meta(session_id, user_id=user_id) or {}
+    existing = persistence.get_session_meta(session_id, user_id=uid) or {}
     last_n = int(existing.get("_refreshed_at_n_user_turns", 0))
     if user_turn_count - last_n < META_REFRESH_EVERY_N_USER_TURNS and last_n > 0:
         return  # not stale enough, skip
@@ -619,7 +642,7 @@ def _maybe_refresh_session_metadata(session_id: str, user_id: str | None = None)
             if result.get(k):
                 merged[k] = result[k]
         merged["_refreshed_at_n_user_turns"] = user_turn_count
-        persistence.set_session_meta(session_id, merged, user_id=user_id)
+        persistence.set_session_meta(session_id, merged, user_id=uid)
     except Exception as e:
         print(f"[meta] session meta refresh for {session_id} failed: {e}", flush=True)
 
@@ -629,12 +652,14 @@ def _load_history(session_id: str | None, user_id: str | None = None) -> list[di
     Returns [] for a brand-new session or any persistence failure — chat
     must never break because the history layer hiccuped.
 
-    Filters by ``user_id`` to prevent cross-tenant history leak.
+    Phase B: filters by firm-tenant key — every member of the firm sees
+    the same prior history (so two associates can pick up each other's
+    threads).
     """
     if not session_id:
         return []
     try:
-        msgs = persistence.list_messages(session_id, user_id=user_id)
+        msgs = persistence.list_messages(session_id, user_id=uid)
     except Exception:
         return []
     # Keep only the most recent window. Filter to user/assistant (drop any
@@ -903,6 +928,50 @@ def _matter_cite_id(n: int) -> str:
     return f"M-{n}"
 
 
+def _org_or_none(user: CurrentUser) -> Optional[str]:
+    """Phase B scope helper — stringified ``org_id`` for the persistence /
+    DDiQ visibility filters, or ``None`` for an org-less user (open signup
+    landing state) whose reads naturally return empty everywhere."""
+    return str(user.org_id) if user.org_id else None
+
+
+def _all_matter_handles(
+    sid: str, uid: Optional[str],
+    focus_doc_indexes: Optional[list[int]] = None,
+) -> set[str]:
+    """Every uploaded matter document's ``[M-n]`` handle for this session.
+
+    The citation validator's ``allowed`` set is otherwise built from the
+    *retrieved* sources only (``matter_sources``), but the matter manifest
+    prefix (:func:`_matter_manifest_prefix`) explicitly invites the model to
+    cite ANY uploaded document by its ``[M-n]`` — searchable and citeable —
+    even when this turn retrieved no passage from it (e.g. a "summarise every
+    document" turn that out-runs the retrieval top-K). A handle that maps to a
+    real uploaded document is therefore **never a fabrication**; widening
+    ``allowed`` with this set stops the validator from stripping such handles
+    and mislabelling correct, real-document citations ``(unbelegt)``.
+
+    Baseline chunks for these documents already ride in ``chunks_out`` (see
+    ``_matter_pgvector_context``), so the citation panel resolves them too.
+
+    Best-effort: a lookup failure must never break the turn — returns an empty
+    set so validation simply falls back to the retrieved-sources behaviour.
+    Per-turn focus: when ``focus_doc_indexes`` is set, the allowed set
+    narrows to those handles — the validator will strip any other [M-n]
+    the model emits as "fabricated", which is what we want for a
+    "this-document" turn.
+    """
+    try:
+        docs = persistence.list_matter_documents(sid, user_id=uid)
+        if focus_doc_indexes:
+            in_scope = set(focus_doc_indexes)
+            docs = [d for d in docs if d["doc_index"] in in_scope]
+        return {_matter_cite_id(d["doc_index"]) for d in docs}
+    except Exception as exc:  # noqa: BLE001 — validation must never raise
+        print(f"[citation] matter-handle widen failed sid={sid}: {exc}", flush=True)
+        return set()
+
+
 def _split_into_pages(doc_text: str) -> list[tuple[int | None, str]]:
     """Split ingestion text on ``<!-- Seite N -->`` markers into
     ``[(page, text)]``. Text without markers (docling / legacy uploads)
@@ -1048,11 +1117,18 @@ _MATTER_FINAL_K = 12
 def _matter_pgvector_context(
     sid: str, question: str,
     candidate_k: int = _MATTER_CANDIDATE_K, final_k: int = _MATTER_FINAL_K,
+    focus_doc_indexes: Optional[list[int]] = None,
 ) -> tuple[list["RetrievedSource"], list["ChunkOut"], str] | None:
     """Scalable matter retrieval: dense KNN over the per-session pgvector
     index + rerank, grouped back into one ``[M-doc_index]`` source per
     document so a data room of any size yields a bounded, citation-ready
     prompt.
+
+    When ``focus_doc_indexes`` is set, post-retrieval hits are restricted
+    to those doc indexes AND the baseline-chunk fill is also narrowed —
+    so a "this document" turn doesn't silently pull in prior project
+    docs the user didn't ask about. ``None``/empty ⇒ full session in
+    scope (the prior behaviour).
 
     Returns ``None`` to signal "no indexed passages for this session" so
     the caller falls back to the legacy whole-document path (sessions
@@ -1069,6 +1145,19 @@ def _matter_pgvector_context(
         return None
     if not hits:
         return None
+
+    # Per-turn focus filter: drop hits that aren't in the focused set.
+    # Done AFTER the dense search (cheap) so the focused docs still come
+    # back with their best passages; if none of the focused docs had a
+    # passage that survived the search, the baseline-chunk fill below
+    # still presents them to the panel.
+    if focus_doc_indexes:
+        focus_set = set(focus_doc_indexes)
+        hits = [h for h in hits if h.doc_index in focus_set]
+        if not hits:
+            # No focused doc had a retrieved passage. Fall back to the
+            # baseline path (where the focus filter is applied below).
+            hits = []
 
     # Rerank (query, passage) pairs — same cross-encoder the corpus uses.
     reranker = STATE.get("reranker")
@@ -1121,16 +1210,23 @@ def _matter_pgvector_context(
         ))
         combined_parts.append(prompt_text)
 
-    # Baseline chunks for EVERY other document in the matter (those with no
-    # retrieved passage this turn). The model may cite any [M-n] — especially
-    # from the manifest, e.g. answering "are all PDFs uploaded?" by listing
-    # all five. Without a chunk those handles render "not available" and the
-    # panel can't open the PDF. These go ONLY into the frontend chunk set,
-    # not the prompt sources (the prompt stays bounded to relevant passages).
+    # Baseline chunks for the other documents IN SCOPE this turn (those
+    # with no retrieved passage). Without these, [M-n] handles the LLM
+    # cites from the manifest render "not available" and the panel can't
+    # open the PDF. These go ONLY into the frontend chunk set, not the
+    # prompt sources (the prompt stays bounded to relevant passages).
+    #
+    # Per-turn focus: when ``focus_doc_indexes`` is set, only those docs
+    # get a baseline chunk — otherwise the citation panel could resolve
+    # an [M-n] for a doc the user didn't ask about, leaking it into the
+    # answer's source list.
     try:
+        in_scope = set(focus_doc_indexes) if focus_doc_indexes else None
         for d in persistence.list_matter_documents(sid):
             di = d["doc_index"]
             if di in by_doc:
+                continue
+            if in_scope is not None and di not in in_scope:
                 continue
             fname = d.get("filename") or ""
             matter_chunks.append(ChunkOut(
@@ -1146,7 +1242,10 @@ def _matter_pgvector_context(
     return matter_sources, matter_chunks, "\n\n".join(combined_parts)
 
 
-def _matter_manifest_prefix(sid: str, uid: str) -> str:
+def _matter_manifest_prefix(
+    sid: str, uid: str | None,
+    focus_doc_indexes: Optional[list[int]] = None,
+) -> str:
     """A short list of the documents in this Matter, prepended to the system
     prompt so the model ALWAYS knows what the user has uploaded — even for
     meta-questions ("are the PDFs uploaded?", "which documents do I have?",
@@ -1154,8 +1253,25 @@ def _matter_manifest_prefix(sid: str, uid: str) -> str:
     only the retrieved snippets to go on and wrongly answers "no documents
     are uploaded". Documents still ingesting are flagged so the model can
     say a file is still being processed rather than that it's missing.
+
+    Per-turn focus: when ``focus_doc_indexes`` is set, the manifest only
+    lists those documents — the model literally doesn't see the rest, so
+    it can't accidentally cite a pre-existing project doc in an answer
+    that was supposed to be about the freshly-attached file.
     """
     docs = persistence.list_matter_documents(sid, user_id=uid)
+    if focus_doc_indexes:
+        in_scope = set(focus_doc_indexes)
+        docs = [d for d in docs if d["doc_index"] in in_scope]
+    # Suppress FAILED rows from the manifest. A failed row has no searchable
+    # content, so listing it just confuses the model — it starts narrating
+    # "Document [M-n] failed to process" notes in the answer (verified live:
+    # a transient Docling temp-file race left an orphaned failed [M-8] beside
+    # a successful [M-9] reupload of the same file, and the assistant wrote
+    # the user an English "Important Note: Document Dok 8 failed to process"
+    # paragraph). They're still visible in the Documents panel where the user
+    # can retry/delete them, but the chat prompt only carries usable docs.
+    docs = [d for d in docs if d.get("status") != "failed"]
     if not docs:
         return ""
     # Cap the listed documents so a large data room (hundreds of files)
@@ -1166,8 +1282,6 @@ def _matter_manifest_prefix(sid: str, uid: str) -> str:
     for d in docs[:cap]:
         status = d.get("status", "done")
         note = "" if status == "done" else " (wird gerade verarbeitet)"
-        if status == "failed":
-            note = " (Verarbeitung fehlgeschlagen)"
         lines.append(f"- [M-{d['doc_index']}] {d.get('filename') or ''}{note}")
     extra = len(docs) - cap
     if extra > 0:
@@ -1185,7 +1299,7 @@ def _empty_grounding_guard(
     matter_sources: list,
     rag_sources: list,
     sid: str,
-    uid: str,
+    uid: str | None,
     lang: str | None,
 ) -> str | None:
     """Empty-retrieval guard for doc-scoped chat turns.
@@ -1294,9 +1408,10 @@ _MATTER_WAIT_S = float(os.environ.get("LAI_MATTER_WAIT_S", "180"))
 _MATTER_WAIT_POLL_S = 1.5
 
 
-def _matter_is_processing(sid: str, uid: str) -> bool:
+def _matter_is_processing(sid: str, uid: str | None) -> bool:
     """True if any document in the session is still being ingested
-    (queued/processing) — i.e. its searchable chunks don't exist yet."""
+    (queued/processing) — i.e. its searchable chunks don't exist yet.
+    Phase B: scoped on the firm-tenant key."""
     try:
         docs = persistence.list_matter_documents(sid, user_id=uid)
     except Exception:
@@ -1307,7 +1422,7 @@ def _matter_is_processing(sid: str, uid: str) -> bool:
     )
 
 
-def _await_matter_ready(sid: str, uid: str, timeout_s: float) -> bool:
+def _await_matter_ready(sid: str, uid: str | None, timeout_s: float) -> bool:
     """Block (in this sync, threadpool-run request) until no document in the
     session is still ingesting, or ``timeout_s`` elapses. Returns True if,
     afterwards, at least one document is ``done`` with searchable chunks (so
@@ -1315,6 +1430,7 @@ def _await_matter_ready(sid: str, uid: str, timeout_s: float) -> bool:
 
     Endpoints are sync ``def`` (FastAPI runs them in a threadpool), so a
     blocking ``time.sleep`` here does not stall the event loop.
+    Phase B: scoped on the firm-tenant key.
     """
     if timeout_s <= 0:
         return False
@@ -1334,9 +1450,10 @@ def _await_matter_ready(sid: str, uid: str, timeout_s: float) -> bool:
     )
 
 
-def _matter_progress(sid: str, uid: str) -> tuple[int, int]:
+def _matter_progress(sid: str, uid: str | None) -> tuple[int, int]:
     """(pages_done, pages_total) summed over the session's still-ingesting
-    documents — drives the live "Seite X/Y" progress shown while waiting."""
+    documents — drives the live "Seite X/Y" progress shown while waiting.
+    Phase B: scoped on the firm-tenant key."""
     try:
         docs = persistence.list_matter_documents(sid, user_id=uid)
     except Exception:
@@ -1375,7 +1492,8 @@ def _build_turn_msgs(
 
 
 def _build_matter_context(
-    sid: str, uid: str, use_contract: bool, question: str = "",
+    sid: str, uid: str | None, use_contract: bool, question: str = "",
+    focus_doc_indexes: Optional[list[int]] = None,
 ) -> tuple[list["RetrievedSource"], list["ChunkOut"], str]:
     """Assemble the matter side of a chat turn.
 
@@ -1387,7 +1505,10 @@ def _build_matter_context(
 
     Returns ``(matter_sources, matter_chunks, combined_text)``; the third
     value is concatenated matter text used only for Bundesland detection in
-    the jurisdiction check.
+    the jurisdiction check. Per-turn focus: when ``focus_doc_indexes`` is
+    set, both the primary (pgvector) and fallback (legacy text) paths are
+    narrowed to ONLY those documents — so the model can't reach back into
+    the rest of the matter when the user asked "analyse this document".
     """
     matter_sources: list[RetrievedSource] = []
     matter_chunks: list[ChunkOut] = []
@@ -1396,12 +1517,15 @@ def _build_matter_context(
         return matter_sources, matter_chunks, ""
 
     # Primary: scalable pgvector retrieval across the indexed data room.
-    pg = _matter_pgvector_context(sid, question)
+    pg = _matter_pgvector_context(sid, question, focus_doc_indexes=focus_doc_indexes)
     if pg is not None:
         return pg
 
     # ── Fallback: legacy whole-document selection (unindexed sessions) ──
     docs = persistence.list_matter_documents(sid, user_id=uid, include_text=True)
+    if focus_doc_indexes:
+        in_scope = set(focus_doc_indexes)
+        docs = [d for d in docs if d["doc_index"] in in_scope]
 
     if not docs:
         # Legacy path: session has an inline contract_text but no
@@ -1740,21 +1864,52 @@ def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int, list[di
             _DOCLING_CONVERTER = DocumentConverter()
 
     suffix_for_tmp = suffix or ".pdf"
-    with tempfile.NamedTemporaryFile(suffix=suffix_for_tmp, delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = Path(tmp.name)
 
-    try:
-        result = _DOCLING_CONVERTER.convert(tmp_path)
-        md = result.document.export_to_markdown()
+    # Single retry with a freshly-written temp file: live runs show Docling
+    # occasionally raises "Input document /tmp/tmpXXXX.pdf is not valid." on
+    # the FIRST attempt for a perfectly valid PDF (the same bytes re-uploaded
+    # a moment later ingest cleanly — verified for SDL-Gutachten_Lamstedt_156pg.pdf
+    # where doc_index 8 failed and doc_index 9 succeeded with 156 pages /
+    # 818 chunks). The temp file is recreated on retry so a clobbered/
+    # unflushed buffer can't be the cause.
+    last_err: Exception | None = None
+    for attempt in (1, 2):
+        with tempfile.NamedTemporaryFile(suffix=suffix_for_tmp, delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp.flush()
+            try:
+                os.fsync(tmp.fileno())  # be sure bytes are on disk before Docling reads
+            except OSError:
+                pass
+            tmp_path = Path(tmp.name)
+
         try:
-            num_pages = len(result.document.pages) if hasattr(result.document, "pages") else 0
-        except Exception:
-            num_pages = 0
-        tables = _extract_docling_tables(result.document)
-        return md, num_pages, tables
-    finally:
-        tmp_path.unlink(missing_ok=True)
+            result = _DOCLING_CONVERTER.convert(tmp_path)
+            md = result.document.export_to_markdown()
+            try:
+                num_pages = (
+                    len(result.document.pages) if hasattr(result.document, "pages") else 0
+                )
+            except Exception:
+                num_pages = 0
+            tables = _extract_docling_tables(result.document)
+            return md, num_pages, tables
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            msg = str(e).lower()
+            transient = "is not valid" in msg or "input document" in msg
+            if attempt == 1 and transient:
+                print(
+                    f"[docling] convert failed transiently on attempt {attempt} "
+                    f"for {filename!r} ({e}) — retrying once",
+                    flush=True,
+                )
+                continue
+            raise
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    # Unreachable (the loop either returns or raises), but satisfies the type checker.
+    raise RuntimeError(f"docling_convert exhausted retries: {last_err}")
 
 
 def convert_document(
@@ -2055,6 +2210,14 @@ class QueryReq(BaseModel):
     # forward-compat frontend can ship new codes without crashing the
     # backend mid-rollout.
     target_language: Optional[str] = None
+    # Per-turn focus: when the FE just attached one or more documents in
+    # the chat composer, it sends their doc_indexes here so this answer is
+    # scoped to ONLY those documents — the manifest, retrieval, and the
+    # validator's allowed-handles all narrow. Prevents the model from
+    # silently pulling in pre-existing project docs when the user asks
+    # "analyse this document". ``None``/empty ⇒ full session is in scope
+    # (the prior behaviour).
+    focus_doc_indexes: Optional[list[int]] = None
 
 
 class ChunkOut(BaseModel):
@@ -2169,6 +2332,11 @@ class UploadResp(BaseModel):
     pages: int
     chunks: int
     message: str
+    # The stable [M-n] handle the just-uploaded document was assigned.
+    # The FE captures this on attachment so the very-next chat turn can
+    # send ``focus_doc_indexes=[n]`` — scoping the answer to ONLY the
+    # docs the user just attached, instead of every prior matter doc.
+    doc_index: int
 
 
 class IssueOut(BaseModel):
@@ -2380,6 +2548,8 @@ async def lifespan(app: FastAPI):
         pool=auth_pool,
     )
     app.include_router(build_auth_router(auth_deps, get_current_user=get_current_user))
+    app.include_router(build_admin_router(auth_deps, get_current_user=get_current_user))
+    app.include_router(build_share_router(auth_deps, get_current_user=get_current_user))
     app.state.auth_deps = auth_deps
     app.state.get_current_user = get_current_user
     print("[startup]   auth: router mounted at /auth/*", flush=True)
@@ -2684,6 +2854,7 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
 
     sid = req.session_id or str(uuid.uuid4())
     uid = str(user.id)
+    org_id = _org_or_none(user)
     # If the caller supplied a session_id, it MUST belong to them.
     # AUTH_PLAN G4: the session id alone is not a capability.
     if req.session_id and not persistence.session_exists(sid, user_id=uid):
@@ -2740,6 +2911,7 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # concatenation used only for Bundesland detection below.
     matter_sources, matter_chunks, contract_text = _build_matter_context(
         sid, uid, use_contract, req.question,
+        focus_doc_indexes=req.focus_doc_indexes,
     )
 
     # Wait-and-answer: a doc-scoped turn with no matter content yet because the
@@ -2754,6 +2926,7 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         if _await_matter_ready(sid, uid, _MATTER_WAIT_S):
             matter_sources, matter_chunks, contract_text = _build_matter_context(
                 sid, uid, use_contract, req.question,
+                focus_doc_indexes=req.focus_doc_indexes,
             )
 
     # Prior chat turns for the same session — gives the model conversational
@@ -2768,7 +2941,7 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # rolling window. Cheap when the session is short or when the previous
     # extraction is still fresh; the refresh fires AFTER persisting the new
     # turn (below) so the freshly stated facts make it into the next refresh.
-    meta_prefix = _matter_manifest_prefix(sid, uid) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
+    meta_prefix = _matter_manifest_prefix(sid, uid, focus_doc_indexes=req.focus_doc_indexes) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
 
     # Matter sources come first so the LLM sees the user's own document
     # before the supporting corpus excerpts — and so the [M-n] handles
@@ -2814,7 +2987,7 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         answer, prompt_tokens, completion_tokens = guard_msg, 0, 0
     else:
         answer, prompt_tokens, completion_tokens = llm_generate(
-            msgs, max_new_tokens=1800 if (use_rag or use_contract) else 1024
+            msgs, max_new_tokens=3000 if (use_rag or use_contract) else 1800
         )
     timings.generate_s = round(time.time() - t0, 3)
 
@@ -2827,7 +3000,11 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # for a guard message (no LLM output, no sources).
     citation_validation_out: CitationValidationOut | None = None
     if guard_msg is None and rag_sources:
-        allowed_handles = {src.cite_id for src in rag_sources}
+        # Allow every retrieved source PLUS every real uploaded matter document
+        # (the manifest invites citing any [M-n], retrieved or not) — see
+        # _all_matter_handles. Prevents real-document citations being stripped
+        # as fabricated / mislabelled (unbelegt).
+        allowed_handles = {src.cite_id for src in rag_sources} | _all_matter_handles(sid, uid, focus_doc_indexes=req.focus_doc_indexes)
         validation = validate_citations(answer, allowed_handles)
         if validation.fabricated:
             print(
@@ -2870,7 +3047,8 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     try:
         if not persistence.session_exists(sid, user_id=uid):
             persistence.save_session(sid, {
-                "user_id": uid,
+                "user_id": uid,           # Phase B: created_by (attribution).
+                "org_id": org_id,         # Phase B: firm-tenant visibility key.
                 "filename": None,         # chat-only session, no upload
                 "contract_text": None,
                 "n_pages": 0,
@@ -3131,6 +3309,7 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
 
     sid = req.session_id or str(uuid.uuid4())
     uid = str(user.id)
+    org_id = _org_or_none(user)
     if req.session_id and not persistence.session_exists(sid, user_id=uid):
         raise HTTPException(404, "session_id not found")
 
@@ -3170,13 +3349,14 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # Matter side: [M-1]..[M-n] across every document in the session.
     matter_sources, matter_chunks, contract_text = _build_matter_context(
         sid, uid, use_contract, req.question,
+        focus_doc_indexes=req.focus_doc_indexes,
     )
 
     # NOTE: the wait-for-OCR happens INSIDE the generator below (not here), so
     # it can stream live progress + heartbeats while waiting (proxy-safe).
 
     history = _load_history(sid, user_id=uid)
-    meta_prefix = _matter_manifest_prefix(sid, uid) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
+    meta_prefix = _matter_manifest_prefix(sid, uid, focus_doc_indexes=req.focus_doc_indexes) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
     rag_sources = matter_sources + corpus_sources
 
     mode, msgs = _build_turn_msgs(
@@ -3185,7 +3365,7 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     )
 
     chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
-    max_new_tokens = 1800 if (use_rag or use_contract) else 1024
+    max_new_tokens = 3000 if (use_rag or use_contract) else 1800
 
     # Empty-retrieval guard (same as /query): a doc-scoped turn with no
     # grounded sources is answered with an honest message, not an LLM
@@ -3242,7 +3422,8 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
                     yield _sse_event("token", {"delta": ""})
                 time.sleep(_MATTER_WAIT_POLL_S)
             matter_sources, matter_chunks, contract_text = _build_matter_context(
-                sid, uid, use_contract, req.question)
+                sid, uid, use_contract, req.question,
+                focus_doc_indexes=req.focus_doc_indexes)
             rag_sources = matter_sources + corpus_sources
             mode, msgs = _build_turn_msgs(
                 use_rag, use_contract, req.question, rag_sources, matter_sources,
@@ -3289,7 +3470,11 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
 
         citation_validation_out: CitationValidationOut | None = None
         if guard_msg is None and rag_sources:
-            allowed = {src.cite_id for src in rag_sources}
+            # Allow every retrieved source PLUS every real uploaded matter
+            # document (the manifest invites citing any [M-n], retrieved or
+            # not) — see _all_matter_handles. Prevents real-document citations
+            # being stripped as fabricated / mislabelled (unbelegt).
+            allowed = {src.cite_id for src in rag_sources} | _all_matter_handles(sid, uid, focus_doc_indexes=req.focus_doc_indexes)
             validation = validate_citations(answer, allowed)
             if validation.fabricated:
                 print(
@@ -3320,6 +3505,7 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
             if not persistence.session_exists(sid, user_id=uid):
                 persistence.save_session(sid, {
                     "user_id": uid,
+                    "org_id": org_id,
                     "filename": None,
                     "contract_text": None,
                     "n_pages": 0,
@@ -3393,14 +3579,15 @@ async def upload(
     user: CurrentUser = Depends(get_current_user),
 ):
     uid = str(user.id)
+    org_id = _org_or_none(user)
     sid = session_id or str(uuid.uuid4())
     # If the caller supplied an existing session_id, it MUST be theirs.
     if session_id and not persistence.session_exists(sid, user_id=uid):
         raise HTTPException(404, "session_id not found")
 
     contents = await file.read()
-    if len(contents) > 50 * 1024 * 1024:
-        raise HTTPException(413, "File too large (max 50 MB)")
+    if len(contents) > 100 * 1024 * 1024:
+        raise HTTPException(413, "File too large (max 100 MB)")
     fname = file.filename or "uploaded.pdf"
 
     # ── Non-blocking ingestion ──────────────────────────────────────────
@@ -3423,6 +3610,7 @@ async def upload(
         # from the first document once OCR completes.
         persistence.save_session(sid, {
             "user_id": uid,
+            "org_id": org_id,
             "filename": fname,
             "contract_text": None,
             "n_pages": 0,
@@ -3437,7 +3625,7 @@ async def upload(
 
     doc = persistence.add_matter_document(
         sid, filename=fname, doc_text="", n_pages=0,
-        upload_ext=upload_ext, user_id=uid, status="queued",
+        upload_ext=upload_ext, user_id=uid, org_id=org_id, status="queued",
     )
     if doc is None:
         raise HTTPException(404, "session_id not found")
@@ -3450,6 +3638,7 @@ async def upload(
 
     return UploadResp(
         session_id=sid, filename=fname, pages=0, chunks=0,
+        doc_index=doc["doc_index"],
         message=(
             f"Dokument [M-{doc['doc_index']}] hochgeladen — wird verarbeitet…"
         ),
@@ -3475,8 +3664,8 @@ def _v1_issue_to_out(i: dict) -> IssueOut:
                     reason=rationale, type=typ)
 
 
-def _analyze_v1(req: AnalyzeReq, user_id: str) -> AnalyzeResp:
-    sess = persistence.load_session(req.session_id, user_id=user_id)
+def _analyze_v1(req: AnalyzeReq, uid: str | None) -> AnalyzeResp:
+    sess = persistence.load_session(req.session_id, user_id=uid)
     if sess is None:
         raise HTTPException(404, "session_id not found")
     t0 = time.time()
@@ -3501,7 +3690,9 @@ def _analyze_v1(req: AnalyzeReq, user_id: str) -> AnalyzeResp:
 
     missing = [IssueOut(**m) for m in check_playbook(types_present)]
     sess["clauses"] = [c.model_dump() for c in clauses_out]
-    sess["user_id"] = user_id  # preserve ownership across the upsert
+    # Phase B: ``sess`` already carries user_id (created_by) AND org_id from
+    # _row_to_session, so save_session preserves both via the COALESCE upsert
+    # — no need to re-stamp here.
     sess["analysis"] = {
         "n_clauses": len(clauses_out),
         "missing_required_clauses": [m.model_dump() for m in missing],
@@ -3518,8 +3709,8 @@ def _analyze_v1(req: AnalyzeReq, user_id: str) -> AnalyzeResp:
     )
 
 
-def _analyze_v2(req: AnalyzeReq, user_id: str) -> AnalyzeResp:
-    sess = persistence.load_session(req.session_id, user_id=user_id)
+def _analyze_v2(req: AnalyzeReq, uid: str | None) -> AnalyzeResp:
+    sess = persistence.load_session(req.session_id, user_id=uid)
     if sess is None:
         raise HTTPException(404, "session_id not found")
     cfg = STATE["analyzer_cfg"]
@@ -3600,9 +3791,10 @@ def _analyze_v2(req: AnalyzeReq, user_id: str) -> AnalyzeResp:
             reason=None,
         ))
 
-    # Persist the full V2 result on the session for richer UI consumption later
+    # Persist the full V2 result on the session for richer UI consumption later.
+    # Phase B: ``sess`` already carries user_id (created_by) AND org_id from
+    # _row_to_session, so save_session preserves both via the COALESCE upsert.
     sess["clauses"] = [c.model_dump() for c in clauses_out]
-    sess["user_id"] = user_id  # preserve ownership across the upsert
     sess["analysis"] = result.model_dump()
     sess["extraction_quality"] = (
         result.extraction_quality.model_dump() if result.extraction_quality else None
@@ -3634,6 +3826,7 @@ def _analyze_v2(req: AnalyzeReq, user_id: str) -> AnalyzeResp:
 @app.post("/analyze-contract", response_model=AnalyzeResp)
 def analyze_contract(req: AnalyzeReq, user: CurrentUser = Depends(get_current_user)):
     uid = str(user.id)
+    org_id = _org_or_none(user)
     sess = persistence.load_session(req.session_id, user_id=uid)
     if not sess:
         raise HTTPException(404, "session_id not found — upload a document first")
@@ -3692,6 +3885,7 @@ def get_session(session_id: str, user: CurrentUser = Depends(get_current_user)):
     """Full session payload for UI rehydration after a refresh.
     Returns the contract metadata + last analysis + message history."""
     uid = str(user.id)
+    org_id = _org_or_none(user)
     sess = persistence.load_session(session_id, user_id=uid)
     if not sess:
         raise HTTPException(404, "session_id not found")
@@ -3710,6 +3904,7 @@ def get_session(session_id: str, user: CurrentUser = Depends(get_current_user)):
 @app.get("/sessions/{session_id}/messages")
 def get_session_messages(session_id: str, user: CurrentUser = Depends(get_current_user)):
     uid = str(user.id)
+    org_id = _org_or_none(user)
     if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     return {"messages": persistence.list_messages(session_id, user_id=uid)}
@@ -3734,6 +3929,7 @@ def append_session_message(
 
     /query already self-persists; the UI shouldn't double-save those."""
     uid = str(user.id)
+    org_id = _org_or_none(user)
     if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     if req.role not in ("user", "assistant"):
@@ -3820,6 +4016,7 @@ def submit_feedback(
         raise HTTPException(400, "comment must be ≤ 2048 characters")
 
     uid = str(user.id)
+    org_id = _org_or_none(user)
     if not persistence.session_exists(req.session_id, user_id=uid):
         # 404 (not 403) so we don't leak existence across tenants.
         raise HTTPException(404, "session_id not found")
@@ -3830,7 +4027,7 @@ def submit_feedback(
 
     row_id = persistence.record_feedback(
         session_id=req.session_id,
-        user_id=uid,
+        user_id=uid,     # author + visibility check (Phase B reverted).
         rating=req.rating,
         message_id=req.message_id,
         reason=req.reason,
@@ -3867,6 +4064,7 @@ def get_session_feedback(
     shape never leaks existence across tenants.
     """
     uid = str(user.id)
+    org_id = _org_or_none(user)
     if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     return {"feedback": persistence.list_feedback(session_id, user_id=uid)}
@@ -3900,6 +4098,7 @@ def get_session_document(
         session with no upload).
     """
     uid = str(user.id)
+    org_id = _org_or_none(user)
     sess = persistence.load_session(session_id, user_id=uid)
     if not sess:
         raise HTTPException(404, "session_id not found")
@@ -3979,6 +4178,7 @@ def list_matter_documents_endpoint(
     checkmark. Returns ``{"documents": [...]}``. Cross-tenant sessions 404.
     """
     uid = str(user.id)
+    org_id = _org_or_none(user)
     if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     docs = persistence.list_matter_documents(session_id, user_id=uid)
@@ -4013,6 +4213,7 @@ def get_matter_document_endpoint(
     index, or a file GC'd from disk.
     """
     uid = str(user.id)
+    org_id = _org_or_none(user)
     if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     doc = persistence.get_matter_document(session_id, doc_index, user_id=uid)
@@ -4034,6 +4235,7 @@ def get_matter_document_endpoint(
 @app.delete("/sessions/{session_id}")
 def delete_session_endpoint(session_id: str, user: CurrentUser = Depends(get_current_user)):
     uid = str(user.id)
+    org_id = _org_or_none(user)
     if not persistence.delete_session(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     # Drop the Matter's pgvector index too — it lives in Postgres, which

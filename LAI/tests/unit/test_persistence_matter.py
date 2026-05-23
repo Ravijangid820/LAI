@@ -96,3 +96,31 @@ def test_cascade_delete_clears_documents(db) -> None:
     persistence.add_matter_document(SID, filename="a.pdf", doc_text="A", n_pages=1, upload_ext=".pdf", user_id=UID)
     assert persistence.delete_session(SID, user_id=UID)
     assert persistence.list_matter_documents(SID) == []
+
+
+@pytest.mark.unit
+def test_delete_session_removes_files_on_disk(db) -> None:
+    # Legacy single upload (<sid><ext>) + two matter docs (<sid>_m<id><ext>).
+    persistence.save_upload(SID, b"%PDF-1.4 legacy", "lease.pdf")
+    d1 = persistence.add_matter_document(SID, filename="a.pdf", doc_text="A", n_pages=1, upload_ext=".pdf", user_id=UID)
+    d2 = persistence.add_matter_document(SID, filename="b.pdf", doc_text="B", n_pages=1, upload_ext=".pdf", user_id=UID)
+    persistence.save_matter_upload(SID, d1["id"], b"%PDF-1.4 one", "a.pdf")
+    persistence.save_matter_upload(SID, d2["id"], b"%PDF-1.4 two", "b.pdf")
+
+    uploads = persistence._STATE["uploads_dir"]
+    assert len(list(uploads.glob(f"{SID}*"))) == 3
+
+    assert persistence.delete_session(SID, user_id=UID)
+
+    # Both the DB rows AND every on-disk blob for this session are gone.
+    assert persistence.list_matter_documents(SID) == []
+    assert list(uploads.glob(f"{SID}*")) == []
+
+
+@pytest.mark.unit
+def test_failed_delete_leaves_files_intact(db) -> None:
+    # A cross-tenant delete must NOT touch another user's files.
+    persistence.save_upload(SID, b"%PDF-1.4 legacy", "lease.pdf")
+    uploads = persistence._STATE["uploads_dir"]
+    assert not persistence.delete_session(SID, user_id=OTHER)
+    assert len(list(uploads.glob(f"{SID}*"))) == 1

@@ -1,0 +1,940 @@
+diff --git a/src/react-app/components/chat/DocumentList.tsx b/src/react-app/components/chat/DocumentList.tsx
+index 2d20643..9751d17 100644
+--- a/src/react-app/components/chat/DocumentList.tsx
++++ b/src/react-app/components/chat/DocumentList.tsx
+@@ -1,75 +1,66 @@
+ // src/react-app/components/chat/DocumentList.tsx
+ //
+-// Per-session document list with status dots. UI_GUIDE.md §5.7:
++// Per-document list with LIVE ingestion status. A Matter (data room) holds
++// many documents, each ingested asynchronously by the backend: uploaded →
++// queued → processing (OCR page-by-page + embed + index) → done | failed.
+ //
+-//   filename.pdf      ● parsed
+-//                     ◐ uploading
+-//                     ◯ failed
+-//
+-// Backend reality (Matter workspace): a session/matter now holds MANY
+-// documents, each addressable as a [M-n] handle. This list fetches the
+-// full set from ``GET /sessions/{id}/documents`` and renders one row per
+-// document with its [M-n] badge, page count, and status dot. Falls back
+-// gracefully to an empty list on error (pending rows from the parent
+-// still show).
+-//
+-// Why this is opt-in via ``sessionId``: in the chat empty state we
+-// don't know yet whether documents were previously uploaded for this
+-// session (the user may have refreshed back into a populated matter).
+-// Fetching here lets the chat page stay agnostic — drop the component
+-// in, pass the session id, get a correctly-rendered list.
++// This component polls ``GET /sessions/{id}/documents`` while any document
++// is still ingesting and renders, per row:
++//   • queued      → "In Warteschlange…"
++//   • processing  → spinner + progress bar (Seite X/Y)
++//   • done        → green checkmark + "N Seiten · M Abschnitte"
++//   • failed      → red alert + error
++// Polling self-stops once every document is done/failed, so an idle matter
++// makes no requests.
+ 
+ import { useEffect, useState } from "react";
+-import { FileText, Loader2 } from "lucide-react";
++import { FileText, Loader2, CheckCircle2, AlertCircle, Clock } from "lucide-react";
+ 
+-import { listMatterDocuments } from "@/react-app/lib/ragApi";
++import {
++  listMatterDocuments,
++  type MatterDocStatus,
++} from "@/react-app/lib/ragApi";
+ import { cn } from "@/react-app/lib/utils";
+ 
+-export type DocumentStatus = "parsed" | "uploading" | "failed";
+-
+ export interface DocumentRow {
+   filename: string;
+   pages: number;
+-  status: DocumentStatus;
+-  /** ``[M-n]`` handle once the backend has parsed + indexed the doc.
+-   *  Absent on pending/uploading rows the parent is tracking. */
++  // "uploading" is a client-only state for a row the parent is tracking
++  // before the first poll lands; the rest mirror the backend status.
++  status: MatterDocStatus | "uploading";
+   citeId?: string;
++  pagesDone?: number;
++  pagesTotal?: number;
++  nChunks?: number;
++  error?: string | null;
+ }
+ 
+ export interface DocumentListProps {
+   /** Session whose documents to list. ``null`` → empty list (no fetch). */
+   sessionId: string | null;
+-  /** Rows the parent already knows about (e.g. uploads still in flight
+-   *  the parent is tracking). Merged on top of the backend-fetched
+-   *  ``parsed`` rows so an uploading row appears immediately without
+-   *  having to wait for the next ``GET /sessions/{id}`` refresh. */
++  /** Rows the parent already knows about (e.g. an upload still in flight
++   *  before the first poll). Merged on top of fetched rows by filename. */
+   pendingRows?: DocumentRow[];
+-  /** Counter the parent bumps after each successful upload to ask the
+-   *  list to refetch. Cheap way to invalidate without pulling react-query. */
++  /** Counter the parent bumps after each successful upload to force a
++   *  refetch (and restart polling). */
+   refreshKey?: number;
+   className?: string;
++  /** Fires whenever ingestion state changes: ``true`` while any document
++   *  is queued/processing, ``false`` once all are done/failed. The parent
++   *  uses this to gate the chat composer so a question isn't asked against
++   *  a document that isn't searchable yet (otherwise the answer silently
++   *  falls back to the corpus with a dangling [M-n]). */
++  onIngestingChange?: (ingesting: boolean) => void;
+ }
+ 
+-const STATUS_DOT: Record<DocumentStatus, { className: string; label: string }> = {
+-  parsed: {
+-    className: "bg-emerald-500",
+-    label: "● parsed",
+-  },
+-  uploading: {
+-    className: "bg-amber-400 animate-pulse",
+-    label: "◐ uploading",
+-  },
+-  failed: {
+-    className: "bg-destructive",
+-    label: "◯ failed",
+-  },
+-};
++const POLL_MS = 1500;
+ 
+ export function DocumentList({
+   sessionId,
+   pendingRows,
+   refreshKey,
+   className,
++  onIngestingChange,
+ }: DocumentListProps) {
+   const [fetched, setFetched] = useState<DocumentRow[]>([]);
+   const [loading, setLoading] = useState(false);
+@@ -77,34 +68,45 @@ export function DocumentList({
+   useEffect(() => {
+     if (!sessionId) {
+       setFetched([]);
++      onIngestingChange?.(false);
+       return;
+     }
+     let cancelled = false;
+-    setLoading(true);
+-    (async () => {
++    let timer: number | undefined;
++
++    const poll = async () => {
+       const docs = await listMatterDocuments(sessionId);
+       if (cancelled) return;
+-      // One row per document, ordered [M-1]..[M-n], each carrying its
+-      // citation handle so the row and the chat chips share one legend.
+       setFetched(
+         docs.map((d) => ({
+           filename: d.filename,
+           pages: d.n_pages || 0,
+-          status: "parsed" as const,
++          status: d.status ?? "done",
+           citeId: d.cite_id,
++          pagesDone: d.pages_done ?? 0,
++          pagesTotal: d.pages_total ?? 0,
++          nChunks: d.n_chunks ?? 0,
++          error: d.error,
+         })),
+       );
+       setLoading(false);
+-    })();
++      // Keep polling only while something is still ingesting.
++      const active = docs.some(
++        (d) => d.status === "queued" || d.status === "processing",
++      );
++      // Surface the ingestion state so the parent can gate the composer.
++      onIngestingChange?.(active);
++      if (active && !cancelled) timer = window.setTimeout(poll, POLL_MS);
++    };
++
++    setLoading(true);
++    poll();
+     return () => {
+       cancelled = true;
++      if (timer) clearTimeout(timer);
+     };
+-  }, [sessionId, refreshKey]);
++  }, [sessionId, refreshKey, onIngestingChange]);
+ 
+-  // Pending rows beat fetched rows on filename collision — if a file
+-  // is mid-upload AND the server already has a prior version under the
+-  // same name, the "uploading" indicator should win until the upload
+-  // settles and the next refresh lands.
+   const merged = mergeRows(fetched, pendingRows ?? []);
+ 
+   if (merged.length === 0 && !loading) {
+@@ -129,53 +131,108 @@ export function DocumentList({
+         </li>
+       )}
+       {merged.map((row) => (
+-        <li
+-          key={`${row.filename}-${row.status}`}
+-          className="flex items-center gap-2.5 px-3 py-2 rounded-md bg-muted/30 border border-border/40"
+-        >
+-          <span
+-            className={cn(
+-              "w-2 h-2 rounded-full flex-shrink-0",
+-              STATUS_DOT[row.status].className,
+-            )}
+-            aria-label={STATUS_DOT[row.status].label}
+-            title={STATUS_DOT[row.status].label}
++        <DocumentRowItem
++          key={`${row.filename}-${row.citeId ?? row.status}`}
++          row={row}
++        />
++      ))}
++    </ul>
++  );
++}
++
++function DocumentRowItem({ row }: { row: DocumentRow }) {
++  const isProcessing = row.status === "processing";
++  const isQueued = row.status === "queued" || row.status === "uploading";
++  const isFailed = row.status === "failed";
++  const isDone = row.status === "done";
++
++  const total = row.pagesTotal ?? 0;
++  const done = row.pagesDone ?? 0;
++  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
++
++  return (
++    <li className="flex items-start gap-2.5 px-3 py-2 rounded-md bg-muted/30 border border-border/40">
++      {/* Status icon */}
++      <span className="flex-shrink-0 mt-0.5">
++        {isDone && (
++          <CheckCircle2 className="w-4 h-4 text-emerald-500" aria-label="Fertig" />
++        )}
++        {isProcessing && (
++          <Loader2
++            className="w-4 h-4 text-amber-500 animate-spin"
++            aria-label="Wird verarbeitet"
+           />
+-          <FileText className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+-          <div className="flex-1 min-w-0">
+-            <div className="flex items-center gap-1.5 min-w-0">
+-              {row.citeId && (
+-                // [M-n] badge — same amber family the chat chips use, so
+-                // the document here and its citation in an answer read as
+-                // the same source.
+-                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[0.65rem] font-mono font-semibold bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300 flex-shrink-0">
+-                  {row.citeId}
+-                </span>
+-              )}
+-              <p className="text-sm truncate text-foreground">{row.filename}</p>
++        )}
++        {isQueued && (
++          <Clock className="w-4 h-4 text-muted-foreground" aria-label="In Warteschlange" />
++        )}
++        {isFailed && (
++          <AlertCircle className="w-4 h-4 text-destructive" aria-label="Fehlgeschlagen" />
++        )}
++      </span>
++
++      <div className="flex-1 min-w-0">
++        <div className="flex items-center gap-1.5 min-w-0">
++          {row.citeId && (
++            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[0.65rem] font-mono font-semibold bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300 flex-shrink-0">
++              {row.citeId}
++            </span>
++          )}
++          <FileText className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
++          <p className="text-sm truncate text-foreground" title={row.filename}>
++            {row.filename}
++          </p>
++        </div>
++
++        {/* Status line */}
++        {isDone && (
++          <p className="text-[0.7rem] text-muted-foreground mt-0.5">
++            {row.pages > 0 ? `${row.pages} Seite${row.pages === 1 ? "" : "n"}` : "—"}
++            {row.nChunks ? ` · ${row.nChunks} Abschnitte` : ""}
++            {" · bereit"}
++          </p>
++        )}
++        {isQueued && (
++          <p className="text-[0.7rem] text-muted-foreground mt-0.5">
++            In Warteschlange…
++          </p>
++        )}
++        {isFailed && (
++          <p
++            className="text-[0.7rem] text-destructive mt-0.5 truncate"
++            title={row.error ?? undefined}
++          >
++            Fehlgeschlagen{row.error ? `: ${row.error}` : ""}
++          </p>
++        )}
++        {isProcessing && (
++          <div className="mt-1">
++            <div className="h-1.5 w-full rounded-full bg-muted overflow-hidden">
++              <div
++                className="h-full bg-amber-500 transition-all duration-300"
++                style={{ width: total > 0 ? `${pct}%` : "40%" }}
++              />
+             </div>
+-            <p className="text-[0.7rem] text-muted-foreground">
+-              {row.pages > 0
+-                ? `${row.pages} page${row.pages === 1 ? "" : "s"}`
+-                : "—"}
+-              {row.status !== "parsed" && (
+-                <>
+-                  {" · "}
+-                  <span className="capitalize">{row.status}</span>
+-                </>
+-              )}
++            <p className="text-[0.7rem] text-muted-foreground mt-0.5">
++              {total > 0
++                ? `Verarbeite Seite ${done}/${total} (${pct}%)`
++                : "Wird verarbeitet…"}
+             </p>
+           </div>
+-        </li>
+-      ))}
+-    </ul>
++        )}
++      </div>
++    </li>
+   );
+ }
+ 
+ function mergeRows(fetched: DocumentRow[], pending: DocumentRow[]): DocumentRow[] {
+   const byName = new Map<string, DocumentRow>();
+   for (const r of fetched) byName.set(r.filename, r);
+-  // Pending rows overwrite — see the "in-flight beats parsed" rationale above.
+-  for (const r of pending) byName.set(r.filename, r);
++  // A pending (just-uploaded) row only wins if the backend hasn't returned
++  // a row for that filename yet — once the server tracks it, the live
++  // backend status (with real progress) takes over.
++  for (const r of pending) {
++    if (!byName.has(r.filename)) byName.set(r.filename, r);
++  }
+   return Array.from(byName.values());
+ }
+diff --git a/src/react-app/pages/DashboardChat.tsx b/src/react-app/pages/DashboardChat.tsx
+index 3a89a17..fdd33fd 100644
+--- a/src/react-app/pages/DashboardChat.tsx
++++ b/src/react-app/pages/DashboardChat.tsx
+@@ -1,9 +1,8 @@
+ import { useState, useRef, useEffect, useCallback } from "react";
+ import { useOutletContext } from "react-router";
+ import { Logo } from "@/react-app/components/Logo";
+-import { ChevronDown } from "lucide-react";
++import { ChevronDown, Sparkles, SquarePen } from "lucide-react";
+ import {
+-  BellIcon,
+   ManuscriptIcon,
+   AlertIcon,
+   SignalTowerIcon,
+@@ -17,10 +16,13 @@ import {
+ import { ChatInput } from "@/react-app/components/chat/ChatInput";
+ import { DocumentList } from "@/react-app/components/chat/DocumentList";
+ import { DropZone } from "@/react-app/components/chat/DropZone";
+-import { LanguageToggle } from "@/react-app/components/LanguageToggle";
+-import { useLanguage } from "@/react-app/contexts/LanguageContext";
+ import { TypingIndicator } from "@/react-app/components/chat/TypingIndicator";
+ import { CitationPanel } from "@/react-app/components/chat/CitationPanel";
++import { NotificationsMenu } from "@/react-app/components/chat/NotificationsMenu";
++import {
++  UploadProgress,
++  type UploadItem,
++} from "@/react-app/components/chat/UploadProgress";
+ import type { Chunk, RAGResponse, UploadResponse } from "@/react-app/lib/ragApi";
+ import { Button } from "@/react-app/components/ui/button";
+ import type { Conversation } from "@/react-app/components/DashboardLayout";
+@@ -85,12 +87,10 @@ export default function DashboardChatPage() {
+     refreshConversations,
+   } = context || {};
+ 
+-  // Answer-language preference from the global toggle — passed as the
+-  // ``target_language`` arg on every /query/stream call so the backend
+-  // can switch the model output to English while keeping the cited
+-  // German statute / contract text verbatim.
+-  const { language } = useLanguage();
+-
++  // Answer language is no longer chosen via a toggle: the backend
++  // mirrors the language of each question (ask in German → German
++  // answer, ask in English → English answer), so /query/stream is
++  // called without a ``target_language`` override.
+   const [messages, setMessages] = useState<ChatMessageData[]>([]);
+   const [isTyping, setIsTyping] = useState(false);
+   const [showScrollBtn, setShowScrollBtn] = useState(false);
+@@ -109,10 +109,20 @@ export default function DashboardChatPage() {
+   // gets wiped and replaced with the server-side message list.
+   const skipNextRehydrate = useRef(false);
+   const [isUploading, setIsUploading] = useState(false);
++  // Live per-file upload batch shown above the composer. Populated when a
++  // submit (or drop) includes document attachments so multi-file uploads
++  // show which file is in flight and which have landed, then cleared a
++  // moment after the batch finishes.
++  const [uploads, setUploads] = useState<UploadItem[]>([]);
+   // Bumped on each successful upload — drives DocumentList's refetch
+   // without pulling in a fetch library. Keeping it in state is fine;
+   // the list is mounted at most once per render of the empty state.
+   const [docRefreshKey, setDocRefreshKey] = useState(0);
++  // True while any uploaded document is still being ingested (OCR + embed
++  // + index). Driven by DocumentList's status poll; gates the composer so
++  // a question isn't asked before the document is searchable (it would
++  // otherwise fall back to the corpus with a dangling [M-n]).
++  const [docsIngesting, setDocsIngesting] = useState(false);
+ 
+   // Citation panel state — opens when a CitationChip is clicked anywhere
+   // in the thread. `openChunks` carries the chunks of the message the
+@@ -251,7 +261,12 @@ export default function DashboardChatPage() {
+         // errors (e.g. serve_rag mid-restart) leave the localStorage cache
+         // alone so a later mount can still rehydrate.
+         if (result.reason === "not-found") {
+-          try { window.localStorage.removeItem(sessionKey(activeConversationId)); } catch {}
++          try { window.localStorage.removeItem(sessionKey(activeConversationId)); } catch { /* ignore */ }
++          // Clear the dead id from the conversation context too — otherwise
++          // the sidebar + DocumentList keep polling a session the server has
++          // deleted, spamming 404s. Refresh the list so it drops out.
++          setActiveConversationId?.(null);
++          refreshConversations?.();
+         }
+         return;
+       }
+@@ -267,6 +282,9 @@ export default function DashboardChatPage() {
+         // after a full page reload. Without this, replayed bubbles
+         // would silently downgrade to session-level feedback.
+         messageId: m.id,
++        // Restore the citation sources so [M-n]/[C-n] chips resolve to
++        // their source after a reload, not just in the live SSE turn.
++        chunks: m.chunks && m.chunks.length > 0 ? m.chunks : undefined,
+       }));
+       setMessages(replayed);
+ 
+@@ -334,13 +352,12 @@ export default function DashboardChatPage() {
+       }
+       refreshConversations?.();
+ 
++      // Just a compact attachment marker — NOT the old verbose "Document
++      // uploaded · Pages · Chunks · type analyze contract" blurb. The real,
++      // document-grounded analysis is streamed right after by
++      // ``autoAnalyzeDocument`` so the user gets an accurate answer instead
++      // of a static confirmation.
+       const userBubbleText = `📎 ${uploadResult.filename}`;
+-      const uploadAssistantText =
+-        `📄 **Document uploaded:** ${uploadResult.filename}\n` +
+-        `- Pages: ${uploadResult.pages}\n` +
+-        `- Chunks: ${uploadResult.chunks}\n\n` +
+-        `You can ask questions about this document, or type **"analyze contract"** ` +
+-        `for a clause-by-clause review (issues, missing clauses, citations).`;
+ 
+       setMessages((prev) => [
+         ...prev,
+@@ -350,22 +367,12 @@ export default function DashboardChatPage() {
+           content: userBubbleText,
+           timestamp: new Date(),
+         },
+-        {
+-          id: randomId(),
+-          role: "assistant",
+-          content: uploadAssistantText,
+-          timestamp: new Date(),
+-        },
+       ]);
+ 
+-      // Persist sequentially so the user bubble is guaranteed a smaller
+-      // server-side time.time() than the assistant bubble. With parallel
+-      // POSTs concurrent SQLite writes could swap their order on
+-      // refresh-replay. Failures are best-effort: the UI already shows
+-      // the bubbles, persistence is recovered on the next /query turn.
++      // Persist the upload marker so refresh-replay shows the attachment.
++      // The grounded analysis that follows is persisted by /query itself.
+       try {
+         await appendMessage(uploadResult.session_id, "user", userBubbleText, "upload");
+-        await appendMessage(uploadResult.session_id, "assistant", uploadAssistantText, "upload");
+       } catch {
+         /* persistence failure — UI already updated */
+       }
+@@ -378,15 +385,151 @@ export default function DashboardChatPage() {
+     [activeConversationId, setActiveConversationId, refreshConversations],
+   );
+ 
++
+   const handleDropZoneUploaded = useCallback(
+     (result: UploadResponse) => {
+-      // Fire and forget — applyUploadConfirmation handles its own
+-      // errors; the DropZone has already painted its own success row.
++      // Ingestion is now asynchronous (OCR + embed + index run in the
++      // background so the upload never blocks — and a data room may be
++      // dozens of files). We therefore DON'T auto-analyze on upload: the
++      // document isn't ready the instant the POST returns, and analyzing
++      // every file in a VDR would be noise. The DocumentList shows live
++      // per-document progress + a checkmark when ready; the lawyer asks
++      // questions once documents are done.
+       void applyUploadConfirmation(result);
+     },
+     [applyUploadConfirmation],
+   );
+ 
++  // ── Stream an answer into an existing assistant bubble ───────────────
++  // Shared by the normal /query path and the Regenerate button so both
++  // produce identical streaming/citation/feedback wiring. The bubble with
++  // ``aiMessageId`` must already exist (created as a streaming placeholder
++  // by the caller); this fills it token-by-token and finalises it with the
++  // citation-validated answer + chunks on completion.
++  const streamAnswerInto = useCallback(
++    (aiMessageId: string, question: string, sid: string | null): Promise<void> =>
++      new Promise<void>((resolve) => {
++        streamAbortRef.current?.abort();
++        let firstTokenSeen = false;
++        streamAbortRef.current = streamQuery(question, sid, {
++          onToken: (delta) => {
++            if (!firstTokenSeen) {
++              firstTokenSeen = true;
++              setIsTyping(false);
++            }
++            setMessages((prev) =>
++              prev.map((m) =>
++                m.id === aiMessageId
++                  ? { ...m, content: m.content + delta }
++                  : m,
++              ),
++            );
++          },
++          onComplete: (payload: RAGResponse) => {
++            if (payload.session_id) {
++              setSessionId(payload.session_id);
++              if (
++                !activeConversationId ||
++                activeConversationId !== payload.session_id
++              ) {
++                skipNextRehydrate.current = true;
++                setActiveConversationId?.(payload.session_id);
++                refreshConversations?.();
++              }
++            }
++            setMessages((prev) =>
++              prev.map((m) =>
++                m.id === aiMessageId
++                  ? {
++                      ...m,
++                      content: payload.answer,
++                      chunks: payload.chunks,
++                      citationValidation: payload.citation_validation ?? null,
++                      jurisdictionWarnings:
++                        payload.jurisdiction_warnings ?? undefined,
++                      streaming: false,
++                      timestamp: new Date(),
++                      messageId: payload.message_id ?? null,
++                    }
++                  : m,
++              ),
++            );
++            streamAbortRef.current = null;
++            resolve();
++          },
++          onError: (detail) => {
++            setMessages((prev) =>
++              prev.map((m) =>
++                m.id === aiMessageId
++                  ? {
++                      ...m,
++                      content: `⚠️ **Error:** ${detail}`,
++                      streaming: false,
++                      timestamp: new Date(),
++                    }
++                  : m,
++              ),
++            );
++            streamAbortRef.current = null;
++            resolve();
++          },
++        });
++      }),
++    [activeConversationId, setActiveConversationId, refreshConversations],
++  );
++
++  // ── Regenerate ────────────────────────────────────────────────────────
++  // Re-runs the user question that produced a given assistant bubble and
++  // streams a fresh answer back INTO the same bubble (so the thread keeps
++  // its position, the previous answer is simply replaced). Walks backwards
++  // from the target to the nearest real user question, skipping the 📎
++  // upload markers so regenerate works even right after an upload turn.
++  const handleRegenerate = useCallback(
++    (assistantMsgId: string) => {
++      const idx = messages.findIndex((m) => m.id === assistantMsgId);
++      if (idx < 0) return;
++      let question = "";
++      for (let i = idx - 1; i >= 0; i--) {
++        const m = messages[i];
++        if (
++          m.role === "user" &&
++          m.content.trim().length > 0 &&
++          !m.content.startsWith("📎")
++        ) {
++          question = m.content;
++          break;
++        }
++      }
++      if (!question) return;
++
++      // Reset the target bubble to a clean streaming state — drop the old
++      // answer's chunks/validation/feedback so stale chips don't linger.
++      setMessages((prev) =>
++        prev.map((m) =>
++          m.id === assistantMsgId
++            ? {
++                ...m,
++                content: "",
++                chunks: undefined,
++                citationValidation: null,
++                jurisdictionWarnings: undefined,
++                feedback: null,
++                messageId: null,
++                streaming: true,
++                timestamp: new Date(),
++              }
++            : m,
++        ),
++      );
++      setIsTyping(true);
++      setTimeout(() => forceScrollToBottom("smooth"), 0);
++      void streamAnswerInto(assistantMsgId, question, sessionId).finally(() =>
++        setIsTyping(false),
++      );
++    },
++    [messages, sessionId, streamAnswerInto, forceScrollToBottom],
++  );
++
+   // ── Send message ──────────────────────────────────────────────────────────
+   // CHANGED: replaced mock timeout + mockResponses with real queryRAG() call
+   //
+@@ -450,18 +593,63 @@ export default function DashboardChatPage() {
+ 
+       if (docAttachments.length > 0) {
+         setIsUploading(true);
++        // Seed the live progress panel with the whole batch so the user
++        // sees every file queued up front, then watches each flip to
++        // "uploading" → "ready"/"failed" instead of bubbles silently
++        // appearing one by one.
++        const batch: UploadItem[] = docAttachments.map((a) => ({
++          id: a.id,
++          name: a.name,
++          status: "pending" as const,
++        }));
++        setUploads(batch);
++
+         for (const attachment of docAttachments) {
+-          if (attachment.file) {
+-            const uploadResult = await uploadDocument(attachment.file, currentSessionId);
++          if (!attachment.file) continue;
++          setUploads((prev) =>
++            prev.map((u) =>
++              u.id === attachment.id ? { ...u, status: "uploading" } : u,
++            ),
++          );
++          try {
++            const uploadResult = await uploadDocument(
++              attachment.file,
++              currentSessionId,
++            );
+             currentSessionId = uploadResult.session_id;
++            setUploads((prev) =>
++              prev.map((u) =>
++                u.id === attachment.id ? { ...u, status: "done" } : u,
++              ),
++            );
+             // Shared helper handles: setSessionId, sidebar sync + skip-
+             // rehydrate, the 📎 + "Document uploaded" bubble pair, and
+             // sequential server persistence. Same flow the DropZone in
+             // the empty state uses, so the two upload paths can't drift.
+             await applyUploadConfirmation(uploadResult);
++          } catch (uploadErr) {
++            // Surface a per-file failure in the panel and keep going so one
++            // bad file in a data room doesn't abort the whole batch.
++            setUploads((prev) =>
++              prev.map((u) =>
++                u.id === attachment.id
++                  ? {
++                      ...u,
++                      status: "error",
++                      error:
++                        uploadErr instanceof Error
++                          ? uploadErr.message
++                          : "Upload failed",
++                    }
++                  : u,
++              ),
++            );
+           }
+         }
+         setIsUploading(false);
++        // Leave the finished panel up briefly so the user registers the
++        // result, then clear it.
++        setTimeout(() => setUploads([]), 2500);
+       }
+ 
+       // After uploads, if the user also typed text, add that bubble now
+@@ -614,10 +802,32 @@ export default function DashboardChatPage() {
+           /* best-effort; UI already shows the result */
+         }
+       } else if (content.trim().length === 0 && docAttachments.length > 0) {
+-        // Upload-only — user attached a file with no question. The
+-        // "Document uploaded" confirmation we showed above is the
+-        // entire response; firing /query with empty content would
+-        // just produce a spurious greeting. Skip.
++        // Upload-only — user attached file(s) with no question. Ingestion is
++        // asynchronous, so we don't analyze immediately (the document isn't
++        // ready the instant upload returns, and a data room may be many
++        // files). Post a short notice; the sidebar shows live per-document
++        // progress and a checkmark when each is ready to query.
++        const noticeId = randomId();
++        const noticeText =
++          docAttachments.length === 1
++            ? `📥 **${docAttachments[0].name}** wird verarbeitet — der Fortschritt erscheint in der Seitenleiste. Stellen Sie Ihre Frage, sobald das Dokument bereit ist (grünes Häkchen).`
++            : `📥 ${docAttachments.length} Dokumente werden verarbeitet — der Fortschritt erscheint in der Seitenleiste. Stellen Sie Ihre Frage, sobald sie bereit sind (grünes Häkchen).`;
++        setMessages((prev) => [
++          ...prev,
++          {
++            id: noticeId,
++            role: "assistant",
++            content: noticeText,
++            timestamp: new Date(),
++          },
++        ]);
++        if (currentSessionId) {
++          try {
++            await appendMessage(currentSessionId, "assistant", noticeText, "upload");
++          } catch {
++            /* best-effort */
++          }
++        }
+       } else if (content.trim().length === 0) {
+         // Empty submit, no attachment either — nothing to do.
+       } else {
+@@ -652,106 +862,12 @@ export default function DashboardChatPage() {
+         };
+         setMessages((prev) => [...prev, placeholder]);
+ 
+-        // Wrap in a promise so the outer try/catch's ``finally`` (which
++        // streamAnswerInto returns a promise that resolves on the terminal
++        // complete/error event, so the outer try/catch's ``finally`` (which
+         // resets isTyping + restores focus) waits for stream completion
+-        // instead of firing right after the placeholder lands.
+-        await new Promise<void>((resolve) => {
+-          streamAbortRef.current?.abort();
+-          let firstTokenSeen = false;
+-
+-          streamAbortRef.current = streamQuery(
+-            content,
+-            currentSessionId,
+-            {
+-              onToken: (delta) => {
+-                // Hide the global typing indicator once content starts
+-                // arriving — the streaming bubble is its own feedback.
+-                if (!firstTokenSeen) {
+-                  firstTokenSeen = true;
+-                  setIsTyping(false);
+-                }
+-                setMessages((prev) =>
+-                  prev.map((m) =>
+-                    m.id === aiMessageId
+-                      ? { ...m, content: m.content + delta }
+-                      : m,
+-                  ),
+-                );
+-              },
+-              onComplete: (payload: RAGResponse) => {
+-                // Sync sidebar to the freshly-assigned session id if the
+-                // backend created one (first turn of a brand-new chat).
+-                // ``skipNextRehydrate`` matches the upload path so the
+-                // in-flight thread isn't wiped by a server replay.
+-                if (payload.session_id) {
+-                  setSessionId(payload.session_id);
+-                  if (!activeConversationId ||
+-                      activeConversationId !== payload.session_id) {
+-                    skipNextRehydrate.current = true;
+-                    setActiveConversationId?.(payload.session_id);
+-                    refreshConversations?.();
+-                  }
+-                }
+-
+-                const modeBadge =
+-                  payload.mode && payload.mode !== "chat"
+-                    ? `\n\n<sub>_Mode: ${payload.mode}_</sub>`
+-                    : "";
+-
+-                setMessages((prev) =>
+-                  prev.map((m) =>
+-                    m.id === aiMessageId
+-                      ? {
+-                          ...m,
+-                          // Swap the streamed raw text for the
+-                          // citation-validated final answer — handles
+-                          // the model fabricated have already been
+-                          // rewritten ``(unbelegt)`` server-side.
+-                          content: payload.answer + modeBadge,
+-                          chunks: payload.chunks,
+-                          citationValidation:
+-                            payload.citation_validation ?? null,
+-                          // Day-4 jurisdiction warnings. Backend emits
+-                          // them when the answer cites a Bundesland-
+-                          // specific rule from the wrong state. Empty
+-                          // array (or undefined) ⇒ no warning chip.
+-                          jurisdictionWarnings:
+-                            payload.jurisdiction_warnings ?? undefined,
+-                          streaming: false,
+-                          timestamp: new Date(),
+-                          // ``messages.id`` from persistence — drives
+-                          // POST /feedback so a thumbs-up scopes to
+-                          // this specific bubble rather than the
+-                          // whole session. ``null`` falls back to
+-                          // session-level feedback.
+-                          messageId: payload.message_id ?? null,
+-                        }
+-                      : m,
+-                  ),
+-                );
+-                streamAbortRef.current = null;
+-                resolve();
+-              },
+-              onError: (detail) => {
+-                setMessages((prev) =>
+-                  prev.map((m) =>
+-                    m.id === aiMessageId
+-                      ? {
+-                          ...m,
+-                          content: `⚠️ **Error:** ${detail}`,
+-                          streaming: false,
+-                          timestamp: new Date(),
+-                        }
+-                      : m,
+-                  ),
+-                );
+-                streamAbortRef.current = null;
+-                resolve();
+-              },
+-            },
+-            language,
+-          );
+-        });
++        // instead of firing right after the placeholder lands. Same wiring
++        // is reused by the Regenerate button.
++        await streamAnswerInto(aiMessageId, content, currentSessionId);
+       }
+     } catch (err: unknown) {
+       setIsUploading(false);
+@@ -778,22 +894,32 @@ export default function DashboardChatPage() {
+     <div className="h-full w-full flex flex-col bg-background overflow-hidden">
+       {/* ── Header ── */}
+       <div className="flex-shrink-0 h-14 border-b border-border flex items-center justify-between px-6 bg-background/50 backdrop-blur">
+-        <div className="flex items-center gap-3">
+-          <Logo size="sm" />
+-          {activeConversation && (
+-            <>
+-              <span className="text-border/60 select-none">·</span>
+-              <span className="text-sm text-muted-foreground truncate max-w-xs">
+-                {activeConversation.title}
+-              </span>
+-            </>
+-          )}
++        <div className="flex items-center gap-3 min-w-0">
++          <div className="flex-shrink-0 w-9 h-9 rounded-xl bg-gradient-to-br from-primary/20 to-primary/5 border border-primary/15 flex items-center justify-center">
++            <Sparkles className="w-[18px] h-[18px] text-primary" />
++          </div>
++          <div className="min-w-0 leading-tight">
++            <h1 className="text-sm font-semibold truncate">
++              {activeConversation?.title || "New chat"}
++            </h1>
++            <p className="text-xs text-muted-foreground flex items-center gap-1.5">
++              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
++              Legal due-diligence assistant
++            </p>
++          </div>
+         </div>
+         <div className="flex items-center gap-2">
+-          <Button variant="ghost" size="icon" className="relative h-9 w-9">
+-            <BellIcon className="w-5 h-5" />
+-            <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-primary rounded-full" />
++          <Button
++            variant="outline"
++            size="sm"
++            className="gap-1.5"
++            onClick={() => setActiveConversationId?.(null)}
++            title="Start a new chat"
++          >
++            <SquarePen className="w-4 h-4" />
++            <span className="hidden sm:inline">New chat</span>
+           </Button>
++          <NotificationsMenu />
+         </div>
+       </div>
+ 
+@@ -872,6 +998,7 @@ export default function DashboardChatPage() {
+                 <DocumentList
+                   sessionId={sessionId ?? activeConversationId}
+                   refreshKey={docRefreshKey}
++                  onIngestingChange={setDocsIngesting}
+                 />
+               </div>
+             </div>
+@@ -882,7 +1009,11 @@ export default function DashboardChatPage() {
+               <ChatMessage
+                 key={message.id}
+                 message={message}
+-                onRegenerate={() => {}}
++                onRegenerate={
++                  message.role === "assistant" && !message.streaming
++                    ? () => handleRegenerate(message.id)
++                    : undefined
++                }
+                 activeCiteHandle={openCiteHandle}
+                 onCiteClick={handleCiteClick}
+                 onFeedback={
+@@ -892,8 +1023,11 @@ export default function DashboardChatPage() {
+                 }
+               />
+             ))}
+-            {(isTyping || isUploading) && (
+-              <TypingIndicator message={isUploading ? "Uploading document..." : "LAI is thinking..."} />
++            {/* Upload feedback now lives in the UploadProgress panel above
++                the composer, so the in-thread indicator is just for the
++                model's thinking/answering phase. */}
++            {isTyping && !isUploading && (
++              <TypingIndicator message="LAI is thinking..." />
+             )}
+             <div ref={bottomAnchorRef} style={{ height: 1 }} />
+           </div>
+@@ -913,18 +1047,23 @@ export default function DashboardChatPage() {
+       {/* ── Input ── */}
+       <div className="flex-shrink-0 border-t border-border">
+         <div className="max-w-4xl mx-auto w-full px-4 py-4 space-y-2">
+-          {/* Day-3 strategy doc deliverable: answer-language toggle.
+-              Wired end-to-end — ``language`` flows from useLanguage()
+-              into every streamQuery() call as ``target_language``;
+-              backend appends an English-answer directive to the
+-              system prompt while keeping cited German verbatim. */}
+-          <div className="flex items-center justify-end">
+-            <LanguageToggle />
+-          </div>
++          {/* Live multi-file upload progress — sits just above the composer
++              so it's always visible while documents are ingesting, even if
++              the thread is scrolled. Renders nothing when idle. */}
++          <UploadProgress items={uploads} />
++          {/* No language toggle: the backend mirrors the question's
++              language automatically (German question → German answer,
++              English question → English answer). */}
+           <ChatInput
+             onSend={handleSendMessage}
+-            disabled={isTyping || isUploading}
+-            placeholder={isUploading ? "Uploading document..." : "Ask LAI about permits, contracts, or upload documents..."}
++            disabled={isTyping || isUploading || docsIngesting}
++            placeholder={
++              isUploading
++                ? "Uploading document..."
++                : docsIngesting
++                  ? "Document is being processed — you can ask once it's ready…"
++                  : "Ask LAI about permits, contracts, or upload documents..."
++            }
+             inputRef={inputRef}
+           />
+         </div>

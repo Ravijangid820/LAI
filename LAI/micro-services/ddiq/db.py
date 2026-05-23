@@ -63,8 +63,12 @@ DB_CONFIG: dict[str, Any] = {
 
 # Document upload size cap, shared with the API layer. Kept here so
 # both the schema (``ddiq_documents.size_bytes``) and the upload
-# handler enforce the same ceiling. 50 MiB matches the legacy default.
-MAX_FILE_SIZE: int = 50 * 1024 * 1024
+# handler enforce the same ceiling. Bumped 50 → 100 MiB after live runs
+# showed that real legal binders (signed scans, expert reports, full
+# data-room exports) routinely land in the 30–70 MB range and hit the
+# old cap. 100 MiB still fits comfortably in memory for one upload at a
+# time and keeps the OOM ceiling generous on the analyzer host.
+MAX_FILE_SIZE: int = 100 * 1024 * 1024
 
 
 # ── Schema ───────────────────────────────────────────────────────────

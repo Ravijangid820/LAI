@@ -151,6 +151,7 @@ def generate_report_task(
     report_id: str,
     req_dict: dict[str, Any],
     user_id: str,
+    org_id: str | None = None,
 ) -> None:
     """Celery task wrapper around :func:`ddiq_report._run_report_generation_job`.
 
@@ -198,7 +199,7 @@ def generate_report_task(
     # let bare exceptions propagate so Celery can log + retry per
     # acks_late semantics — but the inner function should swallow
     # everything routine.
-    _run_report_generation_job(report_id, req, user_id)
+    _run_report_generation_job(report_id, req, user_id, org_id)
 
     _log.info(
         "ddiq.report.generate.complete report_id=%s task_id=%s",

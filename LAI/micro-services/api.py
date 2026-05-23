@@ -134,7 +134,7 @@ def is_greeting(text: str) -> bool:
 # ``document_store`` dicts are gone — they had no tenant binding and
 # were lost on restart.
 MAX_HISTORY = 10  # Keep last 10 messages per conversation in the prompt window
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB (bumped from 50 — real binders hit the cap)
 
 
 def _ensure_conversation(user_id, conversation_id):

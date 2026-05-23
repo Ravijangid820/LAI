@@ -82,16 +82,18 @@ bash /data/projects/lai/LAI/scripts/ops/status.sh
 ### Restart just serve_rag (the chat backend)
 
 ```bash
-bash /data/projects/lai/LAI/scripts/ops/restart-serve_rag.sh
+bash /data/projects/lai/LAI/scripts/ops/restart_serve_rag.sh            # restart + wait for ready
+bash /data/projects/lai/LAI/scripts/ops/restart_serve_rag.sh --status   # PID + /health
+bash /data/projects/lai/LAI/scripts/ops/restart_serve_rag.sh --stop     # stop only
+bash /data/projects/lai/LAI/scripts/ops/restart_serve_rag.sh --no-wait  # restart, skip health gate
 ```
 
-This is the safe one-command restart. It gracefully stops serve_rag, **waits
-for the GPU memory to actually release** (a fast kill+relaunch races the dying
-process for VRAM and crashes the new one with CUDA OOM), relaunches via
-`start.sh` (so the `.env.auth` secret + 27B-remote + `LAI_BIND_HOST=0.0.0.0` +
-`CUDA_VISIBLE_DEVICES=1` env all come from one place), and waits for `/health`
-to return 200. It does **not** touch Docker, the Vite UI, or the running
-pipeline / migration jobs.
+The safe one-command restart. It SIGTERMs serve_rag and **waits for the process
+to fully exit** (which is when its GPU VRAM is released — so the relaunch can't
+CUDA-OOM), escalates to SIGKILL if it overstays, relaunches detached
+(`setsid + nohup`, SSH-disconnect-proof) after sourcing `.env.auth` + DB/CORS
+env, then polls `/health` until `loaded:true` AND `retrieval_ready:true`. It
+does **not** touch Docker, the Vite UI, or the running pipeline / migration jobs.
 
 > If you ever launch serve_rag by hand instead, you must pass the env or it
 > binds to `127.0.0.1` and LAN browsers see "Failed to fetch":
@@ -177,7 +179,7 @@ docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'lai_|d
 
 ## Recent ops history (rolling, last 5)
 
-- 2026-05-21 — `scripts/ops/restart-serve_rag.sh` added — safe one-command serve_rag restart (graceful stop → wait for GPU release → relaunch → health-check). Replaces the manual restart snippet.
+- 2026-05-21 — Documented `scripts/ops/restart_serve_rag.sh` (Sahid's S-5 script) as the canonical safe restart; removed a duplicate `restart-serve_rag.sh` that had been added by mistake.
 - 2026-04-30 — `ops/resume_step6.sh` written (resume embeddings, 16.6% done at last check, ~41.6 M child chunks remaining).
 - 2026-04-30 — `LAI-UI/` directory rename (was `lai-ui/`); all references in scripts + docs flipped uppercase.
 - 2026-04-30 — `serve_rag` LAN bind hardened — restart pattern now in `feedback_serve_rag_restart` memory.

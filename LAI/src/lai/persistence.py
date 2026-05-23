@@ -45,6 +45,8 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id                       TEXT PRIMARY KEY,
     user_id                  TEXT,
+    org_id                   TEXT,  -- firm tenant key (MULTIUSER_PLAN §3); Phase B scopes on it
+    project_id               TEXT,  -- server-side project grouping (MULTIUSER_PLAN §6)
     title                    TEXT,
     filename                 TEXT,
     contract_text            TEXT,
@@ -89,6 +91,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_session
 CREATE TABLE IF NOT EXISTS matter_documents (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id   TEXT NOT NULL,
+    org_id       TEXT,                  -- firm tenant key (MULTIUSER_PLAN §3)
     doc_index    INTEGER NOT NULL,      -- the n in [M-n], 1-based, stable
     filename     TEXT,
     doc_text     TEXT,                  -- extracted markdown/text (filled by worker)
@@ -122,6 +125,7 @@ CREATE INDEX IF NOT EXISTS idx_matter_docs_session
 CREATE TABLE IF NOT EXISTS feedback (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  TEXT NOT NULL,
+    org_id      TEXT,                  -- firm tenant key (MULTIUSER_PLAN §3)
     message_id  INTEGER,
     user_id     TEXT NOT NULL,
     rating      INTEGER NOT NULL,
@@ -136,6 +140,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_feedback_user_session_msg
 
 CREATE INDEX IF NOT EXISTS idx_feedback_session
     ON feedback(session_id, created_at DESC);
+
+-- Per-resource explicit sharing — Path A Step 2 (private-by-default + share
+-- on top). One row per (session, shared-with user). The session's creator
+-- (sessions.user_id) implicitly always sees their own row; the rows here
+-- list COLLABORATORS the owner has explicitly granted access to. v1 is
+-- view-only: shared users can READ everything under the session (messages,
+-- matter documents, citations) but cannot rename/delete/append-message
+-- (those stay owner-only). ``granted_by`` is the owner who issued the
+-- share (audit); always == sessions.user_id at insert time.
+CREATE TABLE IF NOT EXISTS session_shares (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    granted_by  TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    UNIQUE (session_id, user_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_shares_user
+    ON session_shares(user_id);
+
+CREATE INDEX IF NOT EXISTS idx_session_shares_session
+    ON session_shares(session_id);
 """
 
 
@@ -163,6 +191,12 @@ def init(db_path: Path, uploads_dir: Path) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
     if "session_meta_json" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN session_meta_json TEXT")
+    # Firm tenancy (MULTIUSER_PLAN §3/§6). Nullable; unused until Phase B —
+    # added here so existing chat DBs gain the columns on the next boot.
+    if "org_id" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN org_id TEXT")
+    if "project_id" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT")
 
     # ``chunks_json`` holds the retrieval chunks ([M-n]/[C-n] sources) that
     # backed an assistant message, so citation chips still resolve to their
@@ -182,9 +216,16 @@ def init(db_path: Path, uploads_dir: Path) -> None:
         ("pages_total", "ALTER TABLE matter_documents ADD COLUMN pages_total INTEGER NOT NULL DEFAULT 0"),
         ("n_chunks", "ALTER TABLE matter_documents ADD COLUMN n_chunks INTEGER NOT NULL DEFAULT 0"),
         ("error", "ALTER TABLE matter_documents ADD COLUMN error TEXT"),
+        ("org_id", "ALTER TABLE matter_documents ADD COLUMN org_id TEXT"),
     ):
         if col not in md_cols:
             conn.execute(ddl)
+
+    # feedback.org_id — firm tenancy (MULTIUSER_PLAN §3). Nullable, unused
+    # until Phase B; the feedback table is created by the executescript above.
+    fb_cols = {r["name"] for r in conn.execute("PRAGMA table_info(feedback)")}
+    if "org_id" not in fb_cols:
+        conn.execute("ALTER TABLE feedback ADD COLUMN org_id TEXT")
 
     # The feedback table + its unique index were added late; older DBs
     # predate the unique index even when they have the table. Re-running
@@ -220,10 +261,14 @@ def _conn() -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 def _row_to_session(r: sqlite3.Row) -> dict:
+    cols = set(r.keys())
     return {
         "id": r["id"],
         "user_id": r["user_id"],
-        "title": r["title"] if "title" in r.keys() else None,
+        # Phase B: round-trip the firm-tenant key so save_session(load_session(sid))
+        # doesn't drop org_id. Falls back to None on legacy DBs predating 002.
+        "org_id": r["org_id"] if "org_id" in cols else None,
+        "title": r["title"] if "title" in cols else None,
         "filename": r["filename"],
         "contract_text": r["contract_text"],
         "n_pages": r["n_pages"] or 0,
@@ -262,11 +307,12 @@ def _display_title_sql_expr() -> str:
 # ---------------------------------------------------------------------------
 
 def load_session(sid: str, user_id: Optional[str] = None) -> Optional[dict]:
-    """Load a session by id, optionally constrained to a user.
+    """Load a session by id, scoped to a viewer.
 
-    When ``user_id`` is supplied the lookup filters on ownership; a
-    miss returns ``None`` so callers map to 404 (AUTH_PLAN §6 rule 4 —
-    never leak existence of another tenant's row).
+    Path A Step 2: visibility is creator OR explicit-share. A cross-user
+    caller with no share returns ``None`` (route maps to 404 — no
+    existence leak). This is a READ; for write-path checks use
+    :func:`session_owned_by`.
     """
     if user_id is None:
         r = _conn().execute(
@@ -274,27 +320,39 @@ def load_session(sid: str, user_id: Optional[str] = None) -> Optional[dict]:
         ).fetchone()
     else:
         r = _conn().execute(
-            "SELECT * FROM sessions WHERE id = ? AND user_id = ?", (sid, user_id),
+            """
+            SELECT * FROM sessions
+            WHERE id = ?
+              AND (user_id = ?
+                   OR EXISTS (SELECT 1 FROM session_shares
+                              WHERE session_shares.session_id = sessions.id
+                                AND session_shares.user_id = ?))
+            """,
+            (sid, user_id, user_id),
         ).fetchone()
     return _row_to_session(r) if r else None
 
 
 def save_session(sid: str, data: dict) -> None:
     """Upsert a session. Caller passes the same dict shape that was
-    historically stored under ``STATE["sessions"][sid]``. Note: ``title``
-    is preserved on upsert when not explicitly set in ``data`` — it's a
-    user-controlled field, not derived from upload payloads."""
+    historically stored under ``STATE["sessions"][sid]``.
+
+    Phase B writes BOTH ``user_id`` (created_by — attribution / audit
+    trail) AND ``org_id`` (the firm-tenant key Phase B reads filter on).
+    ``title`` is preserved on upsert when not explicitly set in ``data``
+    — it's a user-controlled field, not derived from upload payloads."""
     now = time.time()
     with _STATE["lock"]:
         _conn().execute(
             """
             INSERT INTO sessions (
-                id, user_id, title, filename, contract_text, n_pages,
+                id, user_id, org_id, title, filename, contract_text, n_pages,
                 tables_json, clauses_json, analysis_json, extraction_quality_json,
                 upload_ext, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 user_id                 = COALESCE(excluded.user_id, sessions.user_id),
+                org_id                  = COALESCE(excluded.org_id, sessions.org_id),
                 title                   = COALESCE(excluded.title, sessions.title),
                 filename                = excluded.filename,
                 contract_text           = excluded.contract_text,
@@ -309,6 +367,7 @@ def save_session(sid: str, data: dict) -> None:
             (
                 sid,
                 data.get("user_id"),
+                data.get("org_id"),
                 data.get("title"),
                 data.get("filename"),
                 data.get("contract_text"),
@@ -344,9 +403,8 @@ def update_session_title(sid: str, title: str, user_id: Optional[str] = None) ->
     clear (which falls back to the COALESCE chain in list_sessions).
     Returns True if a row was updated.
 
-    When ``user_id`` is supplied the UPDATE is scoped so a foreign
-    caller cannot mutate another tenant's row (AUTH_PLAN G2).
-    """
+    Phase B-revert: scoped on the creator. A cross-user UPDATE is a
+    no-op; route handler maps False → 404 (no existence leak)."""
     cleaned = (title or "").strip()
     with _STATE["lock"]:
         if user_id is None:
@@ -389,9 +447,9 @@ def delete_session(sid: str, user_id: Optional[str] = None) -> bool:
     """Delete a session, its messages, matter documents, feedback, AND the
     uploaded files on disk.
 
-    Returns ``True`` when a session row was actually deleted (caller
-    maps a ``False`` return to 404 — never 403 — to avoid leaking
-    existence).
+    Phase B-revert: scoped on the creator — only the user who started the
+    session can delete it (no firm-wide rights). Returns ``True`` when a
+    session row was actually deleted; caller maps ``False`` → 404.
     """
     with _STATE["lock"]:
         if user_id is None:
@@ -416,19 +474,60 @@ def delete_session(sid: str, user_id: Optional[str] = None) -> bool:
 
 
 def session_exists(sid: str, user_id: Optional[str] = None) -> bool:
+    """Cheap visibility check used by message/document/feedback READ gates.
+
+    Path A Step 2: returns True when the caller is the session's owner
+    OR the session has been explicitly shared with them via
+    ``session_shares``. Cross-user callers with no share get False —
+    callers map cleanly to 404 without revealing existence.
+
+    WRITE paths (delete, rename, append-message, set-meta, record
+    feedback, add matter doc) MUST use :func:`session_owned_by` instead
+    — sharing is view-only in v1; a shared user can read but not write.
+    """
     if user_id is None:
         r = _conn().execute(
             "SELECT 1 FROM sessions WHERE id = ?", (sid,)
         ).fetchone()
     else:
         r = _conn().execute(
-            "SELECT 1 FROM sessions WHERE id = ? AND user_id = ?", (sid, user_id),
+            """
+            SELECT 1 FROM sessions
+            WHERE id = ?
+              AND (user_id = ?
+                   OR EXISTS (SELECT 1 FROM session_shares
+                              WHERE session_shares.session_id = sessions.id
+                                AND session_shares.user_id = ?))
+            """,
+            (sid, user_id, user_id),
         ).fetchone()
     return r is not None
 
 
+def session_owned_by(sid: str, user_id: str) -> bool:
+    """Strict-owner visibility check for write gates (Path A Step 2).
+
+    Returns True only when ``user_id`` is the session's creator —
+    explicit shares grant READ access, not WRITE. Used by
+    :func:`delete_session`, :func:`update_session_title`,
+    :func:`add_message`, :func:`set_session_meta`,
+    :func:`record_feedback`, :func:`add_matter_document` so a shared
+    collaborator cannot rename / delete / append-message / re-share the
+    session.
+    """
+    r = _conn().execute(
+        "SELECT 1 FROM sessions WHERE id = ? AND user_id = ?", (sid, user_id),
+    ).fetchone()
+    return r is not None
+
+
 def list_sessions(limit: int = 50, user_id: Optional[str] = None) -> list[dict]:
-    """Light-weight list (no contract_text/analysis blobs) for UI sidebars."""
+    """Light-weight list (no contract_text/analysis blobs) for UI sidebars.
+
+    Path A Step 2: sidebar shows the caller's own sessions PLUS sessions
+    explicitly shared with them. Owner+shared appear as one list (no
+    visual differentiation in v1 — the chat header carries the share
+    state). Edit rights remain owner-only at the route layer."""
     title_expr = _display_title_sql_expr()
     base_select = f"""
         SELECT id,
@@ -446,8 +545,14 @@ def list_sessions(limit: int = 50, user_id: Optional[str] = None) -> list[dict]:
         ).fetchall()
     else:
         rows = _conn().execute(
-            base_select + " WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
-            (user_id, limit),
+            base_select + """
+            WHERE user_id = ?
+               OR EXISTS (SELECT 1 FROM session_shares
+                          WHERE session_shares.session_id = sessions.id
+                            AND session_shares.user_id = ?)
+            ORDER BY updated_at DESC
+            LIMIT ?""",
+            (user_id, user_id, limit),
         ).fetchall()
     return [
         {
@@ -484,15 +589,16 @@ def add_message(
 ) -> int:
     """Append a message. Returns the new row id (or 0 on insert failure).
 
-    When ``user_id`` is provided we verify ownership before writing —
-    a foreign caller cannot inject messages into someone else's chat
-    history (AUTH_PLAN G3).
+    Path A Step 2: WRITE-path — only the session's CREATOR can append
+    messages (sharing is view-only in v1). A foreign caller — even one
+    the session is shared with — gets 0. Editor-tier sharing is a
+    future enhancement.
 
     ``chunks`` (assistant turns only) are the citation sources behind the
     answer; stored as JSON so the citation panel still resolves [M-n]/
     [C-n] handles after the conversation is reloaded from the DB.
     """
-    if user_id is not None and not session_exists(session_id, user_id=user_id):
+    if user_id is not None and not session_owned_by(session_id, user_id):
         return 0
     chunks_json = json.dumps(chunks) if chunks else None
     with _STATE["lock"]:
@@ -509,10 +615,9 @@ def add_message(
 def list_messages(session_id: str, user_id: Optional[str] = None) -> list[dict]:
     """Return all messages for a session.
 
-    When ``user_id`` is supplied we verify the session belongs to that
-    user first — returns an empty list otherwise. Combined with the
-    endpoint's existence check, this enforces "no cross-tenant message
-    reads" without leaking via response shape.
+    Phase B-revert: scoped on the creator. A cross-user caller gets an
+    empty list — combined with the route's session_exists check this
+    enforces "no cross-user message reads" without leaking via shape.
     """
     if user_id is not None and not session_exists(session_id, user_id=user_id):
         return []
@@ -543,8 +648,8 @@ def get_session_meta(session_id: str, user_id: Optional[str] = None) -> Optional
     extracted by the LLM and saved alongside the session. None when the
     column is empty (brand-new session or extraction never ran).
 
-    Filters by ``user_id`` when supplied so meta blobs do not leak
-    between tenants.
+    Path A Step 2: READ-path — viewable by creator OR explicit-share
+    user. Write counterpart :func:`set_session_meta` stays owner-only.
     """
     if user_id is None:
         row = _conn().execute(
@@ -553,8 +658,15 @@ def get_session_meta(session_id: str, user_id: Optional[str] = None) -> Optional
         ).fetchone()
     else:
         row = _conn().execute(
-            "SELECT session_meta_json FROM sessions WHERE id = ? AND user_id = ?",
-            (session_id, user_id),
+            """
+            SELECT session_meta_json FROM sessions
+            WHERE id = ?
+              AND (user_id = ?
+                   OR EXISTS (SELECT 1 FROM session_shares
+                              WHERE session_shares.session_id = sessions.id
+                                AND session_shares.user_id = ?))
+            """,
+            (session_id, user_id, user_id),
         ).fetchone()
     if not row or not row["session_meta_json"]:
         return None
@@ -565,7 +677,9 @@ def get_session_meta(session_id: str, user_id: Optional[str] = None) -> Optional
 
 
 def set_session_meta(session_id: str, meta: dict, user_id: Optional[str] = None) -> None:
-    """Persist a refreshed metadata snapshot for the session."""
+    """Persist a refreshed metadata snapshot for the session. Path A
+    Step 2: WRITE — owner-only. A shared collaborator's meta-extraction
+    would no-op here (the WHERE ... AND user_id filter doesn't match)."""
     with _STATE["lock"]:
         if user_id is None:
             _conn().execute(
@@ -594,16 +708,14 @@ def record_feedback(
 ) -> Optional[int]:
     """Upsert a feedback row keyed by ``(user_id, session_id, message_id)``.
 
-    Returns the row id on success, or ``None`` when the session does not
-    belong to ``user_id`` — we treat cross-tenant feedback as silently
-    dropped (matches the rest of persistence.py's pattern).
+    Path A Step 2: ``user_id`` is the feedback author AND visibility
+    check. Owner-only — a shared collaborator cannot rate the session
+    (sharing is view-only). Cross-user feedback is silently dropped.
 
     The upsert uses ``ON CONFLICT ... DO UPDATE`` rather than ``INSERT OR
-    REPLACE`` so the auto-incremented ``id`` is preserved across edits
-    (REPLACE deletes and re-inserts, which makes ``id`` churn). That
-    keeps any future audit trail / link-back-by-id stable.
+    REPLACE`` so the auto-incremented ``id`` is preserved across edits.
     """
-    if not session_exists(session_id, user_id=user_id):
+    if not session_owned_by(session_id, user_id):
         return None
     with _STATE["lock"]:
         cur = _conn().execute(
@@ -628,7 +740,7 @@ def record_feedback(
 def list_feedback(session_id: str, user_id: Optional[str] = None) -> list[dict]:
     """All feedback rows attached to a session.
 
-    Filtered by ``user_id`` when supplied — matches the access model of
+    Phase B-revert: scoped on the creator — matches the access model of
     ``list_messages``. Order is newest-first so the UI can show the
     lawyer their most-recent verdict at the top without re-sorting.
     """
@@ -686,18 +798,24 @@ def add_matter_document(
     n_pages: int,
     upload_ext: str,
     user_id: Optional[str] = None,
+    org_id: Optional[str] = None,
     status: str = "done",
 ) -> Optional[dict]:
     """Append one uploaded document to a matter. Returns the new row as a
     dict (incl. its stable ``doc_index`` = the n in [M-n]), or ``None`` if
     the session isn't owned by ``user_id``.
 
+    Path A Step 2: WRITE — owner-only. A shared collaborator cannot
+    attach new documents (sharing is view-only); ``user_id`` is checked
+    via :func:`session_owned_by`. ``org_id`` is still stamped on the row
+    for membership/audit.
+
     ``doc_index`` is ``max(existing)+1`` so handles never shift when more
     documents are added later. ``status`` is ``'queued'`` for async
     ingestion (the worker fills ``doc_text``/``n_pages`` later) or the
     default ``'done'`` for synchronous callers/tests.
     """
-    if user_id is not None and not session_exists(session_id, user_id=user_id):
+    if user_id is not None and not session_owned_by(session_id, user_id):
         return None
     with _STATE["lock"]:
         row = _conn().execute(
@@ -709,10 +827,10 @@ def add_matter_document(
         cur = _conn().execute(
             """
             INSERT INTO matter_documents
-                (session_id, doc_index, filename, doc_text, n_pages, upload_ext, created_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (session_id, org_id, doc_index, filename, doc_text, n_pages, upload_ext, created_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, next_index, filename, doc_text, n_pages, upload_ext, ts, status),
+            (session_id, org_id, next_index, filename, doc_text, n_pages, upload_ext, ts, status),
         )
         return {
             "id": int(cur.lastrowid or 0),
@@ -795,7 +913,8 @@ def list_matter_documents(
     ``include_text=False`` (default) omits the heavy ``doc_text`` blob —
     the UI document list doesn't need it. The chat path passes
     ``include_text=True`` to build the [M-n] prompt sources.
-    Filtered by ``user_id`` when supplied (no cross-tenant leakage).
+    Phase B-revert: filtered by the session's creator so a caller who
+    didn't create the session sees an empty list (no cross-user leakage).
     """
     if user_id is not None and not session_exists(session_id, user_id=user_id):
         return []
@@ -831,8 +950,9 @@ def list_matter_documents(
 def get_matter_document(
     session_id: str, doc_index: int, user_id: Optional[str] = None,
 ) -> Optional[dict]:
-    """One matter document by its [M-n] index, or None. Used by the
-    per-document preview endpoint."""
+    """One matter document by its [M-n] index, or None. Phase B-revert:
+    scoped on the session's creator so a caller who doesn't own the
+    session sees ``None`` (the per-document preview route maps to 404)."""
     if user_id is not None and not session_exists(session_id, user_id=user_id):
         return None
     r = _conn().execute(
@@ -900,3 +1020,112 @@ def upload_path(sid: str, ext: Optional[str] = None) -> Optional[Path]:
         if p.exists():
             return p
     return None
+
+
+# ---------------------------------------------------------------------------
+# session sharing (Path A Step 2 — explicit per-resource view-only sharing)
+# ---------------------------------------------------------------------------
+
+def session_owner(session_id: str) -> Optional[str]:
+    """Return the ``user_id`` of the session's creator, or ``None`` if the
+    session is unknown. Used by route handlers to gate owner-only share
+    management (add/remove/list shares) without coupling them to the
+    read-visibility widening that everyone else gets."""
+    r = _conn().execute(
+        "SELECT user_id FROM sessions WHERE id = ?", (session_id,),
+    ).fetchone()
+    return r["user_id"] if r else None
+
+
+def list_session_shares(session_id: str) -> list[dict]:
+    """All users this session is explicitly shared with, newest-first.
+
+    Authorisation is the caller's responsibility — route handlers must
+    confirm the caller is the session owner (or a super-admin) before
+    invoking this. We don't take a viewer arg here because the share list
+    itself is owner-only metadata, not part of the "can I see it?" plane.
+    """
+    rows = _conn().execute(
+        """
+        SELECT id, session_id, user_id, granted_by, created_at
+        FROM session_shares
+        WHERE session_id = ?
+        ORDER BY created_at DESC, id DESC
+        """,
+        (session_id,),
+    ).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "session_id": r["session_id"],
+            "user_id": r["user_id"],
+            "granted_by": r["granted_by"],
+            "created_at": float(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+def add_session_share(
+    session_id: str, target_user_id: str, *, granted_by: str,
+) -> Optional[int]:
+    """Grant ``target_user_id`` view access to ``session_id``.
+
+    Returns the new row id, OR an existing row id if the share already
+    exists (idempotent; re-clicking Share in the UI is a no-op). Returns
+    ``None`` when the caller (``granted_by``) is not the session's
+    creator — the route handler maps that to 404 (no existence leak).
+
+    Self-share (granting access to the owner) is also a no-op: an owner
+    already has full access by definition. Returns the synthetic id 0
+    in that case so the caller can distinguish "owner re-added" from
+    a hard authorisation failure.
+    """
+    owner = session_owner(session_id)
+    if owner is None or owner != granted_by:
+        return None
+    if target_user_id == owner:
+        return 0
+    with _STATE["lock"]:
+        cur = _conn().execute(
+            """
+            INSERT INTO session_shares (session_id, user_id, granted_by, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (session_id, user_id) DO UPDATE SET
+                granted_by = excluded.granted_by
+            RETURNING id
+            """,
+            (session_id, target_user_id, granted_by, time.time()),
+        )
+        row = cur.fetchone()
+        return int(row["id"]) if row else None
+
+
+def revoke_session_share(
+    session_id: str, target_user_id: str, *, granted_by: str,
+) -> bool:
+    """Remove ``target_user_id`` from the session's share list.
+
+    Returns ``True`` when a row was deleted, ``False`` otherwise (no such
+    share, OR caller is not the session owner — route maps to 404 to avoid
+    leaking ownership of someone else's session)."""
+    owner = session_owner(session_id)
+    if owner is None or owner != granted_by:
+        return False
+    with _STATE["lock"]:
+        cur = _conn().execute(
+            "DELETE FROM session_shares WHERE session_id = ? AND user_id = ?",
+            (session_id, target_user_id),
+        )
+        return cur.rowcount > 0
+
+
+def session_share_user_ids(session_id: str) -> set[str]:
+    """Set of user_ids the session is shared with. Used by tests + internal
+    callers; route handlers should prefer the SQL-level ``EXISTS`` clauses
+    in the visibility-widening reads (less data over the wire)."""
+    rows = _conn().execute(
+        "SELECT user_id FROM session_shares WHERE session_id = ?",
+        (session_id,),
+    ).fetchall()
+    return {r["user_id"] for r in rows}

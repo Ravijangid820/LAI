@@ -30,6 +30,7 @@ __all__ = [
     "CurrentUserDep",
     "build_get_current_user",
     "require_admin",
+    "require_super_admin",
 ]
 
 # Setting ``auto_error=False`` lets us emit our own 401 with a
@@ -86,7 +87,12 @@ def build_get_current_user(issuer: TokenIssuer):
             # an attacker probe for "valid signature, wrong issuer" vs
             # "tampered signature".
             raise _unauthorized("invalid access token") from exc
-        return CurrentUser(id=claims.user_id, email=claims.email, role=claims.role)
+        return CurrentUser(
+            id=claims.user_id,
+            email=claims.email,
+            role=claims.role,
+            org_id=claims.org_id,
+        )
 
     return get_current_user
 
@@ -117,5 +123,20 @@ async def require_admin(user: CurrentUser) -> CurrentUser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="admin role required",
+        )
+    return user
+
+
+async def require_super_admin(user: CurrentUser) -> CurrentUser:
+    """Sub-dependency that 403s anyone who is not a ``super_admin``.
+
+    A firm admin (``role='admin'``) does NOT satisfy this — only platform
+    super-admins. Use on routes that touch the cross-org plane: creating /
+    deleting organisations, promoting firm admins, listing every org.
+    """
+    if not user.is_super_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="super-admin role required",
         )
     return user

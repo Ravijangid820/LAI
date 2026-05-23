@@ -66,6 +66,10 @@ class AccessTokenClaims:
         user_id: ``sub`` claim, parsed back to :class:`uuid.UUID`.
         email: ``email`` claim, the canonical login email.
         role: ``role`` claim, one of ``'user'`` or ``'admin'``.
+        org_id: ``org_id`` claim — the firm this user belongs to, or
+            ``None`` for an org-less (just-signed-up, not-yet-placed)
+            user. Optional on the wire: tokens minted before firm
+            tenancy (migration 002) omit it and decode to ``None``.
         issued_at: ``iat`` as an aware UTC datetime.
         expires_at: ``exp`` as an aware UTC datetime.
     """
@@ -73,6 +77,7 @@ class AccessTokenClaims:
     user_id: UUID
     email: str
     role: str
+    org_id: UUID | None
     issued_at: datetime
     expires_at: datetime
 
@@ -114,6 +119,7 @@ class TokenIssuer:
         user_id: UUID,
         email: str,
         role: str,
+        org_id: UUID | None = None,
         now: datetime | None = None,
     ) -> tuple[str, int]:
         """Mint a fresh access JWT.
@@ -124,6 +130,9 @@ class TokenIssuer:
             email: The user's canonical email. Becomes the ``email`` claim.
                 Carried so the request handler does not need a DB lookup.
             role: ``'user'`` or ``'admin'``. Carried for the same reason.
+            org_id: The user's firm, or ``None`` for an org-less user.
+                Becomes the ``org_id`` claim so tenant scoping (Phase B)
+                needs no per-request DB round-trip.
             now: Override the "now" reference for deterministic tests.
                 Defaults to :func:`datetime.now` (UTC).
 
@@ -140,6 +149,7 @@ class TokenIssuer:
             "sub": str(user_id),
             "email": email,
             "role": role,
+            "org_id": str(org_id) if org_id is not None else None,
             "iat": int(issued.timestamp()),
             "exp": int(expires.timestamp()),
         }
@@ -188,10 +198,22 @@ class TokenIssuer:
         if not isinstance(email_raw, str) or not isinstance(role_raw, str):
             raise InvalidTokenError("access token has malformed email/role claim")
 
+        # ``org_id`` is optional on the wire: a null/absent value is a
+        # valid org-less user, and tokens minted before firm tenancy omit
+        # it entirely. Only a *present but unparseable* value is rejected.
+        org_raw = payload.get("org_id")
+        org_id: UUID | None = None
+        if org_raw is not None:
+            try:
+                org_id = UUID(str(org_raw))
+            except ValueError as exc:
+                raise InvalidTokenError("access token has malformed org_id claim") from exc
+
         return AccessTokenClaims(
             user_id=user_id,
             email=email_raw,
             role=role_raw,
+            org_id=org_id,
             issued_at=datetime.fromtimestamp(payload["iat"], tz=timezone.utc),
             expires_at=datetime.fromtimestamp(payload["exp"], tz=timezone.utc),
         )
@@ -227,6 +249,37 @@ class TokenIssuer:
             raw=raw,
             token_hash=hash_refresh_token(raw),
             expires_at=issued + timedelta(days=days),
+        )
+
+    # ── One-shot invitation token (same primitive, different table) ────
+    def issue_invite_token(
+        self,
+        *,
+        ttl_days: int = 7,
+        now: datetime | None = None,
+    ) -> RefreshToken:
+        """Mint a single-use organisation-invitation token.
+
+        Reuses the high-entropy random + sha256 storage primitive — the
+        raw value is what goes into the invite URL, the sha256 hex is
+        what's persisted on ``org_invitations.token_hash``.
+
+        Args:
+            ttl_days: Lifetime in days (default 7). Bounded loosely;
+                the caller picks the policy.
+            now: Override "now" for deterministic tests.
+
+        Returns:
+            A :class:`RefreshToken` (raw + hash + expires_at). The same
+            value object as :meth:`issue_reset_token` since the shape is
+            identical; only the persistence table differs.
+        """
+        issued = now or datetime.now(timezone.utc)
+        raw = secrets.token_urlsafe(_REFRESH_TOKEN_NBYTES)
+        return RefreshToken(
+            raw=raw,
+            token_hash=hash_refresh_token(raw),
+            expires_at=issued + timedelta(days=ttl_days),
         )
 
     # ── One-shot reset token (same primitive, different table) ──────────

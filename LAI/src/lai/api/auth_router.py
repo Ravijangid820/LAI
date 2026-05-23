@@ -30,6 +30,7 @@ Design notes
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Annotated, Any, Final
 from uuid import UUID
 
@@ -57,6 +58,8 @@ from lai.common.auth import (
     hash_refresh_token,
 )
 from lai.common.auth.repository import (
+    InvitationRepository,
+    OrganizationRepository,
     RefreshTokenRepository,
     ResetTokenRepository,
     UserRepository,
@@ -96,6 +99,35 @@ class ResetPasswordBody(BaseModel):
     new_password: str = Field(min_length=1)
 
 
+class AcceptInviteBody(BaseModel):
+    """Public payload for ``POST /auth/accept-invite``.
+
+    The token IS the auth — no Bearer / cookie required. ``email`` is
+    pinned by the invitation (not by the caller) so a leaked token can't
+    be replayed against a different address.
+    """
+
+    token: str = Field(min_length=1, max_length=200)
+    full_name: str = Field(min_length=1, max_length=200)
+    password: str = Field(min_length=1)
+
+
+class InvitePreviewResponse(BaseModel):
+    """Public response for ``GET /auth/invite?token=…``.
+
+    Shape lets the accept-invite SPA show "You're invited to «Firm» as a
+    Member" BEFORE the user types their password, so they know what they're
+    accepting. Returns 404 if the token is unknown / expired / already
+    consumed — never reveals which.
+    """
+
+    email: str
+    role: str
+    org_id: UUID
+    org_name: str
+    expires_at: datetime
+
+
 class AccessTokenResponse(BaseModel):
     access_token: str
     expires_in: int
@@ -108,6 +140,11 @@ class MeResponse(BaseModel):
     full_name: str
     company: str | None
     role: str
+    # ``org_id`` is the firm-tenant key (MULTIUSER_PLAN §3). ``None`` for an
+    # org-less, freshly-signed-up user awaiting placement by an admin — the SPA
+    # uses it both to surface the org-less holding state and to decide whether
+    # the admin link should appear (role + org context).
+    org_id: UUID | None
 
 
 # ─── Dependency bag ─────────────────────────────────────────────────────────
@@ -124,7 +161,9 @@ class AuthDeps:
         "auth_config",
         "email_config",
         "hasher",
+        "invitation_repo",
         "issuer",
+        "org_repo",
         "pool",
         "refresh_repo",
         "reset_repo",
@@ -148,6 +187,8 @@ class AuthDeps:
         self.user_repo: UserRepository = UserRepository()
         self.refresh_repo: RefreshTokenRepository = RefreshTokenRepository()
         self.reset_repo: ResetTokenRepository = ResetTokenRepository()
+        self.org_repo: OrganizationRepository = OrganizationRepository()
+        self.invitation_repo: InvitationRepository = InvitationRepository()
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -212,6 +253,7 @@ def _build_me(user: dict[str, Any] | Any) -> MeResponse:
         full_name=user.full_name,
         company=user.company,
         role=user.role,
+        org_id=getattr(user, "org_id", None),
     )
 
 
@@ -270,8 +312,11 @@ def build_auth_router(
                         detail="an account with this email already exists",
                     ) from exc
 
+                # New signups are org-less (user.org_id is None) until an
+                # admin places them in a firm — MULTIUSER_PLAN.md §7.
                 access_token, expires_in = deps.issuer.issue_access_token(
                     user_id=user.id, email=user.email_canonical, role=user.role,
+                    org_id=user.org_id,
                 )
                 refresh = deps.issuer.issue_refresh_token(remember_me=False)
                 await deps.refresh_repo.create(
@@ -323,6 +368,7 @@ def build_auth_router(
 
             access_token, expires_in = deps.issuer.issue_access_token(
                 user_id=user.id, email=user.email_canonical, role=user.role,
+                org_id=user.org_id,
             )
             refresh = deps.issuer.issue_refresh_token(remember_me=body.remember_me)
             await deps.refresh_repo.create(
@@ -365,6 +411,7 @@ def build_auth_router(
 
             access_token, expires_in = deps.issuer.issue_access_token(
                 user_id=user.id, email=user.email_canonical, role=user.role,
+                org_id=user.org_id,
             )
 
         # Refresh the cookie's max-age but keep the same opaque value
@@ -474,6 +521,116 @@ def build_auth_router(
                 await deps.refresh_repo.revoke_all_for_user(conn, row.user_id)
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    # ── GET /auth/invite — preview an invitation token ─────────────
+    # Public, token-authenticated. The accept-invite SPA hits this BEFORE
+    # asking the user to type a password, so the page can show "You're
+    # invited to «Firm» as a Member" with concrete context. 404 on any
+    # missing/expired/consumed token — we never reveal which.
+    @router.get("/invite", response_model=InvitePreviewResponse)
+    async def preview_invite(token: str) -> InvitePreviewResponse:
+        token_hash = hash_refresh_token(token)
+        async with deps.pool.acquire() as conn:
+            invitation = await deps.invitation_repo.get_active_by_hash(
+                conn, token_hash,
+            )
+            if invitation is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="invitation not found or expired",
+                )
+            org = await deps.org_repo.get_by_id(conn, invitation.org_id)
+            if org is None:
+                # The org was deleted between invite-create and accept —
+                # rare, but treat as a dead invitation.
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="invitation not found or expired",
+                )
+        return InvitePreviewResponse(
+            email=invitation.email_canonical,
+            role=invitation.role,
+            org_id=org.id,
+            org_name=org.name,
+            expires_at=invitation.expires_at,
+        )
+
+    # ── POST /auth/accept-invite ─────────────────────────────────────
+    # Public, token-authenticated. Consumes the single-use invitation,
+    # creates the user already INSIDE the inviting org, and mints a
+    # session — exactly the flow signup runs, except the org+role+email
+    # come from the invitation (not the caller).
+    @router.post(
+        "/accept-invite",
+        response_model=AccessTokenResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def accept_invite(
+        body: AcceptInviteBody,
+        response: Response,
+    ) -> AccessTokenResponse:
+        try:
+            _check_password_policy(deps, body.password)
+        except PasswordPolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        token_hash = hash_refresh_token(body.token)
+        password_hash = deps.hasher.hash(body.password)
+
+        async with deps.pool.acquire() as conn:
+            async with conn.transaction():
+                # Atomic consume: returns the row iff it was pending +
+                # unexpired AT THE UPDATE. Two concurrent accepts therefore
+                # observe exactly-one success.
+                invitation = await deps.invitation_repo.accept(conn, token_hash)
+                if invitation is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="invitation invalid, expired, or already accepted",
+                    )
+                try:
+                    user = await deps.user_repo.create(
+                        conn,
+                        email=invitation.email_canonical,
+                        password_hash=password_hash,
+                        full_name=body.full_name,
+                        company=None,
+                        role=invitation.role,
+                        org_id=invitation.org_id,
+                    )
+                except asyncpg.UniqueViolationError as exc:
+                    # Should be vanishingly rare — the invitation flow blocks
+                    # invites to existing emails. If it happens (race after a
+                    # parallel signup), the transaction rolls back, including
+                    # the invitation accept, so the token is preserved for a
+                    # later retry.
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="an account with this email already exists",
+                    ) from exc
+
+                access_token, expires_in = deps.issuer.issue_access_token(
+                    user_id=user.id,
+                    email=user.email_canonical,
+                    role=user.role,
+                    org_id=user.org_id,
+                )
+                refresh = deps.issuer.issue_refresh_token(remember_me=False)
+                await deps.refresh_repo.create(
+                    conn,
+                    user_id=user.id,
+                    token_hash=refresh.token_hash,
+                    expires_at=refresh.expires_at,
+                )
+
+        _set_refresh_cookie(
+            response, deps, refresh.raw, int(refresh.expires_at.timestamp()),
+        )
+        _logger.info(
+            "auth.accept_invite org=%s user=%s role=%s",
+            invitation.org_id, user.id, invitation.role,
+        )
+        return AccessTokenResponse(access_token=access_token, expires_in=expires_in)
 
     # FastAPI ``APIRouter`` has no ``add_exception_handler``; the
     # translation of :class:`InvalidCredentialsError` /

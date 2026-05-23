@@ -38,6 +38,13 @@ dependencies = [
     # Auth
     "python-jose[cryptography]>=3.3.0",
     "passlib[bcrypt]>=1.7.4",
+    # passlib 1.7.4 (the last release, abandoned upstream) reads
+    # bcrypt.__about__.__version__, which was removed in bcrypt 4.0, and
+    # its internal probe feeds bcrypt a >72-byte vector that bcrypt 4.x
+    # now hard-errors on. Pin <4 until passlib is replaced.
+    "bcrypt<4.0",
+    # pydantic.EmailStr (signup/login/me) needs email-validator at runtime.
+    "email-validator>=2.0.0",
     # Monitoring + structured logging
     "prometheus-client>=0.21.0",
     # HTTP-level FastAPI instrumentation — exposes /metrics with

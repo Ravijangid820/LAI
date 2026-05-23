@@ -48,6 +48,54 @@ _RESET_TEMPLATE_BODY: Final[str] = (
     "— LAI"
 )
 
+_REPORT_READY_TEMPLATE_SUBJECT: Final[str] = "Your LAI report is ready — {project_name}"
+_REPORT_READY_TEMPLATE_BODY: Final[str] = (
+    "Hello {full_name},\n"
+    "\n"
+    "Your due-diligence report for {project_name} has finished generating "
+    "(took about {elapsed_minutes} minute(s)). You can open it from your "
+    "LAI dashboard:\n"
+    "\n"
+    "{report_url}\n"
+    "\n"
+    "— LAI"
+)
+
+_REPORT_FAILED_TEMPLATE_SUBJECT: Final[str] = "Your LAI report didn't finish — {project_name}"
+_REPORT_FAILED_TEMPLATE_BODY: Final[str] = (
+    "Hello {full_name},\n"
+    "\n"
+    "We weren't able to finish your due-diligence report for "
+    "{project_name}. Reason:\n"
+    "\n"
+    "    {error}\n"
+    "\n"
+    "You can retry from the dashboard, or reply to this email if the "
+    "problem persists.\n"
+    "\n"
+    "Report id (for support): {report_id}\n"
+    "\n"
+    "— LAI"
+)
+
+_INVITE_TEMPLATE_SUBJECT: Final[str] = "You've been invited to {org_name} on LAI"
+_INVITE_TEMPLATE_BODY: Final[str] = (
+    "Hello,\n"
+    "\n"
+    "{inviter_name} has invited you to join {org_name} on LAI, "
+    "a German legal due-diligence assistant for wind-energy matters.\n"
+    "\n"
+    "Click the link below to accept the invitation and finish setting up your "
+    "account. You'll be asked for your name and to choose a password. The "
+    "link is valid for {ttl_days} days.\n"
+    "\n"
+    "{invite_url}\n"
+    "\n"
+    "If you weren't expecting this invitation, you can safely ignore this email.\n"
+    "\n"
+    "— LAI"
+)
+
 
 class EmailConfig(BaseSettings):
     """Brevo + sender + UI-base configuration.
@@ -190,6 +238,203 @@ async def send_reset_email(
             extra={
                 "recipient": recipient_email,
                 "subject": _RESET_TEMPLATE_SUBJECT,
+                "status_code": status_code,
+                "error": str(exc),
+            },
+        )
+
+
+async def send_invite_email(
+    config: EmailConfig,
+    *,
+    recipient_email: str,
+    raw_invite_token: str,
+    org_name: str,
+    inviter_name: str,
+    ttl_days: int,
+) -> None:
+    """Send an organisation-invitation email via Brevo.
+
+    The invite URL is composed as
+    ``{public_app_base_url}/accept-invite?token={raw_invite_token}``.
+    Mirrors :func:`send_reset_email` deliverability behaviour: dev-mode
+    (``EmailConfig.enabled=False``) logs the rendered body so an
+    engineer can pull the token without standing up Brevo; production
+    swallows + structured-logs Brevo failures rather than crashing the
+    BackgroundTask runner (the admin already got a 201 by then).
+
+    Args:
+        config: Resolved email config.
+        recipient_email: The invited address. The admin endpoint must
+            only call this for an email that just produced an
+            ``org_invitations`` row, never for a free-text input.
+        raw_invite_token: The opaque token value. Goes into the URL
+            query parameter; never logged in the production branch.
+        org_name: Display name of the inviting organisation, for the
+            body copy ("you've been invited to {org_name}").
+        inviter_name: ``users.full_name`` of the admin who pressed the
+            invite button — useful context for the recipient.
+        ttl_days: Lifetime of the invitation, used in the body copy
+            so the user knows how long they have to accept.
+    """
+    invite_url = (
+        f"{str(config.public_app_base_url).rstrip('/')}"
+        f"/accept-invite?token={raw_invite_token}"
+    )
+    subject = _INVITE_TEMPLATE_SUBJECT.format(org_name=org_name)
+    body = _INVITE_TEMPLATE_BODY.format(
+        org_name=org_name,
+        inviter_name=inviter_name,
+        invite_url=invite_url,
+        ttl_days=ttl_days,
+    )
+
+    if not config.enabled:
+        # Dev / CI path: log the body (incl. raw token) so an engineer can
+        # accept without standing up Brevo. Never runs in production.
+        _logger.info(
+            "email.disabled.invite_email",
+            extra={
+                "to": recipient_email,
+                "subject": subject,
+                "body": body,
+            },
+        )
+        return
+
+    payload: dict[str, object] = {
+        "sender": {"email": str(config.sender_email), "name": config.sender_name},
+        "to": [{"email": recipient_email}],
+        "subject": subject,
+        "textContent": body,
+    }
+    try:
+        await _post_brevo(config, payload)
+    except (httpx.HTTPError, RetryError) as exc:
+        status_code = (
+            exc.response.status_code  # type: ignore[union-attr]
+            if isinstance(exc, httpx.HTTPStatusError)
+            else None
+        )
+        _logger.error(
+            "email.send_failed",
+            extra={
+                "recipient": recipient_email,
+                "subject": subject,
+                "status_code": status_code,
+                "error": str(exc),
+            },
+        )
+
+
+async def send_report_ready_email(
+    config: EmailConfig,
+    *,
+    recipient_email: str,
+    recipient_name: str,
+    report_id: str,
+    project_name: str,
+    elapsed_minutes: int,
+) -> None:
+    """Send a "your DDiQ report is ready" email via Brevo.
+
+    Fired from the Celery worker the moment ``_run_report_generation_job``
+    sets the row to ``status='done'`` — so the user can close the tab the
+    instant they submit and still know when the report is ready.
+
+    Same deliverability posture as :func:`send_reset_email`: dev-mode
+    (``EmailConfig.enabled=False``) logs the body so an engineer can
+    follow the link without standing up Brevo; production swallows +
+    structured-logs Brevo failures rather than crashing the worker.
+    """
+    report_url = (
+        f"{str(config.public_app_base_url).rstrip('/')}"
+        f"/dashboard/documents?report={report_id}"
+    )
+    subject = _REPORT_READY_TEMPLATE_SUBJECT.format(project_name=project_name)
+    body = _REPORT_READY_TEMPLATE_BODY.format(
+        full_name=recipient_name or recipient_email,
+        project_name=project_name,
+        elapsed_minutes=elapsed_minutes,
+        report_url=report_url,
+    )
+    if not config.enabled:
+        _logger.info(
+            "email.disabled.report_ready",
+            extra={"to": recipient_email, "subject": subject, "body": body},
+        )
+        return
+    payload: dict[str, object] = {
+        "sender": {"email": str(config.sender_email), "name": config.sender_name},
+        "to": [{"email": recipient_email, "name": recipient_name or recipient_email}],
+        "subject": subject,
+        "textContent": body,
+    }
+    try:
+        await _post_brevo(config, payload)
+    except (httpx.HTTPError, RetryError) as exc:
+        status_code = (
+            exc.response.status_code  # type: ignore[union-attr]
+            if isinstance(exc, httpx.HTTPStatusError) else None
+        )
+        _logger.error(
+            "email.send_failed",
+            extra={
+                "recipient": recipient_email,
+                "subject": subject,
+                "status_code": status_code,
+                "error": str(exc),
+            },
+        )
+
+
+async def send_report_failed_email(
+    config: EmailConfig,
+    *,
+    recipient_email: str,
+    recipient_name: str,
+    report_id: str,
+    project_name: str,
+    error: str,
+) -> None:
+    """Send a "your DDiQ report didn't finish" email via Brevo.
+
+    Mirrors :func:`send_report_ready_email`. The user is notified on
+    failure too, so they aren't left waiting indefinitely after closing
+    the tab. The reason string is included verbatim — the worker has
+    already truncated it to a sane length before calling this.
+    """
+    subject = _REPORT_FAILED_TEMPLATE_SUBJECT.format(project_name=project_name)
+    body = _REPORT_FAILED_TEMPLATE_BODY.format(
+        full_name=recipient_name or recipient_email,
+        project_name=project_name,
+        error=(error or "unknown error").strip()[:500],
+        report_id=report_id,
+    )
+    if not config.enabled:
+        _logger.info(
+            "email.disabled.report_failed",
+            extra={"to": recipient_email, "subject": subject, "body": body},
+        )
+        return
+    payload: dict[str, object] = {
+        "sender": {"email": str(config.sender_email), "name": config.sender_name},
+        "to": [{"email": recipient_email, "name": recipient_name or recipient_email}],
+        "subject": subject,
+        "textContent": body,
+    }
+    try:
+        await _post_brevo(config, payload)
+    except (httpx.HTTPError, RetryError) as exc:
+        status_code = (
+            exc.response.status_code  # type: ignore[union-attr]
+            if isinstance(exc, httpx.HTTPStatusError) else None
+        )
+        _logger.error(
+            "email.send_failed",
+            extra={
+                "recipient": recipient_email,
+                "subject": subject,
                 "status_code": status_code,
                 "error": str(exc),
             },

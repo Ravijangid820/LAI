@@ -199,6 +199,46 @@ class TestRegexShape:
         assert CITATION_PATTERN.fullmatch("C-1") is None
 
 
+class TestManifestCitedDocumentsSurvive:
+    """Regression: a real uploaded matter document cited from the manifest is
+    NOT a fabrication, even when this turn retrieved no passage from it.
+
+    serve_rag widens ``allowed`` with ``_all_matter_handles(sid, uid)`` (every
+    real ``[M-n]``) precisely so the validator does not strip such handles and
+    mislabel correct, real-document citations ``(unbelegt)``. These tests pin
+    the semantics that fix relies on: with the full matter set in ``allowed``,
+    non-retrieved-but-real handles survive; genuinely fabricated handles (no
+    such document, or un-retrieved corpus) are still stripped.
+    """
+
+    @pytest.mark.unit
+    def test_non_retrieved_real_docs_are_not_stripped(self) -> None:
+        answer = (
+            "Übersicht: [M-1] Netzanschluss, [M-2] Darlehen, [M-3] Wartung, "
+            "[M-4] Urteil, [M-5] Änderungsgenehmigung."
+        )
+        retrieved_only = {"M-1", "M-2"}                 # matter_sources (the bug)
+        all_real_docs = {"M-1", "M-2", "M-3", "M-4", "M-5"}  # _all_matter_handles
+
+        bug = validate_citations(answer, retrieved_only)
+        assert set(bug.fabricated) == {"M-3", "M-4", "M-5"}  # the old wrong behaviour
+
+        fixed = validate_citations(answer, retrieved_only | all_real_docs)
+        assert fixed.fabricated == ()
+        assert "(unbelegt)" not in fixed.text
+        assert "[M-3]" in fixed.text and "[M-5]" in fixed.text
+
+    @pytest.mark.unit
+    def test_fabricated_handles_still_stripped(self) -> None:
+        # Widening to real docs must NOT defeat the validator's purpose: a
+        # handle to a non-existent document, or an un-retrieved corpus handle,
+        # is still fabricated.
+        allowed = {"M-1", "M-2", "M-3", "M-4", "M-5"}
+        result = validate_citations("Es gilt [M-99] und [C-7].", allowed)
+        assert set(result.fabricated) == {"M-99", "C-7"}
+        assert "(unbelegt)" in result.text
+
+
 class TestResultShape:
     @pytest.mark.unit
     def test_result_is_frozen(self) -> None:

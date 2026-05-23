@@ -1,0 +1,47 @@
+[
+  {
+    "id": "rueckbau-baugb",
+    "q": "Wie hoch ist die Rückbauverpflichtung bei Windenergieanlagen nach § 35 Abs. 5 BauGB?",
+    "topic": "rueckbau",
+    "expected_doc_type": ["gesetz"],
+    "expected_keywords": ["Rückbau", "BauGB", "Sicherheit"],
+    "min_keyword_hits": 1,
+    "notes": "Canonical statute lookup. § 35 Abs. 5 BauGB is the deal-blocker check for any DD."
+  },
+  {
+    "id": "abstand-niedersachsen",
+    "q": "Welche Abstandsregelung gilt in Niedersachsen für Windenergieanlagen?",
+    "topic": "abstand",
+    "expected_doc_type": ["gesetz"],
+    "expected_keywords": ["NBauO", "Abstand", "Abstandsfläche"],
+    "min_keyword_hits": 1,
+    "notes": "Tests Bundesland-specific retrieval — NBauO is Niedersachsen, not BayBO."
+  },
+  {
+    "id": "uvp-windpark",
+    "q": "Wann ist eine UVP-Pflicht für einen Windpark gegeben?",
+    "topic": "uvp",
+    "expected_doc_type": ["gesetz", "urteil"],
+    "expected_keywords": ["UVPG", "Vorprüfung", "Umweltverträglichkeit"],
+    "min_keyword_hits": 1,
+    "notes": "Tests cross-type retrieval (UVPG statute + case law)."
+  },
+  {
+    "id": "schriftform-bgb",
+    "q": "Was sind die Anforderungen an die Schriftform nach § 550 BGB bei Pachtverträgen?",
+    "topic": "schriftform",
+    "expected_doc_type": ["gesetz"],
+    "expected_keywords": ["Schriftform", "BGB", "Pacht"],
+    "min_keyword_hits": 2,
+    "notes": "Common pitfall in lease DD — § 550 BGB voids non-written long leases."
+  },
+  {
+    "id": "schattenwurf-ta-laerm",
+    "q": "Welche Schattenwurfgrenzwerte sieht die TA Lärm vor?",
+    "topic": "schattenwurf",
+    "expected_doc_type": ["gesetz", "urteil"],
+    "expected_keywords": ["TA Lärm", "Schattenwurf", "30 Minuten"],
+    "min_keyword_hits": 1,
+    "notes": "Real-world: TA Lärm is the relevant TA but courts often cite WEA-Schattenwurf-Hinweise. Either should hit."
+  }
+]

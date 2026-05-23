@@ -13,6 +13,8 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
+from uuid import UUID
+from datetime import datetime, timezone
 import os, re, json, time, uuid, logging, math, hashlib
 from concurrent.futures import ThreadPoolExecutor
 import psycopg2
@@ -387,33 +389,37 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[di
 
 
 def _org_str(user) -> Optional[str]:
-    """Phase B scope helper — stringified ``org_id`` for the DDiQ visibility
-    filters, or ``None`` for an org-less user whose reads return empty and
-    whose creates are 403-blocked (MULTIUSER_PLAN §5)."""
+    """Helper — stringified ``org_id`` (membership only post-revert).
+
+    Visibility is back to private-by-default after Phase B revert, but the
+    column is still stamped on every new row so the explicit-share flow
+    (Step 2 of Path A) and admin/audit queries have org context to use.
+    """
     return str(user.org_id) if getattr(user, "org_id", None) else None
 
 
-def _assert_in_org(doc_ids, org_id) -> None:
-    """Raise 404 if ``org_id`` does not own every document in ``doc_ids``.
+def _assert_can_view_documents(doc_ids, user_id) -> None:
+    """Raise 404 if ``user_id`` cannot view every document in ``doc_ids``.
 
-    Phase B: ownership is firm-scoped — every member of the firm sees the
-    same documents. Used at the boundary of every endpoint that takes a
-    list of doc IDs. Returning 404 (not 403) matches AUTH_PLAN §6 rule 4
-    — never leak the existence of another firm's row.
+    Path A Step 2: viewability is creator OR explicit share. A user can
+    include documents shared with them in their own report — that's the
+    natural workflow (a colleague shares the source PDFs, the recipient
+    runs their own analysis). Returning 404 (not 403) matches the
+    no-existence-leak posture used everywhere else.
     """
     if not doc_ids:
         return
-    if not org_id:
-        # Org-less caller: no document belongs to "no org", so the count
-        # mismatch below would raise anyway. Make the intent explicit.
-        raise HTTPException(status_code=404, detail="documents not found")
     conn = get_conn(); cur = conn.cursor()
     try:
         ph = ",".join(["%s"] * len(doc_ids))
         cur.execute(
-            f"SELECT COUNT(*) FROM ddiq_documents "
-            f"WHERE id::text IN ({ph}) AND org_id = %s",
-            (*doc_ids, str(org_id)),
+            f"""SELECT COUNT(*) FROM ddiq_documents
+                WHERE id::text IN ({ph})
+                  AND (user_id = %s
+                       OR EXISTS (SELECT 1 FROM ddiq_document_shares s
+                                  WHERE s.document_id = ddiq_documents.id
+                                    AND s.user_id = %s))""",
+            (*doc_ids, str(user_id), str(user_id)),
         )
         n = cur.fetchone()[0]
     finally:
@@ -1722,19 +1728,23 @@ def build_parcels(doc_ids, full_text, wea_statuses, project_center=None, locatio
 
 @router.get("/documents", response_model=DocumentListResponse)
 def list_documents(user: CurrentUser = Depends(get_current_user)):
-    """List the caller's firm's documents (MULTIUSER_PLAN §5 / Phase B).
+    """List the caller's own documents (Phase B-revert: private-by-default).
 
-    Firm-scoped: every member of the same org sees the same documents —
-    that's the multi-user point. An org-less user (open-signup landing
-    state) sees an empty list."""
-    org_id = _org_str(user)
-    if not org_id:
-        return DocumentListResponse(documents=[], total=0)
+    Each user sees only what they uploaded. Explicit sharing (Step 2 of
+    Path A) will widen this with a UNION over rows shared with them."""
+    # Path A Step 2: list the caller's OWN documents PLUS documents
+    # explicitly shared with them. (Write paths — upload, delete — stay
+    # owner-only and aren't affected by shares.)
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
-        "SELECT id, filename, size_bytes, upload_date, status, category "
-        "FROM ddiq_documents WHERE org_id = %s ORDER BY upload_date DESC",
-        (org_id,),
+        """SELECT id, filename, size_bytes, upload_date, status, category
+           FROM ddiq_documents
+           WHERE user_id = %s
+              OR EXISTS (SELECT 1 FROM ddiq_document_shares s
+                         WHERE s.document_id = ddiq_documents.id
+                           AND s.user_id = %s)
+           ORDER BY upload_date DESC""",
+        (str(user.id), str(user.id)),
     )
     rows = cur.fetchall(); cur.close(); conn.close()
     return DocumentListResponse(documents=[DocumentOut(id=str(r["id"]), name=r["filename"],
@@ -1751,14 +1761,10 @@ def upload_document(
 ):
     # Sync handler — runs in FastAPI's threadpool. Use file.file.read()
     # (the underlying SpooledTemporaryFile) instead of `await file.read()`.
-    # user_id (created_by) AND org_id (firm-tenant visibility) come from
-    # the JWT (AUTH_PLAN G3) — never from the body.
+    # user_id (created_by + visibility, post-revert) comes from the JWT
+    # (AUTH_PLAN G3) — never from the body. org_id is stamped alongside
+    # for membership/audit but doesn't gate reads anymore.
     org_id = _org_str(user)
-    if not org_id:
-        # Phase B create-guard: org-less users can't create — without an
-        # org_id the new doc would be invisible (and the lockdown migration
-        # would reject the insert anyway once it lands).
-        raise HTTPException(403, "join a firm to upload documents — ask your admin to add you")
     if not file.filename.lower().endswith(".pdf"): raise HTTPException(400, "Only PDF")
     fb = file.file.read()
     if len(fb) > MAX_FILE_SIZE: raise HTTPException(400, "Too large")
@@ -1784,27 +1790,24 @@ def upload_document(
 @router.delete("/documents/{doc_id}")
 def delete_document(doc_id: str, user: CurrentUser = Depends(get_current_user)):
     """Hard-delete an uploaded document and its chunks. Idempotent — returns
-    404 if the id is unknown OR belongs to a different firm.
+    404 if the id is unknown OR belongs to a different user.
 
     ``ddiq_doc_chunks.doc_id`` has ON DELETE CASCADE, so removing the
-    document row drops its chunks automatically. Phase B: the firm-tenant
-    filter is on both the existence check and the DELETE, so a cross-firm
-    delete is structurally impossible.
+    document row drops its chunks automatically. Phase B-revert: scoped
+    on the creator — cross-user delete is structurally impossible.
     """
-    org_id = _org_str(user)
-    if not org_id:
-        raise HTTPException(404, "Document not found")
+    uid = str(user.id)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM ddiq_documents WHERE id = %s AND org_id = %s",
-                (doc_id, org_id),
+                "SELECT 1 FROM ddiq_documents WHERE id = %s AND user_id = %s",
+                (doc_id, uid),
             )
             if not cur.fetchone():
                 raise HTTPException(404, "Document not found")
             cur.execute(
-                "DELETE FROM ddiq_documents WHERE id = %s AND org_id = %s",
-                (doc_id, org_id),
+                "DELETE FROM ddiq_documents WHERE id = %s AND user_id = %s",
+                (doc_id, uid),
             )
     return {"deleted": True, "document_id": doc_id}
 
@@ -1819,16 +1822,62 @@ def delete_document(doc_id: str, user: CurrentUser = Depends(get_current_user)):
 _INFLIGHT_TTL = "2 hours"  # reuse window for queued/running rows
 
 
-def _compute_fingerprint(doc_ids, preset, project_name, org_id) -> str:
+def _estimate_report_minutes(doc_ids: list, preset: str) -> int:
+    """Heuristic estimate for how long a DDiQ report will take, in minutes.
+
+    Primary signal: median wall-clock of recent COMPLETED reports with a
+    similar ``doc_count`` (±2). That's a far better estimate than any
+    static formula because it absorbs the realities of the live GPU,
+    network connectors, and the current preset's prompt budget — all of
+    which drift over time.
+
+    Fallback: simple ``2 + 2 * n_docs`` heuristic when no historical
+    samples exist (fresh install, never-before-seen doc_count).
+
+    Used by ``/report/generate/async`` to populate the toast estimate
+    shown to the user on submit. Never raises — best-effort.
+    """
+    n = len(doc_ids or [])
+    if n == 0:
+        return 2
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT EXTRACT(EPOCH FROM (finished_at - started_at)) / 60.0
+                    FROM ddiq_reports
+                    WHERE status = 'done'
+                      AND finished_at IS NOT NULL
+                      AND started_at IS NOT NULL
+                      AND COALESCE(array_length(document_ids, 1), 0)
+                          BETWEEN %s AND %s
+                    ORDER BY finished_at DESC
+                    LIMIT 30
+                    """,
+                    (max(1, n - 2), n + 2),
+                )
+                samples = [float(r[0]) for r in cur.fetchall()
+                           if r[0] is not None and float(r[0]) > 0]
+        if samples:
+            samples.sort()
+            median = samples[len(samples) // 2]
+            return max(1, int(round(median)))
+    except Exception as e:  # noqa: BLE001 — best-effort estimate
+        logger.warning(f"estimate: median lookup failed: {e}")
+    # Heuristic fallback: ~2 min overhead + ~2 min per document.
+    return max(2, 2 + 2 * n)
+
+
+def _compute_fingerprint(doc_ids, preset, project_name, user_id) -> str:
     """Cache key for report-generation requests.
 
-    Phase B: scoped by ``org_id`` so two firms requesting the same
-    documents do not collide, and so two members of the SAME firm
-    requesting the identical report dedup to ONE job (the explicit win
-    that motivated firm-tenancy in the first place).
+    Phase B-revert: scoped by ``user_id`` (private-by-default). Two users
+    requesting the same documents+preset produce DIFFERENT fingerprints
+    — each user's report is their own.
     """
     parts = [
-        str(org_id) if org_id else "",
+        str(user_id),
         ",".join(sorted(doc_ids or [])),
         (preset or "").strip().lower(),
         (project_name or "").strip().lower(),
@@ -1836,23 +1885,21 @@ def _compute_fingerprint(doc_ids, preset, project_name, org_id) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
-def _find_existing_report(fp: str, org_id) -> Optional[dict]:
-    """Most recent reusable row for this fingerprint visible to ``org_id``.
+def _find_existing_report(fp: str, user_id) -> Optional[dict]:
+    """Most recent reusable row for this fingerprint owned by ``user_id``.
 
-    Phase B: the fingerprint already includes the org_id, but the WHERE
-    clause filters explicitly — defense in depth: if a future change
-    drops org_id from the fingerprint, the SQL still refuses to leak
-    across firms.
+    Phase B-revert: the fingerprint already includes the user_id, but the
+    WHERE clause filters explicitly — defense in depth: if a future
+    change drops user_id from the fingerprint, the SQL still refuses to
+    leak across users.
     """
-    if not org_id:
-        return None
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 f"""SELECT id, status, created_at, started_at
                     FROM ddiq_reports
                     WHERE request_fingerprint = %s
-                      AND org_id = %s
+                      AND user_id = %s
                       AND (
                         status = 'done'
                         OR (status IN ('queued','running')
@@ -1860,7 +1907,7 @@ def _find_existing_report(fp: str, org_id) -> Optional[dict]:
                       )
                     ORDER BY created_at DESC
                     LIMIT 1""",
-                (fp, str(org_id)),
+                (fp, str(user_id)),
             )
             return cur.fetchone()
 
@@ -1959,14 +2006,90 @@ def _persist_report_jsonb(rid: str, project_name: str, doc_ids: list, preset: st
         logger.warning(f"checkpoint persist for {rid} failed: {e}")
 
 
+def _notify_report_complete(rid: str, user_id, *, success: bool, error: str = "") -> None:
+    """Email the requesting user that their report finished (or didn't).
+
+    Called from the worker on the success / failure branches of
+    ``_run_report_generation_job``. The user can close the tab the moment
+    they submit and still get notified — that's the whole point of the
+    "we'll email you" UX on bulk reports. Best-effort: a Brevo hiccup, a
+    missing email config, a DB read failure must NEVER crash the worker
+    (the report itself is already done/failed and persisted).
+    """
+    try:
+        # Look up the recipient + project name from the DB (synchronously,
+        # the worker is sync). One round-trip; ~ms.
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT u.email, u.full_name, u.status AS user_status,
+                              r.project_name, r.started_at, r.finished_at
+                       FROM ddiq_reports r
+                       JOIN users u ON u.id = r.user_id
+                       WHERE r.id = %s""",
+                    (rid,),
+                )
+                row = cur.fetchone()
+        if row is None or (row.get("user_status") or "") != "active":
+            return  # user gone / disabled — nothing to do
+        elapsed_minutes = 0
+        if row["started_at"] and row["finished_at"]:
+            elapsed_minutes = max(
+                1,
+                int(round((row["finished_at"] - row["started_at"]).total_seconds() / 60.0)),
+            )
+        # Deferred import: the worker doesn't otherwise pull lai.api.email
+        # at module load. Constructing EmailConfig() lazily lets a missing
+        # LAI_EMAIL_* env (dev / CI) surface as a one-line warning instead
+        # of a worker boot failure.
+        try:
+            from lai.api.email import (  # type: ignore[import-not-found]
+                EmailConfig,
+                send_report_failed_email,
+                send_report_ready_email,
+            )
+            config = EmailConfig()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "report notify: email not configured — skipping (%s)", exc,
+            )
+            return
+        import asyncio
+        if success:
+            asyncio.run(send_report_ready_email(
+                config,
+                recipient_email=row["email"],
+                recipient_name=row["full_name"] or row["email"],
+                report_id=rid,
+                project_name=row["project_name"] or "Wind Energy Project",
+                elapsed_minutes=elapsed_minutes,
+            ))
+        else:
+            asyncio.run(send_report_failed_email(
+                config,
+                recipient_email=row["email"],
+                recipient_name=row["full_name"] or row["email"],
+                report_id=rid,
+                project_name=row["project_name"] or "Wind Energy Project",
+                error=error or "An unexpected error occurred during generation.",
+            ))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("report notify: send failed for %s: %s", rid, exc)
+
+
 def _run_report_generation_job(rid: str, req: "GenerateReportRequest", user_id, org_id=None) -> None:
     """Runs the same pipeline as the sync /report/generate, but writes
     progress + final report into the existing ddiq_reports row instead
     of returning. Errors are recorded in ``status='failed'`` + ``error``.
 
-    Phase B: ``org_id`` (firm-tenant key) is threaded through so reads /
-    visibility checks are firm-scoped. ``user_id`` stays as the
-    ``created_by`` attribution on writes.
+    Phase B-revert: ``user_id`` is the visibility scope (private-by-
+    default). ``org_id`` is accepted (worker contract back-compat) and
+    still stamped on writes for membership/audit, but doesn't gate reads.
+
+    Notification: on the terminal status transition (done OR failed) we
+    fire a one-shot email to the user who initiated the report so they
+    can close the tab the moment they submit and still know when it's
+    ready. See :func:`_notify_report_complete`.
     """
     try:
         _update_report_progress(rid, status="running", step="starting", percent=0.0)
@@ -1975,11 +2098,16 @@ def _run_report_generation_job(rid: str, req: "GenerateReportRequest", user_id, 
             progress=lambda step, pct: _update_report_progress(rid, step=step, percent=pct),
         )
         _update_report_progress(rid, status="done", step="done", percent=1.0)
+        _notify_report_complete(rid, user_id, success=True)
     except HTTPException as e:
-        _update_report_progress(rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}")
+        detail = f"HTTP {e.status_code}: {e.detail}"
+        _update_report_progress(rid, status="failed", error=detail)
+        _notify_report_complete(rid, user_id, success=False, error=detail)
     except Exception as e:
         logger.exception(f"report {rid} failed")
-        _update_report_progress(rid, status="failed", error=str(e)[:500])
+        msg = str(e)[:500]
+        _update_report_progress(rid, status="failed", error=msg)
+        _notify_report_complete(rid, user_id, success=False, error=msg)
 
 
 @router.post("/report/generate/async")
@@ -1990,27 +2118,27 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
     progress and the final result."""
     if not req.document_ids:
         raise HTTPException(400, "No documents selected")
-    org_id = _org_str(user)
-    if not org_id:
-        # Phase B create-guard: an org-less user (open-signup landing state)
-        # has no firm to attach a report to and can't see the documents
-        # anyway. 403 so the SPA surfaces the "ask your admin" path.
-        raise HTTPException(403, "join a firm to generate reports — ask your admin to add you")
-    _assert_in_org(req.document_ids, org_id)
+    uid = str(user.id)
+    org_id = _org_str(user)  # stamped on the row; doesn't gate reads post-revert
+    _assert_can_view_documents(req.document_ids, user.id)
 
-    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name, org_id)
-    existing = _find_existing_report(fp, org_id)
+    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name, uid)
+    existing = _find_existing_report(fp, uid)
     if existing:
+        # Cache hit — same user, same docs, same preset, same project name.
+        # No new work; no email will be sent (none was queued). ``estimated_minutes``
+        # is 0 to suppress the "we'll email you" toast on the SPA.
         return {
             "report_id": str(existing["id"]),
             "status": existing["status"],
             "poll_url": f"/ddiq/report/{existing['id']}/status",
             "cached": True,
+            "estimated_minutes": 0,
         }
 
-    # Pre-create the row so the caller has a real report_id to poll.
-    # Phase B: stamp both user_id (created_by) and org_id (firm-tenant
-    # visibility) so the row is discoverable by every member of the firm.
+    # Pre-create the row so the caller has a real report_id to poll. Phase
+    # B-revert: ``user_id`` is the visibility key; ``org_id`` is still
+    # stamped (membership/audit + the explicit-share flow in Step 2).
     rid = str(uuid.uuid4())
     pname = req.project_name or "Wind Energy Project"
     with get_conn() as conn:
@@ -2020,7 +2148,7 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
                                               report_data, status, started_at, progress_step, progress_percent,
                                               request_fingerprint)
                    VALUES (%s, %s, %s, %s, %s::uuid[], %s, '{}'::jsonb, 'queued', NULL, 'queued', 0.0, %s)""",
-                (rid, str(user.id), org_id, pname, req.document_ids, req.preset, fp),
+                (rid, uid, org_id, pname, req.document_ids, req.preset, fp),
             )
 
     # Enqueue via Celery (H-4). The worker process picks up the message
@@ -2044,8 +2172,8 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE ddiq_reports SET celery_task_id = %s "
-                    "WHERE id = %s AND org_id = %s",
-                    (async_result.id, rid, org_id),
+                    "WHERE id = %s AND user_id = %s",
+                    (async_result.id, rid, uid),
                 )
     except Exception:
         pass  # column missing or transient DB issue — non-blocking
@@ -2055,6 +2183,10 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
         "status": "queued",
         "poll_url": f"/ddiq/report/{rid}/status",
         "cached": False,
+        # Heuristic from the recent-runs median (or a fallback formula).
+        # The SPA shows a "we'll email you when this finishes — ~N minutes"
+        # toast on submit so the user can close the tab safely.
+        "estimated_minutes": _estimate_report_minutes(req.document_ids, req.preset),
     }
 
 
@@ -2062,16 +2194,18 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
 def get_report_status(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Poll endpoint for the async report-generation flow. Cheap — only
     reads the row's status fields, not the full payload."""
-    org_id = _org_str(user)
-    if not org_id:
-        raise HTTPException(404, "Report not found")
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """SELECT id, status, progress_step, progress_percent, started_at,
                           finished_at, error, project_name
-                   FROM ddiq_reports WHERE id = %s AND org_id = %s""",
-                (report_id, org_id),
+                   FROM ddiq_reports
+                   WHERE id = %s
+                     AND (user_id = %s
+                          OR EXISTS (SELECT 1 FROM ddiq_report_shares s
+                                     WHERE s.report_id = ddiq_reports.id
+                                       AND s.user_id = %s))""",
+                (report_id, str(user.id), str(user.id)),
             )
             row = cur.fetchone()
     if not row:
@@ -2092,13 +2226,13 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
     """Inner pipeline used by both the sync handler and the async worker.
     ``progress(step, percent)`` is invoked at each major step when given.
 
-    Phase B tenant isolation: ``org_id`` (firm-tenant key) is the
-    visibility scope — ownership of every doc in ``req.document_ids`` is
-    asserted firm-wide, and reads filter by ``org_id``. ``user_id`` stays
-    as the ``created_by`` attribution stamped onto writes (ddiq_reports,
-    ddiq_project_areas, ddiq_contracts, ddiq_classified_parcels).
+    Phase B-revert: ``user_id`` is the visibility scope (private-by-
+    default). ``org_id`` is accepted for back-compat and still stamped
+    on every write (ddiq_reports, ddiq_project_areas, ddiq_contracts,
+    ddiq_classified_parcels) so explicit sharing in Step 2 of Path A
+    has the membership context to work with.
     """
-    _assert_in_org(req.document_ids, org_id)
+    _assert_can_view_documents(req.document_ids, user_id)
 
     if progress is None:
         progress = lambda step, pct: None  # noqa: E731
@@ -2113,9 +2247,13 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
 
     conn = get_conn(); cur = conn.cursor()
     cur.execute(
-        f"SELECT id, filename FROM ddiq_documents "
-        f"WHERE id::text IN ({','.join(['%s']*len(req.document_ids))}) AND org_id = %s",
-        (*req.document_ids, str(org_id) if org_id else ""),
+        f"""SELECT id, filename FROM ddiq_documents
+            WHERE id::text IN ({','.join(['%s']*len(req.document_ids))})
+              AND (user_id = %s
+                   OR EXISTS (SELECT 1 FROM ddiq_document_shares s
+                              WHERE s.document_id = ddiq_documents.id
+                                AND s.user_id = %s))""",
+        (*req.document_ids, str(user_id), str(user_id)),
     )
     _doc_rows = cur.fetchall(); cur.close(); conn.close()
     doc_names = [r[1] for r in _doc_rows]
@@ -2883,19 +3021,18 @@ def generate_report(req: GenerateReportRequest, user: CurrentUser = Depends(get_
     /report/generate/async + /report/{id}/status for any UI-driven flow."""
     if not req.document_ids:
         raise HTTPException(400, "No documents selected")
-    org_id = _org_str(user)
-    if not org_id:
-        raise HTTPException(403, "join a firm to generate reports — ask your admin to add you")
-    _assert_in_org(req.document_ids, org_id)
+    uid = str(user.id)
+    org_id = _org_str(user)  # stamped on row; doesn't gate reads post-revert
+    _assert_can_view_documents(req.document_ids, user.id)
 
-    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name, org_id)
-    existing = _find_existing_report(fp, org_id)
+    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name, uid)
+    existing = _find_existing_report(fp, uid)
     if existing and existing["status"] == "done":
         with get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT report_data FROM ddiq_reports WHERE id = %s AND org_id = %s",
-                    (existing["id"], org_id),
+                    "SELECT report_data FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                    (existing["id"], uid),
                 )
                 row = cur.fetchone()
         if row and row["report_data"]:
@@ -2938,13 +3075,13 @@ def generate_report(req: GenerateReportRequest, user: CurrentUser = Depends(get_
         # A concurrent request already holds this fingerprint. Don't run a
         # duplicate pipeline — surface the in-flight (or just-finished)
         # row instead of recomputing.
-        other = _find_existing_report(fp, org_id)
+        other = _find_existing_report(fp, uid)
         if other and other["status"] == "done":
             with get_conn() as conn:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(
-                        "SELECT report_data FROM ddiq_reports WHERE id = %s AND org_id = %s",
-                        (other["id"], org_id),
+                        "SELECT report_data FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                        (other["id"], uid),
                     )
                     row = cur.fetchone()
             if row and row["report_data"]:
@@ -2995,9 +3132,6 @@ def list_reports(limit: int = 50, user: CurrentUser = Depends(get_current_user))
     via GET /report/{id}."""
     if limit < 1: limit = 1
     if limit > 200: limit = 200
-    org_id = _org_str(user)
-    if not org_id:
-        return {"reports": [], "total": 0}
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -3006,10 +3140,13 @@ def list_reports(limit: int = 50, user: CurrentUser = Depends(get_current_user))
                           COALESCE(array_length(document_ids, 1), 0) AS doc_count,
                           COALESCE(jsonb_array_length(report_data->'findings'), 0) AS finding_count
                    FROM ddiq_reports
-                   WHERE org_id = %s
+                   WHERE user_id = %s
+                      OR EXISTS (SELECT 1 FROM ddiq_report_shares s
+                                 WHERE s.report_id = ddiq_reports.id
+                                   AND s.user_id = %s)
                    ORDER BY created_at DESC NULLS LAST
                    LIMIT %s""",
-                (org_id, limit),
+                (str(user.id), str(user.id), limit),
             )
             rows = cur.fetchall()
     return {
@@ -3035,13 +3172,15 @@ def list_reports(limit: int = 50, user: CurrentUser = Depends(get_current_user))
 
 @router.get("/report/{report_id}")
 def get_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
-    org_id = _org_str(user)
-    if not org_id:
-        raise HTTPException(404, "Not found")
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
-        "SELECT * FROM ddiq_reports WHERE id = %s AND org_id = %s",
-        (report_id, org_id),
+        """SELECT * FROM ddiq_reports
+           WHERE id = %s
+             AND (user_id = %s
+                  OR EXISTS (SELECT 1 FROM ddiq_report_shares s
+                             WHERE s.report_id = ddiq_reports.id
+                               AND s.user_id = %s))""",
+        (report_id, str(user.id), str(user.id)),
     )
     row = cur.fetchone(); cur.close(); conn.close()
     if not row: raise HTTPException(404, "Not found")
@@ -3066,25 +3205,20 @@ def delete_report(report_id: str, user: CurrentUser = Depends(get_current_user))
     means even if the cascade DELETEs were re-ordered, a cross-tenant
     delete is structurally impossible.
     """
-    org_id = _org_str(user)
-    if not org_id:
-        raise HTTPException(404, "Report not found")
+    uid = str(user.id)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Phase B: visibility is firm-scoped — any member of the firm
-            # can delete the firm's reports. The report must belong to the
-            # caller's org; we 404 (not 403) on cross-firm so existence
-            # isn't leaked.
+            # Phase B-revert: visibility is per-user. The report must
+            # belong to the caller; 404 (not 403) on cross-user so we
+            # never leak existence.
             cur.execute(
-                "SELECT 1 FROM ddiq_reports WHERE id = %s AND org_id = %s",
-                (report_id, org_id),
+                "SELECT 1 FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                (report_id, uid),
             )
             if not cur.fetchone():
                 raise HTTPException(404, "Report not found")
-            # Sub-table cleanup: scope by report_id (unique). user_id filter
-            # is left for now — the rows were written by the report's
-            # original creator; the report_id constraint already binds them
-            # to a row we just confirmed is in the caller's org.
+            # Sub-table cleanup: scope by report_id (unique). The row was
+            # already confirmed to belong to the caller above.
             cur.execute(
                 "DELETE FROM ddiq_classified_parcels WHERE report_id = %s",
                 (report_id,),
@@ -3098,8 +3232,8 @@ def delete_report(report_id: str, user: CurrentUser = Depends(get_current_user))
                 (report_id,),
             )
             cur.execute(
-                "DELETE FROM ddiq_reports WHERE id = %s AND org_id = %s",
-                (report_id, org_id),
+                "DELETE FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                (report_id, uid),
             )
     return {"deleted": True, "report_id": report_id}
 
@@ -3107,13 +3241,15 @@ def delete_report(report_id: str, user: CurrentUser = Depends(get_current_user))
 @router.get("/report/{report_id}/geojson")
 def get_report_geojson(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Return GeoJSON FeatureCollection for GIS import (QGIS, ArcGIS, MapBox, etc.)."""
-    org_id = _org_str(user)
-    if not org_id:
-        raise HTTPException(404, "Report not found")
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
-        "SELECT report_data FROM ddiq_reports WHERE id = %s AND org_id = %s",
-        (report_id, org_id),
+        """SELECT report_data FROM ddiq_reports
+           WHERE id = %s
+             AND (user_id = %s
+                  OR EXISTS (SELECT 1 FROM ddiq_report_shares s
+                             WHERE s.report_id = ddiq_reports.id
+                               AND s.user_id = %s))""",
+        (report_id, str(user.id), str(user.id)),
     )
     row = cur.fetchone(); cur.close(); conn.close()
     if not row: raise HTTPException(404, "Report not found")
@@ -3173,13 +3309,15 @@ def get_report_geojson(report_id: str, user: CurrentUser = Depends(get_current_u
 @router.get("/report/{report_id}/validate")
 def validate_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Run validation checks on a generated report (Step 13)."""
-    org_id = _org_str(user)
-    if not org_id:
-        raise HTTPException(404, "Report not found")
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
-        "SELECT report_data FROM ddiq_reports WHERE id = %s AND org_id = %s",
-        (report_id, org_id),
+        """SELECT report_data FROM ddiq_reports
+           WHERE id = %s
+             AND (user_id = %s
+                  OR EXISTS (SELECT 1 FROM ddiq_report_shares s
+                             WHERE s.report_id = ddiq_reports.id
+                               AND s.user_id = %s))""",
+        (report_id, str(user.id), str(user.id)),
     )
     row = cur.fetchone(); cur.close(); conn.close()
     if not row: raise HTTPException(404, "Report not found")
@@ -3256,6 +3394,230 @@ async def get_map_tiles():
     }
 
 # reap_orphans() lives in ``ddiq.db`` (imported above).
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHARING (Path A Step 2 — explicit per-resource view-only sharing)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Symmetric to ``session_shares`` in serve_rag. Two resource types: DDiQ
+# reports and DDiQ documents (the source PDFs). A share grants READ
+# access to a colleague in the same firm; write paths (delete, re-share)
+# stay owner-only. The pg_trgm member typeahead for the share dialog
+# lives in ``share_router.py`` on serve_rag — the SPA calls it across
+# ports the same way it calls /admin/users/search.
+
+class _ShareUserRow(BaseModel):
+    user_id: UUID
+    email: str
+    full_name: str
+    granted_at: datetime
+
+
+class _AddShareBody(BaseModel):
+    user_id: UUID
+
+
+def _resource_owner(table: str, resource_id: str) -> Optional[str]:
+    """Return the ``user_id`` (str) of the resource's creator, or None
+    if no such row. Used by the share-management gates."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute(f"SELECT user_id FROM {table} WHERE id = %s", (resource_id,))
+        r = cur.fetchone()
+    finally:
+        cur.close(); conn.close()
+    return str(r[0]) if r else None
+
+
+def _can_manage_resource_shares(table: str, resource_id: str, user: CurrentUser) -> bool:
+    """Owner OR super-admin gate for the share-management endpoints."""
+    if user.is_super_admin:
+        return True
+    owner = _resource_owner(table, resource_id)
+    return owner is not None and owner == str(user.id)
+
+
+def _list_resource_shares(share_table: str, resource_col: str, resource_id: str) -> list[dict]:
+    """Enriched share list — joins to ``users`` so the FE has names/emails
+    without a second round-trip per row."""
+    conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            f"""SELECT u.id AS user_id, u.email, u.full_name, s.created_at AS granted_at
+                FROM {share_table} s
+                JOIN users u ON u.id = s.user_id
+                WHERE s.{resource_col} = %s
+                ORDER BY s.created_at DESC, s.id DESC""",
+            (resource_id,),
+        )
+        return list(cur.fetchall())
+    finally:
+        cur.close(); conn.close()
+
+
+def _add_resource_share(
+    share_table: str, resource_col: str,
+    resource_id: str, target_user_id: str, granted_by: str,
+) -> None:
+    """Idempotent insert. Caller has already validated authorisation +
+    same-org constraint."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute(
+            f"""INSERT INTO {share_table} ({resource_col}, user_id, granted_by)
+                VALUES (%s, %s, %s)
+                ON CONFLICT ({resource_col}, user_id) DO UPDATE SET
+                    granted_by = EXCLUDED.granted_by""",
+            (resource_id, target_user_id, granted_by),
+        )
+        conn.commit()
+    finally:
+        cur.close(); conn.close()
+
+
+def _revoke_resource_share(
+    share_table: str, resource_col: str, resource_id: str, target_user_id: str,
+) -> bool:
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute(
+            f"DELETE FROM {share_table} WHERE {resource_col} = %s AND user_id = %s",
+            (resource_id, target_user_id),
+        )
+        deleted = cur.rowcount > 0
+        conn.commit()
+    finally:
+        cur.close(); conn.close()
+    return deleted
+
+
+def _assert_same_org(target_user_id: UUID, caller: CurrentUser) -> dict:
+    """Look up target user and confirm same org. Returns the user row
+    (id, email, full_name) for response enrichment. Raises 404/403 on
+    miss / cross-firm."""
+    conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT id, email, full_name, org_id FROM users WHERE id = %s",
+            (str(target_user_id),),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close(); conn.close()
+    if row is None:
+        raise HTTPException(404, "user not found")
+    if caller.org_id is None or row["org_id"] != caller.org_id:
+        raise HTTPException(403, "user is not in your organisation")
+    return row
+
+
+# ─── /ddiq/reports/{id}/shares ─────────────────────────────────────────────
+
+@router.get("/reports/{report_id}/shares", response_model=list[_ShareUserRow])
+def list_report_shares(report_id: str, user: CurrentUser = Depends(get_current_user)):
+    if not _can_manage_resource_shares("ddiq_reports", report_id, user):
+        raise HTTPException(404, "report not found")
+    return _list_resource_shares("ddiq_report_shares", "report_id", report_id)
+
+
+@router.post("/reports/{report_id}/shares", response_model=_ShareUserRow, status_code=201)
+def add_report_share(
+    report_id: str, body: _AddShareBody,
+    user: CurrentUser = Depends(get_current_user),
+):
+    if not _can_manage_resource_shares("ddiq_reports", report_id, user):
+        raise HTTPException(404, "report not found")
+    if str(body.user_id) == str(user.id):
+        # Idempotent self-share; the owner already has access.
+        conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute("SELECT id, email, full_name FROM users WHERE id = %s", (str(user.id),))
+            me = cur.fetchone()
+        finally:
+            cur.close(); conn.close()
+        return _ShareUserRow(
+            user_id=me["id"], email=me["email"], full_name=me["full_name"],
+            granted_at=datetime.now(timezone.utc),
+        )
+    target = _assert_same_org(body.user_id, user)
+    grantor = _resource_owner("ddiq_reports", report_id) if user.is_super_admin else str(user.id)
+    assert grantor is not None  # noqa: S101 — authz already confirmed
+    _add_resource_share("ddiq_report_shares", "report_id", report_id, str(body.user_id), grantor)
+    logger.info("ddiq.report.share.add report=%s target=%s by=%s",
+                report_id, body.user_id, user.id)
+    # Read back the row so the response carries the real created_at.
+    rows = _list_resource_shares("ddiq_report_shares", "report_id", report_id)
+    for r in rows:
+        if str(r["user_id"]) == str(body.user_id):
+            return r
+    raise HTTPException(500, "share persisted but not readable")
+
+
+@router.delete("/reports/{report_id}/shares/{user_id}", status_code=204)
+def revoke_report_share(
+    report_id: str, user_id: UUID,
+    user: CurrentUser = Depends(get_current_user),
+):
+    if not _can_manage_resource_shares("ddiq_reports", report_id, user):
+        raise HTTPException(404, "report not found")
+    if not _revoke_resource_share("ddiq_report_shares", "report_id", report_id, str(user_id)):
+        raise HTTPException(404, "share not found")
+    logger.info("ddiq.report.share.revoke report=%s target=%s by=%s",
+                report_id, user_id, user.id)
+
+
+# ─── /ddiq/documents/{id}/shares ───────────────────────────────────────────
+
+@router.get("/documents/{document_id}/shares", response_model=list[_ShareUserRow])
+def list_document_shares(document_id: str, user: CurrentUser = Depends(get_current_user)):
+    if not _can_manage_resource_shares("ddiq_documents", document_id, user):
+        raise HTTPException(404, "document not found")
+    return _list_resource_shares("ddiq_document_shares", "document_id", document_id)
+
+
+@router.post("/documents/{document_id}/shares", response_model=_ShareUserRow, status_code=201)
+def add_document_share(
+    document_id: str, body: _AddShareBody,
+    user: CurrentUser = Depends(get_current_user),
+):
+    if not _can_manage_resource_shares("ddiq_documents", document_id, user):
+        raise HTTPException(404, "document not found")
+    if str(body.user_id) == str(user.id):
+        conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute("SELECT id, email, full_name FROM users WHERE id = %s", (str(user.id),))
+            me = cur.fetchone()
+        finally:
+            cur.close(); conn.close()
+        return _ShareUserRow(
+            user_id=me["id"], email=me["email"], full_name=me["full_name"],
+            granted_at=datetime.now(timezone.utc),
+        )
+    target = _assert_same_org(body.user_id, user)
+    grantor = _resource_owner("ddiq_documents", document_id) if user.is_super_admin else str(user.id)
+    assert grantor is not None  # noqa: S101
+    _add_resource_share("ddiq_document_shares", "document_id", document_id, str(body.user_id), grantor)
+    logger.info("ddiq.document.share.add document=%s target=%s by=%s",
+                document_id, body.user_id, user.id)
+    rows = _list_resource_shares("ddiq_document_shares", "document_id", document_id)
+    for r in rows:
+        if str(r["user_id"]) == str(body.user_id):
+            return r
+    raise HTTPException(500, "share persisted but not readable")
+
+
+@router.delete("/documents/{document_id}/shares/{user_id}", status_code=204)
+def revoke_document_share(
+    document_id: str, user_id: UUID,
+    user: CurrentUser = Depends(get_current_user),
+):
+    if not _can_manage_resource_shares("ddiq_documents", document_id, user):
+        raise HTTPException(404, "document not found")
+    if not _revoke_resource_share("ddiq_document_shares", "document_id", document_id, str(user_id)):
+        raise HTTPException(404, "share not found")
+    logger.info("ddiq.document.share.revoke document=%s target=%s by=%s",
+                document_id, user_id, user.id)
 
 
 @router.on_event("startup")
