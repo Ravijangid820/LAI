@@ -1959,26 +1959,27 @@ def _persist_report_jsonb(rid: str, project_name: str, doc_ids: list, preset: st
         logger.warning(f"checkpoint persist for {rid} failed: {e}")
 
 
-def _run_report_generation_job(rid: str, req: "GenerateReportRequest", user_id) -> None:
+def _run_report_generation_job(rid: str, req: "GenerateReportRequest", user_id, org_id=None) -> None:
     """Runs the same pipeline as the sync /report/generate, but writes
     progress + final report into the existing ddiq_reports row instead
     of returning. Errors are recorded in ``status='failed'`` + ``error``.
 
-    ``user_id`` is threaded into every write so a worker on a shared
-    pool cannot accidentally update a different tenant's row.
+    Phase B: ``org_id`` (firm-tenant key) is threaded through so reads /
+    visibility checks are firm-scoped. ``user_id`` stays as the
+    ``created_by`` attribution on writes.
     """
     try:
-        _update_report_progress(rid, status="running", step="starting", percent=0.0, user_id=user_id)
+        _update_report_progress(rid, status="running", step="starting", percent=0.0)
         report, _T = _generate_report_core(
-            rid, req, user_id,
-            progress=lambda step, pct: _update_report_progress(rid, step=step, percent=pct, user_id=user_id),
+            rid, req, user_id, org_id,
+            progress=lambda step, pct: _update_report_progress(rid, step=step, percent=pct),
         )
-        _update_report_progress(rid, status="done", step="done", percent=1.0, user_id=user_id)
+        _update_report_progress(rid, status="done", step="done", percent=1.0)
     except HTTPException as e:
-        _update_report_progress(rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}", user_id=user_id)
+        _update_report_progress(rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}")
     except Exception as e:
         logger.exception(f"report {rid} failed")
-        _update_report_progress(rid, status="failed", error=str(e)[:500], user_id=user_id)
+        _update_report_progress(rid, status="failed", error=str(e)[:500])
 
 
 @router.post("/report/generate/async")
@@ -1989,10 +1990,16 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
     progress and the final result."""
     if not req.document_ids:
         raise HTTPException(400, "No documents selected")
-    _assert_owns_documents(req.document_ids, user.id)
+    org_id = _org_str(user)
+    if not org_id:
+        # Phase B create-guard: an org-less user (open-signup landing state)
+        # has no firm to attach a report to and can't see the documents
+        # anyway. 403 so the SPA surfaces the "ask your admin" path.
+        raise HTTPException(403, "join a firm to generate reports — ask your admin to add you")
+    _assert_in_org(req.document_ids, org_id)
 
-    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name, user.id)
-    existing = _find_existing_report(fp, user.id)
+    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name, org_id)
+    existing = _find_existing_report(fp, org_id)
     if existing:
         return {
             "report_id": str(existing["id"]),
@@ -2002,16 +2009,18 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
         }
 
     # Pre-create the row so the caller has a real report_id to poll.
+    # Phase B: stamp both user_id (created_by) and org_id (firm-tenant
+    # visibility) so the row is discoverable by every member of the firm.
     rid = str(uuid.uuid4())
     pname = req.project_name or "Wind Energy Project"
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO ddiq_reports (id, user_id, project_name, document_ids, preset,
+                """INSERT INTO ddiq_reports (id, user_id, org_id, project_name, document_ids, preset,
                                               report_data, status, started_at, progress_step, progress_percent,
                                               request_fingerprint)
-                   VALUES (%s, %s, %s, %s::uuid[], %s, '{}'::jsonb, 'queued', NULL, 'queued', 0.0, %s)""",
-                (rid, str(user.id), pname, req.document_ids, req.preset, fp),
+                   VALUES (%s, %s, %s, %s, %s::uuid[], %s, '{}'::jsonb, 'queued', NULL, 'queued', 0.0, %s)""",
+                (rid, str(user.id), org_id, pname, req.document_ids, req.preset, fp),
             )
 
     # Enqueue via Celery (H-4). The worker process picks up the message
@@ -2024,7 +2033,7 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
     # default, but ``mode="json"`` converts them to strings. The worker
     # rehydrates via ``GenerateReportRequest.model_validate``.
     async_result = generate_report_task.delay(
-        rid, req.model_dump(mode="json"), str(user.id),
+        rid, req.model_dump(mode="json"), str(user.id), org_id,
     )
 
     # Best-effort: attach the celery task id to the row so an operator
@@ -2035,8 +2044,8 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE ddiq_reports SET celery_task_id = %s "
-                    "WHERE id = %s AND user_id = %s",
-                    (async_result.id, rid, str(user.id)),
+                    "WHERE id = %s AND org_id = %s",
+                    (async_result.id, rid, org_id),
                 )
     except Exception:
         pass  # column missing or transient DB issue — non-blocking
@@ -2053,13 +2062,16 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
 def get_report_status(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Poll endpoint for the async report-generation flow. Cheap — only
     reads the row's status fields, not the full payload."""
+    org_id = _org_str(user)
+    if not org_id:
+        raise HTTPException(404, "Report not found")
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """SELECT id, status, progress_step, progress_percent, started_at,
                           finished_at, error, project_name
-                   FROM ddiq_reports WHERE id = %s AND user_id = %s""",
-                (report_id, str(user.id)),
+                   FROM ddiq_reports WHERE id = %s AND org_id = %s""",
+                (report_id, org_id),
             )
             row = cur.fetchone()
     if not row:
@@ -2076,17 +2088,17 @@ def get_report_status(report_id: str, user: CurrentUser = Depends(get_current_us
     }
 
 
-def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progress=None) -> "tuple[DDiQReportData, dict]":
+def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_id=None, progress=None) -> "tuple[DDiQReportData, dict]":
     """Inner pipeline used by both the sync handler and the async worker.
     ``progress(step, percent)`` is invoked at each major step when given.
 
-    Tenant isolation: ownership of every doc in ``req.document_ids`` is
-    asserted at the boundary, and ``user_id`` is plumbed into every
-    write (``ddiq_reports``, ``ddiq_project_areas``, ``ddiq_contracts``,
-    ``ddiq_classified_parcels``). Read helpers also filter by user_id
-    as defense in depth.
+    Phase B tenant isolation: ``org_id`` (firm-tenant key) is the
+    visibility scope — ownership of every doc in ``req.document_ids`` is
+    asserted firm-wide, and reads filter by ``org_id``. ``user_id`` stays
+    as the ``created_by`` attribution stamped onto writes (ddiq_reports,
+    ddiq_project_areas, ddiq_contracts, ddiq_classified_parcels).
     """
-    _assert_owns_documents(req.document_ids, user_id)
+    _assert_in_org(req.document_ids, org_id)
 
     if progress is None:
         progress = lambda step, pct: None  # noqa: E731
@@ -2102,8 +2114,8 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     conn = get_conn(); cur = conn.cursor()
     cur.execute(
         f"SELECT id, filename FROM ddiq_documents "
-        f"WHERE id::text IN ({','.join(['%s']*len(req.document_ids))}) AND user_id = %s",
-        (*req.document_ids, str(user_id)),
+        f"WHERE id::text IN ({','.join(['%s']*len(req.document_ids))}) AND org_id = %s",
+        (*req.document_ids, str(org_id) if org_id else ""),
     )
     _doc_rows = cur.fetchall(); cur.close(); conn.close()
     doc_names = [r[1] for r in _doc_rows]
@@ -2134,7 +2146,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
         analyzedDocuments=doc_names,
         documentMap=document_map,
     )
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     t = time.time()
     # Sections are the bulk (~80% of wall time). Report progress AFTER each
@@ -2175,7 +2187,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
             logger.info("projectName reconciled: %r → %r", pname, new_pname)
             pname = new_pname
     report.projectName = pname
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     t = time.time()
     progress("geocoding", 0.55)
@@ -2190,12 +2202,12 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     # reconciler (and the map), so one canonical turbine set is used everywhere.
     weas = _drop_geocode_outlier_weas(weas)
     report.weaStatuses = weas
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     progress("infrastructure", 0.70)
     t = time.time(); infra = extract_infrastructure(req.document_ids, sections, pc); T["infra_s"] = round(time.time()-t, 2)
     report.infrastructure = infra
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     # ── 13-Step Cadastral Pipeline ────────────────────────────────────────
     progress("cadastral", 0.78)
@@ -2282,7 +2294,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     report.clearanceZones = clearance_data0
     report.validation = pipeline_result.validation.model_dump() if pipeline_result.validation else None
     report.geojson = pipeline_result.geojson if pipeline_result.geojson else None
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     # ── Cross-source reconciliation ──────────────────────────────────────
     # Compute canonical values for fields that multiple upstream sources
@@ -2564,14 +2576,14 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     # canonical facts from the saved row even though the pipeline derived
     # them. Persisting here means a usable report survives a findings
     # crash with its reconciled numbers intact.
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     progress("findings", 0.85)
     t = time.time()
     findings = generate_findings(req.document_ids, sections, total_capacity_mw=total_mw)
     T["findings_s"] = round(time.time()-t, 2)
     report.findings = findings  # may be augmented with deadline/rueckbau/grundbuch findings later
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     # E1b: the four "extras" passes — timeline (P0 #2), cross-document
     # consistency (P0 #3), Rückbaubürgschaft (P1 #9), Grundbuch (P1 #6) —
@@ -2596,7 +2608,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     report.crossDocFindings = cross_doc_findings
     report.rueckbauBond = rueckbau
     report.grundbuchChecks = grundbuch_checks
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     # Promote material timeline events (urgent / expired) into Findings so
     # the lawyer's findings list reflects deadline pressure, not just
@@ -2791,7 +2803,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
 
     # Final report_data checkpoint — byte-identical to what the
     # original single end-of-pipeline UPSERT wrote.
-    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id)
+    _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     # Auxiliary-table writes (ddiq_project_areas / ddiq_contracts /
     # ddiq_classified_parcels). The report_data JSONB above already has a
@@ -2811,17 +2823,20 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, progr
     uid = str(user_id)
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Phase B: scope by report_id (unique). The aux-row creator was
+            # this same pipeline call; an extra user_id check would block
+            # legitimate re-runs by a different firm member.
             cur.execute(
-                "DELETE FROM ddiq_classified_parcels WHERE report_id = %s AND user_id = %s",
-                (rid, uid),
+                "DELETE FROM ddiq_classified_parcels WHERE report_id = %s",
+                (rid,),
             )
             cur.execute(
-                "DELETE FROM ddiq_contracts WHERE report_id = %s AND user_id = %s",
-                (rid, uid),
+                "DELETE FROM ddiq_contracts WHERE report_id = %s",
+                (rid,),
             )
             cur.execute(
-                "DELETE FROM ddiq_project_areas WHERE report_id = %s AND user_id = %s",
-                (rid, uid),
+                "DELETE FROM ddiq_project_areas WHERE report_id = %s",
+                (rid,),
             )
 
             # Persist project area first (parent of contracts and parcels).
@@ -2868,16 +2883,19 @@ def generate_report(req: GenerateReportRequest, user: CurrentUser = Depends(get_
     /report/generate/async + /report/{id}/status for any UI-driven flow."""
     if not req.document_ids:
         raise HTTPException(400, "No documents selected")
-    _assert_owns_documents(req.document_ids, user.id)
+    org_id = _org_str(user)
+    if not org_id:
+        raise HTTPException(403, "join a firm to generate reports — ask your admin to add you")
+    _assert_in_org(req.document_ids, org_id)
 
-    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name, user.id)
-    existing = _find_existing_report(fp, user.id)
+    fp = _compute_fingerprint(req.document_ids, req.preset, req.project_name, org_id)
+    existing = _find_existing_report(fp, org_id)
     if existing and existing["status"] == "done":
         with get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT report_data FROM ddiq_reports WHERE id = %s AND user_id = %s",
-                    (existing["id"], str(user.id)),
+                    "SELECT report_data FROM ddiq_reports WHERE id = %s AND org_id = %s",
+                    (existing["id"], org_id),
                 )
                 row = cur.fetchone()
         if row and row["report_data"]:
@@ -2920,13 +2938,13 @@ def generate_report(req: GenerateReportRequest, user: CurrentUser = Depends(get_
         # A concurrent request already holds this fingerprint. Don't run a
         # duplicate pipeline — surface the in-flight (or just-finished)
         # row instead of recomputing.
-        other = _find_existing_report(fp, user.id)
+        other = _find_existing_report(fp, org_id)
         if other and other["status"] == "done":
             with get_conn() as conn:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(
-                        "SELECT report_data FROM ddiq_reports WHERE id = %s AND user_id = %s",
-                        (other["id"], str(user.id)),
+                        "SELECT report_data FROM ddiq_reports WHERE id = %s AND org_id = %s",
+                        (other["id"], org_id),
                     )
                     row = cur.fetchone()
             if row and row["report_data"]:
@@ -2947,11 +2965,11 @@ def generate_report(req: GenerateReportRequest, user: CurrentUser = Depends(get_
     # persist wrote. Mirrors ``_run_report_generation_job``'s async
     # error-recovery shape.
     try:
-        report, T = _generate_report_core(rid, req, user.id)
+        report, T = _generate_report_core(rid, req, user.id, org_id)
     except HTTPException as e:
         try:
             _update_report_progress(
-                rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}", user_id=user.id,
+                rid, status="failed", error=f"HTTP {e.status_code}: {e.detail}",
             )
         except Exception:
             pass  # row may not exist yet if the crash was pre-first-persist
@@ -2959,7 +2977,7 @@ def generate_report(req: GenerateReportRequest, user: CurrentUser = Depends(get_
     except Exception as e:
         logger.exception(f"sync report {rid} failed")
         try:
-            _update_report_progress(rid, status="failed", error=str(e)[:500], user_id=user.id)
+            _update_report_progress(rid, status="failed", error=str(e)[:500])
         except Exception:
             pass
         raise HTTPException(500, f"Report generation failed: {e}") from e
@@ -2977,6 +2995,9 @@ def list_reports(limit: int = 50, user: CurrentUser = Depends(get_current_user))
     via GET /report/{id}."""
     if limit < 1: limit = 1
     if limit > 200: limit = 200
+    org_id = _org_str(user)
+    if not org_id:
+        return {"reports": [], "total": 0}
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -2985,10 +3006,10 @@ def list_reports(limit: int = 50, user: CurrentUser = Depends(get_current_user))
                           COALESCE(array_length(document_ids, 1), 0) AS doc_count,
                           COALESCE(jsonb_array_length(report_data->'findings'), 0) AS finding_count
                    FROM ddiq_reports
-                   WHERE user_id = %s
+                   WHERE org_id = %s
                    ORDER BY created_at DESC NULLS LAST
                    LIMIT %s""",
-                (str(user.id), limit),
+                (org_id, limit),
             )
             rows = cur.fetchall()
     return {
@@ -3014,10 +3035,13 @@ def list_reports(limit: int = 50, user: CurrentUser = Depends(get_current_user))
 
 @router.get("/report/{report_id}")
 def get_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
+    org_id = _org_str(user)
+    if not org_id:
+        raise HTTPException(404, "Not found")
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
-        "SELECT * FROM ddiq_reports WHERE id = %s AND user_id = %s",
-        (report_id, str(user.id)),
+        "SELECT * FROM ddiq_reports WHERE id = %s AND org_id = %s",
+        (report_id, org_id),
     )
     row = cur.fetchone(); cur.close(); conn.close()
     if not row: raise HTTPException(404, "Not found")
@@ -3042,30 +3066,40 @@ def delete_report(report_id: str, user: CurrentUser = Depends(get_current_user))
     means even if the cascade DELETEs were re-ordered, a cross-tenant
     delete is structurally impossible.
     """
-    uid = str(user.id)
+    org_id = _org_str(user)
+    if not org_id:
+        raise HTTPException(404, "Report not found")
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Phase B: visibility is firm-scoped — any member of the firm
+            # can delete the firm's reports. The report must belong to the
+            # caller's org; we 404 (not 403) on cross-firm so existence
+            # isn't leaked.
             cur.execute(
-                "SELECT 1 FROM ddiq_reports WHERE id = %s AND user_id = %s",
-                (report_id, uid),
+                "SELECT 1 FROM ddiq_reports WHERE id = %s AND org_id = %s",
+                (report_id, org_id),
             )
             if not cur.fetchone():
                 raise HTTPException(404, "Report not found")
+            # Sub-table cleanup: scope by report_id (unique). user_id filter
+            # is left for now — the rows were written by the report's
+            # original creator; the report_id constraint already binds them
+            # to a row we just confirmed is in the caller's org.
             cur.execute(
-                "DELETE FROM ddiq_classified_parcels WHERE report_id = %s AND user_id = %s",
-                (report_id, uid),
+                "DELETE FROM ddiq_classified_parcels WHERE report_id = %s",
+                (report_id,),
             )
             cur.execute(
-                "DELETE FROM ddiq_contracts WHERE report_id = %s AND user_id = %s",
-                (report_id, uid),
+                "DELETE FROM ddiq_contracts WHERE report_id = %s",
+                (report_id,),
             )
             cur.execute(
-                "DELETE FROM ddiq_project_areas WHERE report_id = %s AND user_id = %s",
-                (report_id, uid),
+                "DELETE FROM ddiq_project_areas WHERE report_id = %s",
+                (report_id,),
             )
             cur.execute(
-                "DELETE FROM ddiq_reports WHERE id = %s AND user_id = %s",
-                (report_id, uid),
+                "DELETE FROM ddiq_reports WHERE id = %s AND org_id = %s",
+                (report_id, org_id),
             )
     return {"deleted": True, "report_id": report_id}
 
@@ -3073,10 +3107,13 @@ def delete_report(report_id: str, user: CurrentUser = Depends(get_current_user))
 @router.get("/report/{report_id}/geojson")
 def get_report_geojson(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Return GeoJSON FeatureCollection for GIS import (QGIS, ArcGIS, MapBox, etc.)."""
+    org_id = _org_str(user)
+    if not org_id:
+        raise HTTPException(404, "Report not found")
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
-        "SELECT report_data FROM ddiq_reports WHERE id = %s AND user_id = %s",
-        (report_id, str(user.id)),
+        "SELECT report_data FROM ddiq_reports WHERE id = %s AND org_id = %s",
+        (report_id, org_id),
     )
     row = cur.fetchone(); cur.close(); conn.close()
     if not row: raise HTTPException(404, "Report not found")
@@ -3136,10 +3173,13 @@ def get_report_geojson(report_id: str, user: CurrentUser = Depends(get_current_u
 @router.get("/report/{report_id}/validate")
 def validate_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Run validation checks on a generated report (Step 13)."""
+    org_id = _org_str(user)
+    if not org_id:
+        raise HTTPException(404, "Report not found")
     conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
-        "SELECT report_data FROM ddiq_reports WHERE id = %s AND user_id = %s",
-        (report_id, str(user.id)),
+        "SELECT report_data FROM ddiq_reports WHERE id = %s AND org_id = %s",
+        (report_id, org_id),
     )
     row = cur.fetchone(); cur.close(); conn.close()
     if not row: raise HTTPException(404, "Report not found")
