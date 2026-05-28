@@ -17,14 +17,16 @@ import _guardrail as g
 def test_scrub_strips_chunk_refs_from_value():
     r = g.scrub_row_value("Die Pacht beträgt 6,0 % [#3] der Einspeiseerlöse [#1, 5].")
     assert "[#" not in r.cleaned
-    assert "Pacht" in r.cleaned and "6,0" in r.cleaned
+    assert "Pacht" in r.cleaned
+    assert "6,0" in r.cleaned
     # original preserved for audit
     assert "[#3]" in r.original
 
 
 def test_scrub_chunk_only_value_becomes_empty():
     r = g.scrub_row_value("[#2]")
-    assert "[#" not in r.cleaned and not r.cleaned.strip()
+    assert "[#" not in r.cleaned
+    assert not r.cleaned.strip()
 
 
 def test_apply_to_rows_strips_chunk_refs_in_value_and_note():

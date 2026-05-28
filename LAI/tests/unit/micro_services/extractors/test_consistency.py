@@ -34,7 +34,7 @@ def _section(title: str, rows: list[tuple[str, str, str]]) -> AusgabeblattSectio
     return AusgabeblattSection(
         id=title.lower().replace(" ", "_"),
         title=title,
-        rows=[AusgabeblattRow(label=l, value=v, ampel=a) for l, v, a in rows],
+        rows=[AusgabeblattRow(label=lbl, value=v, ampel=a) for lbl, v, a in rows],
     )
 
 

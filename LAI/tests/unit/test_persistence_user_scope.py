@@ -89,7 +89,8 @@ def test_matter_documents_per_user_with_org_stamp():
         org_id=ORG_A,
         status="done",
     )
-    assert doc is not None and doc["doc_index"] == 1
+    assert doc is not None
+    assert doc["doc_index"] == 1
     # Bob (same firm) tries — blocked.
     assert (
         p.add_matter_document(
@@ -130,13 +131,15 @@ def test_feedback_per_user():
     p.save_session("sess-alpha", {"user_id": ALICE, "org_id": ORG_A, "filename": "x.pdf"})
     # Alice (owner) can rate her own session.
     rid = p.record_feedback(session_id="sess-alpha", user_id=ALICE, rating=1)
-    assert rid is not None and rid > 0
+    assert rid is not None
+    assert rid > 0
     # Bob (same firm) cannot — silently dropped.
     assert p.record_feedback(session_id="sess-alpha", user_id=BOB, rating=-1) is None
     # Bob sees no feedback; Alice sees hers.
     assert p.list_feedback("sess-alpha", user_id=BOB) == []
     rows = p.list_feedback("sess-alpha", user_id=ALICE)
-    assert len(rows) == 1 and rows[0]["user_id"] == ALICE
+    assert len(rows) == 1
+    assert rows[0]["user_id"] == ALICE
 
 
 def test_save_session_round_trips_org_id():
@@ -173,7 +176,8 @@ def test_share_grants_read_but_not_write():
 
     # Alice shares with Bob.
     share_id = p.add_session_share("sess-1", BOB, granted_by=ALICE)
-    assert share_id is not None and share_id > 0
+    assert share_id is not None
+    assert share_id > 0
 
     # READ widens for Bob.
     assert p.load_session("sess-1", user_id=BOB) is not None
@@ -208,7 +212,8 @@ def test_share_grants_read_but_not_write():
 
     # Bob can READ the messages Alice wrote.
     msgs = p.list_messages("sess-1", user_id=BOB)
-    assert len(msgs) == 1 and msgs[0]["content"] == "from Alice"
+    assert len(msgs) == 1
+    assert msgs[0]["content"] == "from Alice"
 
 
 def test_share_is_idempotent_and_owner_only_to_grant():
@@ -220,7 +225,8 @@ def test_share_is_idempotent_and_owner_only_to_grant():
 
     first = p.add_session_share("sess-1", BOB, granted_by=ALICE)
     again = p.add_session_share("sess-1", BOB, granted_by=ALICE)
-    assert first is not None and again is not None
+    assert first is not None
+    assert again is not None
     # No duplicate row — UNIQUE(session_id, user_id).
     assert p.session_share_user_ids("sess-1") == {BOB}
 

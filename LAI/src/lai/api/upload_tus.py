@@ -31,6 +31,7 @@ contract + rollout plan.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import time
@@ -196,7 +197,7 @@ def build_tus_router(
         try:
             length = int(length_h)
         except ValueError:
-            raise HTTPException(400, "Upload-Length must be an integer")
+            raise HTTPException(400, "Upload-Length must be an integer") from None
         if length < 0 or length > TUS_MAX_SIZE:
             raise HTTPException(413, f"File too large (max {TUS_MAX_SIZE} bytes)")
 
@@ -293,7 +294,7 @@ def build_tus_router(
         try:
             info = _tenant_guard(_read_info(upload_id), str(user.id))
         except ValueError:
-            raise HTTPException(404, "Upload not found")
+            raise HTTPException(404, "Upload not found") from None
         return Response(
             status_code=200,
             headers=_tus_headers(
@@ -328,12 +329,12 @@ def build_tus_router(
         try:
             info = _tenant_guard(_read_info(upload_id), str(user.id))
         except ValueError:
-            raise HTTPException(404, "Upload not found")
+            raise HTTPException(404, "Upload not found") from None
 
         try:
             offset_in = int(request.headers.get("Upload-Offset", ""))
         except ValueError:
-            raise HTTPException(400, "Upload-Offset header must be an integer")
+            raise HTTPException(400, "Upload-Offset header must be an integer") from None
         if offset_in != info["offset"]:
             # 409 is the spec's "conflict — re-HEAD and try again" code.
             return Response(
@@ -396,7 +397,7 @@ def build_tus_router(
         try:
             info = _tenant_guard(_read_info(upload_id), str(user.id))
         except ValueError:
-            raise HTTPException(404, "Upload not found")
+            raise HTTPException(404, "Upload not found") from None
         del info  # only validated for the tenant guard side-effect
         _cleanup(upload_id)
         return Response(status_code=204, headers=_tus_headers())
@@ -415,14 +416,10 @@ def _cleanup(upload_id: str) -> None:
     if not d.exists():
         return
     for p in d.iterdir():
-        try:
+        with contextlib.suppress(OSError):
             p.unlink()
-        except OSError:
-            pass
-    try:
+    with contextlib.suppress(OSError):
         d.rmdir()
-    except OSError:
-        pass
 
 
 def gc_stale_uploads(max_age_seconds: int = 24 * 60 * 60) -> int:

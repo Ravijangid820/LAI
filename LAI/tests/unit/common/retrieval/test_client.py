@@ -218,7 +218,7 @@ def test_ping_success():
 
 @pytest.mark.unit
 def test_ping_failure_returns_false():
-    conn = _FakeConn({}, fail_with=psycopg2.OperationalError("down"))
+    _FakeConn({}, fail_with=psycopg2.OperationalError("down"))
 
     # Make SELECT 1 fail too by raising on any execute.
     class _AlwaysFailCursor(_FakeCursor):

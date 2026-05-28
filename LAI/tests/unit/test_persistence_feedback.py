@@ -74,7 +74,8 @@ def test_record_feedback_inserts_row(session_with_message: int) -> None:
         reason="wrong-citation",
         comment="bad source",
     )
-    assert isinstance(fid, int) and fid > 0
+    assert isinstance(fid, int)
+    assert fid > 0
     rows = persistence.list_feedback(SID, user_id=UID)
     assert len(rows) == 1
     assert rows[0]["rating"] == 1

@@ -287,7 +287,7 @@ class TestReadableCharRatio:
 
     @pytest.mark.unit
     def test_umlauts_and_symbols_are_readable(self) -> None:
-        assert _readable_char_ratio("äöüß §€„“»«–—…") == 1.0  # noqa: RUF001
+        assert _readable_char_ratio("äöüß §€„“»«–—…") == 1.0
 
 
 class TestQualityGate:

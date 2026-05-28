@@ -181,7 +181,11 @@ def test_env_defaults_are_strings() -> None:
     """The four env-derived URLs/models are strings even when no env
     var is set — the LLM/embedding clients are constructed at import
     time using them. A None here would crash the module load."""
-    assert isinstance(ddiq_llm.LLM_URL, str) and ddiq_llm.LLM_URL
-    assert isinstance(ddiq_llm.LLM_MODEL, str) and ddiq_llm.LLM_MODEL
-    assert isinstance(ddiq_llm.EMBEDDING_URL, str) and ddiq_llm.EMBEDDING_URL
-    assert isinstance(ddiq_llm.RERANKER_URL, str) and ddiq_llm.RERANKER_URL
+    assert isinstance(ddiq_llm.LLM_URL, str)
+    assert ddiq_llm.LLM_URL
+    assert isinstance(ddiq_llm.LLM_MODEL, str)
+    assert ddiq_llm.LLM_MODEL
+    assert isinstance(ddiq_llm.EMBEDDING_URL, str)
+    assert ddiq_llm.EMBEDDING_URL
+    assert isinstance(ddiq_llm.RERANKER_URL, str)
+    assert ddiq_llm.RERANKER_URL

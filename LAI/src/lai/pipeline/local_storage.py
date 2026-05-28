@@ -595,7 +595,7 @@ def _sqlite_execute_values(cur, query: str, argslist, template=None, fetch=False
     insert_sql = f"INSERT OR IGNORE INTO {table} ({columns}) VALUES ({placeholders})"
 
     results = []
-    adapter = cur if isinstance(cur, _SQLiteCursorAdapter) else cur
+    adapter = cur
 
     for row in argslist:
         try:
@@ -613,6 +613,7 @@ def _sqlite_execute_values(cur, query: str, argslist, template=None, fetch=False
 
     if fetch:
         return results
+    return None
 
 
 def patch_execute_values():

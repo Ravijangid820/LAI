@@ -61,14 +61,12 @@ def parse_german_number(s: str) -> float | None:
     elif has_comma:
         # Single comma → German decimal
         candidate = candidate.replace(",", ".")
-    elif has_dot:
-        # Single dot — could be German thousands or US decimal.
-        # If exactly one dot and exactly 3 trailing digits → thousands.
-        if candidate.count(".") == 1:
-            head, tail = candidate.split(".")
-            if len(tail) == 3 and tail.isdigit():
-                candidate = head + tail
-        # Otherwise leave as-is (US decimal)
+    elif has_dot and candidate.count(".") == 1:
+        # Single dot — German thousands or US decimal. Exactly 3 trailing
+        # digits → thousands separator; otherwise leave as-is (US decimal).
+        head, tail = candidate.split(".")
+        if len(tail) == 3 and tail.isdigit():
+            candidate = head + tail
 
     try:
         return float(candidate)

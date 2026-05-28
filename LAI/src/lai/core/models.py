@@ -6,7 +6,7 @@ packages (retrieval, generation, api) live here.
 
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
@@ -17,7 +17,7 @@ from lai.core.constants import QueryIntent
 # ---------------------------------------------------------------------------
 
 
-class LegalReferenceType(str, Enum):
+class LegalReferenceType(StrEnum):
     PARAGRAPH = "paragraph"
     ARTICLE = "article"
     LAW_CODE = "law_code"
@@ -129,7 +129,7 @@ class ParsedQuery:
 # ---------------------------------------------------------------------------
 
 
-class QualityCheckStatus(str, Enum):
+class QualityCheckStatus(StrEnum):
     PASSED = "passed"
     INSUFFICIENT_CHUNKS = "insufficient_chunks"
     LOW_SIMILARITY = "low_similarity"
@@ -215,7 +215,7 @@ class RankedChunk:
 # ---------------------------------------------------------------------------
 
 
-class ResponseStatus(str, Enum):
+class ResponseStatus(StrEnum):
     GENERATED = "generated"
     REFUSED = "refused"
     CLARIFICATION_NEEDED = "clarification_needed"
@@ -223,7 +223,7 @@ class ResponseStatus(str, Enum):
     ERROR = "error"
 
 
-class CitationStatus(str, Enum):
+class CitationStatus(StrEnum):
     VERIFIED = "verified"
     PARTIAL_MATCH = "partial_match"
     NOT_FOUND = "not_found"
@@ -336,7 +336,7 @@ class RAGResponse:
 # ---------------------------------------------------------------------------
 
 
-class DocumentStatus(str, Enum):
+class DocumentStatus(StrEnum):
     PENDING = "pending"
     PARSING = "parsing"
     CHUNKING = "chunking"

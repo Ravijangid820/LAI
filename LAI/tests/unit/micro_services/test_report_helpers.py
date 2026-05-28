@@ -204,19 +204,22 @@ class TestParseExplicitParkSize:
         # The real Lamstedt capacity cell: 2 MW × 10 Einheiten = 20 MW, count 10.
         cell = "… teilweiser Verweis auf 2 MW pro Einheit für 10 Einheiten …"
         count, total = ddiq_report._parse_explicit_park_size(cell)
-        assert count == 10 and total == 20.0
+        assert count == 10
+        assert total == 20.0
 
     def test_explicit_total(self) -> None:
-        count, total = ddiq_report._parse_explicit_park_size("20 MW Gesamtleistung")
+        _count, total = ddiq_report._parse_explicit_park_size("20 MW Gesamtleistung")
         assert total == 20.0
 
     def test_nothing_explicit(self) -> None:
         count, total = ddiq_report._parse_explicit_park_size("Status unklar.")
-        assert count is None and total is None
+        assert count is None
+        assert total is None
 
     def test_count_only(self) -> None:
         count, total = ddiq_report._parse_explicit_park_size("10 Anlagen")
-        assert count == 10 and total is None
+        assert count == 10
+        assert total is None
 
 
 # ── timeline severity calibration ────────────────────────────────────
@@ -273,7 +276,8 @@ class TestDetectParksInText:
             "Anlagen L 1 bis L 16 — Windpark Lamstedt",
             "Errichtet: 8; Geplant: 3 (Windpark Zodel II, Flur 1)",
         )
-        assert "Windpark Lamstedt" in got and "Windpark Zodel II" in got
+        assert "Windpark Lamstedt" in got
+        assert "Windpark Zodel II" in got
 
     def test_no_park_returns_empty(self) -> None:
         assert ddiq_report._detect_parks_in_text("kein Windpark hier", "") == set()
@@ -304,8 +308,10 @@ class TestBuildParkFacts:
         ]
         parks = ddiq_report._build_park_facts(weas, "Windpark Zodel")
         assert [p.name for p in parks] == ["Windpark Zodel", "Windpark Lamstedt"]
-        assert parks[0].isPrimary and not parks[1].isPrimary
-        assert parks[0].turbineCount == 8 and parks[1].turbineCount == 10
+        assert parks[0].isPrimary
+        assert not parks[1].isPrimary
+        assert parks[0].turbineCount == 8
+        assert parks[1].turbineCount == 10
         # Lamstedt capacity = 10 × 2 MW; Zodel = None (no kw)
         assert parks[1].totalCapacityMw == 20.0
         assert parks[0].totalCapacityMw is None
@@ -328,7 +334,8 @@ class TestBuildParkFacts:
 
     def test_single_park_is_primary_regardless_of_name_match(self) -> None:
         parks = ddiq_report._build_park_facts([self._wea("WEA Z 1", "Windpark Zodel")], "Windpark Lamstedt")
-        assert len(parks) == 1 and parks[0].isPrimary
+        assert len(parks) == 1
+        assert parks[0].isPrimary
 
 
 # ── make_parcel_polygon ──────────────────────────────────────────────
@@ -520,7 +527,16 @@ class TestApplyCanonicalSpecs:
     def _wea(self, **kw):
         from ddiq.models import WEAStatus
 
-        base = dict(name="WEA 1", ampel="green", owner="o", parcel="", contract="", lat=53.0, lng=8.0, address="")
+        base = {
+            "name": "WEA 1",
+            "ampel": "green",
+            "owner": "o",
+            "parcel": "",
+            "contract": "",
+            "lat": 53.0,
+            "lng": 8.0,
+            "address": "",
+        }
         base.update(kw)
         return WEAStatus(**base)
 
@@ -721,7 +737,8 @@ class TestDropGeocodeOutlierWeas:
         return [self._w(53.63 + 0.001 * i, 9.10 + 0.001 * i) for i in range(n)]
 
     def test_drops_far_outliers(self) -> None:
-        weas = self._cluster(8) + [
+        weas = [
+            *self._cluster(8),
             self._w(53.09, 8.78),  # Bremen ~60 km
             self._w(48.14, 11.58),  # Munich
             self._w(52.52, 13.40),
@@ -730,7 +747,7 @@ class TestDropGeocodeOutlierWeas:
         assert len(kept) == 8
 
     def test_keeps_ungeocoded_drops_outlier(self) -> None:
-        weas = self._cluster(5) + [self._w(48.14, 11.58)] + [self._w(0.0, 0.0)]
+        weas = [*self._cluster(5), self._w(48.14, 11.58), self._w(0.0, 0.0)]
         kept = ddiq_report._drop_geocode_outlier_weas(weas)
         assert len(kept) == 6  # 5 cluster + ungeocoded
         assert any(w.lat == 0 for w in kept)  # ungeocoded kept

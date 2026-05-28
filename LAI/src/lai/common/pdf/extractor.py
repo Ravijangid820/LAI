@@ -292,9 +292,7 @@ class PdfExtractor:
 # intentional: they are exactly the characters real German legal text
 # uses, so they must count as readable. RUF001 (ambiguous-unicode in a
 # string) is therefore expected here and suppressed on the data line.
-_READABLE_PUNCT: frozenset[str] = frozenset(
-    " .,;:!?-–—()[]{}'\"/%&§€$@#*+=<>|~`^_\\…„“”‚‘’«»°№"  # noqa: RUF001
-)
+_READABLE_PUNCT: frozenset[str] = frozenset(" .,;:!?-–—()[]{}'\"/%&§€$@#*+=<>|~`^_\\…„“”‚‘’«»°№")
 
 
 def _readable_char_ratio(text: str) -> float:

@@ -5,14 +5,14 @@ used across the LAI platform. Consolidated from V3 constants.py and V4 constants
 """
 
 import re
-from enum import Enum
+from enum import Enum, StrEnum
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
 
 
-class DocumentType(str, Enum):
+class DocumentType(StrEnum):
     LEGISLATION = "legislation"
     COURT_DECISION = "court_decision"
     COMMENTARY = "commentary"
@@ -30,7 +30,7 @@ class CourtLevel(int, Enum):
     LOCAL = 4  # AG
 
 
-class ProcessingStatus(str, Enum):
+class ProcessingStatus(StrEnum):
     PENDING = "pending"
     PROCESSING = "processing"
     COMPLETED = "completed"
@@ -38,7 +38,7 @@ class ProcessingStatus(str, Enum):
     PARTIAL = "partial"
 
 
-class QueryIntent(str, Enum):
+class QueryIntent(StrEnum):
     CURRENT_LAW = "current_law"
     HISTORICAL_LAW = "historical_law"
     COURT_RULING = "court_ruling"
@@ -49,7 +49,7 @@ class QueryIntent(str, Enum):
     AMBIGUOUS = "ambiguous"
 
 
-class FeedbackType(str, Enum):
+class FeedbackType(StrEnum):
     WRONG_LAW_CITED = "wrong_law_cited"
     OUTDATED_INFO = "outdated_info"
     HALLUCINATED_CONTENT = "hallucinated_content"

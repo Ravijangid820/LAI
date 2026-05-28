@@ -145,13 +145,29 @@ ignore = [
     "E501",   # line length — ruff format handles wrapping; long URLs in comments are fine
     "B008",   # function calls in argument defaults — FastAPI Depends() is the canonical example
     "SIM108", # ternary vs if — readability call, not always cleaner
+    # German-language legal codebase: prompts, statute refs, identifiers and
+    # comments legitimately use non-ASCII punctuation/letters (§ „ " – × ° é).
+    # ruff's confusable detection is a false-positive generator here, and its
+    # "fix" would corrupt the text. Scope these out rather than mangle German.
+    "RUF001", # ambiguous-unicode-character-string
+    "RUF002", # ambiguous-unicode-character-docstring
+    "RUF003", # ambiguous-unicode-character-comment
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = [
     "S101",     # asserts are the point of tests
     "ARG",      # unused fixtures appear as unused args
+    "B017",     # some tests deliberately assert a broad Exception is raised
+    "PT011",    # pytest.raises(Exception) without match is intentional in those tests
 ]
+# Intentional patterns scoped per-file rather than churned to satisfy the rule:
+"src/lai/api/serve_rag.py" = [
+    "E402",     # ordered/late module imports in this god-module (avoids import cycles)
+    "N806",     # env-read local config constants (LLM_API_URL, …) kept UPPER by convention
+]
+"src/lai/analyzer/pipeline.py" = ["N806"]  # local progress-percent constants (PCT_*) kept UPPER
+"src/lai/pipeline/cli.py" = ["N806"]       # local constant (BACKUP_FLUSH_ROWS) kept UPPER
 
 [tool.ruff.lint.extend-per-file-ignores]
 # `lai.common` and its tests opt in to the strict ruleset above, with no extra ignores

@@ -253,10 +253,10 @@ def retrieve_bm25(query: str, corpus: Corpus, k: int) -> tuple[list[int], list[f
     # Was 15 — too many OR terms make FTS5 scan a huge candidate set on a
     # 50M-row index. 6 still captures the rare/specific terms that drive
     # BM25 quality without blowing query time.
-    tokens = sorted(set(t for t in safe.split() if len(t) > 4), key=len, reverse=True)[:6]
+    tokens = sorted({t for t in safe.split() if len(t) > 4}, key=len, reverse=True)[:6]
     if not tokens:
         # Fallback for very short queries
-        tokens = sorted(set(t for t in safe.split() if len(t) > 2), key=len, reverse=True)[:6]
+        tokens = sorted({t for t in safe.split() if len(t) > 2}, key=len, reverse=True)[:6]
     if not tokens:
         return [], []
     match_expr = " OR ".join(f'"{t}"' for t in tokens)
@@ -291,9 +291,9 @@ def retrieve_bm25(query: str, corpus: Corpus, k: int) -> tuple[list[int], list[f
 # helper so the two paths can't drift on tokenisation.
 def _bm25_match_expr(query: str) -> str | None:
     safe = query.replace('"', " ").strip()
-    tokens = sorted(set(t for t in safe.split() if len(t) > 4), key=len, reverse=True)[:6]
+    tokens = sorted({t for t in safe.split() if len(t) > 4}, key=len, reverse=True)[:6]
     if not tokens:
-        tokens = sorted(set(t for t in safe.split() if len(t) > 2), key=len, reverse=True)[:6]
+        tokens = sorted({t for t in safe.split() if len(t) > 2}, key=len, reverse=True)[:6]
     if not tokens:
         return None
     return " OR ".join(f'"{t}"' for t in tokens)
@@ -520,7 +520,7 @@ def eval_run(
     top_k: int = 10,
     candidate_k: int = 50,
     reranker: Reranker = None,
-    parent_text: dict = None,
+    parent_text: dict | None = None,
 ) -> dict:
     ranks = []
     per_q = []
@@ -532,18 +532,18 @@ def eval_run(
 
         # Retrieve candidates
         if mode == "dense":
-            idx, sims = retrieve_dense(embed_query(question), corpus, candidate_k)
+            idx, _sims = retrieve_dense(embed_query(question), corpus, candidate_k)
         elif mode == "dense_prefix":
-            idx, sims = retrieve_dense(embed_query(question, with_prefix=True), corpus, candidate_k)
+            idx, _sims = retrieve_dense(embed_query(question, with_prefix=True), corpus, candidate_k)
         elif mode == "bm25":
-            idx, sims = retrieve_bm25(question, corpus, candidate_k)
+            idx, _sims = retrieve_bm25(question, corpus, candidate_k)
         elif mode in ("hybrid", "hybrid_prefix", "hybrid_rerank"):
             qvec = embed_query(question, with_prefix=(mode != "hybrid"))
             d_idx, _ = retrieve_dense(qvec, corpus, candidate_k)
             b_idx, _ = retrieve_bm25(question, corpus, candidate_k)
             fused = rrf_fuse([d_idx, b_idx])[:candidate_k]
             idx = [p for p, _ in fused]
-            sims = [s for _, s in fused]
+            [s for _, s in fused]
         else:
             raise ValueError(f"unknown mode: {mode}")
 
@@ -555,7 +555,7 @@ def eval_run(
             scores = reranker.score(pairs)
             order = np.argsort(-np.asarray(scores))
             idx = [idx[j] for j in order]
-            sims = [scores[j] for j in order]
+            [scores[j] for j in order]
 
         top_parents = dedupe_by_parent(idx, corpus, top_k)
 
@@ -581,7 +581,10 @@ def eval_run(
     dt = time.time() - t0
 
     n = len(ranks)
-    recall_at = lambda k: sum(1 for r in ranks if r is not None and r <= k) / n
+
+    def recall_at(k):
+        return sum(1 for r in ranks if r is not None and r <= k) / n
+
     mrr = sum((1 / r) if r is not None else 0 for r in ranks) / n
 
     metrics = {

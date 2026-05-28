@@ -117,4 +117,5 @@ def test_build_turn_msgs_modes():
     ]:
         mode, msgs = sr._build_turn_msgs(use_rag, use_contract, "Was gilt?", [], [], [], "", "de")
         assert mode == expected
-        assert isinstance(msgs, list) and msgs
+        assert isinstance(msgs, list)
+        assert msgs

@@ -41,7 +41,8 @@ def test_page_order_preserved_when_completion_is_out_of_order(monkeypatch):
     # markdown is assembled in page order despite out-of-order completion
     positions = [md.index(f"<!-- Seite {i} -->") for i in range(1, 6)]
     assert positions == sorted(positions)
-    assert "text-of-page-0" in md and "text-of-page-4" in md
+    assert "text-of-page-0" in md
+    assert "text-of-page-4" in md
     # progress: initial (0, total) then one tick per completed page
     assert seen[0] == (0, 5)
     assert [d for d, _ in seen] == [0, 1, 2, 3, 4, 5]

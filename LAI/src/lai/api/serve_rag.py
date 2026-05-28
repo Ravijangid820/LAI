@@ -32,7 +32,7 @@ import sqlite3
 import tempfile
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1224,7 +1224,7 @@ def _rank_passages(
         qvec = embed_query(question, with_prefix=True)
         results = _get_embedding_client().embed([t for _, t in capped])
         scored: list[tuple[float, int, int | None, str]] = []
-        for i, ((page, t), r) in enumerate(zip(capped, results)):
+        for i, ((page, t), r) in enumerate(zip(capped, results, strict=False)):
             pv = np.asarray(r.embedding, dtype=np.float32)
             n = np.linalg.norm(pv)
             if n > 0:
@@ -1484,7 +1484,7 @@ def _matter_pgvector_context(
         return f"(S. {pg}) {t}" if pg else t
 
     by_doc: dict[int, dict] = {}
-    for rank, (h, rs) in enumerate(zip(hits, rscores)):
+    for rank, (h, rs) in enumerate(zip(hits, rscores, strict=False)):
         info = by_doc.setdefault(
             h.doc_index,
             {
@@ -2068,9 +2068,7 @@ def session_uses_contract(session_id: str | None, question: str) -> bool:
         return False
     # Pure greeting / smalltalk needs no document context.
     q = question.strip()
-    if len(q) < 4 or CONVERSATIONAL.match(q):
-        return False
-    return True
+    return not (len(q) < 4 or CONVERSATIONAL.match(q))
 
 
 # ---------------------------------------------------------------------------
@@ -2438,7 +2436,7 @@ def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int, list[di
         try:
             return file_bytes.decode("utf-8", errors="replace"), 0, []
         except Exception as e:
-            raise RuntimeError(f"Could not decode text file: {e}")
+            raise RuntimeError(f"Could not decode text file: {e}") from e
 
     global _DOCLING_CONVERTER
     if _DOCLING_CONVERTER is None:
@@ -2483,10 +2481,8 @@ def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int, list[di
         with tempfile.NamedTemporaryFile(suffix=suffix_for_tmp, delete=False) as tmp:
             tmp.write(file_bytes)
             tmp.flush()
-            try:
+            with suppress(OSError):
                 os.fsync(tmp.fileno())  # be sure bytes are on disk before Docling reads
-            except OSError:
-                pass
             tmp_path = Path(tmp.name)
 
         try:
@@ -2622,7 +2618,7 @@ def index_matter_document(sid: str, doc_index: int, filename: str, md: str) -> i
             sid,
             doc_index,
             filename,
-            [(page, text, r.embedding) for (page, text), r in zip(rows, results)],
+            [(page, text, r.embedding) for (page, text), r in zip(rows, results, strict=False)],
         )
         print(f"[ingest] indexed {indexed} passage(s) for [M-{doc_index}] {filename!r} in session {sid}", flush=True)
         return indexed
@@ -2705,10 +2701,8 @@ def _ingest_document_job(
         )
     except Exception as e:
         print(f"[ingest] FAILED [M-{doc_index}] {filename!r} session={sid}: {e}", flush=True)
-        try:
+        with suppress(Exception):
             persistence.fail_matter_document(doc_id, str(e))
-        except Exception:
-            pass
 
 
 def _enqueue_ingestion(
@@ -3167,7 +3161,7 @@ async def lifespan(app: FastAPI):
                 f"LLM endpoint {LLM_API_URL} not reachable: {e}\n"
                 "  → Start the analyzer container: cd Docker/llm-analyzer && docker compose up -d\n"
                 "  → Or override LLM_API_URL to point at a reachable endpoint."
-            )
+            ) from e
         # Build the shared SyncLlmClient. The OpenAI-compatible base
         # URL for vLLM is the endpoint root plus ``/v1``. Other
         # SyncLlmClient knobs (retry, timeout) come from
@@ -3414,9 +3408,7 @@ def _is_readable_passage(text: str) -> bool:
         return False
     # Letter-salad guard: a passage long enough to be a real chunk must
     # contain at least one common German/English function word.
-    if len(text) > 120 and not _COMMON_WORDS_RE.search(text):
-        return False
-    return True
+    return not (len(text) > 120 and not _COMMON_WORDS_RE.search(text))
 
 
 def _do_rag(
@@ -4839,7 +4831,7 @@ def _analyze_v2(req: AnalyzeReq, uid: str | None) -> AnalyzeResp:
     def _on_progress(event: dict) -> None:
         # Pipeline callback — write the latest event to the shared dict.
         STATE["analyzer_progress"][sid] = {
-            "status": "running" if event.get("step") != "done" else "running",
+            "status": "running",
             **event,
             "started_at": t0,
         }
@@ -4939,7 +4931,7 @@ def _analyze_v2(req: AnalyzeReq, uid: str | None) -> AnalyzeResp:
 @app.post("/analyze-contract", response_model=AnalyzeResp)
 def analyze_contract(req: AnalyzeReq, user: CurrentUser = Depends(get_current_user)):
     uid = str(user.id)
-    org_id = _org_or_none(user)
+    _org_or_none(user)
     sess = persistence.load_session(req.session_id, user_id=uid)
     if not sess:
         raise HTTPException(404, "session_id not found — upload a document first")
@@ -4999,7 +4991,7 @@ def get_session(session_id: str, user: CurrentUser = Depends(get_current_user)):
     """Full session payload for UI rehydration after a refresh.
     Returns the contract metadata + last analysis + message history."""
     uid = str(user.id)
-    org_id = _org_or_none(user)
+    _org_or_none(user)
     sess = persistence.load_session(session_id, user_id=uid)
     if not sess:
         raise HTTPException(404, "session_id not found")
@@ -5018,7 +5010,7 @@ def get_session(session_id: str, user: CurrentUser = Depends(get_current_user)):
 @app.get("/sessions/{session_id}/messages")
 def get_session_messages(session_id: str, user: CurrentUser = Depends(get_current_user)):
     uid = str(user.id)
-    org_id = _org_or_none(user)
+    _org_or_none(user)
     if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     return {"messages": persistence.list_messages(session_id, user_id=uid)}
@@ -5043,7 +5035,7 @@ def append_session_message(
 
     /query already self-persists; the UI shouldn't double-save those."""
     uid = str(user.id)
-    org_id = _org_or_none(user)
+    _org_or_none(user)
     if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     if req.role not in ("user", "assistant"):
@@ -5136,7 +5128,7 @@ def submit_feedback(
         raise HTTPException(400, "comment must be ≤ 2048 characters")
 
     uid = str(user.id)
-    org_id = _org_or_none(user)
+    _org_or_none(user)
     if not persistence.session_exists(req.session_id, user_id=uid):
         # 404 (not 403) so we don't leak existence across tenants.
         raise HTTPException(404, "session_id not found")
@@ -5186,7 +5178,7 @@ def get_session_feedback(
     shape never leaks existence across tenants.
     """
     uid = str(user.id)
-    org_id = _org_or_none(user)
+    _org_or_none(user)
     if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     return {"feedback": persistence.list_feedback(session_id, user_id=uid)}
@@ -5220,7 +5212,7 @@ def get_session_document(
         session with no upload).
     """
     uid = str(user.id)
-    org_id = _org_or_none(user)
+    _org_or_none(user)
     sess = persistence.load_session(session_id, user_id=uid)
     if not sess:
         raise HTTPException(404, "session_id not found")
@@ -5316,7 +5308,7 @@ def list_matter_documents_endpoint(
     checkmark. Returns ``{"documents": [...]}``. Cross-tenant sessions 404.
     """
     uid = str(user.id)
-    org_id = _org_or_none(user)
+    _org_or_none(user)
     if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     docs = persistence.list_matter_documents(session_id, user_id=uid)
@@ -5352,7 +5344,7 @@ def get_matter_document_endpoint(
     index, or a file GC'd from disk.
     """
     uid = str(user.id)
-    org_id = _org_or_none(user)
+    _org_or_none(user)
     if not persistence.session_exists(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     doc = persistence.get_matter_document(session_id, doc_index, user_id=uid)
@@ -5416,7 +5408,7 @@ def delete_matter_document_endpoint(
 @app.delete("/sessions/{session_id}")
 def delete_session_endpoint(session_id: str, user: CurrentUser = Depends(get_current_user)):
     uid = str(user.id)
-    org_id = _org_or_none(user)
+    _org_or_none(user)
     if not persistence.delete_session(session_id, user_id=uid):
         raise HTTPException(404, "session_id not found")
     # Drop the Matter's pgvector index too — it lives in Postgres, which

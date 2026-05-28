@@ -82,17 +82,16 @@ os.environ.setdefault("DB_PASSWORD", "unit-test-db-password")
 # ``error`` filter stays fully in force for actual test execution —
 # this only neutralises the one known import-time decorator warning,
 # rather than weakening the gate project-wide.
+import contextlib  # noqa: E402
 import warnings  # noqa: E402
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore", DeprecationWarning)
-    try:
+    # If the import fails for a real reason (missing dep, etc.), let the
+    # individual test module surface it with a clear error rather than
+    # masking it here.
+    with contextlib.suppress(Exception):
         import ddiq_report  # noqa: F401 — cached for the test modules
-    except Exception:
-        # If the import fails for a real reason (missing dep, etc.),
-        # let the individual test module surface it with a clear error
-        # rather than masking it here.
-        pass
 
 
 # ── Fakes ────────────────────────────────────────────────────────────

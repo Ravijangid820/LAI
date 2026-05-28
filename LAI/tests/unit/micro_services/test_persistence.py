@@ -77,7 +77,7 @@ class TestComputeFingerprint:
 class TestFindExistingReport:
     def test_returns_staged_row(self, fake_db) -> None:
         row = {"id": "r-1", "status": "done", "created_at": None, "started_at": None}
-        _, cur = fake_db(fetchone=row)
+        _, _cur = fake_db(fetchone=row)
         out = ddiq_report._find_existing_report("fp-abc", "user-1")
         assert out == row
 
@@ -169,7 +169,7 @@ class TestPersistReportJsonb:
         )
 
     def test_upsert_writes_report_data(self, fake_db) -> None:
-        conn, cur = fake_db()
+        _conn, cur = fake_db()
         ddiq_report._persist_report_jsonb(
             "r-1",
             "Proj",

@@ -44,19 +44,24 @@ def test_ragcontract_with_corpus_only_still_generates():
 def test_processing_returns_progress_de(monkeypatch):
     _set_docs(monkeypatch, [{"status": "processing", "n_chunks": 0, "pages_done": 3, "pages_total": 10}])
     msg = sr._empty_grounding_guard("contract", [], [], "s", "u", "de")
-    assert msg and "wird gerade verarbeitet" in msg and "3/10" in msg
+    assert msg
+    assert "wird gerade verarbeitet" in msg
+    assert "3/10" in msg
 
 
 def test_processing_returns_progress_en(monkeypatch):
     _set_docs(monkeypatch, [{"status": "processing", "n_chunks": 0, "pages_done": 4, "pages_total": 10}])
     msg = sr._empty_grounding_guard("contract", [], [], "s", "u", "en")
-    assert msg and "still being processed" in msg and "4/10" in msg
+    assert msg
+    assert "still being processed" in msg
+    assert "4/10" in msg
 
 
 def test_queued_zero_chunks_is_processing(monkeypatch):
     _set_docs(monkeypatch, [{"status": "queued", "n_chunks": 0, "pages_done": 0, "pages_total": 0}])
     msg = sr._empty_grounding_guard("contract", [], [], "s", "u", "de")
-    assert msg and "verarbeitet" in msg
+    assert msg
+    assert "verarbeitet" in msg
     # no page-count parenthetical when total is unknown yet (the explanatory
     # "Seite für Seite" phrase is still present, but not "(Seite X/Y)")
     assert "(Seite" not in msg
@@ -72,14 +77,17 @@ def test_processing_takes_priority_over_failed(monkeypatch):
         ],
     )
     msg = sr._empty_grounding_guard("contract", [], [], "s", "u", "de")
-    assert msg and "verarbeitet" in msg and "2/9" in msg
+    assert msg
+    assert "verarbeitet" in msg
+    assert "2/9" in msg
 
 
 # ── 2. failed (and nothing usable) → honest failure + reason ─────────────
 def test_failed_status_returns_failure_with_reason_de(monkeypatch):
     _set_docs(monkeypatch, [{"status": "failed", "n_chunks": 0, "error": "pdftoppm render error"}])
     msg = sr._empty_grounding_guard("contract", [], [], "s", "u", "de")
-    assert msg and "konnte nicht verarbeitet werden" in msg
+    assert msg
+    assert "konnte nicht verarbeitet werden" in msg
     assert "pdftoppm render error" in msg
     assert "verarbeitet wird" not in msg  # not the processing wording
 
@@ -88,21 +96,26 @@ def test_done_but_zero_chunks_is_failure(monkeypatch):
     # the live "ALT F III" case: status done but extraction produced nothing
     _set_docs(monkeypatch, [{"status": "done", "n_chunks": 0, "pages_done": 21, "pages_total": 21}])
     msg = sr._empty_grounding_guard("contract", [], [], "s", "u", "en")
-    assert msg and "couldn’t process your document" in msg
+    assert msg
+    assert "couldn’t process your document" in msg
 
 
 def test_failed_with_no_error_omits_reason(monkeypatch):
     _set_docs(monkeypatch, [{"status": "failed", "n_chunks": 0, "error": None}])
     msg = sr._empty_grounding_guard("contract", [], [], "s", "u", "de")
-    assert msg and "konnte nicht verarbeitet werden" in msg and "Grund:" not in msg
+    assert msg
+    assert "konnte nicht verarbeitet werden" in msg
+    assert "Grund:" not in msg
 
 
 # ── 3. usable docs exist but query found nothing → "no relevant passage" ──
 def test_indexed_with_chunks_returns_no_content(monkeypatch):
     _set_docs(monkeypatch, [{"status": "done", "n_chunks": 72, "pages_done": 10, "pages_total": 10}])
     msg = sr._empty_grounding_guard("contract", [], [], "s", "u", "de")
-    assert msg and "keine relevante" in msg
-    assert "verarbeitet" not in msg and "konnte nicht" not in msg
+    assert msg
+    assert "keine relevante" in msg
+    assert "verarbeitet" not in msg
+    assert "konnte nicht" not in msg
 
 
 def test_usable_doc_plus_failed_doc_prefers_no_content(monkeypatch):
@@ -116,5 +129,6 @@ def test_usable_doc_plus_failed_doc_prefers_no_content(monkeypatch):
         ],
     )
     msg = sr._empty_grounding_guard("rag+contract", [], [], "s", "u", "de")
-    assert msg and "keine relevante" in msg
+    assert msg
+    assert "keine relevante" in msg
     assert "konnte nicht verarbeitet" not in msg

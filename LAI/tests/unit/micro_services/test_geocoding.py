@@ -115,7 +115,7 @@ class TestAlkisQueryParcels:
         assert out == cached
 
     def test_cache_miss_calls_connector_and_writes(self, monkeypatch, fake_db) -> None:
-        conn, cur = fake_db(fetchone=None)
+        _conn, cur = fake_db(fetchone=None)
         parcels = [{"parcelNumber": "99/1", "gemarkung": "Lamstedt"}]
         monkeypatch.setattr(
             ddiq_report._ALKIS_CLIENT,

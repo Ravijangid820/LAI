@@ -9,6 +9,7 @@ already saturates a Pro 6000 with reasoning enabled.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import time
@@ -443,7 +444,9 @@ def analyze(
     def _emit(step: str, current: int = 0, total: int = 0, percent: float = 0.0) -> None:
         if on_progress is None:
             return
-        try:
+        # Progress is observability only — never let a callback bug take down
+        # the analysis.
+        with contextlib.suppress(Exception):
             on_progress(
                 {
                     "step": step,
@@ -453,10 +456,6 @@ def analyze(
                     "percent": max(0.0, min(1.0, percent)),
                 }
             )
-        except Exception:
-            # Progress is observability only — never let a callback bug
-            # take down the analysis.
-            pass
 
     # Rough percent budget — tuned to reality (per-clause thinking pass
     # dominates, ~70% of total wall time on a 10-clause contract):

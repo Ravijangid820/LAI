@@ -93,7 +93,9 @@ def test_get_matter_document_by_index(db) -> None:
     persistence.add_matter_document(SID, filename="a.pdf", doc_text="A", n_pages=1, upload_ext=".pdf", user_id=UID)
     persistence.add_matter_document(SID, filename="b.pdf", doc_text="B", n_pages=9, upload_ext=".pdf", user_id=UID)
     g = persistence.get_matter_document(SID, 2, user_id=UID)
-    assert g and g["filename"] == "b.pdf" and g["n_pages"] == 9
+    assert g
+    assert g["filename"] == "b.pdf"
+    assert g["n_pages"] == 9
     assert persistence.get_matter_document(SID, 99, user_id=UID) is None
 
 
@@ -104,7 +106,8 @@ def test_file_path_roundtrip(db) -> None:
     )
     persistence.save_matter_upload(SID, d["id"], b"%PDF-1.4 fake", "permit.pdf")
     p = persistence.matter_document_path(SID, d["id"], ".pdf")
-    assert p is not None and p.exists()
+    assert p is not None
+    assert p.exists()
     # ext-agnostic lookup also finds it
     assert persistence.matter_document_path(SID, d["id"]) is not None
 

@@ -15,7 +15,7 @@ import os
 import signal
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any
 
 from lai.core.config import get_settings
@@ -451,7 +451,7 @@ def run_step2(args):
             pending_count = 0
             return
 
-        with _db_transaction() as (conn, cur):
+        with _db_transaction() as (_conn, cur):
             inserted = execute_values(
                 cur,
                 """INSERT INTO parent_chunks
@@ -614,7 +614,7 @@ def run_step3(args):
         )
 
         # Write to both tables in one transaction per batch
-        with _db_transaction() as (conn, cur):
+        with _db_transaction() as (_conn, cur):
             history_rows = []
             for parent_id, (domains, raw_response) in results.items():
                 # Update parent_chunks.domain (latest value)
@@ -1019,10 +1019,8 @@ def run_step6(args):
         existing = sorted(backup_dir.glob("child_embeddings_*.npz"))
         if existing:
             last_name = existing[-1].stem
-            try:
+            with suppress(ValueError):
                 backup_batch_idx = int(last_name.rsplit("_", 1)[-1]) + 1
-            except ValueError:
-                pass
         logger.info(
             f"  Embedding backup -> {backup_dir} (starting batch #{backup_batch_idx}, flush every {BACKUP_FLUSH_ROWS:,})"
         )
@@ -1122,7 +1120,9 @@ def run_step6(args):
             import struct
 
             pool = _get_db()  # patched to LocalDB
-            insert_rows = [(child_id, struct.pack(f"{len(emb)}f", *emb)) for child_id, emb in zip(ids, embeddings)]
+            insert_rows = [
+                (child_id, struct.pack(f"{len(emb)}f", *emb)) for child_id, emb in zip(ids, embeddings, strict=False)
+            ]
             pool.executemany(
                 "INSERT OR REPLACE INTO child_embeddings (child_id, embedding) VALUES (?, ?)",
                 insert_rows,
@@ -1139,7 +1139,7 @@ def run_step6(args):
             conn = pool.getconn()
             try:
                 with conn.cursor() as cur:
-                    for child_id, emb, text in zip(ids, embeddings, texts):
+                    for child_id, emb, text in zip(ids, embeddings, texts, strict=False):
                         cur.execute(
                             """
                             UPDATE child_chunks

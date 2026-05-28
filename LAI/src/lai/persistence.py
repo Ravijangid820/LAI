@@ -27,6 +27,7 @@ Public API
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -465,10 +466,8 @@ def _delete_session_files(sid: str) -> None:
         return
     try:
         for p in Path(base).glob(f"{sid}*"):
-            try:
+            with contextlib.suppress(OSError):
                 p.unlink()
-            except OSError:
-                pass
     except OSError:
         pass
 
@@ -1300,10 +1299,8 @@ def save_matter_upload(session_id: str, doc_id: int, content: bytes, filename: s
     with open(target, "wb") as f:
         f.write(content)
         f.flush()
-        try:
+        with contextlib.suppress(OSError):
             os.fsync(f.fileno())
-        except OSError:
-            pass
     actual = target.stat().st_size
     if actual != len(content):
         # Surface partial writes loudly. The caller (`POST /upload` and

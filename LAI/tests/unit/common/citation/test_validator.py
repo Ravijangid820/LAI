@@ -225,7 +225,8 @@ class TestManifestCitedDocumentsSurvive:
         fixed = validate_citations(answer, retrieved_only | all_real_docs)
         assert fixed.fabricated == ()
         assert "(unbelegt)" not in fixed.text
-        assert "[M-3]" in fixed.text and "[M-5]" in fixed.text
+        assert "[M-3]" in fixed.text
+        assert "[M-5]" in fixed.text
 
     @pytest.mark.unit
     def test_fabricated_handles_still_stripped(self) -> None:

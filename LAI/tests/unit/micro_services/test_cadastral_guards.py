@@ -43,7 +43,7 @@ class TestFilterOutlierPoints:
 
     def test_drops_far_outlier(self) -> None:
         outlier = (54.62, 8.90)  # ~110 km north
-        kept = cp.filter_outlier_points(self._cluster() + [outlier])
+        kept = cp.filter_outlier_points([*self._cluster(), outlier])
         assert outlier not in kept
         assert len(kept) == 7
 
@@ -124,4 +124,5 @@ class TestAlkisCircuitBreaker:
 
         pipe = cp.CadastralPipeline(alkis_query_fn=failing)
         parcels = pipe._step2_collect_parcels(self._park_area(), "", [])
-        assert calls["n"] == 0 and parcels == []
+        assert calls["n"] == 0
+        assert parcels == []
