@@ -41,6 +41,15 @@ numpy==2.4.6
 # ── Spatial Operations (cadastral pipeline) ──
 shapely==2.1.2
 
+# ── DOCX export (GET /ddiq/report/{id}/export.docx) ──
+# Used directly by ddiq.docx_export to render the report as a Word
+# deliverable. NOT a lai.common transitive dep, so it has to be listed
+# here explicitly — the image installs `lai` with --no-deps, so the
+# python-docx floor in pyproject.toml never reaches this container.
+# Matches pyproject.toml's `python-docx>=1.1.0`; pinned to the host venv's
+# working version.
+python-docx==1.2.0
+
 # ── lai.common transitive runtime deps ──
 # Listed explicitly so the container can pip-install `lai` with --no-deps,
 # avoiding the heavy unused parts of lai's full dep tree (vllm, docling,
