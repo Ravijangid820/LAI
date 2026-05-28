@@ -875,10 +875,29 @@ class CadastralPipeline:
         project_area_polygon: list[list[float]] = None,
         location: str = "",
         project_center: tuple[float, float] = None,
+        progress=None,
     ) -> PipelineResult:
-        """Execute the full 13-step pipeline."""
+        """Execute the full 13-step pipeline.
+
+        ``progress`` (optional) is called with a float in [0, 1] after each
+        step group completes, so a caller can advance a progress bar through
+        the pipeline's wall time instead of leaving it frozen for the whole
+        run. Any exception from the callback is swallowed — progress is
+        cosmetic and must never break classification.
+        """
         timings = {}
         wea_statuses = wea_statuses or []
+
+        _STEPS = 11  # number of _tick() points below; keep in sync if steps change
+        _done = [0]
+
+        def _tick():
+            _done[0] += 1
+            if progress is not None:
+                try:
+                    progress(min(_done[0] / _STEPS, 1.0))
+                except Exception:  # noqa: BLE001 — progress is cosmetic, never fatal
+                    pass
 
         # Step 1: Define Project Area
         t = time.time()
@@ -887,6 +906,7 @@ class CadastralPipeline:
         )
         timings["step1_project_area_s"] = round(time.time() - t, 2)
         logger.info(f"Step 1: Project area defined via {project_area.source}, area={project_area.area_km2} km2")
+        _tick()
 
         # Step 2: Collect Cadastral Parcels
         t = time.time()
@@ -894,12 +914,14 @@ class CadastralPipeline:
         raw_parcels = self._step2_collect_parcels(project_area, bundesland, wea_statuses)
         timings["step2_collect_parcels_s"] = round(time.time() - t, 2)
         logger.info(f"Step 2: Collected {len(raw_parcels)} raw parcels")
+        _tick()
 
         # Step 3: Filter Relevant Parcels
         t = time.time()
         relevant_parcels = self._step3_filter_relevant(raw_parcels, project_area)
         timings["step3_filter_s"] = round(time.time() - t, 2)
         logger.info(f"Step 3: {len(relevant_parcels)} parcels within project area")
+        _tick()
 
         # Steps 4-5: Extract and Build Contract Dataset
         t = time.time()
@@ -907,12 +929,14 @@ class CadastralPipeline:
         timings["step4_5_contracts_s"] = round(time.time() - t, 2)
         total_refs = sum(len(c.referenced_parcels) for c in contracts)
         logger.info(f"Steps 4-5: {len(contracts)} contracts, {total_refs} parcel references")
+        _tick()
 
         # Step 6: Match Contracts to Parcels
         t = time.time()
         secured, fuzzy_matches = self._step6_match(relevant_parcels, contracts, wea_statuses)
         timings["step6_match_s"] = round(time.time() - t, 2)
         logger.info(f"Step 6: {len(secured)} exact, {len(fuzzy_matches)} fuzzy matches")
+        _tick()
 
         # Step 7: Identify Unsecured
         t = time.time()
@@ -921,12 +945,14 @@ class CadastralPipeline:
         unsecured = self._step7_unsecured(relevant_parcels, secured_ids, fuzzy_ids)
         timings["step7_unsecured_s"] = round(time.time() - t, 2)
         logger.info(f"Step 7: {len(unsecured)} unsecured parcels")
+        _tick()
 
         # Step 8: Handle Ambiguity
         t = time.time()
         uncertain = self._step8_ambiguity(fuzzy_matches)
         timings["step8_ambiguity_s"] = round(time.time() - t, 2)
         logger.info(f"Step 8: {len(uncertain)} uncertain parcels")
+        _tick()
 
         # Steps 9-11: Classify All + Colors
         t = time.time()
@@ -936,20 +962,24 @@ class CadastralPipeline:
         red = sum(1 for p in classified if p.color == "red")
         yellow = sum(1 for p in classified if p.color == "yellow")
         logger.info(f"Steps 9-11: {len(classified)} total — green={green}, red={red}, yellow={yellow}")
+        _tick()
 
         # Clearance Zones
         clearance_zones = build_clearance_zones(wea_statuses, bundesland or "")
+        _tick()
 
         # Step 12: Generate GeoJSON
         t = time.time()
         geojson = generate_geojson(classified, project_area, wea_statuses, clearance_zones)
         timings["step12_geojson_s"] = round(time.time() - t, 2)
+        _tick()
 
         # Step 13: Validate
         t = time.time()
         validation = validate_results(classified, contracts, project_area, full_text)
         timings["step13_validate_s"] = round(time.time() - t, 2)
         logger.info(f"Step 13: Validation {'PASSED' if validation.passed else 'FAILED'} ({len(validation.issues)} issues)")
+        _tick()
 
         return PipelineResult(
             project_area=project_area,

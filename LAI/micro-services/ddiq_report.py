@@ -2508,6 +2508,11 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
         llm_json_fn=llm_json,
         detect_bundesland_fn=detect_bundesland,
     )
+    # Map the pipeline's internal 0..1 completion into the report band so the
+    # bar advances through the (multi-minute) 13-step run instead of freezing
+    # at 78%. Leaves 0.84→0.85 for the fast post-pipeline reconciliation.
+    def _cad_progress(frac):
+        progress("cadastral", round(0.78 + (0.84 - 0.78) * frac, 3))
     pipeline_result = pipeline.run(
         doc_ids=req.document_ids,
         full_text=full_text,
@@ -2515,6 +2520,7 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
         project_area_polygon=None,  # Will auto-generate from WEA hull
         location=ploc,
         project_center=pc,
+        progress=_cad_progress,
     )
     T["cadastral_pipeline_s"] = round(time.time()-t, 2)
 
