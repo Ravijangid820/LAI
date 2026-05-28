@@ -30,8 +30,10 @@ unit-test cheaply. The HTTP fetch sits in
 from __future__ import annotations
 
 import re
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ET  # nosec B405 — Element type + ParseError only; all parsing uses defusedxml below
 from typing import Any
+
+from defusedxml.ElementTree import fromstring as _safe_fromstring
 
 __all__ = [
     "ParcelDict",
@@ -271,7 +273,7 @@ def parse_alkis_xml(
         return []
     parcels: list[ParcelDict] = []
     try:
-        root = ET.fromstring(xml_text)
+        root = _safe_fromstring(xml_text)
     except ET.ParseError:
         # Malformed XML — return empty so the caller can fall back
         # cleanly. The caller logs the underlying bytes.

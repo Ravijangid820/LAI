@@ -57,6 +57,9 @@ dependencies = [
     "tenacity>=9.0.0",
     # Utilities
     "numpy>=1.26.0",
+    # Secure XML parsing for external ALKIS WFS responses (XXE / billion-laughs
+    # defence) — used by lai.common.connectors._parsers.
+    "defusedxml>=0.7.1",
     # NOTE: vllm is intentionally NOT a runtime dep of this package.
     # The LAI runtime serves models via the ``vllm/vllm-openai`` Docker
     # image — the authoritative serving path — so the Python code never
@@ -229,6 +232,12 @@ module = [
     "passlib.*",
     "jose.*",
     "sse_starlette.*",
+    "asyncpg",
+    "asyncpg.*",
+    "psycopg2",
+    "psycopg2.*",
+    "defusedxml",
+    "defusedxml.*",
 ]
 ignore_missing_imports = true
 
@@ -293,4 +302,11 @@ directory = ".coverage_html"
 exclude_dirs = ["tests", "scripts/archive", ".venv", "build", "dist"]
 skips = [
     "B101",  # asserts are fine in production code we control
+    # B608 (SQL built via string formatting): audited false-positive here.
+    # Every auth SQL statement lives in the asyncpg repositories
+    # (src/lai/common/auth/repository.py), passes ALL values through
+    # parameterized $1..$n placeholders, and only ever f-string-interpolates
+    # trusted ``Final[str]`` column-list constants (_USER_COLS / _ORG_COLS /
+    # _INVITATION_COLS) — never user input. Reviewed 2026-05-28.
+    "B608",
 ]

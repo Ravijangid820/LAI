@@ -59,7 +59,7 @@ class PasswordHasher:
             The bcrypt hash string (``$2b$<rounds>$<salt><digest>``),
             suitable for storage in ``users.password_hash``.
         """
-        return self._context.hash(plain)
+        return str(self._context.hash(plain))
 
     def verify(self, plain: str, hashed: str) -> bool:
         """Constant-time-ish verification of plain against an existing hash.
@@ -76,7 +76,7 @@ class PasswordHasher:
             ``True`` if the password matches the hash, ``False`` otherwise.
         """
         try:
-            return self._context.verify(plain, hashed)
+            return bool(self._context.verify(plain, hashed))
         except (ValueError, TypeError):
             # Malformed or unrecognised hash payload. Treat as a miss;
             # never raise into the auth router — that would let an
@@ -97,4 +97,4 @@ class PasswordHasher:
         Returns:
             ``True`` if a re-hash with the current cost is recommended.
         """
-        return self._context.needs_update(hashed)
+        return bool(self._context.needs_update(hashed))

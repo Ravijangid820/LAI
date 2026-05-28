@@ -50,6 +50,9 @@ tenacity==9.1.4
 structlog==25.5.0
 pydantic-settings==2.14.1
 prometheus-client==0.25.0
+# Secure XML parsing for ALKIS WFS responses (lai.common.connectors._parsers);
+# the cadastral pipeline parses external WFS XML in this container.
+defusedxml==0.7.1
 # Auth subsystem (lai.common.auth + lai.api.auth_router + lai.api.email)
 # added in commits c15f2f1 and 85008f1. Required by ``import ddiq_report``
 # (which now pulls in auth_dep) and ``import api`` (which mounts the

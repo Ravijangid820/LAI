@@ -14,6 +14,7 @@ query params, or request bodies.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
@@ -55,7 +56,7 @@ def _unauthorized(detail: str, *, expired: bool = False) -> HTTPException:
     )
 
 
-def build_get_current_user(issuer: TokenIssuer):
+def build_get_current_user(issuer: TokenIssuer) -> Callable[..., Awaitable[CurrentUser]]:
     """Build a request-scoped ``get_current_user`` dependency bound to ``issuer``.
 
     The :class:`TokenIssuer` carries the signing secret and lifetime

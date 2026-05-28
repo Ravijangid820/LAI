@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = ["RetrievalConfig"]
@@ -142,7 +142,7 @@ class RetrievalConfig(BaseSettings):
 
     @field_validator("pool_max_size")
     @classmethod
-    def _max_ge_min(cls, v: int, info) -> int:
+    def _max_ge_min(cls, v: int, info: ValidationInfo) -> int:
         """``pool_max_size`` must be >= ``pool_min_size``."""
         pool_min = info.data.get("pool_min_size", 1)
         if v < pool_min:

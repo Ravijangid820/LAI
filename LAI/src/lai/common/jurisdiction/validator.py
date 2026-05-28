@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 
 __all__ = [
     "BUNDESLAND_BBOX",
@@ -227,7 +227,7 @@ def detect_bundesland(text: str) -> str | None:
 # Adding more rules is mechanical — each one prevents a recurring
 # false-positive citation.
 
-BUNDESLAND_SPECIFIC_RULES: Final[list[dict]] = [
+BUNDESLAND_SPECIFIC_RULES: Final[list[dict[str, Any]]] = [
     {
         "key": "bayern",
         "label": "Bayerns 10H-Regel (Art. 82 BayBO)",

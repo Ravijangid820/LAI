@@ -181,7 +181,7 @@ class UserRepository:
         state and stop seeing the firm's data. Their authored rows
         (``created_by``) stay with the firm.
         """
-        res = await conn.execute(
+        res: str = await conn.execute(
             "UPDATE users SET org_id = $1, updated_at = NOW() WHERE id = $2",
             org_id,
             user_id,
@@ -197,7 +197,7 @@ class UserRepository:
         """Update a user's role. Caller is responsible for authorisation
         (only a super-admin may grant ``super_admin``; a firm admin may
         only promote within their own org and never beyond ``admin``)."""
-        res = await conn.execute(
+        res: str = await conn.execute(
             "UPDATE users SET role = $1, updated_at = NOW() WHERE id = $2",
             role,
             user_id,
@@ -598,7 +598,7 @@ class OrganizationRepository:
         Returns ``True`` when a row was updated (an unknown ``org_id``
         returns ``False`` and the route maps to 404 — never 403 — to
         avoid leaking org existence)."""
-        res = await conn.execute(
+        res: str = await conn.execute(
             "UPDATE organizations SET name = $1, updated_at = NOW() WHERE id = $2",
             name,
             org_id,
@@ -781,7 +781,7 @@ class InvitationRepository:
         admin cannot revoke another firm's invitation via id-guessing —
         the WHERE clause makes a cross-firm revoke a no-op (route maps
         the False return to a 404, never 403)."""
-        res = await conn.execute(
+        res: str = await conn.execute(
             "DELETE FROM org_invitations WHERE id = $1 AND org_id = $2 AND accepted_at IS NULL",
             invitation_id,
             org_id,
