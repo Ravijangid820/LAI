@@ -63,8 +63,11 @@ and [`resume_step6.sh`](../scripts/ops/resume_step6.sh).
 ## Part B — The chat service (`serve_rag`, :18000)
 
 `lai.api.serve_rag` is a FastAPI host process. **At startup** it loads the
-~8 M child embeddings into RAM (~127 GB) as a NumPy float32 matrix, and loads
-the Qwen3-Reranker-8B cross-encoder onto the GPU. Then it serves three flows.
+Qwen3-Reranker-8B cross-encoder onto the GPU and wires up retrieval. Retrieval
+now runs through **`lai.common.retrieval`** — pgvector + HNSW ANN over
+`corpus_child_chunks` (the Track-B migration's table) — so it no longer loads
+the old ~144 GB in-RAM NumPy matrix at boot (that path survives in
+`lai.search.eval` for offline recall evals only). Then it serves these flows.
 
 ### B1 — Uploading a document (`POST /upload`)
 
@@ -198,17 +201,24 @@ timeline, cross-doc findings, Grundbuch checks, the Rückbau bond, and a
 ```
 
 Both backends are stateless-ish front-ends over the **same two model servers**
-(embedding + analyzer LLM) and the **same PostgreSQL**. `serve_rag` additionally
-holds the big in-RAM embedding matrix and the in-process reranker; DDiQ reaches
-the reranker over HTTP. Both consume `lai.common` primitives so bug fixes land
-once across both codebases.
+(embedding + analyzer LLM) and the **same PostgreSQL**. `serve_rag` retrieves via
+`lai.common.retrieval` (pgvector/HNSW) and holds the in-process reranker; DDiQ
+reaches the reranker over HTTP. Both consume `lai.common` primitives so bug
+fixes land once across both codebases.
 
-**Track B — corpus → pgvector migration:** `scripts/ops/migrate_corpus.py`
-streams the SQLite corpus into pgvector with a `topup` daemon that keeps the
-two stores in sync as Step 6 emits new embeddings. `serve_rag` still uses the
-in-RAM SQLite matrix today; the switch to pgvector retrieval is a separate
-commit after the HNSW index finishes building (per
-[`DEMO_STATUS.md`](DEMO_STATUS.md)).
+**Track B — corpus → pgvector migration (done):** `scripts/ops/migrate_corpus.py`
+loaded the corpus into `corpus_child_chunks`, built the HNSW index, and runs a
+`topup` daemon that streams new Step-6 embeddings in. **`serve_rag` now retrieves
+from pgvector** via `lai.common.retrieval` — the in-RAM matrix is retired from the
+live path.
+
+**DOCX export + resumable upload:** DDiQ findings export to a client-deliverable
+Word doc (`GET /ddiq/report/{id}/export.docx`); VDR-scale uploads use a tus 1.0
+resumable server (`lai.api.upload_tus`).
+
+**Auth, org tenancy & sharing:** `auth_router` (JWT), `admin_router` (orgs,
+super-admin, invitations — migrations 002–004), and `share_router` (per-session
+view-only sharing — migration 005).
 
 **Observability:** both backends expose `/metrics` for Prometheus, scraped by
 the stack at [`infra/monitoring/`](../infra/monitoring/) (`docker compose -f

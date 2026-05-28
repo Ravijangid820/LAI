@@ -13,25 +13,28 @@ Each subpackage is one **domain** with its own `README.md`; ownership is in
 ```
 LAI/
 ├── src/lai/                      # Installable package (`lai`)
-│   ├── common/                   # Strict-gated shared primitives (the v1 foundation)
+│   ├── common/                   # Strict-gated shared primitives (the foundation)
 │   │   ├── llm/                  # LlmClient (async + sync), strip_think, salvage_json, metrics
 │   │   ├── embedding/            # EmbeddingClient + sync façade
 │   │   ├── reranker/             # RerankerClient (TEI /rerank)
+│   │   ├── retrieval/            # RetrievalClient — pgvector/HNSW (Track B); serve_rag's live retriever
 │   │   ├── pdf/                  # PdfExtractor with OCR fallback
 │   │   ├── chunk/                # German-legal-aware Chunker
 │   │   ├── citation/             # Extract + validate [C-n]/[M-n] handles (strips fabricated)
 │   │   ├── jurisdiction/         # Bundesland detection + JurisdictionWarning
+│   │   ├── connectors/          # NominatimClient (geocode) + AlkisClient (cadastral WFS), secure XML
 │   │   └── auth/                 # JWT auth + tenant isolation
-│   ├── api/                      # serve_rag.py (chat :18000) + auth_router + metrics
-│   ├── search/                   # eval.py — retrieval kernel (Corpus, dense + BM25 + RRF, Reranker)
+│   ├── api/                      # serve_rag.py (:18000) + auth_router + admin_router
+│   │                            #   + share_router + upload_tus (resumable) + metrics + email
+│   ├── search/                   # eval.py — recall/RAG eval harness (legacy in-RAM retriever)
 │   ├── analyzer/                 # Qwen3.6-27B contract analyzer (playbooks, prompts, schema)
 │   ├── pipeline/                 # Offline 6-step corpus build (CLI)
 │   └── core/                     # Config, constants, logging, utils, exceptions
 │   #
-│   # Removed on 2026-05-15 (commit 8431797): auth/, documents/, extraction/,
+│   # Removed on 2026-05-15 (commit 8431797): old auth/, documents/, extraction/,
 │   # generation/, infra/, api/main.py, api/pipeline.py — unwired FastAPI scaffolding.
-│   # Capabilities migrated into lai.common; retrieval/document services return as
-│   # `lai.retrieval` in v1.1. See src/lai/README.md.
+│   # Capabilities migrated into lai.common; the promised retrieval package shipped
+│   # as lai.common.retrieval (pgvector/HNSW). See src/lai/README.md.
 │
 ├── micro-services/               # DDiQ microservice (lai-backend, :18001, Docker)
 │   ├── api.py                    # FastAPI app with the /ddiq/* routes

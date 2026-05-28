@@ -90,21 +90,23 @@ ship. See [`src/lai/README.md`](../src/lai/README.md) for the canonical map.
 │   │   │   ├── llm/                  # LlmClient (async+sync), strip_think, salvage_json, metrics
 │   │   │   ├── embedding/            # EmbeddingClient + sync façade
 │   │   │   ├── reranker/             # RerankerClient (TEI /rerank)
+│   │   │   ├── retrieval/            # RetrievalClient — pgvector/HNSW (Track B); serve_rag's live retriever
 │   │   │   ├── pdf/                  # PdfExtractor + OCR fallback
 │   │   │   ├── chunk/                # German-legal-aware Chunker
 │   │   │   ├── citation/             # [C-n]/[M-n] extract + validate (strips fabricated)
 │   │   │   ├── jurisdiction/         # Bundesland detection + JurisdictionWarning
+│   │   │   ├── connectors/           # NominatimClient (geocode) + AlkisClient (cadastral WFS)
 │   │   │   └── auth/                 # JWT auth + tenant isolation
-│   │   ├── api/                      # serve_rag.py (chat backend :18000) + auth_router + metrics
-│   │   ├── search/                   # eval.py — retrieval kernel (Corpus, dense+BM25+RRF, Reranker)
+│   │   ├── api/                      # serve_rag.py (:18000) + auth_router + admin_router
+│   │   │                            #   + share_router + upload_tus + metrics + email
+│   │   ├── search/                   # eval.py — recall/RAG eval harness (legacy in-RAM retriever)
 │   │   ├── analyzer/                 # Qwen3.6-27B contract analyzer (playbooks, prompts, schema)
 │   │   ├── pipeline/                 # 6-step corpus build (`python -m lai.pipeline.cli`)
 │   │   └── core/                     # Config, logging, exceptions, constants
 │   │
-│   │   (Deleted on 2026-05-15: auth/, documents/, extraction/, generation/, infra/, and
-│   │    api/main.py + api/pipeline.py — unwired FastAPI scaffolding that never talked to
-│   │    the live corpus. Capabilities migrated into lai.common; equivalent retrieval/
-│   │    document services return as `lai.retrieval` in v1.1.)
+│   │   (Deleted on 2026-05-15: old auth/, documents/, extraction/, generation/, infra/, and
+│   │    api/main.py + api/pipeline.py — unwired FastAPI scaffolding. Capabilities migrated
+│   │    into lai.common; the promised retrieval package shipped as lai.common.retrieval.)
 │   │
 │   ├── micro-services/               # DDiQ due-diligence report service (:18001, Docker)
 │   ├── infra/monitoring/             # Prometheus + Grafana stack (9-panel dashboard)
@@ -156,11 +158,11 @@ Authoritative ownership is declared in [`.github/CODEOWNERS`](../../.github/CODE
 
 | Area | Role | What You Touch |
 |---------|-------|---------------|
-| `lai.common` (all subpackages) | platform/foundation | Strict-gated primitives — every new feature usually starts here |
+| `lai.common` (all subpackages) | platform/foundation | Strict-gated primitives — every new feature usually starts here. Incl. `retrieval/` (pgvector) + `connectors/` (Nominatim/ALKIS) |
 | `lai.pipeline` | data-pipeline | The 6-step corpus build; `python -m lai.pipeline.cli` |
-| `lai.search` | retrieval | Retrieval kernel (`eval.py`) — dense+BM25+RRF+Reranker; `lai.retrieval` (v1.1) |
+| `lai.search` | retrieval | `eval.py` recall/RAG eval harness; live retrieval is now `lai.common.retrieval` (pgvector) |
 | `lai.analyzer` | contract-analyzer | Qwen3.6-27B contract analyzer — playbooks, prompts, schema |
-| `lai.api` | api / chat | `serve_rag.py`, `auth_router.py`, `/metrics`, `/feedback`, `/query/stream` |
+| `lai.api` | api / chat | `serve_rag.py`, `auth_router`, `admin_router`, `share_router`, `upload_tus`, `/metrics`, `/feedback`, `/query/stream` |
 | `lai.core` | platform | Config, logging, exceptions, constants |
 | `micro-services/` | ddiq | DDiQ due-diligence report service |
 | `infra/monitoring/` | platform | Prometheus + Grafana stack |
@@ -233,9 +235,12 @@ microservice on `:18001`). Below is the surface area as of the v1 demo build.
 | `POST` | `/sessions/{id}/messages` | Append a user/assistant message |
 | `PATCH`| `/sessions/{id}` | Set a user-facing title (rename) |
 | `DELETE`| `/sessions/{id}` | Delete a session |
-| `POST` | `/auth/login`, `/auth/register`, `/auth/me` | JWT auth (via `auth_router`). Tenant isolation is enforced per-request. |
+| `POST` | `/auth/login`, `/auth/register`, `/auth/me` | JWT auth (via `auth_router`). Tenant isolation enforced per-request. |
+| `*`    | `/admin/*` | Org + super-admin endpoints (`admin_router`; org tenancy, invitations — migrations 002–004) |
+| `*`    | `/share/*` | Per-session view-only sharing (`share_router`; resource shares — migration 005) |
+| `POST` | `/upload` (tus 1.0) | Resumable upload server (`upload_tus`) for VDR-scale documents |
 | `GET`  | `/metrics` | Prometheus instrumentation (request latency, token usage, citation-validation counters) — scraped by `infra/monitoring/` |
-| `GET`  | `/health` | Liveness |
+| `GET`  | `/health` | Liveness — reports `loaded`, `retrieval_backend` (pgvector), `retrieval_ready` |
 
 ### Runtime: lai-backend / DDiQ microservice (`:18001`) — multi-doc due-diligence
 
@@ -247,14 +252,16 @@ microservice on `:18001`). Below is the surface area as of the v1 demo build.
 | `POST` | `/ddiq/report/generate/async` | **Preferred.** Returns `{report_id, status:"queued", cached?}` immediately; backend executor runs the pipeline. Request-fingerprint dedup (sorted doc_ids + preset + project_name) returns the cached row instantly when matched. |
 | `GET`  | `/ddiq/report/{id}/status` | Cheap status poll (status, step, percent, error) |
 | `GET`  | `/ddiq/report/{id}` | Full report payload (sections, WEAs, parcels, findings, timeline, crossDocFindings, grundbuchChecks, rueckbauBond, geojson) |
+| `GET`  | `/ddiq/report/{id}/export.docx` | DOCX export of findings — client-deliverable (placeholders for firm letterhead) |
 | `GET`  | `/ddiq/report/{id}/geojson` | GeoJSON FeatureCollection for QGIS / ArcGIS / MapBox |
+| `DELETE`| `/ddiq/documents/{id}` | Remove an uploaded DDiQ document |
 | `GET`  | `/ddiq/reports?limit=N` | Lightweight summary list for the Past Reports browser (no full report_data) |
 | `DELETE`| `/ddiq/report/{id}` | Hard-delete a report and cascade through `ddiq_classified_parcels` / `ddiq_contracts` / `ddiq_project_areas` in one transaction |
 | `GET`  | `/ddiq/config/map-tiles` | Map tile layer config for the frontend Leaflet map |
 
-> **Auth status (2026-05-18):** JWT auth + tenant isolation are built (`lai.common.auth`, `api/auth_router.py`, `001_auth_and_tenant_isolation.up.sql`) and partly landed; per [`DEMO_STATUS.md`](DEMO_STATUS.md) some of this is still uncommitted on `v2-restructure` pending Sumit's commit. The frontend `AuthContext` is fake-auth in v0; the v1 demo build wires real JWT through.
+> **Auth status (v2.0.0):** JWT auth + tenant isolation are built and merged to `master` (`lai.common.auth`, `api/auth_router.py` + `admin_router.py` + `share_router.py`, migrations `001`–`005`). Org tenancy, super-admin, invitations and per-session sharing all landed in the v2 cut. Confirm per-route enforcement against the deep-review checklist before external production use.
 
-> **Deferred to v1.1.** A unified `lai.api.main` FastAPI app with explicit `/documents/*`, `/extraction/locations/*` routes was scoped but never wired — that scaffolding (`api/main.py`, `lai.auth`, `lai.documents`, `lai.extraction`, `lai.generation`, `lai.infra`) was **deleted in commit `8431797`** on 2026-05-15. The capabilities will return as `lai.retrieval` + related modules in the v1.1 unification work. See [`LAI_V1_STRATEGY.md`](LAI_V1_STRATEGY.md) §9.1 (out-of-v1) and [`src/lai/README.md`](../src/lai/README.md) "Removed during the v1 demo restructure".
+> **Deferred to v1.1 — now shipped.** The retrieval package that the dead-stack note (`8431797`, 2026-05-15) promised "returns in v1.1" shipped as **`lai.common.retrieval`** (pgvector/HNSW). A unified `lai.api.main` FastAPI app consolidating all routers is still the longer-term design target; today the runtime is `serve_rag.py` + its mounted routers. See [`docs/TECHNICAL_DOCUMENTATION.md`](TECHNICAL_DOCUMENTATION.md) for the current authoritative technical reference.
 
 ---
 

@@ -201,7 +201,8 @@ The frontend lives in its own repo as of v1.0.0:
   this `LAI/` directory; gitignored from this repo)
 
 ```bash
-# Backend (loads 127 GB embeddings + reranker + Qwen2.5-7B-Instruct, ~5-30 min cold start)
+# Backend (loads the Qwen3-Reranker-8B onto GPU + wires pgvector retrieval; ~30-60s cold start)
+# LLM is the remote Qwen3.6-27B analyzer (:8005); restart cleanly via scripts/ops/restart_serve_rag.sh
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m lai.api.serve_rag --port 18000
 
 # Frontend (separate repo)
@@ -298,42 +299,48 @@ Each subpackage is one **domain**; ownership is declared in
 
 ```
 src/lai/                  Installable domain-driven package (`lai`)
-  common/                 Shared production-grade primitives — the v1 foundation.
+  common/                 Shared production-grade primitives — the foundation.
                           Held to strict mypy + ruff + ≥85% coverage + bandit.
     llm/                    LlmClient (async + sync), strip_think, salvage_json
     embedding/              EmbeddingClient + sync façade
     reranker/               RerankerClient (TEI /rerank)
+    retrieval/              RetrievalClient — pgvector/HNSW corpus retrieval (Track B;
+                            supersedes the in-RAM matrix in search/eval.py)
     pdf/                    PdfExtractor with OCR fallback
     chunk/                  German-legal-aware Chunker
     citation/               Extract + validate [C-n]/[M-n] handles, strip fabricated ones
     jurisdiction/           Bundesland detection + JurisdictionWarning
-    auth/                   JWT auth + tenant isolation (Sumit's work)
+    connectors/             External registries — NominatimClient (geocode) + AlkisClient
+                            (cadastral WFS → Flurstück polygons); secure XML parsing
+    auth/                   JWT auth + tenant isolation
   pipeline/               Offline 6-step corpus build (`python -m lai.pipeline.cli`)
-  search/                 Retrieval kernel — eval.py (Corpus, dense + BM25 + RRF, Reranker)
+  search/                 eval.py — recall/RAG eval harness (the legacy in-RAM retriever)
   analyzer/               Qwen3.6-27B contract analyzer — playbooks, prompts, schema
-  api/                    serve_rag.py (the :18000 chat backend) + auth_router + metrics
+  api/                    serve_rag.py (:18000 chat backend) + auth_router + admin_router
+                          + share_router + upload_tus (resumable) + metrics + email
   core/                   Config, logging, exceptions, constants
 
-  (Deleted on 2026-05-15: auth/, documents/, extraction/, generation/, infra/, and
-   api/main.py + api/pipeline.py — unwired FastAPI scaffolding that never talked to
-   the live corpus. Capabilities moved into lai.common; equivalents will return in
-   a forthcoming `lai.retrieval` package as part of v1.1.)
+  (Deleted on 2026-05-15: the old auth/, documents/, extraction/, generation/, infra/
+   packages + api/main.py + api/pipeline.py — unwired FastAPI scaffolding. Their
+   capabilities now live in lai.common; the promised retrieval package shipped as
+   `lai.common.retrieval`.)
 
 micro-services/           DDiQ due-diligence report service (:18001, Docker)
 infra/monitoring/         Prometheus + Grafana stack — backend exposes /metrics
 scripts/
-  ops/                    Entry points — start/stop/status{,-host}.sh, resume_step5/6.sh,
-                          migrate_corpus.py (Track B), load_demo_matter.py
+  ops/                    Entry points — start/stop/status{,-host}.sh, restart_serve_rag.sh,
+                          resume_step5/6.sh, migrate_corpus.py (Track B), load_demo_matter.py
   eval/                   Eval & benchmark harnesses + golden_retrieval_sanity.py
-  db/migrations/          SQL migrations (auth + tenant isolation; corpus → pgvector)
+  db/migrations/          SQL migrations (001 auth+tenant, corpus→pgvector;
+                          002 org tenancy, 003 super-admin, 004 invitations, 005 shares)
   archive/                Completed one-off migrations, audits, pilots
 training/                 Model fine-tuning (separate lifecycle)
 tests/                    Unit / integration / e2e (strict-gated under lai.common)
-docs/                     Documentation (incl. adr/ and the v1 strategy/demo docs)
+docs/                     Documentation (incl. adr/ + the v1 strategy/demo/technical docs)
 demo-seed/                Curated demo matters (e.g. lamstedt/) — input to load_demo_matter.py
 ```
 
-## v1 features (as of 2026-05-18, see [`docs/DEMO_STATUS.md`](docs/DEMO_STATUS.md))
+## Runtime features (v2.0.0 — see [`docs/DEMO_STATUS.md`](docs/DEMO_STATUS.md) + [`docs/TECHNICAL_DOCUMENTATION.md`](docs/TECHNICAL_DOCUMENTATION.md))
 
 The chat backend (`lai.api.serve_rag`) wires the `lai.common` primitives into a
 production-grade Q&A flow:
@@ -341,10 +348,14 @@ production-grade Q&A flow:
 - **Streaming** answers via `POST /query/stream` (SSE) + non-streaming `POST /query`
 - **Citation rigor** — `[C-n]` / `[M-n]` handles in retrieved chunks; `lai.common.citation.validate_citations` strips fabricated handles post-LLM and rewrites the sentence to end `(unbelegt)`
 - **Jurisdictional sanity** — `lai.common.jurisdiction.check_jurisdiction` returns a `JurisdictionWarning` when the matter's Bundesland disagrees with citations
-- **Auth + tenant isolation** — JWT (`POST /auth/login`, `auth_router`), per-tenant scoping
+- **Auth, org tenancy & sharing** — JWT (`auth_router`), org/super-admin endpoints (`admin_router`, migrations 002–004), and per-session view-only sharing (`share_router`, migration 005)
+- **DOCX export** — `GET /ddiq/report/{id}/export.docx` for client-deliverable findings
+- **Resumable uploads** — tus 1.0 server (`upload_tus`) for VDR-scale documents
 - **Feedback** — `POST /feedback` lawyer thumbs-up/down, persisted, optimistic UI
 - **Observability** — `/metrics` Prometheus endpoint; 9-panel Grafana dashboard at [`infra/monitoring/`](infra/monitoring/)
 - **Bilingual EN ⇄ DE** — `target_language` on `/query`
+
+> **Retrieval backend:** the chat path now retrieves via `lai.common.retrieval` (pgvector + HNSW over `corpus_child_chunks`, loaded by the Track-B migration), not the legacy in-RAM numpy matrix — so cold-start no longer waits on a ~144 GB RAM load.
 
 ## Quality gate
 

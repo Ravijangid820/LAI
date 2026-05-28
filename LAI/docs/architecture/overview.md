@@ -47,18 +47,20 @@ foundation plus the runtime packages that actually ship.
 
 | Package | Owner | Purpose | Key files |
 |---|---|---|---|
-| `lai.common` | platform/foundation | Strict-gated shared primitives — held to `mypy --strict` + ≥85 % branch coverage + bandit. Building blocks every other module imports. | `llm/`, `embedding/`, `reranker/`, `pdf/`, `chunk/`, `citation/`, `jurisdiction/`, `auth/`, `exceptions.py` |
-| `lai.api` | api/chat | `serve_rag.py` — the :18000 chat backend; auth router; metrics endpoint. | `serve_rag.py`, `auth_router.py`, `metrics.py`, `email.py` |
-| `lai.search` | retrieval | Retrieval kernel — `Corpus`, dense + BM25 + RRF fusion, in-process `Reranker`. Used by `serve_rag` + eval scripts. | `eval.py` |
+| `lai.common` | platform/foundation | Strict-gated shared primitives — held to `mypy --strict` + ≥85 % branch coverage + bandit. Building blocks every other module imports. | `llm/`, `embedding/`, `reranker/`, `retrieval/`, `pdf/`, `chunk/`, `citation/`, `jurisdiction/`, `connectors/`, `auth/`, `exceptions.py` |
+| `lai.common.retrieval` | retrieval | `RetrievalClient` — pgvector + HNSW ANN over `corpus_child_chunks` (Track-B). **Supersedes** the in-RAM numpy matrix in `lai.search.eval`; this is what `serve_rag` uses. | `client.py`, `config.py`, `metrics.py` |
+| `lai.common.connectors` | ddiq/ingestion | External public-registry clients: `NominatimClient` (geocode) + `AlkisClient` (German cadastral INSPIRE WFS → Flurstück polygons), secure XML parsing (defusedxml). | `nominatim.py`, `alkis.py`, `_parsers.py`, `config.py`, `metrics.py` |
+| `lai.api` | api/chat | `serve_rag.py` (:18000 chat) + JWT auth, org/super-admin, per-session sharing, resumable upload, metrics, email. | `serve_rag.py`, `auth_router.py`, `admin_router.py`, `share_router.py`, `upload_tus.py`, `metrics.py`, `email.py` |
+| `lai.search` | retrieval | `eval.py` — recall/RAG eval harness (the legacy in-RAM `Corpus` + dense/BM25/RRF/Reranker). Live retrieval moved to `lai.common.retrieval`. | `eval.py` |
 | `lai.analyzer` | contract-analyzer | Qwen3.6-27B contract analyzer — playbooks, prompts, schema, cadastral NER, reconciler. | `pipeline.py`, `playbooks.py`, `prompts.py`, `schema.py`, `reconciler.py`, `cadastral_ner.py`, `llm_client.py` |
 | `lai.pipeline` | data-pipeline | Offline 6-step corpus build. | `cli.py`, `convert.py`, `chunk.py`, `classify.py`, `enrich.py`, `generate.py`, `embed.py`, `utils/` |
 | `lai.core` | platform | Config, constants, logging, utils, exceptions. Imported by `pipeline` and `analyzer`. | `config.py`, `models.py`, `logging.py`, `constants.py`, `utils.py`, `exceptions.py` |
 
-> **Removed on 2026-05-15** (commit `8431797`): `lai.auth`, `lai.documents`,
+> **Removed on 2026-05-15** (commit `8431797`): the old `lai.auth`, `lai.documents`,
 > `lai.extraction`, `lai.generation`, `lai.infra`, plus `api/main.py` +
-> `api/pipeline.py`. These were unwired FastAPI scaffolding that never talked
-> to the live corpus. Their capabilities migrated into `lai.common`;
-> retrieval/document services return as `lai.retrieval` in v1.1.
+> `api/pipeline.py` — unwired FastAPI scaffolding that never talked to the live
+> corpus. Capabilities migrated into `lai.common`; the promised retrieval package
+> shipped as **`lai.common.retrieval`** (pgvector/HNSW).
 
 ## RAG Pipeline (8 steps + CRAG loop)
 
@@ -127,7 +129,7 @@ All logging uses `lai.core.logging`:
 ```python
 from lai.core.logging import get_logger, trace_operation
 
-logger = get_logger("lai.retrieval.hybrid_search")
+logger = get_logger("lai.common.retrieval.client")
 
 async with trace_operation("hybrid_search", request_id) as ctx:
     results = await search(query)
