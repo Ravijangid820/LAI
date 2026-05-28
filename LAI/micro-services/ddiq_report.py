@@ -16,7 +16,7 @@ from typing import Optional
 from uuid import UUID
 from datetime import datetime, timezone
 import os, re, json, time, uuid, logging, math, hashlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import psycopg2
 import psycopg2.extras
 
@@ -1086,13 +1086,19 @@ green for verified-compliant, null when not enough information.""")
         return AusgabeblattRow(label=label, value="Could not extract", ampel="red", note=f"Error: {str(e)[:80]}")
 
 
-def analyze_section(doc_ids, section_id, max_workers=None):
+def analyze_section(doc_ids, section_id, max_workers=None, on_question_done=None):
     """Run the section's questions through evidence-aware RAG, concurrently.
 
     Each row carries the chunks the LLM cited so the frontend can show
-    'click to see source'. ``executor.map`` preserves question order, so
-    the row ordering is identical to the old sequential version.
-    ``max_workers=1`` forces sequential (tests / debugging).
+    'click to see source'. Rows are returned in question order regardless of
+    completion order (rebuilt by index), so the ordering is identical to the
+    old ``executor.map`` version. ``max_workers=1`` forces sequential
+    (tests / debugging).
+
+    ``on_question_done`` (when given) is invoked in the CALLING thread once
+    per completed question — it lets the caller advance the report progress
+    bar per question instead of per section, so the bar doesn't sit flat for
+    minutes during a single section.
     """
     questions = SECTION_QUESTIONS.get(section_id, [])
     title = _SECTION_TITLES.get(section_id, section_id.title())
@@ -1100,8 +1106,15 @@ def analyze_section(doc_ids, section_id, max_workers=None):
         return AusgabeblattSection(id=section_id, title=title, rows=[])
     workers = max_workers if max_workers is not None else _SECTION_WORKERS
     workers = max(1, min(workers, len(questions)))
+    rows_by_idx: dict[int, AusgabeblattRow] = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        rows = list(ex.map(lambda q: _analyze_one_question(doc_ids, q), questions))
+        futs = {ex.submit(_analyze_one_question, doc_ids, q): i
+                for i, q in enumerate(questions)}
+        for fut in as_completed(futs):
+            rows_by_idx[futs[fut]] = fut.result()
+            if on_question_done is not None:
+                on_question_done()
+    rows = [rows_by_idx[i] for i in range(len(questions))]
     return AusgabeblattSection(id=section_id, title=title, rows=rows)
 
 
@@ -2410,15 +2423,30 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     t = time.time()
-    # Sections are the bulk (~80% of wall time). Report progress AFTER each
-    # of the four sections so the UI bar visibly advances (0.07 → 0.55)
-    # instead of sitting flat at 7% for ~10 min and looking hung — the
-    # "stuck at 5%" report. Percent is interpolated across the four steps.
+    # Sections are the bulk (~80% of wall time). Tick the bar PER QUESTION as
+    # each one completes (not once per section) so it advances smoothly
+    # 0.07 → 0.55 instead of sitting flat at 7% for the whole first section
+    # and looking hung — the "stuck at 7%" report. The step label tracks the
+    # current section; the percent is interpolated across every question in
+    # all four sections. ``_tick_question`` runs in this (the calling) thread,
+    # so the shared counter needs no lock.
     _section_ids = ["overview", "land", "permits", "economics"]
+    _SEC_START, _SEC_END = 0.07, 0.55
+    _total_q = sum(len(SECTION_QUESTIONS.get(s, [])) for s in _section_ids) or 1
+    _q_done = [0]
+    _cur_section = [_section_ids[0]]
+
+    def _tick_question():
+        _q_done[0] += 1
+        progress(f"sections:{_cur_section[0]}",
+                 round(_SEC_START + (_SEC_END - _SEC_START) * _q_done[0] / _total_q, 3))
+
     sections = []
-    for _i, _sid in enumerate(_section_ids):
-        progress(f"sections:{_sid}", round(0.07 + (0.55 - 0.07) * _i / len(_section_ids), 3))
-        sections.append(analyze_section(req.document_ids, _sid))
+    for _sid in _section_ids:
+        _cur_section[0] = _sid
+        progress(f"sections:{_sid}",
+                 round(_SEC_START + (_SEC_END - _SEC_START) * _q_done[0] / _total_q, 3))
+        sections.append(analyze_section(req.document_ids, _sid, on_question_done=_tick_question))
     T["sections_s"] = round(time.time()-t, 2)
     progress("sections_done", 0.55)
     report.sections = sections
