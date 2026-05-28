@@ -22,11 +22,9 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
 import ddiq.rag as ddiq_rag
+import pytest
 from ddiq.models import Evidence
-
 
 # ── evidence_from_chunks ─────────────────────────────────────────────
 
@@ -97,6 +95,7 @@ class _StubResponse:
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             import requests
+
             raise requests.HTTPError(f"HTTP {self.status_code}")
 
     def json(self) -> Any:

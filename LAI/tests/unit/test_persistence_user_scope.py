@@ -22,8 +22,8 @@ import lai.persistence as p
 
 ORG_A = "11111111-1111-1111-1111-111111111111"
 ALICE = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"  # in Org A
-BOB   = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"  # ALSO in Org A — same firm
-CARL  = "cccccccc-cccc-cccc-cccc-cccccccccccc"  # different org
+BOB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"  # ALSO in Org A — same firm
+CARL = "cccccccc-cccc-cccc-cccc-cccccccccccc"  # different org
 
 
 def _init():
@@ -37,8 +37,7 @@ def test_same_org_users_are_still_isolated():
     cannot see Alice's session — firm-membership alone doesn't grant
     visibility. Explicit sharing (Step 2 of Path A) will widen this."""
     _init()
-    p.save_session("sess-alpha", {"user_id": ALICE, "org_id": ORG_A,
-                                  "filename": "vertrag.pdf"})
+    p.save_session("sess-alpha", {"user_id": ALICE, "org_id": ORG_A, "filename": "vertrag.pdf"})
     # Alice (creator) sees it.
     assert p.load_session("sess-alpha", user_id=ALICE) is not None
     assert p.session_exists("sess-alpha", user_id=ALICE) is True
@@ -54,11 +53,11 @@ def test_list_sessions_is_per_user():
     # Alice and Bob both in ORG_A.
     p.save_session("a1", {"user_id": ALICE, "org_id": ORG_A, "filename": "a.pdf"})
     p.save_session("a2", {"user_id": ALICE, "org_id": ORG_A, "filename": "b.pdf"})
-    p.save_session("b1", {"user_id": BOB,   "org_id": ORG_A, "filename": "c.pdf"})
+    p.save_session("b1", {"user_id": BOB, "org_id": ORG_A, "filename": "c.pdf"})
 
     # Each user sees only their own — even though they're in the same firm.
     assert {s["id"] for s in p.list_sessions(user_id=ALICE)} == {"a1", "a2"}
-    assert {s["id"] for s in p.list_sessions(user_id=BOB)}   == {"b1"}
+    assert {s["id"] for s in p.list_sessions(user_id=BOB)} == {"b1"}
 
 
 def test_messages_inherit_session_scope():
@@ -81,24 +80,37 @@ def test_matter_documents_per_user_with_org_stamp():
     p.save_session("sess-alpha", {"user_id": ALICE, "org_id": ORG_A, "filename": "x.pdf"})
     # Alice adds — fine. org_id stamped on the row.
     doc = p.add_matter_document(
-        "sess-alpha", filename="anhang.pdf", doc_text="", n_pages=0,
-        upload_ext=".pdf", user_id=ALICE, org_id=ORG_A, status="done",
+        "sess-alpha",
+        filename="anhang.pdf",
+        doc_text="",
+        n_pages=0,
+        upload_ext=".pdf",
+        user_id=ALICE,
+        org_id=ORG_A,
+        status="done",
     )
     assert doc is not None and doc["doc_index"] == 1
     # Bob (same firm) tries — blocked.
-    assert p.add_matter_document(
-        "sess-alpha", filename="evil.pdf", doc_text="", n_pages=0,
-        upload_ext=".pdf", user_id=BOB, org_id=ORG_A, status="done",
-    ) is None
+    assert (
+        p.add_matter_document(
+            "sess-alpha",
+            filename="evil.pdf",
+            doc_text="",
+            n_pages=0,
+            upload_ext=".pdf",
+            user_id=BOB,
+            org_id=ORG_A,
+            status="done",
+        )
+        is None
+    )
     # Bob sees no matter docs.
     assert p.list_matter_documents("sess-alpha", user_id=BOB) == []
     # Alice sees hers.
     docs = p.list_matter_documents("sess-alpha", user_id=ALICE)
     assert len(docs) == 1
     # Confirm org_id was actually stamped (read back via direct SQL).
-    row = p._conn().execute(
-        "SELECT org_id FROM matter_documents WHERE doc_index = 1"
-    ).fetchone()
+    row = p._conn().execute("SELECT org_id FROM matter_documents WHERE doc_index = 1").fetchone()
     assert row["org_id"] == ORG_A, "org_id should be persisted for future sharing"
 
 
@@ -147,6 +159,7 @@ def test_save_session_round_trips_org_id():
 # Path A Step 2 — explicit per-session sharing (view-only in v1)
 # ───────────────────────────────────────────────────────────────────────────────
 
+
 def test_share_grants_read_but_not_write():
     """The whole point of Step 2: Alice can grant Bob view access to her
     session. Bob can READ but cannot WRITE — sharing is view-only in v1.
@@ -176,10 +189,19 @@ def test_share_grants_read_but_not_write():
     assert p.delete_session("sess-1", user_id=BOB) is False
     assert p.update_session_title("sess-1", "stolen", user_id=BOB) is False
     assert p.record_feedback(session_id="sess-1", user_id=BOB, rating=1) is None
-    assert p.add_matter_document(
-        "sess-1", filename="evil.pdf", doc_text="", n_pages=0,
-        upload_ext=".pdf", user_id=BOB, org_id=ORG_A, status="done",
-    ) is None
+    assert (
+        p.add_matter_document(
+            "sess-1",
+            filename="evil.pdf",
+            doc_text="",
+            n_pages=0,
+            upload_ext=".pdf",
+            user_id=BOB,
+            org_id=ORG_A,
+            status="done",
+        )
+        is None
+    )
 
     # Alice (owner) still writes normally.
     assert p.add_message("sess-1", "user", "from Alice", user_id=ALICE) > 0
@@ -255,14 +277,20 @@ def test_session_owned_by_is_strict_for_writes():
 
 if __name__ == "__main__":
     import traceback
+
     funcs = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     passed = failed = 0
     for fn in funcs:
         try:
-            fn(); print(f"PASS  {fn.__name__}"); passed += 1
+            fn()
+            print(f"PASS  {fn.__name__}")
+            passed += 1
         except AssertionError as e:
-            print(f"FAIL  {fn.__name__}: {e}"); failed += 1
+            print(f"FAIL  {fn.__name__}: {e}")
+            failed += 1
         except Exception:
-            print(f"ERROR {fn.__name__}:"); traceback.print_exc(); failed += 1
+            print(f"ERROR {fn.__name__}:")
+            traceback.print_exc()
+            failed += 1
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(0 if failed == 0 else 1)

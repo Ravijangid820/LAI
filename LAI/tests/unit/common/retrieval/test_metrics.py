@@ -22,12 +22,7 @@ def m(registry: CollectorRegistry) -> RetrievalMetrics:
 def test_default_metrics_registered_against_default_registry() -> None:
     assert isinstance(default_retrieval_metrics, RetrievalMetrics)
     default_retrieval_metrics.queries_total.labels(status="success").inc()
-    assert (
-        REGISTRY.get_sample_value(
-            "lai_retrieval_queries_total", {"status": "success"}
-        )
-        is not None
-    )
+    assert REGISTRY.get_sample_value("lai_retrieval_queries_total", {"status": "success"}) is not None
 
 
 @pytest.mark.unit
@@ -35,12 +30,8 @@ def test_query_counters(m: RetrievalMetrics, registry: CollectorRegistry) -> Non
     m.queries_total.labels(status="success").inc()
     m.queries_total.labels(status="error").inc()
     m.queries_total.labels(status="success").inc()
-    assert registry.get_sample_value(
-        "lai_retrieval_queries_total", {"status": "success"}
-    ) == pytest.approx(2.0)
-    assert registry.get_sample_value(
-        "lai_retrieval_queries_total", {"status": "error"}
-    ) == pytest.approx(1.0)
+    assert registry.get_sample_value("lai_retrieval_queries_total", {"status": "success"}) == pytest.approx(2.0)
+    assert registry.get_sample_value("lai_retrieval_queries_total", {"status": "error"}) == pytest.approx(1.0)
 
 
 @pytest.mark.unit

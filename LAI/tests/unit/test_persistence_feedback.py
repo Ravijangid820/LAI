@@ -21,7 +21,6 @@ import pytest
 
 from lai import persistence
 
-
 SID = "sess-feedback-1"
 UID = "11111111-1111-1111-1111-111111111111"
 OTHER_UID = "22222222-2222-2222-2222-222222222222"
@@ -46,11 +45,19 @@ def fresh_db(tmp_path: Path):
 @pytest.fixture
 def session_with_message(fresh_db):
     """Create one session owned by ``UID`` with one assistant message."""
-    persistence.save_session(SID, {
-        "user_id": UID, "filename": None, "contract_text": None,
-        "n_pages": 0, "tables": [], "uploaded_at": time.time(),
-        "clauses": None, "analysis": None,
-    })
+    persistence.save_session(
+        SID,
+        {
+            "user_id": UID,
+            "filename": None,
+            "contract_text": None,
+            "n_pages": 0,
+            "tables": [],
+            "uploaded_at": time.time(),
+            "clauses": None,
+            "analysis": None,
+        },
+    )
     mid = persistence.add_message(SID, "assistant", "hello", mode="rag", user_id=UID)
     assert mid > 0
     return mid
@@ -60,8 +67,12 @@ def session_with_message(fresh_db):
 def test_record_feedback_inserts_row(session_with_message: int) -> None:
     mid = session_with_message
     fid = persistence.record_feedback(
-        session_id=SID, user_id=UID, rating=1, message_id=mid,
-        reason="wrong-citation", comment="bad source",
+        session_id=SID,
+        user_id=UID,
+        rating=1,
+        message_id=mid,
+        reason="wrong-citation",
+        comment="bad source",
     )
     assert isinstance(fid, int) and fid > 0
     rows = persistence.list_feedback(SID, user_id=UID)
@@ -77,10 +88,16 @@ def test_record_feedback_upsert_preserves_id(session_with_message: int) -> None:
     """Re-submitting on the same (user, session, message) edits in place."""
     mid = session_with_message
     fid_first = persistence.record_feedback(
-        session_id=SID, user_id=UID, rating=1, message_id=mid,
+        session_id=SID,
+        user_id=UID,
+        rating=1,
+        message_id=mid,
     )
     fid_second = persistence.record_feedback(
-        session_id=SID, user_id=UID, rating=-1, message_id=mid,
+        session_id=SID,
+        user_id=UID,
+        rating=-1,
+        message_id=mid,
         reason="hallucination",
     )
     assert fid_first == fid_second, "ON CONFLICT DO UPDATE must keep the id stable"
@@ -98,10 +115,16 @@ def test_record_feedback_null_message_id_is_session_level(
     rated bubble. Both must coexist (no spurious unique-violation)."""
     mid = session_with_message
     fid_bubble = persistence.record_feedback(
-        session_id=SID, user_id=UID, rating=1, message_id=mid,
+        session_id=SID,
+        user_id=UID,
+        rating=1,
+        message_id=mid,
     )
     fid_session = persistence.record_feedback(
-        session_id=SID, user_id=UID, rating=-1, message_id=None,
+        session_id=SID,
+        user_id=UID,
+        rating=-1,
+        message_id=None,
         comment="overall not great",
     )
     assert fid_bubble != fid_session
@@ -113,7 +136,10 @@ def test_record_feedback_null_message_id_is_session_level(
 def test_record_feedback_cross_tenant_dropped(session_with_message: int) -> None:
     mid = session_with_message
     fid = persistence.record_feedback(
-        session_id=SID, user_id=OTHER_UID, rating=1, message_id=mid,
+        session_id=SID,
+        user_id=OTHER_UID,
+        rating=1,
+        message_id=mid,
     )
     assert fid is None
     # The owner of the session sees nothing — the cross-tenant call
@@ -128,7 +154,10 @@ def test_list_feedback_filters_by_user(session_with_message: int) -> None:
     the no-leak semantics of list_messages)."""
     mid = session_with_message
     persistence.record_feedback(
-        session_id=SID, user_id=UID, rating=1, message_id=mid,
+        session_id=SID,
+        user_id=UID,
+        rating=1,
+        message_id=mid,
     )
     assert persistence.list_feedback(SID, user_id=OTHER_UID) == []
     assert len(persistence.list_feedback(SID, user_id=UID)) == 1
@@ -152,7 +181,10 @@ def test_session_cascade_deletes_feedback(session_with_message: int) -> None:
     deleting the parent session must clear its feedback."""
     mid = session_with_message
     persistence.record_feedback(
-        session_id=SID, user_id=UID, rating=1, message_id=mid,
+        session_id=SID,
+        user_id=UID,
+        rating=1,
+        message_id=mid,
     )
     assert persistence.delete_session(SID, user_id=UID)
     assert persistence.list_feedback(SID) == []
@@ -177,7 +209,9 @@ def test_init_is_idempotent(fresh_db) -> None:
     persistence._STATE["uploads_dir"] = None
     persistence.init(db_path, uploads_dir)
     # If we got here, re-init didn't raise; the unique index still exists.
-    idx = persistence._STATE["conn"].execute(
-        "SELECT name FROM sqlite_master WHERE type='index' AND name='uq_feedback_user_session_msg'"
-    ).fetchone()
+    idx = (
+        persistence._STATE["conn"]
+        .execute("SELECT name FROM sqlite_master WHERE type='index' AND name='uq_feedback_user_session_msg'")
+        .fetchone()
+    )
     assert idx is not None

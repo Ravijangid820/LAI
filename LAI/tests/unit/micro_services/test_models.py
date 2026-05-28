@@ -14,7 +14,6 @@ required, etc.), which is hard to catch from end-to-end tests.
 from __future__ import annotations
 
 import pytest
-
 from ddiq.models import (
     AusgabeblattRow,
     AusgabeblattSection,
@@ -36,7 +35,6 @@ from ddiq.models import (
     WEAStatus,
 )
 
-
 # ── Default-value contracts ──────────────────────────────────────────
 
 
@@ -49,8 +47,11 @@ class TestDefaults:
 
     def test_ddiq_report_data_starts_empty(self) -> None:
         r = DDiQReportData(
-            projectName="P", preparedBy="b", preparedFor="f",
-            date="2026-05-19", projectCenter={"lat": 53.0, "lng": 8.0},
+            projectName="P",
+            preparedBy="b",
+            preparedFor="f",
+            date="2026-05-19",
+            projectCenter={"lat": 53.0, "lng": 8.0},
         )
         assert r.sections == []
         assert r.weaStatuses == []
@@ -134,12 +135,14 @@ class TestRoundTrip:
             text="BImSchG-Genehmigung läuft am 2027-06-30 ab.",
             legal_basis="BImSchG §6",
             recommended_action="Verlängerungsantrag spätestens 6 Mt vor Ablauf",
-            evidence=[Evidence(
-                doc_id="permit-doc-1",
-                doc_filename="Bescheid.pdf",
-                excerpt="…Genehmigung gilt bis 30.06.2027…",
-                clause="§6 BImSchG",
-            )],
+            evidence=[
+                Evidence(
+                    doc_id="permit-doc-1",
+                    doc_filename="Bescheid.pdf",
+                    excerpt="…Genehmigung gilt bis 30.06.2027…",
+                    clause="§6 BImSchG",
+                )
+            ],
             quantification=Quantification(
                 mw_affected=12.6,
                 eur_impact_estimate=8_400_000.0,
@@ -166,15 +169,24 @@ class TestValidation:
         Pydantic raises on construction without them."""
         with pytest.raises(Exception):
             WEAStatus(  # type: ignore[call-arg] — exercising the missing-required path
-                name="WEA-1", ampel="green", owner="o", parcel="p",
-                contract="c", address="a",
+                name="WEA-1",
+                ampel="green",
+                owner="o",
+                parcel="p",
+                contract="c",
+                address="a",
             )
 
     def test_cadastral_parcel_polygon_is_list_of_pairs(self) -> None:
         p = CadastralParcel(
-            id="p-1", parcelNumber="12/4", gemarkung="Test", flur=1,
+            id="p-1",
+            parcelNumber="12/4",
+            gemarkung="Test",
+            flur=1,
             polygon=[[53.0, 8.0], [53.001, 8.0], [53.001, 8.001]],
-            status="secured", owner="X", area=12345.0,
+            status="secured",
+            owner="X",
+            area=12345.0,
         )
         assert p.polygon[0] == [53.0, 8.0]
         # Defaults that the cadastral pipeline relies on:
@@ -203,24 +215,33 @@ class TestValidation:
 
 def test_document_out_shape() -> None:
     d = DocumentOut(
-        id="d1", name="x.pdf", size=12.5,
-        uploadDate="2026-05-19", type="application/pdf",
-        status="processed", category="Permit",
+        id="d1",
+        name="x.pdf",
+        size=12.5,
+        uploadDate="2026-05-19",
+        type="application/pdf",
+        status="processed",
+        category="Permit",
     )
     assert d.id == "d1"
 
 
 def test_upload_doc_response_shape() -> None:
     u = UploadDocResponse(
-        id="u1", filename="x.pdf", pages=10, chunks=24,
-        status="ok", message="processed",
+        id="u1",
+        filename="x.pdf",
+        pages=10,
+        chunks=24,
+        status="ok",
+        message="processed",
     )
     assert u.pages == 10
 
 
 def test_ausgabeblatt_nesting() -> None:
     s = AusgabeblattSection(
-        id="overview", title="Übersicht",
+        id="overview",
+        title="Übersicht",
         rows=[
             AusgabeblattRow(label="Status", value="erteilt", ampel="green"),
             AusgabeblattRow(label="Frist", value="2027-06-30", ampel="yellow"),
@@ -250,8 +271,11 @@ def test_generate_report_response_shape() -> None:
     r = GenerateReportResponse(
         report_id="r-1",
         report=DDiQReportData(
-            projectName="P", preparedBy="b", preparedFor="f",
-            date="2026-05-19", projectCenter={"lat": 53.0, "lng": 8.0},
+            projectName="P",
+            preparedBy="b",
+            preparedFor="f",
+            date="2026-05-19",
+            projectCenter={"lat": 53.0, "lng": 8.0},
         ),
         timings={"total_s": 42.5},
     )
@@ -261,8 +285,12 @@ def test_generate_report_response_shape() -> None:
 
 def test_project_area_response_shape() -> None:
     r = ProjectAreaResponse(
-        id="pa-1", name="Site A", polygon=[[53.0, 8.0]],
-        centroid_lat=53.0, centroid_lng=8.0,
-        area_km2=0.5, source="user_drawn",
+        id="pa-1",
+        name="Site A",
+        polygon=[[53.0, 8.0]],
+        centroid_lat=53.0,
+        centroid_lng=8.0,
+        area_km2=0.5,
+        source="user_drawn",
     )
     assert r.source == "user_drawn"

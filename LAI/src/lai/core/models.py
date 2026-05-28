@@ -5,17 +5,17 @@ packages (retrieval, generation, api) live here.
 """
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any
 from uuid import UUID
 
 from lai.core.constants import QueryIntent
 
-
 # ---------------------------------------------------------------------------
 # Legal reference models
 # ---------------------------------------------------------------------------
+
 
 class LegalReferenceType(str, Enum):
     PARAGRAPH = "paragraph"
@@ -68,6 +68,7 @@ class ExtractedDateReference:
 # Query models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ParsedQuery:
     original_text: str
@@ -88,8 +89,7 @@ class ParsedQuery:
     @property
     def has_legal_references(self) -> bool:
         return bool(
-            self.legal_references or self.law_codes
-            or self.paragraph_refs or self.article_refs or self.court_refs
+            self.legal_references or self.law_codes or self.paragraph_refs or self.article_refs or self.court_refs
         )
 
     @property
@@ -99,9 +99,7 @@ class ParsedQuery:
     @property
     def is_historical_query(self) -> bool:
         return self.intent == QueryIntent.HISTORICAL_LAW or (
-            self.has_temporal_constraint
-            and self.temporal_context is not None
-            and self.temporal_context < date.today()
+            self.has_temporal_constraint and self.temporal_context is not None and self.temporal_context < date.today()
         )
 
     @property
@@ -129,6 +127,7 @@ class ParsedQuery:
 # ---------------------------------------------------------------------------
 # Retrieval models
 # ---------------------------------------------------------------------------
+
 
 class QualityCheckStatus(str, Enum):
     PASSED = "passed"
@@ -215,6 +214,7 @@ class RankedChunk:
 # Response models
 # ---------------------------------------------------------------------------
 
+
 class ResponseStatus(str, Enum):
     GENERATED = "generated"
     REFUSED = "refused"
@@ -281,7 +281,7 @@ class RAGResponse:
     generation_model: str = ""
     generation_time_ms: float = 0.0
     total_time_ms: float = 0.0
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     request_id: str | None = None
     warnings: list[str] = field(default_factory=list)
     node_timings: dict[str, float] = field(default_factory=dict)
@@ -292,8 +292,7 @@ class RAGResponse:
             "status": self.status.value,
             "response_text": self.response_text,
             "citations": [
-                {"text": c.raw_text, "verified": c.is_verified, "law_code": c.law_code}
-                for c in self.citations
+                {"text": c.raw_text, "verified": c.is_verified, "law_code": c.law_code} for c in self.citations
             ],
             "citations_verified": self.citations_verified,
             "citations_total": self.citations_total,
@@ -318,8 +317,7 @@ class RAGResponse:
         if self.status == ResponseStatus.GENERATED:
             result["answer"] = self.response_text
             result["citations"] = [
-                {"text": c.raw_text, "verified": c.is_verified, "law_code": c.law_code}
-                for c in self.citations
+                {"text": c.raw_text, "verified": c.is_verified, "law_code": c.law_code} for c in self.citations
             ]
             result["sources_used"] = self.sources_used
         elif self.status == ResponseStatus.REFUSED:
@@ -336,6 +334,7 @@ class RAGResponse:
 # ---------------------------------------------------------------------------
 # Document models
 # ---------------------------------------------------------------------------
+
 
 class DocumentStatus(str, Enum):
     PENDING = "pending"
@@ -398,6 +397,7 @@ class ProcessingResult:
 # Feedback models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class FeedbackRecord:
     query_text: str
@@ -406,7 +406,7 @@ class FeedbackRecord:
     correction_text: str | None = None
     chunk_ids: list[str] = field(default_factory=list)
     user_id: str | None = None
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -422,6 +422,7 @@ class FeedbackRecord:
 # ---------------------------------------------------------------------------
 # Analysis response models
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class AnalysisResponse:
@@ -478,8 +479,7 @@ class ComparisonResponse:
             "document_id_2": self.document_id_2,
             "matching_clauses": len(self.matching_clauses),
             "conflicting_clauses": [
-                {"number": c.clause_number, "title": c.clause_title,
-                 "differences": c.differences, "risk": c.risk_level}
+                {"number": c.clause_number, "title": c.clause_title, "differences": c.differences, "risk": c.risk_level}
                 for c in self.conflicting_clauses
             ],
             "overall_risk": self.overall_risk,

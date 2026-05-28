@@ -19,8 +19,6 @@ fallback on any unrecoverable error.
 
 from __future__ import annotations
 
-import json
-
 from ddiq.extractors.consistency import check_cross_doc_consistency
 from ddiq.models import (
     AusgabeblattRow,
@@ -28,7 +26,6 @@ from ddiq.models import (
     CadastralParcel,
     WEAStatus,
 )
-
 
 # ── Fixtures (local helpers) ─────────────────────────────────────────
 
@@ -43,16 +40,28 @@ def _section(title: str, rows: list[tuple[str, str, str]]) -> AusgabeblattSectio
 
 def _wea(name: str, status: str = "errichtet") -> WEAStatus:
     return WEAStatus(
-        name=name, ampel="green", owner="op", parcel="12/4",
-        contract="c", lat=53.0, lng=8.0, address="a",
+        name=name,
+        ampel="green",
+        owner="op",
+        parcel="12/4",
+        contract="c",
+        lat=53.0,
+        lng=8.0,
+        address="a",
         status_code=status,
     )
 
 
 def _parcel(parcel_id: str, status: str = "secured") -> CadastralParcel:
     return CadastralParcel(
-        id=parcel_id, parcelNumber=parcel_id, gemarkung="test", flur=1,
-        polygon=[[53.0, 8.0]], status=status, owner="o", area=1000.0,
+        id=parcel_id,
+        parcelNumber=parcel_id,
+        gemarkung="test",
+        flur=1,
+        polygon=[[53.0, 8.0]],
+        status=status,
+        owner="o",
+        area=1000.0,
     )
 
 
@@ -97,14 +106,17 @@ class TestPrompt:
 
 class TestParsing:
     def test_clean_array_response(self, make_llm_json) -> None:
-        make_llm_json([
-            {
-                "text": "Turbine count differs across BImSchG and Pachtvertrag",
-                "severity": "red", "domain": "Permits",
-                "legal_basis": "BImSchG §6",
-                "recommended_action": "Reconcile sources",
-            },
-        ])
+        make_llm_json(
+            [
+                {
+                    "text": "Turbine count differs across BImSchG and Pachtvertrag",
+                    "severity": "red",
+                    "domain": "Permits",
+                    "legal_basis": "BImSchG §6",
+                    "recommended_action": "Reconcile sources",
+                },
+            ]
+        )
         out = check_cross_doc_consistency(sections=[], weas=[], parcels=[])
         assert len(out) == 1
         assert out[0].kind == "cross_document"
@@ -116,9 +128,13 @@ class TestParsing:
         """Some prompts return the array wrapped as
         ``{"inconsistencies": [...]}`` instead of a bare array — the
         extractor accepts both shapes."""
-        make_llm_json({"inconsistencies": [
-            {"text": "x", "severity": "yellow"},
-        ]})
+        make_llm_json(
+            {
+                "inconsistencies": [
+                    {"text": "x", "severity": "yellow"},
+                ]
+            }
+        )
         out = check_cross_doc_consistency(sections=[], weas=[], parcels=[])
         assert len(out) == 1
         assert out[0].text == "x"
@@ -142,28 +158,32 @@ class TestParsing:
     def test_severity_normalization(self, make_llm_json) -> None:
         """Anything outside (red, yellow, green) coerces to ``yellow``
         so the UI ampel widget never has to handle an unknown state."""
-        make_llm_json([
-            {"text": "a", "severity": "critical"},  # unknown → yellow
-            {"text": "b", "severity": "yellow"},
-            {"text": "c", "severity": "red"},
-            {"text": "d", "severity": "green"},
-            {"text": "e"},  # missing → yellow
-        ])
+        make_llm_json(
+            [
+                {"text": "a", "severity": "critical"},  # unknown → yellow
+                {"text": "b", "severity": "yellow"},
+                {"text": "c", "severity": "red"},
+                {"text": "d", "severity": "green"},
+                {"text": "e"},  # missing → yellow
+            ]
+        )
         out = check_cross_doc_consistency(sections=[], weas=[], parcels=[])
         assert [f.severity for f in out] == ["yellow", "yellow", "red", "green", "yellow"]
 
     def test_quantification_attached(self, make_llm_json) -> None:
-        make_llm_json([
-            {
-                "text": "Bond too small",
-                "severity": "red",
-                "quantification": {
-                    "mw_affected": 12.6,
-                    "eur_impact_estimate": 250000.0,
-                    "rationale": "80k/MW shortfall",
+        make_llm_json(
+            [
+                {
+                    "text": "Bond too small",
+                    "severity": "red",
+                    "quantification": {
+                        "mw_affected": 12.6,
+                        "eur_impact_estimate": 250000.0,
+                        "rationale": "80k/MW shortfall",
+                    },
                 },
-            },
-        ])
+            ]
+        )
         out = check_cross_doc_consistency(sections=[], weas=[], parcels=[])
         assert out[0].quantification is not None
         assert out[0].quantification.mw_affected == 12.6
@@ -174,27 +194,31 @@ class TestParsing:
         """The model often returns ``{"mw_affected": null, ...}`` for
         narrow textual findings — drop the whole object so the UI
         doesn't render an empty card."""
-        make_llm_json([
-            {
-                "text": "narrow text-only finding",
-                "quantification": {
-                    "mw_affected": None,
-                    "eur_impact_estimate": None,
-                    "days_until_deadline": None,
-                    "rationale": "n/a",
+        make_llm_json(
+            [
+                {
+                    "text": "narrow text-only finding",
+                    "quantification": {
+                        "mw_affected": None,
+                        "eur_impact_estimate": None,
+                        "days_until_deadline": None,
+                        "rationale": "n/a",
+                    },
                 },
-            },
-        ])
+            ]
+        )
         out = check_cross_doc_consistency(sections=[], weas=[], parcels=[])
         assert out[0].quantification is None
 
 
 class TestErrorPaths:
     def test_empty_text_dropped(self, make_llm_json) -> None:
-        make_llm_json([
-            {"text": "", "severity": "red"},
-            {"text": "real finding", "severity": "red"},
-        ])
+        make_llm_json(
+            [
+                {"text": "", "severity": "red"},
+                {"text": "real finding", "severity": "red"},
+            ]
+        )
         out = check_cross_doc_consistency(sections=[], weas=[], parcels=[])
         # Only the non-empty one survives.
         assert len(out) == 1
@@ -209,7 +233,9 @@ class TestErrorPaths:
         for the production-grade contract: no extractor failure is
         allowed to kill the orchestrator."""
         import ddiq.extractors.consistency as cons
+
         def boom(*a, **kw):
             raise RuntimeError("model crashed")
+
         monkeypatch.setattr(cons, "llm_json", boom)
         assert check_cross_doc_consistency(sections=[], weas=[], parcels=[]) == []

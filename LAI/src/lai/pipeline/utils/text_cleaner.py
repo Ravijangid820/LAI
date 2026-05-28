@@ -21,7 +21,11 @@ def clean_text(text: str) -> str:
     # "$" followed by a section number + law code is almost certainly "§"
     text = re.sub(r"\$\s*(\d+\s*(?:Abs\.|Nr\.|Satz|ff\b))", r"§ \1", text)
     # "$" + number + German law abbreviation (3+ chars starting uppercase, not currency codes)
-    text = re.sub(r"\$\s*(\d+[a-z]?\s+(?:(?:HGB|BGB|BImSchG|GG|VwVfG|BauGB|StGB|ZPO|AO|GewO|WHG|BNatSchG|EEG|EnWG|UVPG|ROG|LPlG|FlurbG|GrStG|UStG|EStG|KStG|GewStG|AktG|GmbHG)\b))", r"§ \1", text)
+    text = re.sub(
+        r"\$\s*(\d+[a-z]?\s+(?:(?:HGB|BGB|BImSchG|GG|VwVfG|BauGB|StGB|ZPO|AO|GewO|WHG|BNatSchG|EEG|EnWG|UVPG|ROG|LPlG|FlurbG|GrStG|UStG|EStG|KStG|GewStG|AktG|GmbHG)\b))",
+        r"§ \1",
+        text,
+    )
 
     # Rejoin hyphenated line breaks: "Bau- last" → "Baulast"
     # Only when lowercase letter follows (not compound words like "Getriebe- und")

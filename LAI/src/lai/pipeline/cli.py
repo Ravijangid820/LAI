@@ -8,18 +8,15 @@ Usage:
 """
 
 import argparse
-import gc
-import hashlib
 import io
 import json
+import multiprocessing
 import os
 import signal
-import sys
 import time
-import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
-from typing import Dict, Any, Optional
+from typing import Any
 
 from lai.core.config import get_settings
 from lai.core.logging import get_logger
@@ -39,6 +36,7 @@ def _signal_handler(signum, frame):
     elif _shutdown_count >= 2:
         logger.warning("Forced exit.")
         import sys
+
         sys.exit(1)
 
 
@@ -59,6 +57,7 @@ def _get_minio():
     global _minio_client
     if _minio_client is None:
         from minio import Minio
+
         settings = get_settings().minio
         _minio_client = Minio(
             settings.endpoint,
@@ -120,8 +119,8 @@ _db_pool = None
 def _get_db():
     global _db_pool
     if _db_pool is None:
-        import psycopg2
         from psycopg2 import pool
+
         settings = get_settings().db
         _db_pool = pool.ThreadedConnectionPool(
             minconn=settings.pool_min_size,
@@ -204,11 +203,15 @@ def _db_transaction():
 # Step 1: Raw → Segments
 # ============================================================
 
-def _process_single_file(task: Dict[str, Any]) -> Dict[str, Any]:
+
+def _process_single_file(task: dict[str, Any]) -> dict[str, Any]:
     """Worker: download → convert → upload segments."""
     from lai.pipeline.convert import (
-        convert_file, build_output_documents, get_source_type,
-        infer_language_doctype, release_gpu_memory,
+        build_output_documents,
+        convert_file,
+        get_source_type,
+        infer_language_doctype,
+        release_gpu_memory,
     )
 
     file_path = task["file_path"]
@@ -273,7 +276,9 @@ def run_step1(args):
 
     if args.dry_run:
         from collections import Counter
+
         from lai.pipeline.convert import get_source_type
+
         types = Counter(get_source_type(f["name"]) for f in raw_files)
         for t, count in types.most_common():
             logger.info(f"  {t:25s} {count:>8d}")
@@ -293,9 +298,12 @@ def run_step1(args):
             if _shutdown:
                 break
 
-            batch = raw_files[i:i + batch_size]
+            batch = raw_files[i : i + batch_size]
             force = getattr(args, "force", False)
-            tasks = [{"file_path": f["name"], "bucket_raw": bucket_raw, "bucket_segments": bucket_segments, "force": force} for f in batch]
+            tasks = [
+                {"file_path": f["name"], "bucket_raw": bucket_raw, "bucket_segments": bucket_segments, "force": force}
+                for f in batch
+            ]
 
             futures = {executor.submit(_process_single_file, t): t for t in tasks}
             for future in as_completed(futures):
@@ -320,12 +328,14 @@ def run_step1(args):
 # Step 2: Segments → Parent-Child Chunks
 # ============================================================
 
+
 def _download_and_chunk(file_name: str, bucket: str):
     """Download a segment file from MinIO and chunk it.
 
     Returns pre-flattened parent_rows and child_rows ready for batch insert.
     """
     import re
+
     from lai.pipeline.chunk import process_document
 
     data = _download(bucket, file_name)
@@ -336,7 +346,7 @@ def _download_and_chunk(file_name: str, bucket: str):
 
     text = raw[start:].decode("utf-8", errors="replace")
     parent_rows = []  # flat list of tuples
-    child_map = {}    # parent_chunk_id -> list of (chunk_id, text, char_count)
+    child_map = {}  # parent_chunk_id -> list of (chunk_id, text, char_count)
 
     for line in text.split("\n"):
         line = line.strip()
@@ -361,12 +371,21 @@ def _download_and_chunk(file_name: str, bucket: str):
             safe_section = re.sub(r"[^a-zA-Z0-9_]", "_", parent.get("section", "general"))[:50]
             parent_chunk_id = f"{doc_id}_{safe_section}_{p_idx:04d}"
 
-            parent_rows.append((
-                doc_id, parent_chunk_id, parent.get("section"),
-                parent["text"], parent["char_count"],
-                language, doc_type, source_file,
-                parent.get("page_start"), parent.get("page_end"), metadata,
-            ))
+            parent_rows.append(
+                (
+                    doc_id,
+                    parent_chunk_id,
+                    parent.get("section"),
+                    parent["text"],
+                    parent["char_count"],
+                    language,
+                    doc_type,
+                    source_file,
+                    parent.get("page_start"),
+                    parent.get("page_end"),
+                    metadata,
+                )
+            )
 
             children = []
             for c_idx, child in enumerate(children_per_parent[p_idx]):
@@ -383,8 +402,9 @@ def run_step2(args):
     Downloads + chunks files, then batch-inserts into DB using execute_values.
     Files are processed sequentially; DB writes are batched for throughput.
     """
-    from psycopg2.extras import execute_values
     import time as _time
+
+    from psycopg2.extras import execute_values
 
     settings = get_settings()
     bucket_segments = settings.pipeline.bucket_segments
@@ -465,7 +485,7 @@ def run_step2(args):
 
         logger.info(
             f"Flushed {pending_count} files — "
-            f"{files_done}/{len(seg_files)} ({files_done*100//len(seg_files)}%), "
+            f"{files_done}/{len(seg_files)} ({files_done * 100 // len(seg_files)}%), "
             f"{total_parents} parents, {total_children} children"
         )
         pending_parents = []
@@ -480,7 +500,7 @@ def run_step2(args):
             break
 
         file_name = seg_file["name"]
-        logger.info(f"[{i+1}/{len(seg_files)}] {file_name}")
+        logger.info(f"[{i + 1}/{len(seg_files)}] {file_name}")
         try:
             parent_rows, child_map = _download_and_chunk(file_name, bucket_segments)
             logger.info(f"  -> {len(parent_rows)} parents, {len(child_map)} child groups")
@@ -506,8 +526,8 @@ def run_step2(args):
             eta = (len(seg_files) - files_done) / rate if rate > 0 else 0
             logger.info(
                 f"Progress: {files_done}/{len(seg_files)} "
-                f"({files_done*100//len(seg_files)}%), "
-                f"{rate:.1f} files/s, ETA {eta/60:.0f}m"
+                f"({files_done * 100 // len(seg_files)}%), "
+                f"{rate:.1f} files/s, ETA {eta / 60:.0f}m"
             )
 
     # Flush remaining
@@ -522,13 +542,14 @@ def run_step2(args):
     logger.info(
         f"Step 2 complete: {files_done} files, "
         f"{total_parents} parents, {total_children} children, "
-        f"{files_failed} failed, {elapsed/60:.1f}m elapsed"
+        f"{files_failed} failed, {elapsed / 60:.1f}m elapsed"
     )
 
 
 # ============================================================
 # Step 3: Domain Classification
 # ============================================================
+
 
 def run_step3(args):
     """Step 3: Classify parent chunks into legal domains.
@@ -537,8 +558,9 @@ def run_step3(args):
     Re-running with a new prompt/model version adds new history rows without
     deleting old ones. Use the latest_classifications view to query.
     """
-    from lai.pipeline.classify import classify_batch, PROMPT_VERSION
     from psycopg2.extras import execute_values
+
+    from lai.pipeline.classify import PROMPT_VERSION, classify_batch
 
     settings = get_settings()
     pipe = settings.pipeline
@@ -569,13 +591,16 @@ def run_step3(args):
     classified = 0
 
     while not _shutdown:
-        rows = _db_fetch("""
+        rows = _db_fetch(
+            """
             SELECT id, content, doc_type, section
             FROM parent_chunks
             WHERE domain IS NULL OR domain = '{}'
             ORDER BY id
             LIMIT %s
-        """, (batch_size,))
+        """,
+            (batch_size,),
+        )
 
         if not rows:
             break
@@ -598,10 +623,16 @@ def run_step3(args):
                     (domains, parent_id),
                 )
                 # Prepare history row
-                history_rows.append((
-                    parent_id, domains, pipe.synth_llm_model,
-                    model_version, PROMPT_VERSION, raw_response,
-                ))
+                history_rows.append(
+                    (
+                        parent_id,
+                        domains,
+                        pipe.synth_llm_model,
+                        model_version,
+                        PROMPT_VERSION,
+                        raw_response,
+                    )
+                )
 
             # Batch insert into classification history
             if history_rows:
@@ -624,15 +655,17 @@ def run_step3(args):
 # Step 4: Contextual Enrichment
 # ============================================================
 
+
 def run_step4(args):
     """Step 4: Generate context prefixes for child chunks.
 
     Processes children in large concurrent batches — sends 16 LLM requests
     in parallel across multiple parents for maximum throughput.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from lai.pipeline.enrich import generate_context_prefix
     import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from lai.pipeline.enrich import generate_context_prefix
 
     settings = get_settings()
     pipe = settings.pipeline
@@ -659,14 +692,17 @@ def run_step4(args):
 
     while not _shutdown:
         # Fetch a batch of unenriched children with their parent info
-        rows = _db_fetch("""
+        rows = _db_fetch(
+            """
             SELECT c.id, c.content, p.content, p.doc_type, p.section, p.domain
             FROM child_chunks c
             JOIN parent_chunks p ON p.id = c.parent_id
             WHERE c.context_prefix IS NULL
             ORDER BY c.id
             LIMIT %s
-        """, (batch_size,))
+        """,
+            (batch_size,),
+        )
 
         if not rows:
             break
@@ -674,20 +710,28 @@ def run_step4(args):
         # Build work items
         work = []
         for r in rows:
-            work.append({
-                "child_id": r[0], "child_text": r[1],
-                "parent_text": r[2], "doc_type": r[3] or "",
-                "section": r[4] or "", "domains": r[5] or [],
-            })
+            work.append(
+                {
+                    "child_id": r[0],
+                    "child_text": r[1],
+                    "parent_text": r[2],
+                    "doc_type": r[3] or "",
+                    "section": r[4] or "",
+                    "domains": r[5] or [],
+                }
+            )
 
         def _enrich_one(item):
             if len(item["child_text"]) < 50:
                 return item["child_id"], ""
             prefix = generate_context_prefix(
-                item["parent_text"], item["child_text"],
-                doc_type=item["doc_type"], section=item["section"],
+                item["parent_text"],
+                item["child_text"],
+                doc_type=item["doc_type"],
+                section=item["section"],
                 domains=item["domains"],
-                llm_url=pipe.synth_llm_url, llm_model=pipe.synth_llm_model,
+                llm_url=pipe.synth_llm_url,
+                llm_model=pipe.synth_llm_model,
             )
             return item["child_id"], prefix
 
@@ -714,20 +758,18 @@ def run_step4(args):
         eta = (total_unenriched - enriched) / rate if rate > 0 else 0
         logger.info(
             f"Progress: {enriched}/{total_unenriched} enriched "
-            f"({enriched*100//max(total_unenriched,1)}%), "
-            f"{rate:.1f} chunks/s, ETA {eta/60:.0f}m"
+            f"({enriched * 100 // max(total_unenriched, 1)}%), "
+            f"{rate:.1f} chunks/s, ETA {eta / 60:.0f}m"
         )
 
     elapsed = _time.time() - t0
-    logger.info(
-        f"Step 4 complete: {enriched} enriched, {failed} failed, "
-        f"{elapsed/60:.1f}m elapsed"
-    )
+    logger.info(f"Step 4 complete: {enriched} enriched, {failed} failed, {elapsed / 60:.1f}m elapsed")
 
 
 # ============================================================
 # Step 5: Synthetic Fine-Tuning Data
 # ============================================================
+
 
 def run_step5(args):
     """Step 5: Generate synthetic training samples from parent chunks."""
@@ -764,7 +806,9 @@ def run_step5(args):
     logger.info(f"Parents: {total_parents} total, {used_parents} already used for training")
 
     if args.dry_run:
-        samples_per_parent = (target - existing_count) / max(1, total_parents - used_parents) if total_parents > used_parents else 0
+        samples_per_parent = (
+            (target - existing_count) / max(1, total_parents - used_parents) if total_parents > used_parents else 0
+        )
         logger.info(f"Would need ~{samples_per_parent:.1f} samples per remaining parent")
         return
 
@@ -773,6 +817,7 @@ def run_step5(args):
     parents_processed = 0
     import time as _time
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
     t0 = _time.time()
 
     # Process multiple parents concurrently
@@ -782,7 +827,8 @@ def run_step5(args):
 
     while not _shutdown and total_count < target:
         # Fetch parents not yet used, or with few samples
-        parent_rows = _db_fetch("""
+        parent_rows = _db_fetch(
+            """
             SELECT p.id, p.content, p.doc_type, p.section, p.domain,
                    COALESCE(ts.cnt, 0) as sample_count
             FROM parent_chunks p
@@ -792,7 +838,9 @@ def run_step5(args):
             WHERE p.char_count >= 200
             ORDER BY COALESCE(ts.cnt, 0) ASC, p.id
             LIMIT %s
-        """, (batch_size,))
+        """,
+            (batch_size,),
+        )
 
         if not parent_rows:
             break
@@ -800,23 +848,28 @@ def run_step5(args):
         # Build parent dicts
         parents = []
         for p_row in parent_rows:
-            parents.append({
-                "id": p_row[0], "content": p_row[1],
-                "doc_type": p_row[2], "section": p_row[3],
-                "domain": p_row[4] or [],
-            })
+            parents.append(
+                {
+                    "id": p_row[0],
+                    "content": p_row[1],
+                    "doc_type": p_row[2],
+                    "section": p_row[3],
+                    "domain": p_row[4] or [],
+                }
+            )
 
         # Process parents in concurrent batches
         for batch_start in range(0, len(parents), concurrent_parents):
             if _shutdown or total_count >= target:
                 break
 
-            batch = parents[batch_start:batch_start + concurrent_parents]
+            batch = parents[batch_start : batch_start + concurrent_parents]
 
             with ThreadPoolExecutor(max_workers=concurrent_parents) as executor:
                 future_to_parent = {
                     executor.submit(
-                        generate_samples_for_parent, parent,
+                        generate_samples_for_parent,
+                        parent,
                         llm_url=pipe.synth_llm_url,
                         llm_model=pipe.synth_llm_model,
                         temperature=pipe.synth_temperature,
@@ -835,16 +888,19 @@ def run_step5(args):
                         continue
 
                     for sample in samples:
-                        _db_execute("""
+                        _db_execute(
+                            """
                             INSERT INTO training_samples (parent_id, domain, task_type, messages, quality_score)
                             VALUES (%s, %s, %s, %s, %s)
-                        """, (
-                            sample["parent_id"],
-                            sample["domain"],
-                            sample["task_type"],
-                            json.dumps(sample["messages"], ensure_ascii=False),
-                            sample.get("quality_score"),
-                        ))
+                        """,
+                            (
+                                sample["parent_id"],
+                                sample["domain"],
+                                sample["task_type"],
+                                json.dumps(sample["messages"], ensure_ascii=False),
+                                sample.get("quality_score"),
+                            ),
+                        )
                         generated += 1
                         total_count += 1
                     parents_processed += 1
@@ -856,18 +912,19 @@ def run_step5(args):
                         eta = (target - total_count) / rate / 60 if rate > 0 else 0
                         logger.info(
                             f"Progress: {total_count}/{target} samples "
-                            f"({total_count*100//target}%), "
+                            f"({total_count * 100 // target}%), "
                             f"{parents_processed} parents done, "
                             f"{rate:.1f} samples/s, ETA {eta:.0f}m"
                         )
 
     elapsed = _time.time() - t0
-    logger.info(f"Step 5 complete: {generated} new samples, {total_count} total, {elapsed/60:.1f}m elapsed")
+    logger.info(f"Step 5 complete: {generated} new samples, {total_count} total, {elapsed / 60:.1f}m elapsed")
 
 
 # ============================================================
 # Step 6: Embeddings → pgvector
 # ============================================================
+
 
 def _format_pgvector(emb):
     """Format a Python list of floats as a pgvector/halfvec string literal.
@@ -892,7 +949,7 @@ def run_step6(args):
     BLOB column in the main child_chunks table triggers btree rebalancing
     and is ~100× slower than a clean INSERT into a fresh table.
     """
-    from lai.pipeline.embed import embed_batch, build_search_text
+    from lai.pipeline.embed import build_search_text, embed_batch
 
     settings = get_settings()
     embed_cfg = settings.embedding
@@ -955,6 +1012,7 @@ def run_step6(args):
     backup_buf_embs: list = []
     if backup_embeddings and local_mode:
         from pathlib import Path as _Path
+
         backup_dir = _Path(__file__).resolve().parents[3] / "data" / "lai-embeddings" / "child_embeddings"
         backup_dir.mkdir(parents=True, exist_ok=True)
         # Continue numbering from whatever files already exist
@@ -965,7 +1023,9 @@ def run_step6(args):
                 backup_batch_idx = int(last_name.rsplit("_", 1)[-1]) + 1
             except ValueError:
                 pass
-        logger.info(f"  Embedding backup -> {backup_dir} (starting batch #{backup_batch_idx}, flush every {BACKUP_FLUSH_ROWS:,})")
+        logger.info(
+            f"  Embedding backup -> {backup_dir} (starting batch #{backup_batch_idx}, flush every {BACKUP_FLUSH_ROWS:,})"
+        )
 
     def _flush_backup(force: bool = False):
         """Write buffered embeddings to a single NPZ file."""
@@ -975,6 +1035,7 @@ def run_step6(args):
         if not force and len(backup_buf_ids) < BACKUP_FLUSH_ROWS:
             return
         import numpy as _np
+
         fp = backup_dir / f"child_embeddings_{backup_batch_idx:06d}.npz"
         _np.savez_compressed(
             fp,
@@ -1008,7 +1069,8 @@ def run_step6(args):
         if local_mode:
             # LEFT join against the sidecar table — primary-key index on
             # both sides, so this is O(log n) per iteration.
-            child_rows = _db_fetch(f"""
+            child_rows = _db_fetch(
+                f"""
                 SELECT c.id, c.content, c.context_prefix
                 FROM child_chunks c
                 LEFT JOIN child_embeddings e ON e.child_id = c.id
@@ -1017,15 +1079,20 @@ def run_step6(args):
                   {exclude_where_sql}
                 ORDER BY c.id
                 LIMIT %s
-            """, (last_id, *exclude_params, batch_size))
+            """,
+                (last_id, *exclude_params, batch_size),
+            )
         else:
-            child_rows = _db_fetch("""
+            child_rows = _db_fetch(
+                """
                 SELECT id, content, context_prefix
                 FROM child_chunks
                 WHERE id > %s AND embedding IS NULL
                 ORDER BY id
                 LIMIT %s
-            """, (last_id, batch_size))
+            """,
+                (last_id, batch_size),
+            )
 
         if not child_rows:
             break
@@ -1053,11 +1120,9 @@ def run_step6(args):
             # search_vector is not populated in local mode (SQLite lacks
             # tsvector); BM25 is only used on the postgres deployment.
             import struct
+
             pool = _get_db()  # patched to LocalDB
-            insert_rows = [
-                (child_id, struct.pack(f"{len(emb)}f", *emb))
-                for child_id, emb in zip(ids, embeddings)
-            ]
+            insert_rows = [(child_id, struct.pack(f"{len(emb)}f", *emb)) for child_id, emb in zip(ids, embeddings)]
             pool.executemany(
                 "INSERT OR REPLACE INTO child_embeddings (child_id, embedding) VALUES (?, ?)",
                 insert_rows,
@@ -1075,12 +1140,15 @@ def run_step6(args):
             try:
                 with conn.cursor() as cur:
                     for child_id, emb, text in zip(ids, embeddings, texts):
-                        cur.execute("""
+                        cur.execute(
+                            """
                             UPDATE child_chunks
                             SET embedding = %s::halfvec,
                                 search_vector = to_tsvector('german', %s)
                             WHERE id = %s
-                        """, (_format_pgvector(emb), text[:50000], child_id))
+                        """,
+                            (_format_pgvector(emb), text[:50000], child_id),
+                        )
                 conn.commit()
                 embedded += len(ids)
             except Exception as e:
@@ -1117,6 +1185,7 @@ def run_step6(args):
 # ============================================================
 # Main CLI
 # ============================================================
+
 
 def _build_log_name(step: str, args) -> str:
     """Build a descriptive log file name from step and args."""
@@ -1179,34 +1248,54 @@ def main():
     p6.add_argument("--embed-batch-size", type=int, default=32, help="Embedding API batch size")
     p6.add_argument("--dry-run", action="store_true")
     p6.add_argument("--create-indexes", action="store_true", help="Create HNSW + GIN indexes after embedding")
-    p6.add_argument("--exclude-raw-types", type=lambda s: [x for x in s.split(",") if x],
-                    default=[],
-                    help="Skip children whose parent's metadata.raw_type is in this comma-separated "
-                         "list. Use for dropping noisy buckets like 'legal-mc4' from multilegalpile.")
-    p6.add_argument("--no-backup-embeddings", dest="backup_embeddings", action="store_false",
-                    help="Skip mirroring each embedding batch to disk at "
-                         "data/lai-embeddings/. Default: backup enabled in --local mode.")
+    p6.add_argument(
+        "--exclude-raw-types",
+        type=lambda s: [x for x in s.split(",") if x],
+        default=[],
+        help="Skip children whose parent's metadata.raw_type is in this comma-separated "
+        "list. Use for dropping noisy buckets like 'legal-mc4' from multilegalpile.",
+    )
+    p6.add_argument(
+        "--no-backup-embeddings",
+        dest="backup_embeddings",
+        action="store_false",
+        help="Skip mirroring each embedding batch to disk at "
+        "data/lai-embeddings/. Default: backup enabled in --local mode.",
+    )
     p6.set_defaults(backup_embeddings=True)
-    p6.add_argument("--embed-urls", type=str, default=None,
-                    help="Comma-separated embedding server URLs. If multiple are given, "
-                         "batches are dispatched across them in parallel. Overrides "
-                         "EMBEDDING_URL / embed_cfg.url. Example: "
-                         "http://localhost:8003,http://localhost:8005")
+    p6.add_argument(
+        "--embed-urls",
+        type=str,
+        default=None,
+        help="Comma-separated embedding server URLs. If multiple are given, "
+        "batches are dispatched across them in parallel. Overrides "
+        "EMBEDDING_URL / embed_cfg.url. Example: "
+        "http://localhost:8003,http://localhost:8005",
+    )
 
     # Global --local flag on each subparser
     for p in [p1, p2, p3, p4, p5, p6]:
-        p.add_argument("--local", action="store_true",
-                        help="Run without Docker (read MinIO from disk, use SQLite instead of PostgreSQL)")
-        p.add_argument("--minio-data-dir", type=str, default=None,
-                        help="Path to MinIO bind-mount data dir (auto-detected if omitted)")
-        p.add_argument("--db-path", type=str, default=None,
-                        help="Path to local SQLite database (auto-detected if omitted)")
+        p.add_argument(
+            "--local",
+            action="store_true",
+            help="Run without Docker (read MinIO from disk, use SQLite instead of PostgreSQL)",
+        )
+        p.add_argument(
+            "--minio-data-dir",
+            type=str,
+            default=None,
+            help="Path to MinIO bind-mount data dir (auto-detected if omitted)",
+        )
+        p.add_argument(
+            "--db-path", type=str, default=None, help="Path to local SQLite database (auto-detected if omitted)"
+        )
 
     args = parser.parse_args()
 
     # Activate local mode if requested
     if getattr(args, "local", False):
         from lai.pipeline.local_storage import patch_cli_for_local
+
         patch_cli_for_local(
             minio_data_dir=getattr(args, "minio_data_dir", None),
             db_path=getattr(args, "db_path", None),

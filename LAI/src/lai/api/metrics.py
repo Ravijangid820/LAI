@@ -44,14 +44,30 @@ __all__ = ["RagMetrics", "default_metrics"]
 # analysis. Default Prometheus buckets top out at 10s and would
 # collapse the tail into a single +Inf bucket.
 _QUERY_LATENCY_BUCKETS: tuple[float, ...] = (
-    0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, float("inf"),
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    20.0,
+    30.0,
+    60.0,
+    120.0,
+    float("inf"),
 )
 
 # Chunk-count buckets — RAG turns return 0 chunks (chat-only) up to
 # ``top_k`` (default 3, ceiling around 8 for power users). Beyond 8
 # we don't care about resolution.
 _CHUNK_COUNT_BUCKETS: tuple[float, ...] = (
-    0, 1, 2, 3, 5, 8, 13, float("inf"),
+    0,
+    1,
+    2,
+    3,
+    5,
+    8,
+    13,
+    float("inf"),
 )
 
 

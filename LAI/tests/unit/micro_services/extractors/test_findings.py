@@ -32,10 +32,8 @@ from ddiq.extractors.findings import (
 from ddiq.models import (
     AusgabeblattRow,
     AusgabeblattSection,
-    Evidence,
     Finding,
 )
-
 
 # ── Local helpers ────────────────────────────────────────────────────
 
@@ -47,7 +45,8 @@ def _row(label: str, value: str, ampel: str) -> AusgabeblattRow:
 def _section_with_flag(label: str, ampel: str = "red") -> AusgabeblattSection:
     """One section with one flagged row."""
     return AusgabeblattSection(
-        id="s1", title="Permits",
+        id="s1",
+        title="Permits",
         rows=[
             _row(label="OK row", value="erteilt", ampel="green"),
             _row(label=label, value="ungültig", ampel=ampel),
@@ -207,10 +206,14 @@ class TestGenerateFindings:
         LLM is not called."""
         make_llm_json([], queue=True)  # would record any call; expecting zero
         green = [
-            AusgabeblattSection(id="s", title="S", rows=[
-                _row("a", "ok", "green"),
-                _row("b", "fine", "green"),
-            ]),
+            AusgabeblattSection(
+                id="s",
+                title="S",
+                rows=[
+                    _row("a", "ok", "green"),
+                    _row("b", "fine", "green"),
+                ],
+            ),
         ]
         out = generate_findings(doc_ids=["d1"], sections=green)
         assert len(out) == 1
@@ -218,16 +221,23 @@ class TestGenerateFindings:
         assert out[0].domain == "General"
 
     def test_one_finding_per_flagged_row(self, make_llm_json) -> None:
-        make_llm_json([
-            {"text": "first finding", "severity": "red"},
-            {"text": "second finding", "severity": "yellow"},
-        ], queue=True)
+        make_llm_json(
+            [
+                {"text": "first finding", "severity": "red"},
+                {"text": "second finding", "severity": "yellow"},
+            ],
+            queue=True,
+        )
         sections = [
-            AusgabeblattSection(id="s1", title="Permits", rows=[
-                _row("a", "v", "red"),
-                _row("b", "v", "yellow"),
-                _row("c", "v", "green"),  # not flagged → skipped
-            ]),
+            AusgabeblattSection(
+                id="s1",
+                title="Permits",
+                rows=[
+                    _row("a", "v", "red"),
+                    _row("b", "v", "yellow"),
+                    _row("c", "v", "green"),  # not flagged → skipped
+                ],
+            ),
         ]
         # max_workers=1: queue-mode responses are popped in call order,
         # so force sequential execution for a deterministic mapping.
@@ -242,9 +252,13 @@ class TestGenerateFindings:
         :func:`_placeholder_finding_for_issue` fills the slot."""
         make_llm_json([{}], queue=True)
         sections = [
-            AusgabeblattSection(id="s1", title="Permits", rows=[
-                _row("Permit Status", "v", "red"),
-            ]),
+            AusgabeblattSection(
+                id="s1",
+                title="Permits",
+                rows=[
+                    _row("Permit Status", "v", "red"),
+                ],
+            ),
         ]
         out = generate_findings(doc_ids=["d1"], sections=sections, max_workers=1)
         assert len(out) == 1
@@ -255,17 +269,24 @@ class TestGenerateFindings:
         """The "partial degradation" property — the reliability win
         the per-row design buys. ONE bad LLM response only
         downgrades ITS slot; the other findings come through."""
-        make_llm_json([
-            {"text": "good first", "severity": "red"},
-            {},  # bad — placeholder
-            {"text": "good third", "severity": "yellow"},
-        ], queue=True)
+        make_llm_json(
+            [
+                {"text": "good first", "severity": "red"},
+                {},  # bad — placeholder
+                {"text": "good third", "severity": "yellow"},
+            ],
+            queue=True,
+        )
         sections = [
-            AusgabeblattSection(id="s", title="X", rows=[
-                _row("r1", "v", "red"),
-                _row("r2", "v", "yellow"),
-                _row("r3", "v", "red"),
-            ]),
+            AusgabeblattSection(
+                id="s",
+                title="X",
+                rows=[
+                    _row("r1", "v", "red"),
+                    _row("r2", "v", "yellow"),
+                    _row("r3", "v", "red"),
+                ],
+            ),
         ]
         out = generate_findings(doc_ids=["d1"], sections=sections, max_workers=1)
         assert len(out) == 3
@@ -284,9 +305,13 @@ class TestGenerateFindings:
 
         monkeypatch.setattr(f, "llm_json", boom)
         sections = [
-            AusgabeblattSection(id="s", title="X", rows=[
-                _row("r1", "v", "red"),
-            ]),
+            AusgabeblattSection(
+                id="s",
+                title="X",
+                rows=[
+                    _row("r1", "v", "red"),
+                ],
+            ),
         ]
         out = generate_findings(doc_ids=["d1"], sections=sections)
         assert len(out) == 1
@@ -296,9 +321,12 @@ class TestGenerateFindings:
         """If the LLM ignores the "single object" instruction and
         returns ``[{...}]`` we still accept the first element rather
         than placeholdering the whole row."""
-        make_llm_json([
-            [{"text": "wrapped in array", "severity": "red"}],
-        ], queue=True)
+        make_llm_json(
+            [
+                [{"text": "wrapped in array", "severity": "red"}],
+            ],
+            queue=True,
+        )
         sections = [
             AusgabeblattSection(id="s", title="X", rows=[_row("r1", "v", "red")]),
         ]
@@ -313,9 +341,7 @@ class TestGenerateFindings:
         assembles results in flagged-row order without dropping any."""
         make_llm_json({"text": "parallel finding", "severity": "yellow"})
         sections = [
-            AusgabeblattSection(id="s", title="X", rows=[
-                _row(f"r{i}", "v", "red") for i in range(8)
-            ]),
+            AusgabeblattSection(id="s", title="X", rows=[_row(f"r{i}", "v", "red") for i in range(8)]),
         ]
         out = generate_findings(doc_ids=["d1"], sections=sections)  # default workers
         assert len(out) == 8

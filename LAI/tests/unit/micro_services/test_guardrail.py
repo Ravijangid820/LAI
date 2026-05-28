@@ -28,8 +28,7 @@ def test_scrub_chunk_only_value_becomes_empty():
 
 
 def test_apply_to_rows_strips_chunk_refs_in_value_and_note():
-    rows = [SimpleNamespace(value="30 Nutzungsjahre [#2].",
-                            note="Quelle [#4]", ampel="yellow")]
+    rows = [SimpleNamespace(value="30 Nutzungsjahre [#2].", note="Quelle [#4]", ampel="yellow")]
     g.apply_to_rows(rows, target_language="de", section_language_hint="de")
     assert "[#" not in (rows[0].value or "")
     assert "[#" not in (rows[0].note or "")
@@ -37,8 +36,7 @@ def test_apply_to_rows_strips_chunk_refs_in_value_and_note():
 
 def test_no_sprache_marker_on_mixed_language():
     # An English cell in a German section: counted as mixed, but NO visible tag.
-    rows = [SimpleNamespace(value="The lease term is 30 years.",
-                            note=None, ampel="yellow")]
+    rows = [SimpleNamespace(value="The lease term is 30 years.", note=None, ampel="yellow")]
     counts = g.apply_to_rows(rows, target_language="de", section_language_hint="de")
     assert counts["mixed_lang"] >= 1
     assert not rows[0].note or "Sprache" not in rows[0].note

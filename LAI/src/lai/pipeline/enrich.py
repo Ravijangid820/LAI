@@ -10,12 +10,10 @@ The prefix is stored in child_chunks.context_prefix and prepended to
 content before embedding in Step 6.
 """
 
-import json
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
 
-from lai.core.config import get_settings
 from lai.core.logging import get_logger
 
 logger = get_logger("lai.pipeline.enrich")
@@ -37,7 +35,7 @@ def generate_context_prefix(
     *,
     doc_type: str = "",
     section: str = "",
-    domains: Optional[List[str]] = None,
+    domains: list[str] | None = None,
     llm_url: str,
     llm_model: str,
     timeout: float = 60.0,
@@ -107,20 +105,20 @@ Abschnitt zum Anreichern:
 
 
 def enrich_children_for_parent(
-    parent: Dict[str, Any],
-    children: List[Dict[str, Any]],
+    parent: dict[str, Any],
+    children: list[dict[str, Any]],
     *,
     llm_url: str,
     llm_model: str,
     max_concurrent: int = 16,
-) -> Dict[int, str]:
+) -> dict[int, str]:
     """
     Generate context prefixes for all children of a parent chunk concurrently.
     Returns {child_id: prefix}.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    results: Dict[int, str] = {}
+    results: dict[int, str] = {}
     logger.info(f"Enriching {len(children)} children for parent {parent['id']}")
     parent_text = parent["content"]
     doc_type = parent.get("doc_type", "")

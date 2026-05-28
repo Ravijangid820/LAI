@@ -8,9 +8,7 @@ Parent chunks: 1024-2048 tokens (~3072-6144 chars) — fine-tuning context
 Child chunks:  ~512 tokens (~1536 chars) — RAG retrieval
 """
 
-import json
-import re
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 from lai.core.config import get_settings
 from lai.core.logging import get_logger
@@ -20,11 +18,11 @@ logger = get_logger("lai.pipeline.chunk")
 
 
 def build_parent_chunks(
-    segments: List[Dict[str, Any]],
+    segments: list[dict[str, Any]],
     target_chars: int,
     max_chars: int,
     min_chars: int,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Build parent chunks from document segments.
     Respects section boundaries from the document structure.
@@ -33,7 +31,7 @@ def build_parent_chunks(
         logger.debug("build_parent_chunks called with empty segments")
         return []
 
-    parents: List[Dict[str, Any]] = []
+    parents: list[dict[str, Any]] = []
     current_text = ""
     current_section = segments[0].get("section", "General")
     current_pages: set = set()
@@ -42,13 +40,15 @@ def build_parent_chunks(
         nonlocal current_text, current_section, current_pages
         text = current_text.strip()
         if len(text) >= min_chars:
-            parents.append({
-                "text": text,
-                "section": current_section,
-                "page_start": min(current_pages) if current_pages else None,
-                "page_end": max(current_pages) if current_pages else None,
-                "char_count": len(text),
-            })
+            parents.append(
+                {
+                    "text": text,
+                    "section": current_section,
+                    "page_start": min(current_pages) if current_pages else None,
+                    "page_end": max(current_pages) if current_pages else None,
+                    "char_count": len(text),
+                }
+            )
         current_text = ""
         current_pages = set()
 
@@ -97,26 +97,30 @@ def build_parent_chunks(
             sub_text = ""
             for sent in sentences:
                 if len(sub_text) + len(sent) + 1 > target_chars and len(sub_text) >= min_chars:
-                    final.append({
-                        "text": sub_text.strip(),
-                        "section": parent["section"],
-                        "page_start": parent["page_start"],
-                        "page_end": parent["page_end"],
-                        "char_count": len(sub_text.strip()),
-                    })
+                    final.append(
+                        {
+                            "text": sub_text.strip(),
+                            "section": parent["section"],
+                            "page_start": parent["page_start"],
+                            "page_end": parent["page_end"],
+                            "char_count": len(sub_text.strip()),
+                        }
+                    )
                     sub_text = sent
                 else:
                     sub_text += (" " if sub_text else "") + sent
 
             if sub_text.strip():
                 if len(sub_text.strip()) >= min_chars:
-                    final.append({
-                        "text": sub_text.strip(),
-                        "section": parent["section"],
-                        "page_start": parent["page_start"],
-                        "page_end": parent["page_end"],
-                        "char_count": len(sub_text.strip()),
-                    })
+                    final.append(
+                        {
+                            "text": sub_text.strip(),
+                            "section": parent["section"],
+                            "page_start": parent["page_start"],
+                            "page_end": parent["page_end"],
+                            "char_count": len(sub_text.strip()),
+                        }
+                    )
                 elif final:
                     final[-1]["text"] += "\n\n" + sub_text.strip()
                     final[-1]["char_count"] = len(final[-1]["text"])
@@ -130,7 +134,7 @@ def build_child_chunks(
     max_chars: int,
     min_chars: int,
     overlap_chars: int,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Split a parent chunk into overlapping child chunks using sentence boundaries."""
     if len(parent_text) <= max_chars:
         return [{"text": parent_text, "char_count": len(parent_text)}]
@@ -141,7 +145,7 @@ def build_child_chunks(
         children = []
         step = target_chars - overlap_chars
         for i in range(0, len(parent_text), step):
-            chunk = parent_text[i:i + target_chars]
+            chunk = parent_text[i : i + target_chars]
             if i + target_chars < len(parent_text):
                 last_space = chunk.rfind(" ")
                 if last_space > min_chars:
@@ -152,7 +156,7 @@ def build_child_chunks(
         return children or [{"text": parent_text, "char_count": len(parent_text)}]
 
     children = []
-    current: List[str] = []
+    current: list[str] = []
     current_len = 0
     i = 0
 
@@ -200,7 +204,7 @@ def build_child_chunks(
     return children
 
 
-def process_document(doc: Dict[str, Any]) -> Tuple[List[Dict], List[List[Dict]]]:
+def process_document(doc: dict[str, Any]) -> tuple[list[dict], list[list[dict]]]:
     """
     Process one document: segments → parent chunks → child chunks.
 
@@ -223,7 +227,7 @@ def process_document(doc: Dict[str, Any]) -> Tuple[List[Dict], List[List[Dict]]]
         if boundaries:
             new_segments = []
             if boundaries[0][0] > 50:
-                intro = text[:boundaries[0][0]].strip()
+                intro = text[: boundaries[0][0]].strip()
                 if intro:
                     new_segments.append({"text": intro, "section": "Einleitung", "type": "text"})
 

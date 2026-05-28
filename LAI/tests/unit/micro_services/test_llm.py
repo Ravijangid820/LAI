@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import ddiq.llm as ddiq_llm
 
-
 # ── llm_call ─────────────────────────────────────────────────────────
 
 
@@ -75,9 +74,7 @@ class TestLlmJson:
     def test_falls_through_to_salvage(self, patch_llm_singletons) -> None:
         """Trailing chatter after the JSON body — :func:`salvage_json`
         extracts the first balanced JSON substring."""
-        patch_llm_singletons.responses = [
-            'Here is the result: {"ok": true} (let me know if you need more)'
-        ]
+        patch_llm_singletons.responses = ['Here is the result: {"ok": true} (let me know if you need more)']
         out = ddiq_llm.llm_json("s", "u")
         assert out == {"ok": True}
 
@@ -141,6 +138,7 @@ class TestEmbeddings:
         non-default value emits a warning so the caller isn't
         silently surprised."""
         import logging
+
         caplog.set_level(logging.WARNING, logger="ddiq")
         ddiq_llm.embed_texts(["x"], batch_size=16)
         assert any("batch_size=16" in r.message for r in caplog.records)

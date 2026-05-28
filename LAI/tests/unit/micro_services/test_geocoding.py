@@ -17,11 +17,9 @@ Both the connector singleton and ``get_conn`` are monkeypatched.
 
 from __future__ import annotations
 
-import pytest
-
 import ddiq_report
-from lai.common.connectors import AlkisError, NominatimError
 
+from lai.common.connectors import AlkisError, NominatimError
 
 # ── geocode_address ──────────────────────────────────────────────────
 
@@ -29,8 +27,10 @@ from lai.common.connectors import AlkisError, NominatimError
 class TestGeocodeAddress:
     def test_empty_address_returns_none_without_db(self, monkeypatch) -> None:
         """Short-circuits before touching the pool — no get_conn call."""
+
         def explode():
             raise AssertionError("get_conn must not be called for empty address")
+
         monkeypatch.setattr(ddiq_report, "get_conn", explode)
         assert ddiq_report.geocode_address("") is None
         assert ddiq_report.geocode_address("   ") is None
@@ -40,6 +40,7 @@ class TestGeocodeAddress:
 
         def explode(*a, **kw):
             raise AssertionError("connector must not be called on cache hit")
+
         monkeypatch.setattr(ddiq_report._NOMINATIM_CLIENT, "geocode", explode)
 
         out = ddiq_report.geocode_address("Cuxhaven, Niedersachsen")
@@ -48,7 +49,8 @@ class TestGeocodeAddress:
     def test_cache_miss_calls_connector_and_writes(self, monkeypatch, fake_db) -> None:
         conn, cur = fake_db(fetchone=None)  # cache miss
         monkeypatch.setattr(
-            ddiq_report._NOMINATIM_CLIENT, "geocode",
+            ddiq_report._NOMINATIM_CLIENT,
+            "geocode",
             lambda address, expected_bundesland=None: (53.86, 8.69),
         )
         out = ddiq_report.geocode_address("Cuxhaven", expected_bundesland="niedersachsen")
@@ -64,7 +66,8 @@ class TestGeocodeAddress:
         (so a later, more-specific query gets a fresh attempt)."""
         conn, cur = fake_db(fetchone=None)
         monkeypatch.setattr(
-            ddiq_report._NOMINATIM_CLIENT, "geocode",
+            ddiq_report._NOMINATIM_CLIENT,
+            "geocode",
             lambda address, expected_bundesland=None: None,
         )
         out = ddiq_report.geocode_address("Nowhere", expected_bundesland="bayern")
@@ -79,6 +82,7 @@ class TestGeocodeAddress:
 
         def boom(address, expected_bundesland=None):
             raise NominatimError("retries exhausted")
+
         monkeypatch.setattr(ddiq_report._NOMINATIM_CLIENT, "geocode", boom)
 
         assert ddiq_report.geocode_address("Cuxhaven") is None
@@ -94,6 +98,7 @@ class TestAlkisQueryParcels:
 
         def explode(*a, **kw):
             raise AssertionError("connector must not be called on cache hit")
+
         monkeypatch.setattr(ddiq_report._ALKIS_CLIENT, "query_parcels", explode)
 
         out = ddiq_report.alkis_query_parcels(53.86, 8.69, "niedersachsen")
@@ -103,6 +108,7 @@ class TestAlkisQueryParcels:
         """The cache column round-trips as JSON text in some rows; the
         shim json.loads it when it isn't already a list."""
         import json
+
         cached = [{"parcelNumber": "7/2"}]
         fake_db(fetchone=(json.dumps(cached),))
         out = ddiq_report.alkis_query_parcels(53.0, 8.0, "niedersachsen")
@@ -112,7 +118,8 @@ class TestAlkisQueryParcels:
         conn, cur = fake_db(fetchone=None)
         parcels = [{"parcelNumber": "99/1", "gemarkung": "Lamstedt"}]
         monkeypatch.setattr(
-            ddiq_report._ALKIS_CLIENT, "query_parcels",
+            ddiq_report._ALKIS_CLIENT,
+            "query_parcels",
             lambda lat, lng, bundesland, radius_m=150: parcels,
         )
         out = ddiq_report.alkis_query_parcels(53.0, 8.0, "niedersachsen")
@@ -124,6 +131,7 @@ class TestAlkisQueryParcels:
 
         def boom(lat, lng, bundesland, radius_m=150):
             raise AlkisError("WFS down")
+
         monkeypatch.setattr(ddiq_report._ALKIS_CLIENT, "query_parcels", boom)
 
         assert ddiq_report.alkis_query_parcels(53.0, 8.0, "nrw") == []
@@ -135,6 +143,7 @@ class TestAlkisQueryParcels:
 class TestGeocodeProjectLocation:
     def _sections(self, location="", name=""):
         from ddiq.models import AusgabeblattRow, AusgabeblattSection
+
         rows = []
         if location:
             rows.append(AusgabeblattRow(label="Location", value=location))
@@ -189,7 +198,7 @@ class TestGeocodeProjectLocation:
 
         def fake_geocode(address, expected_bundesland=None):
             attempts.append(address)
-            return None  # nothing resolves
+            return  # nothing resolves
 
         monkeypatch.setattr(ddiq_report, "geocode_address", fake_geocode)
         out = ddiq_report.geocode_project_location(
@@ -246,8 +255,10 @@ class TestGeocodeProjectLocation:
         """Counterpart: 'Lamstedt' IS a known Niedersachsen municipality
         (detect_bundesland resolves it), so the gated name fallback still
         works — the fix is surgical, not a blanket disable."""
+
         def fake_geocode(address, expected_bundesland=None):
             return (53.62, 9.14) if "Lamstedt" in address else None
+
         monkeypatch.setattr(ddiq_report, "geocode_address", fake_geocode)
         out = ddiq_report.geocode_project_location(
             self._sections(location="", name="Windpark Lamstedt"),
@@ -256,7 +267,8 @@ class TestGeocodeProjectLocation:
 
     def test_returns_none_when_nothing_resolves(self, monkeypatch) -> None:
         monkeypatch.setattr(
-            ddiq_report, "geocode_address",
+            ddiq_report,
+            "geocode_address",
             lambda address, expected_bundesland=None: None,
         )
         out = ddiq_report.geocode_project_location(
@@ -266,7 +278,8 @@ class TestGeocodeProjectLocation:
 
     def test_empty_sections_returns_none(self, monkeypatch) -> None:
         monkeypatch.setattr(
-            ddiq_report, "geocode_address",
+            ddiq_report,
+            "geocode_address",
             lambda address, expected_bundesland=None: (1.0, 1.0),
         )
         # No Location and no Project Name → no geocode attempt → None.

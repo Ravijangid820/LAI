@@ -8,12 +8,12 @@ The whole-contract analysis pass turns absences into
 These are V2.0 baselines, edit-in-place by legal review. See
 docs/analysis/CONTRACT_ANALYZER_V2.md §6.
 """
+
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 from lai.analyzer.schema import ContractType
-
 
 # Topics flagged at severity 4 if missing; everything else severity 3.
 CRITICAL_TOPICS: set[str] = {
@@ -151,50 +151,47 @@ def all_topics(types: Iterable[ContractType] = ()) -> set[str]:
 # topic counts as covered. Patterns default to ``[topic.lower()]`` for
 # topics not listed here.
 TOPIC_SYNONYMS: dict[str, list[str]] = {
-    "Vertragsdauer":           ["vertragsdauer", "laufzeit", "vertragslaufzeit",
-                                "beginn und ende", "vertragsverhältnis"],
-    "Verlängerungsoption":     ["verlängerung", "verlängerungsoption", "renewal"],
-    "Pacht/Vergütung":         ["pacht", "vergütung", "entgelt", "miete"],
-    "Vergütung":               ["vergütung", "entgelt", "honorar", "preis"],
-    "Vergütungsformel":        ["vergütungsformel", "preisformel", "marktprämie", "vergütung"],
-    "Kündigungsrechte":        ["kündigung"],
-    "Haftung":                 ["haftung"],
-    "Haftungsbegrenzung":      ["haftungsbegrenzung", "haftungsbeschränkung",
-                                "haftungsausschluss", "haftung"],
-    "Versicherung":            ["versicherung", "haftpflicht"],
-    "Verfügbarkeitsgarantie":  ["verfügbarkeit", "availability"],
-    "Reaktionszeiten":         ["reaktionszeit", "sla", "service level"],
-    "Pönale/Bonus-Malus":      ["pönale", "bonus", "malus", "vertragsstrafe"],
-    "Force Majeure":           ["force majeure", "höhere gewalt"],
-    "Rückbauverpflichtung":    ["rückbau", "demontage", "wiederherstellung"],
-    "Standsicherheitsnachweis":["standsicherheit"],
-    "Wegerecht/Zufahrt":       ["wegerecht", "zufahrt", "zugang"],
-    "Übertragung/Sukzession":  ["übertragung", "sukzession", "abtretung"],
-    "Vorkaufsrecht":           ["vorkaufsrecht"],
-    "Genehmigungsrisiko":      ["genehmigung", "bimschg"],
+    "Vertragsdauer": ["vertragsdauer", "laufzeit", "vertragslaufzeit", "beginn und ende", "vertragsverhältnis"],
+    "Verlängerungsoption": ["verlängerung", "verlängerungsoption", "renewal"],
+    "Pacht/Vergütung": ["pacht", "vergütung", "entgelt", "miete"],
+    "Vergütung": ["vergütung", "entgelt", "honorar", "preis"],
+    "Vergütungsformel": ["vergütungsformel", "preisformel", "marktprämie", "vergütung"],
+    "Kündigungsrechte": ["kündigung"],
+    "Haftung": ["haftung"],
+    "Haftungsbegrenzung": ["haftungsbegrenzung", "haftungsbeschränkung", "haftungsausschluss", "haftung"],
+    "Versicherung": ["versicherung", "haftpflicht"],
+    "Verfügbarkeitsgarantie": ["verfügbarkeit", "availability"],
+    "Reaktionszeiten": ["reaktionszeit", "sla", "service level"],
+    "Pönale/Bonus-Malus": ["pönale", "bonus", "malus", "vertragsstrafe"],
+    "Force Majeure": ["force majeure", "höhere gewalt"],
+    "Rückbauverpflichtung": ["rückbau", "demontage", "wiederherstellung"],
+    "Standsicherheitsnachweis": ["standsicherheit"],
+    "Wegerecht/Zufahrt": ["wegerecht", "zufahrt", "zugang"],
+    "Übertragung/Sukzession": ["übertragung", "sukzession", "abtretung"],
+    "Vorkaufsrecht": ["vorkaufsrecht"],
+    "Genehmigungsrisiko": ["genehmigung", "bimschg"],
     "Untervermietung/Überlassung": ["untervermiet", "überlassung"],
-    "Grunddienstbarkeit":      ["dienstbarkeit", "grunddienstbarkeit"],
-    "Nutzungsumfang":          ["nutzungsumfang", "gegenstand", "nutzung"],
-    "Leistungsumfang":         ["leistungsumfang", "umfang", "instandhaltung", "wartungsumfang"],
-    "Ersatzteilversorgung":    ["ersatzteil"],
-    "Anschlusspunkt":          ["anschlusspunkt", "netzanschluss", "netzverknüpfung"],
-    "Einspeiseleistung":       ["einspeise"],
+    "Grunddienstbarkeit": ["dienstbarkeit", "grunddienstbarkeit"],
+    "Nutzungsumfang": ["nutzungsumfang", "gegenstand", "nutzung"],
+    "Leistungsumfang": ["leistungsumfang", "umfang", "instandhaltung", "wartungsumfang"],
+    "Ersatzteilversorgung": ["ersatzteil"],
+    "Anschlusspunkt": ["anschlusspunkt", "netzanschluss", "netzverknüpfung"],
+    "Einspeiseleistung": ["einspeise"],
     "EEG-Vergütung / Marktprämie": ["eeg", "marktprämie"],
     "Mess- und Abrechnungsmodalitäten": ["abrechnung", "messung", "messkonzept"],
     "Curtailment / Einspeisemanagement": ["curtailment", "einspeisemanagement", "einsman"],
-    "Bilanzkreismanagement":   ["bilanzkreis"],
-    "Abnahmeverpflichtung":    ["abnahme", "take-or-pay"],
-    "Marktprämie":             ["marktprämie"],
-    "Lieferprofil":            ["lieferprofil", "baseload", "as-produced", "as-forecasted"],
-    "Herkunftsnachweise":      ["herkunftsnachweis", "guarantees of origin", "goo"],
-    "Change of Law":           ["change of law", "gesetzliche änderung"],
-    "Kaufgegenstand":          ["kaufgegenstand"],
-    "Kaufpreis":               ["kaufpreis"],
-    "Garantien":               ["garantie", "zusicherung", "warranties"],
-    "Closing-Bedingungen":     ["closing", "conditions precedent", "vollzugsvoraussetzung"],
-    "Übergangsstichtag":       ["übergangsstichtag", "übergabestichtag", "stichtag",
-                                "gefahrenübergang"],
-    "Vertraulichkeit":         ["vertraulichkeit", "geheimhaltung", "nda"],
+    "Bilanzkreismanagement": ["bilanzkreis"],
+    "Abnahmeverpflichtung": ["abnahme", "take-or-pay"],
+    "Marktprämie": ["marktprämie"],
+    "Lieferprofil": ["lieferprofil", "baseload", "as-produced", "as-forecasted"],
+    "Herkunftsnachweise": ["herkunftsnachweis", "guarantees of origin", "goo"],
+    "Change of Law": ["change of law", "gesetzliche änderung"],
+    "Kaufgegenstand": ["kaufgegenstand"],
+    "Kaufpreis": ["kaufpreis"],
+    "Garantien": ["garantie", "zusicherung", "warranties"],
+    "Closing-Bedingungen": ["closing", "conditions precedent", "vollzugsvoraussetzung"],
+    "Übergangsstichtag": ["übergangsstichtag", "übergabestichtag", "stichtag", "gefahrenübergang"],
+    "Vertraulichkeit": ["vertraulichkeit", "geheimhaltung", "nda"],
 }
 
 

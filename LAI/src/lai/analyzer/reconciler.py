@@ -3,14 +3,14 @@
 The LLM never does the arithmetic; it only interprets the findings this
 module produces. See docs/analysis/CONTRACT_ANALYZER_V2.md §7.
 """
+
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Optional
 
 from lai.analyzer.schema import FinancialTable, ReconciliationFinding
-
 
 # ---------------------------------------------------------------------------
 # German number parsing
@@ -21,7 +21,7 @@ _CURRENCY_TOKENS = ("€", "EUR", "Euro", "USD", "$")
 _PERCENT_RE = re.compile(r"%|\bProzent\b", re.IGNORECASE)
 
 
-def parse_german_number(s: str) -> Optional[float]:
+def parse_german_number(s: str) -> float | None:
     """Parse '1.234,56' → 1234.56, '1,5%' → 1.5, '€ 12.500' → 12500.0.
 
     Returns None when the string contains no recognizable number. Accepts
@@ -90,8 +90,13 @@ def detect_currency(*texts: str) -> str:
 # ---------------------------------------------------------------------------
 
 _TOTAL_LABELS = (
-    "summe", "gesamt", "gesamtsumme", "gesamtbetrag", "total",
-    "endbetrag", "rechnungsbetrag",
+    "summe",
+    "gesamt",
+    "gesamtsumme",
+    "gesamtbetrag",
+    "total",
+    "endbetrag",
+    "rechnungsbetrag",
 )
 _VAT_LABELS = ("ust", "umsatzsteuer", "mwst", "mehrwertsteuer", "vat")
 _NET_LABELS = ("netto",)
@@ -106,9 +111,9 @@ def _row_label(row: dict) -> str:
     return ""
 
 
-def _row_numeric(row: dict) -> Optional[float]:
+def _row_numeric(row: dict) -> float | None:
     """Last numeric cell in the row — typically the amount column."""
-    last: Optional[float] = None
+    last: float | None = None
     for v in row.values():
         n = parse_german_number(v) if v is not None else None
         if n is not None:
@@ -136,14 +141,15 @@ def _is_gross_row(label: str) -> bool:
 # Severity classification
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class _SeverityBands:
     abs_info: float = 0.5
     abs_low: float = 5.0
     abs_med: float = 100.0
-    rel_info: float = 0.001   # 0.1%
-    rel_low: float = 0.005    # 0.5%
-    rel_med: float = 0.01     # 1.0%
+    rel_info: float = 0.001  # 0.1%
+    rel_low: float = 0.005  # 0.5%
+    rel_med: float = 0.01  # 1.0%
 
 
 _BANDS = _SeverityBands()
@@ -181,10 +187,11 @@ def _classify(stated: float, computed: float) -> tuple[str, float, float]:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def reconcile_table(
     title: str,
     rows: list[dict],
-    currency: Optional[str] = None,
+    currency: str | None = None,
 ) -> tuple[FinancialTable, list[ReconciliationFinding]]:
     """Reconcile one Docling-extracted table.
 
@@ -193,10 +200,10 @@ def reconcile_table(
     """
     findings: list[ReconciliationFinding] = []
     line_items: list[float] = []
-    stated_total: Optional[float] = None
-    net_value: Optional[float] = None
-    vat_value: Optional[float] = None
-    gross_value: Optional[float] = None
+    stated_total: float | None = None
+    net_value: float | None = None
+    vat_value: float | None = None
+    gross_value: float | None = None
 
     for row in rows:
         label = _row_label(row)
@@ -214,26 +221,28 @@ def reconcile_table(
         else:
             line_items.append(amount)
 
-    computed_total: Optional[float] = sum(line_items) if line_items else None
+    computed_total: float | None = sum(line_items) if line_items else None
     cur = currency or detect_currency(title, *(str(v) for r in rows for v in r.values()))
 
     # Sum check — line items vs stated total
     if stated_total is not None and computed_total is not None:
         sev, abs_d, rel_d = _classify(stated_total, computed_total)
         if sev != "info":
-            findings.append(ReconciliationFinding(
-                table_title=title,
-                kind="sum_mismatch",
-                stated=stated_total,
-                computed=computed_total,
-                delta=stated_total - computed_total,
-                severity=sev,  # type: ignore[arg-type]
-                note=(
-                    f"Posten summieren auf {computed_total:.2f} {cur}; "
-                    f"ausgewiesener Gesamtbetrag {stated_total:.2f} {cur} "
-                    f"(Δ {abs_d:.2f}, {rel_d*100:.2f}%)."
-                ),
-            ))
+            findings.append(
+                ReconciliationFinding(
+                    table_title=title,
+                    kind="sum_mismatch",
+                    stated=stated_total,
+                    computed=computed_total,
+                    delta=stated_total - computed_total,
+                    severity=sev,  # type: ignore[arg-type]
+                    note=(
+                        f"Posten summieren auf {computed_total:.2f} {cur}; "
+                        f"ausgewiesener Gesamtbetrag {stated_total:.2f} {cur} "
+                        f"(Δ {abs_d:.2f}, {rel_d * 100:.2f}%)."
+                    ),
+                )
+            )
 
     # VAT check — net + vat ≈ gross/total
     if net_value is not None and vat_value is not None:
@@ -244,21 +253,27 @@ def reconcile_table(
             if sev != "info":
                 # If the VAT rate looks off, label it vat_mismatch; otherwise sum
                 inferred_rate = vat_value / net_value if net_value else 0.0
-                kind = "vat_mismatch" if abs(inferred_rate - 0.19) > 0.005 and abs(inferred_rate - 0.07) > 0.005 else "sum_mismatch"
-                findings.append(ReconciliationFinding(
-                    table_title=title,
-                    kind=kind,  # type: ignore[arg-type]
-                    stated=target,
-                    computed=computed,
-                    delta=target - computed,
-                    severity=sev,  # type: ignore[arg-type]
-                    note=(
-                        f"Netto {net_value:.2f} + USt {vat_value:.2f} = "
-                        f"{computed:.2f} {cur}; ausgewiesen {target:.2f} {cur} "
-                        f"(Δ {abs_d:.2f}, {rel_d*100:.2f}%, "
-                        f"impliziter Steuersatz {inferred_rate*100:.2f}%)."
-                    ),
-                ))
+                kind = (
+                    "vat_mismatch"
+                    if abs(inferred_rate - 0.19) > 0.005 and abs(inferred_rate - 0.07) > 0.005
+                    else "sum_mismatch"
+                )
+                findings.append(
+                    ReconciliationFinding(
+                        table_title=title,
+                        kind=kind,  # type: ignore[arg-type]
+                        stated=target,
+                        computed=computed,
+                        delta=target - computed,
+                        severity=sev,  # type: ignore[arg-type]
+                        note=(
+                            f"Netto {net_value:.2f} + USt {vat_value:.2f} = "
+                            f"{computed:.2f} {cur}; ausgewiesen {target:.2f} {cur} "
+                            f"(Δ {abs_d:.2f}, {rel_d * 100:.2f}%, "
+                            f"impliziter Steuersatz {inferred_rate * 100:.2f}%)."
+                        ),
+                    )
+                )
 
     table = FinancialTable(
         title=title,
@@ -266,9 +281,7 @@ def reconcile_table(
         stated_total=stated_total,
         computed_total=computed_total,
         discrepancy=(
-            stated_total - computed_total
-            if stated_total is not None and computed_total is not None
-            else None
+            stated_total - computed_total if stated_total is not None and computed_total is not None else None
         ),
         currency=cur,
     )

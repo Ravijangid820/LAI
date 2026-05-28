@@ -24,6 +24,7 @@ Public API
 ``add_message(sid, role, content, mode)`` / ``list_messages(sid)``
 ``save_upload(sid, content, filename)`` / ``upload_path(sid)``
 """
+
 from __future__ import annotations
 
 import json
@@ -32,8 +33,6 @@ import sqlite3
 import time
 from pathlib import Path
 from threading import Lock
-from typing import Optional
-
 
 _STATE: dict = {
     "conn": None,
@@ -172,6 +171,7 @@ CREATE INDEX IF NOT EXISTS idx_session_shares_session
 # init
 # ---------------------------------------------------------------------------
 
+
 def init(db_path: Path, uploads_dir: Path) -> None:
     """Open (or create) the SQLite database and uploads directory."""
     db_path = Path(db_path)
@@ -261,6 +261,7 @@ def _conn() -> sqlite3.Connection:
 # helpers
 # ---------------------------------------------------------------------------
 
+
 def _row_to_session(r: sqlite3.Row) -> dict:
     cols = set(r.keys())
     return {
@@ -276,10 +277,7 @@ def _row_to_session(r: sqlite3.Row) -> dict:
         "tables": json.loads(r["tables_json"] or "[]"),
         "clauses": json.loads(r["clauses_json"]) if r["clauses_json"] else None,
         "analysis": json.loads(r["analysis_json"]) if r["analysis_json"] else None,
-        "extraction_quality": (
-            json.loads(r["extraction_quality_json"])
-            if r["extraction_quality_json"] else None
-        ),
+        "extraction_quality": (json.loads(r["extraction_quality_json"]) if r["extraction_quality_json"] else None),
         "upload_ext": r["upload_ext"],
         "uploaded_at": r["created_at"],
         "updated_at": r["updated_at"],
@@ -307,7 +305,8 @@ def _display_title_sql_expr() -> str:
 # sessions
 # ---------------------------------------------------------------------------
 
-def load_session(sid: str, user_id: Optional[str] = None) -> Optional[dict]:
+
+def load_session(sid: str, user_id: str | None = None) -> dict | None:
     """Load a session by id, scoped to a viewer.
 
     Path A Step 2: visibility is creator OR explicit-share. A cross-user
@@ -316,12 +315,12 @@ def load_session(sid: str, user_id: Optional[str] = None) -> Optional[dict]:
     :func:`session_owned_by`.
     """
     if user_id is None:
-        r = _conn().execute(
-            "SELECT * FROM sessions WHERE id = ?", (sid,)
-        ).fetchone()
+        r = _conn().execute("SELECT * FROM sessions WHERE id = ?", (sid,)).fetchone()
     else:
-        r = _conn().execute(
-            """
+        r = (
+            _conn()
+            .execute(
+                """
             SELECT * FROM sessions
             WHERE id = ?
               AND (user_id = ?
@@ -329,8 +328,10 @@ def load_session(sid: str, user_id: Optional[str] = None) -> Optional[dict]:
                               WHERE session_shares.session_id = sessions.id
                                 AND session_shares.user_id = ?))
             """,
-            (sid, user_id, user_id),
-        ).fetchone()
+                (sid, user_id, user_id),
+            )
+            .fetchone()
+        )
     return _row_to_session(r) if r else None
 
 
@@ -376,7 +377,9 @@ def save_session(sid: str, data: dict) -> None:
                 json.dumps(data.get("tables") or [], ensure_ascii=False),
                 json.dumps(data["clauses"], ensure_ascii=False) if data.get("clauses") is not None else None,
                 json.dumps(data["analysis"], ensure_ascii=False) if data.get("analysis") is not None else None,
-                json.dumps(data["extraction_quality"], ensure_ascii=False) if data.get("extraction_quality") is not None else None,
+                json.dumps(data["extraction_quality"], ensure_ascii=False)
+                if data.get("extraction_quality") is not None
+                else None,
                 data.get("upload_ext"),
                 data.get("uploaded_at") or now,
                 now,
@@ -397,8 +400,7 @@ def set_session_filename_if_unset(sid: str, fname: str) -> None:
     parallel uploads: only the first to land wins, the rest no-op."""
     with _STATE["lock"]:
         _conn().execute(
-            "UPDATE sessions SET filename = ?, updated_at = ? "
-            "WHERE id = ? AND filename IS NULL",
+            "UPDATE sessions SET filename = ?, updated_at = ? WHERE id = ? AND filename IS NULL",
             (fname, time.time(), sid),
         )
 
@@ -421,13 +423,12 @@ def set_session_contract(sid: str, contract_text: str, n_pages: int) -> None:
     upload would silently overwrite the legacy mirror."""
     with _STATE["lock"]:
         _conn().execute(
-            "UPDATE sessions SET contract_text = ?, n_pages = ?, updated_at = ? "
-            "WHERE id = ? AND contract_text IS NULL",
+            "UPDATE sessions SET contract_text = ?, n_pages = ?, updated_at = ? WHERE id = ? AND contract_text IS NULL",
             (contract_text, n_pages, time.time(), sid),
         )
 
 
-def update_session_title(sid: str, title: str, user_id: Optional[str] = None) -> bool:
+def update_session_title(sid: str, title: str, user_id: str | None = None) -> bool:
     """Set the user-facing title for a session. Pass an empty string to
     clear (which falls back to the COALESCE chain in list_sessions).
     Returns True if a row was updated.
@@ -472,7 +473,7 @@ def _delete_session_files(sid: str) -> None:
         pass
 
 
-def delete_session(sid: str, user_id: Optional[str] = None) -> bool:
+def delete_session(sid: str, user_id: str | None = None) -> bool:
     """Delete a session, its messages, matter documents, feedback, AND the
     uploaded files on disk.
 
@@ -485,7 +486,8 @@ def delete_session(sid: str, user_id: Optional[str] = None) -> bool:
             cur = _conn().execute("DELETE FROM sessions WHERE id = ?", (sid,))
         else:
             cur = _conn().execute(
-                "DELETE FROM sessions WHERE id = ? AND user_id = ?", (sid, user_id),
+                "DELETE FROM sessions WHERE id = ? AND user_id = ?",
+                (sid, user_id),
             )
         deleted = cur.rowcount > 0
         if deleted:
@@ -502,7 +504,7 @@ def delete_session(sid: str, user_id: Optional[str] = None) -> bool:
         return deleted
 
 
-def session_exists(sid: str, user_id: Optional[str] = None) -> bool:
+def session_exists(sid: str, user_id: str | None = None) -> bool:
     """Cheap visibility check used by message/document/feedback READ gates.
 
     Path A Step 2: returns True when the caller is the session's owner
@@ -515,12 +517,12 @@ def session_exists(sid: str, user_id: Optional[str] = None) -> bool:
     — sharing is view-only in v1; a shared user can read but not write.
     """
     if user_id is None:
-        r = _conn().execute(
-            "SELECT 1 FROM sessions WHERE id = ?", (sid,)
-        ).fetchone()
+        r = _conn().execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone()
     else:
-        r = _conn().execute(
-            """
+        r = (
+            _conn()
+            .execute(
+                """
             SELECT 1 FROM sessions
             WHERE id = ?
               AND (user_id = ?
@@ -528,8 +530,10 @@ def session_exists(sid: str, user_id: Optional[str] = None) -> bool:
                               WHERE session_shares.session_id = sessions.id
                                 AND session_shares.user_id = ?))
             """,
-            (sid, user_id, user_id),
-        ).fetchone()
+                (sid, user_id, user_id),
+            )
+            .fetchone()
+        )
     return r is not None
 
 
@@ -544,13 +548,18 @@ def session_owned_by(sid: str, user_id: str) -> bool:
     collaborator cannot rename / delete / append-message / re-share the
     session.
     """
-    r = _conn().execute(
-        "SELECT 1 FROM sessions WHERE id = ? AND user_id = ?", (sid, user_id),
-    ).fetchone()
+    r = (
+        _conn()
+        .execute(
+            "SELECT 1 FROM sessions WHERE id = ? AND user_id = ?",
+            (sid, user_id),
+        )
+        .fetchone()
+    )
     return r is not None
 
 
-def list_sessions(limit: int = 50, user_id: Optional[str] = None) -> list[dict]:
+def list_sessions(limit: int = 50, user_id: str | None = None) -> list[dict]:
     """Light-weight list (no contract_text/analysis blobs) for UI sidebars.
 
     Path A Step 2: sidebar shows the caller's own sessions PLUS sessions
@@ -568,25 +577,34 @@ def list_sessions(limit: int = 50, user_id: Optional[str] = None) -> list[dict]:
         FROM sessions
     """
     if user_id is None:
-        rows = _conn().execute(
-            base_select + " ORDER BY updated_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = (
+            _conn()
+            .execute(
+                base_select + " ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            )
+            .fetchall()
+        )
     else:
-        rows = _conn().execute(
-            base_select + """
+        rows = (
+            _conn()
+            .execute(
+                base_select
+                + """
             WHERE user_id = ?
                OR EXISTS (SELECT 1 FROM session_shares
                           WHERE session_shares.session_id = sessions.id
                             AND session_shares.user_id = ?)
             ORDER BY updated_at DESC
             LIMIT ?""",
-            (user_id, user_id, limit),
-        ).fetchall()
+                (user_id, user_id, limit),
+            )
+            .fetchall()
+        )
     return [
         {
             "id": r["id"],
-            "title": r["title"],          # always non-null (COALESCE chain)
+            "title": r["title"],  # always non-null (COALESCE chain)
             "user_title": r["user_title"],  # what the user explicitly set, or null
             "filename": r["filename"],
             "n_pages": r["n_pages"] or 0,
@@ -608,13 +626,14 @@ def count_sessions() -> int:
 # messages
 # ---------------------------------------------------------------------------
 
+
 def add_message(
     session_id: str,
     role: str,
     content: str,
-    mode: Optional[str] = None,
-    user_id: Optional[str] = None,
-    chunks: Optional[list] = None,
+    mode: str | None = None,
+    user_id: str | None = None,
+    chunks: list | None = None,
 ) -> int:
     """Append a message. Returns the new row id (or 0 on insert failure).
 
@@ -641,7 +660,7 @@ def add_message(
         return int(cur.lastrowid or 0)
 
 
-def list_messages(session_id: str, user_id: Optional[str] = None) -> list[dict]:
+def list_messages(session_id: str, user_id: str | None = None) -> list[dict]:
     """Return all messages for a session.
 
     Phase B-revert: scoped on the creator. A cross-user caller gets an
@@ -650,15 +669,19 @@ def list_messages(session_id: str, user_id: Optional[str] = None) -> list[dict]:
     """
     if user_id is not None and not session_exists(session_id, user_id=user_id):
         return []
-    rows = _conn().execute(
-        """
+    rows = (
+        _conn()
+        .execute(
+            """
         SELECT id, role, content, mode, created_at, chunks_json
         FROM messages
         WHERE session_id = ?
         ORDER BY created_at ASC, id ASC
         """,
-        (session_id,),
-    ).fetchall()
+            (session_id,),
+        )
+        .fetchall()
+    )
     return [
         {
             "id": r["id"],
@@ -672,7 +695,7 @@ def list_messages(session_id: str, user_id: Optional[str] = None) -> list[dict]:
     ]
 
 
-def get_session_meta(session_id: str, user_id: Optional[str] = None) -> Optional[dict]:
+def get_session_meta(session_id: str, user_id: str | None = None) -> dict | None:
     """Pinned conversational context (user name, project, key dates, ...)
     extracted by the LLM and saved alongside the session. None when the
     column is empty (brand-new session or extraction never ran).
@@ -681,13 +704,19 @@ def get_session_meta(session_id: str, user_id: Optional[str] = None) -> Optional
     user. Write counterpart :func:`set_session_meta` stays owner-only.
     """
     if user_id is None:
-        row = _conn().execute(
-            "SELECT session_meta_json FROM sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
+        row = (
+            _conn()
+            .execute(
+                "SELECT session_meta_json FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            .fetchone()
+        )
     else:
-        row = _conn().execute(
-            """
+        row = (
+            _conn()
+            .execute(
+                """
             SELECT session_meta_json FROM sessions
             WHERE id = ?
               AND (user_id = ?
@@ -695,8 +724,10 @@ def get_session_meta(session_id: str, user_id: Optional[str] = None) -> Optional
                               WHERE session_shares.session_id = sessions.id
                                 AND session_shares.user_id = ?))
             """,
-            (session_id, user_id, user_id),
-        ).fetchone()
+                (session_id, user_id, user_id),
+            )
+            .fetchone()
+        )
     if not row or not row["session_meta_json"]:
         return None
     try:
@@ -705,7 +736,7 @@ def get_session_meta(session_id: str, user_id: Optional[str] = None) -> Optional
         return None
 
 
-def set_session_meta(session_id: str, meta: dict, user_id: Optional[str] = None) -> None:
+def set_session_meta(session_id: str, meta: dict, user_id: str | None = None) -> None:
     """Persist a refreshed metadata snapshot for the session. Path A
     Step 2: WRITE — owner-only. A shared collaborator's meta-extraction
     would no-op here (the WHERE ... AND user_id filter doesn't match)."""
@@ -726,15 +757,16 @@ def set_session_meta(session_id: str, meta: dict, user_id: Optional[str] = None)
 # feedback (lawyer's thumbs-up/down on an assistant turn)
 # ---------------------------------------------------------------------------
 
+
 def record_feedback(
     *,
     session_id: str,
     user_id: str,
     rating: int,
-    message_id: Optional[int] = None,
-    reason: Optional[str] = None,
-    comment: Optional[str] = None,
-) -> Optional[int]:
+    message_id: int | None = None,
+    reason: str | None = None,
+    comment: str | None = None,
+) -> int | None:
     """Upsert a feedback row keyed by ``(user_id, session_id, message_id)``.
 
     Path A Step 2: ``user_id`` is the feedback author AND visibility
@@ -766,7 +798,7 @@ def record_feedback(
         return int(row["id"]) if row else None
 
 
-def list_feedback(session_id: str, user_id: Optional[str] = None) -> list[dict]:
+def list_feedback(session_id: str, user_id: str | None = None) -> list[dict]:
     """All feedback rows attached to a session.
 
     Phase B-revert: scoped on the creator — matches the access model of
@@ -775,15 +807,19 @@ def list_feedback(session_id: str, user_id: Optional[str] = None) -> list[dict]:
     """
     if user_id is not None and not session_exists(session_id, user_id=user_id):
         return []
-    rows = _conn().execute(
-        """
+    rows = (
+        _conn()
+        .execute(
+            """
         SELECT id, session_id, message_id, user_id, rating, reason, comment, created_at
         FROM feedback
         WHERE session_id = ?
         ORDER BY created_at DESC, id DESC
         """,
-        (session_id,),
-    ).fetchall()
+            (session_id,),
+        )
+        .fetchall()
+    )
     return [
         {
             "id": r["id"],
@@ -808,16 +844,21 @@ def message_belongs_to_session(message_id: int, session_id: str) -> bool:
     record feedback against the wrong bubble. This guard is the cheap
     fix.
     """
-    row = _conn().execute(
-        "SELECT 1 FROM messages WHERE id = ? AND session_id = ?",
-        (message_id, session_id),
-    ).fetchone()
+    row = (
+        _conn()
+        .execute(
+            "SELECT 1 FROM messages WHERE id = ? AND session_id = ?",
+            (message_id, session_id),
+        )
+        .fetchone()
+    )
     return row is not None
 
 
 # ---------------------------------------------------------------------------
 # matter documents (multiple uploads per session = a "Matter")
 # ---------------------------------------------------------------------------
+
 
 def add_matter_document(
     session_id: str,
@@ -826,10 +867,10 @@ def add_matter_document(
     doc_text: str,
     n_pages: int,
     upload_ext: str,
-    user_id: Optional[str] = None,
-    org_id: Optional[str] = None,
+    user_id: str | None = None,
+    org_id: str | None = None,
     status: str = "done",
-) -> Optional[dict]:
+) -> dict | None:
     """Append one uploaded document to a matter. Returns the new row as a
     dict (incl. its stable ``doc_index`` = the n in [M-n]), or ``None`` if
     the session isn't owned by ``user_id``.
@@ -870,15 +911,19 @@ def add_matter_document(
         # The ``__dedup_existing`` marker lets the endpoint skip
         # save_matter_upload + _enqueue_ingestion (which would otherwise
         # rewrite the bytes and re-index, creating duplicate chunks).
-        existing = _conn().execute(
-            """
+        existing = (
+            _conn()
+            .execute(
+                """
             SELECT id, session_id, doc_index, filename, n_pages,
                    upload_ext, created_at, status
             FROM matter_documents
             WHERE session_id = ? AND filename = ?
             """,
-            (session_id, filename),
-        ).fetchone()
+                (session_id, filename),
+            )
+            .fetchone()
+        )
         if existing is not None:
             base = {
                 "id": int(existing["id"]),
@@ -904,10 +949,14 @@ def add_matter_document(
                 return base
             base["__dedup_existing"] = True
             return base
-        row = _conn().execute(
-            "SELECT COALESCE(MAX(doc_index), 0) AS mx FROM matter_documents WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
+        row = (
+            _conn()
+            .execute(
+                "SELECT COALESCE(MAX(doc_index), 0) AS mx FROM matter_documents WHERE session_id = ?",
+                (session_id,),
+            )
+            .fetchone()
+        )
         next_index = int(row["mx"]) + 1
         ts = time.time()
         cur = _conn().execute(
@@ -931,30 +980,41 @@ def add_matter_document(
 
 
 def update_matter_progress(
-    doc_id: int, *, status: Optional[str] = None,
-    pages_done: Optional[int] = None, pages_total: Optional[int] = None,
+    doc_id: int,
+    *,
+    status: str | None = None,
+    pages_done: int | None = None,
+    pages_total: int | None = None,
 ) -> None:
     """Update a document's ingestion status / progress (called by the
     background worker as it processes pages). Any field left ``None`` is
     untouched."""
     sets, params = [], []
     if status is not None:
-        sets.append("status = ?"); params.append(status)
+        sets.append("status = ?")
+        params.append(status)
     if pages_done is not None:
-        sets.append("pages_done = ?"); params.append(int(pages_done))
+        sets.append("pages_done = ?")
+        params.append(int(pages_done))
     if pages_total is not None:
-        sets.append("pages_total = ?"); params.append(int(pages_total))
+        sets.append("pages_total = ?")
+        params.append(int(pages_total))
     if not sets:
         return
     params.append(doc_id)
     with _STATE["lock"]:
         _conn().execute(
-            f"UPDATE matter_documents SET {', '.join(sets)} WHERE id = ?", params,
+            f"UPDATE matter_documents SET {', '.join(sets)} WHERE id = ?",
+            params,
         )
 
 
 def finalize_matter_document(
-    doc_id: int, *, doc_text: str, n_pages: int, n_chunks: int,
+    doc_id: int,
+    *,
+    doc_text: str,
+    n_pages: int,
+    n_chunks: int,
 ) -> None:
     """Mark a document done and store its extracted text + chunk count."""
     with _STATE["lock"]:
@@ -997,8 +1057,11 @@ def reset_matter_document_for_retry(doc_id: int) -> None:
 
 
 def delete_matter_document(
-    session_id: str, doc_index: int, *, user_id: Optional[str] = None,
-) -> Optional[dict]:
+    session_id: str,
+    doc_index: int,
+    *,
+    user_id: str | None = None,
+) -> dict | None:
     """Hard-delete a matter document from a session: DB row + on-disk file.
 
     Caller is responsible for also clearing the pgvector embeddings
@@ -1020,11 +1083,15 @@ def delete_matter_document(
     if user_id is not None and not session_owned_by(session_id, user_id):
         return None
     with _STATE["lock"]:
-        row = _conn().execute(
-            "SELECT id, doc_index, filename, upload_ext FROM matter_documents "
-            "WHERE session_id = ? AND doc_index = ?",
-            (session_id, int(doc_index)),
-        ).fetchone()
+        row = (
+            _conn()
+            .execute(
+                "SELECT id, doc_index, filename, upload_ext FROM matter_documents "
+                "WHERE session_id = ? AND doc_index = ?",
+                (session_id, int(doc_index)),
+            )
+            .fetchone()
+        )
         if row is None:
             return None
         info = {
@@ -1039,14 +1106,15 @@ def delete_matter_document(
     # truth and the caller has already done what the user asked.
     try:
         path = matter_document_path(
-            session_id, info["id"], ext=info["upload_ext"],
+            session_id,
+            info["id"],
+            ext=info["upload_ext"],
         )
         if path is not None and path.exists():
             path.unlink()
-    except Exception as exc:  # noqa: BLE001 — DB delete already succeeded
+    except Exception as exc:
         print(
-            f"[delete] matter file unlink failed for "
-            f"{session_id}/M-{doc_index}: {exc}",
+            f"[delete] matter file unlink failed for {session_id}/M-{doc_index}: {exc}",
             flush=True,
         )
     return info
@@ -1064,14 +1132,20 @@ def fail_matter_document(doc_id: int, error: str) -> None:
 def list_unfinished_matter_documents() -> list[dict]:
     """All documents still queued/processing across every session — used at
     startup to re-enqueue work that an interrupted process left mid-flight."""
-    rows = _conn().execute(
-        "SELECT id, session_id, doc_index, filename, upload_ext "
-        "FROM matter_documents WHERE status IN ('queued', 'processing')",
-    ).fetchall()
+    rows = (
+        _conn()
+        .execute(
+            "SELECT id, session_id, doc_index, filename, upload_ext "
+            "FROM matter_documents WHERE status IN ('queued', 'processing')",
+        )
+        .fetchall()
+    )
     return [
         {
-            "id": int(r["id"]), "session_id": r["session_id"],
-            "doc_index": int(r["doc_index"]), "filename": r["filename"],
+            "id": int(r["id"]),
+            "session_id": r["session_id"],
+            "doc_index": int(r["doc_index"]),
+            "filename": r["filename"],
             "upload_ext": r["upload_ext"],
         }
         for r in rows
@@ -1079,7 +1153,10 @@ def list_unfinished_matter_documents() -> list[dict]:
 
 
 def list_matter_documents(
-    session_id: str, user_id: Optional[str] = None, *, include_text: bool = False,
+    session_id: str,
+    user_id: str | None = None,
+    *,
+    include_text: bool = False,
 ) -> list[dict]:
     """All documents attached to a matter, ordered by ``doc_index`` (= [M-n]).
 
@@ -1091,14 +1168,17 @@ def list_matter_documents(
     """
     if user_id is not None and not session_exists(session_id, user_id=user_id):
         return []
-    cols = ("id, doc_index, filename, n_pages, upload_ext, created_at, "
-            "status, pages_done, pages_total, n_chunks, error")
+    cols = "id, doc_index, filename, n_pages, upload_ext, created_at, status, pages_done, pages_total, n_chunks, error"
     if include_text:
         cols += ", doc_text"
-    rows = _conn().execute(
-        f"SELECT {cols} FROM matter_documents WHERE session_id = ? ORDER BY doc_index ASC",
-        (session_id,),
-    ).fetchall()
+    rows = (
+        _conn()
+        .execute(
+            f"SELECT {cols} FROM matter_documents WHERE session_id = ? ORDER BY doc_index ASC",
+            (session_id,),
+        )
+        .fetchall()
+    )
     out: list[dict] = []
     for r in rows:
         d = {
@@ -1121,18 +1201,24 @@ def list_matter_documents(
 
 
 def get_matter_document(
-    session_id: str, doc_index: int, user_id: Optional[str] = None,
-) -> Optional[dict]:
+    session_id: str,
+    doc_index: int,
+    user_id: str | None = None,
+) -> dict | None:
     """One matter document by its [M-n] index, or None. Phase B-revert:
     scoped on the session's creator so a caller who doesn't own the
     session sees ``None`` (the per-document preview route maps to 404)."""
     if user_id is not None and not session_exists(session_id, user_id=user_id):
         return None
-    r = _conn().execute(
-        "SELECT id, doc_index, filename, n_pages, upload_ext, created_at "
-        "FROM matter_documents WHERE session_id = ? AND doc_index = ?",
-        (session_id, doc_index),
-    ).fetchone()
+    r = (
+        _conn()
+        .execute(
+            "SELECT id, doc_index, filename, n_pages, upload_ext, created_at "
+            "FROM matter_documents WHERE session_id = ? AND doc_index = ?",
+            (session_id, doc_index),
+        )
+        .fetchone()
+    )
     if not r:
         return None
     return {
@@ -1145,7 +1231,7 @@ def get_matter_document(
     }
 
 
-def matter_document_path(session_id: str, doc_id: int, ext: Optional[str] = None) -> Optional[Path]:
+def matter_document_path(session_id: str, doc_id: int, ext: str | None = None) -> Path | None:
     """Disk path of a matter document's original file. Files are stored as
     ``<session_id>_m<doc_id><ext>`` to keep many docs per session distinct.
 
@@ -1160,9 +1246,22 @@ def matter_document_path(session_id: str, doc_id: int, ext: Optional[str] = None
         p = base / f"{session_id}_m{doc_id}{ext}"
         return p if p.exists() else None
     for candidate in (
-        ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".txt", ".csv", ".md",
+        ".pdf",
+        ".docx",
+        ".doc",
+        ".xlsx",
+        ".xls",
+        ".txt",
+        ".csv",
+        ".md",
         # Image OCR (vision-LLM path):
-        ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".tiff",
+        ".tif",
+        ".bmp",
         ".bin",
     ):
         p = base / f"{session_id}_m{doc_id}{candidate}"
@@ -1189,8 +1288,7 @@ def save_matter_upload(session_id: str, doc_id: int, content: bytes, filename: s
     """
     if not content:
         raise ValueError(
-            f"save_matter_upload: refusing to write 0 bytes for {filename!r} "
-            f"(session={session_id}, doc_id={doc_id})"
+            f"save_matter_upload: refusing to write 0 bytes for {filename!r} (session={session_id}, doc_id={doc_id})"
         )
     suffix = Path(filename).suffix.lower() or ".bin"
     target = Path(_STATE["uploads_dir"]) / f"{session_id}_m{doc_id}{suffix}"
@@ -1213,7 +1311,7 @@ def save_matter_upload(session_id: str, doc_id: int, content: bytes, filename: s
         # matter_documents row gets marked status='failed' with this
         # exact message — instead of "Input document is not valid"
         # popping out of Docling 30s later.
-        raise IOError(
+        raise OSError(
             f"save_matter_upload: wrote {actual} bytes to {target}, "
             f"expected {len(content)} bytes — partial write detected"
         )
@@ -1223,6 +1321,7 @@ def save_matter_upload(session_id: str, doc_id: int, content: bytes, filename: s
 # ---------------------------------------------------------------------------
 # uploads (file blobs on disk)
 # ---------------------------------------------------------------------------
+
 
 def save_upload(sid: str, content: bytes, filename: str) -> str:
     """Write the raw upload to disk and return the extension stored. Cheap
@@ -1234,7 +1333,7 @@ def save_upload(sid: str, content: bytes, filename: str) -> str:
     return suffix
 
 
-def upload_path(sid: str, ext: Optional[str] = None) -> Optional[Path]:
+def upload_path(sid: str, ext: str | None = None) -> Path | None:
     base = Path(_STATE["uploads_dir"])
     if ext:
         p = base / f"{sid}{ext}"
@@ -1251,14 +1350,20 @@ def upload_path(sid: str, ext: Optional[str] = None) -> Optional[Path]:
 # session sharing (Path A Step 2 — explicit per-resource view-only sharing)
 # ---------------------------------------------------------------------------
 
-def session_owner(session_id: str) -> Optional[str]:
+
+def session_owner(session_id: str) -> str | None:
     """Return the ``user_id`` of the session's creator, or ``None`` if the
     session is unknown. Used by route handlers to gate owner-only share
     management (add/remove/list shares) without coupling them to the
     read-visibility widening that everyone else gets."""
-    r = _conn().execute(
-        "SELECT user_id FROM sessions WHERE id = ?", (session_id,),
-    ).fetchone()
+    r = (
+        _conn()
+        .execute(
+            "SELECT user_id FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+        .fetchone()
+    )
     return r["user_id"] if r else None
 
 
@@ -1270,15 +1375,19 @@ def list_session_shares(session_id: str) -> list[dict]:
     invoking this. We don't take a viewer arg here because the share list
     itself is owner-only metadata, not part of the "can I see it?" plane.
     """
-    rows = _conn().execute(
-        """
+    rows = (
+        _conn()
+        .execute(
+            """
         SELECT id, session_id, user_id, granted_by, created_at
         FROM session_shares
         WHERE session_id = ?
         ORDER BY created_at DESC, id DESC
         """,
-        (session_id,),
-    ).fetchall()
+            (session_id,),
+        )
+        .fetchall()
+    )
     return [
         {
             "id": int(r["id"]),
@@ -1292,8 +1401,11 @@ def list_session_shares(session_id: str) -> list[dict]:
 
 
 def add_session_share(
-    session_id: str, target_user_id: str, *, granted_by: str,
-) -> Optional[int]:
+    session_id: str,
+    target_user_id: str,
+    *,
+    granted_by: str,
+) -> int | None:
     """Grant ``target_user_id`` view access to ``session_id``.
 
     Returns the new row id, OR an existing row id if the share already
@@ -1327,7 +1439,10 @@ def add_session_share(
 
 
 def revoke_session_share(
-    session_id: str, target_user_id: str, *, granted_by: str,
+    session_id: str,
+    target_user_id: str,
+    *,
+    granted_by: str,
 ) -> bool:
     """Remove ``target_user_id`` from the session's share list.
 
@@ -1349,8 +1464,12 @@ def session_share_user_ids(session_id: str) -> set[str]:
     """Set of user_ids the session is shared with. Used by tests + internal
     callers; route handlers should prefer the SQL-level ``EXISTS`` clauses
     in the visibility-widening reads (less data over the wire)."""
-    rows = _conn().execute(
-        "SELECT user_id FROM session_shares WHERE session_id = ?",
-        (session_id,),
-    ).fetchall()
+    rows = (
+        _conn()
+        .execute(
+            "SELECT user_id FROM session_shares WHERE session_id = ?",
+            (session_id,),
+        )
+        .fetchall()
+    )
     return {r["user_id"] for r in rows}

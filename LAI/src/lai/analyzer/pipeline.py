@@ -6,6 +6,7 @@ The pipeline is deliberately synchronous and single-process. Concurrency
 should happen above this layer (one analysis per request) — Qwen3.6-27B
 already saturates a Pro 6000 with reasoning enabled.
 """
+
 from __future__ import annotations
 
 import json
@@ -13,9 +14,7 @@ import re
 import time
 from typing import Optional
 
-from lai.analyzer import cadastral_ner
-from lai.analyzer import llm_client
-from lai.analyzer import prompts
+from lai.analyzer import cadastral_ner, llm_client, prompts
 from lai.analyzer.llm_client import AnalyzerLLMConfig
 from lai.analyzer.playbooks import PLAYBOOKS, severity_for_topic, topic_covered
 from lai.analyzer.reconciler import reconcile_all
@@ -29,7 +28,6 @@ from lai.analyzer.schema import (
     Issue,
     Parcel,
 )
-
 
 # Empirical thresholds (German legal text typically runs ~2000-3500 chars/page
 # under decent extraction). Below 1800 the body is usually fragmentary; below
@@ -106,10 +104,7 @@ def assess_extraction_quality(
         chars_per_page=chars_per_page,
         total_chars=total_chars,
         n_pages=pages,
-        reason=(
-            f"Gute Textdichte: {chars_per_page:.0f} Zeichen pro Seite "
-            f"({total_chars:,} / {pages})."
-        ),
+        reason=(f"Gute Textdichte: {chars_per_page:.0f} Zeichen pro Seite ({total_chars:,} / {pages})."),
     )
 
 
@@ -120,19 +115,22 @@ def _mark_low_confidence(issues: list[Issue]) -> list[Issue]:
     out: list[Issue] = []
     for i in issues:
         new_sev = max(2, int(i.severity) - 1)
-        out.append(i.model_copy(update={
-            "severity": new_sev,
-            "low_confidence": True,
-            "description": (
-                "[Niedrige Extraktionsqualität — Klausel könnte vorhanden sein, "
-                "aber nicht erkannt] " + i.description
-            ),
-            "rectify_or_ignore": "negotiate",
-            "rationale": (
-                "Erst PDF-Extraktion prüfen, bevor diese Klausel als fehlend behandelt wird. "
-                + i.rationale
-            ),
-        }))
+        out.append(
+            i.model_copy(
+                update={
+                    "severity": new_sev,
+                    "low_confidence": True,
+                    "description": (
+                        "[Niedrige Extraktionsqualität — Klausel könnte vorhanden sein, "
+                        "aber nicht erkannt] " + i.description
+                    ),
+                    "rectify_or_ignore": "negotiate",
+                    "rationale": (
+                        "Erst PDF-Extraktion prüfen, bevor diese Klausel als fehlend behandelt wird. " + i.rationale
+                    ),
+                }
+            )
+        )
     return out
 
 
@@ -162,19 +160,30 @@ def _parse_json_lenient(s: str) -> object:
 # Stage helpers
 # ---------------------------------------------------------------------------
 
+
 def classify(cfg: AnalyzerLLMConfig, contract_text: str) -> ContractType:
     snippet = contract_text[:6000]
     try:
         out, _ = llm_client.call(
-            cfg, prompts.CLASSIFY_SYSTEM, snippet,
-            enable_thinking=False, max_new_tokens=16, temperature=0.0,
+            cfg,
+            prompts.CLASSIFY_SYSTEM,
+            snippet,
+            enable_thinking=False,
+            max_new_tokens=16,
+            temperature=0.0,
         )
     except Exception:
         return "Sonstiges"
     valid: tuple[ContractType, ...] = (
-        "Pachtvertrag", "Nutzungsvertrag", "Wartungsvertrag",
-        "Direktvermarktungsvertrag", "Einspeisevertrag", "PPA",
-        "Dienstleistungsvertrag", "Kaufvertrag", "Sonstiges",
+        "Pachtvertrag",
+        "Nutzungsvertrag",
+        "Wartungsvertrag",
+        "Direktvermarktungsvertrag",
+        "Einspeisevertrag",
+        "PPA",
+        "Dienstleistungsvertrag",
+        "Kaufvertrag",
+        "Sonstiges",
     )
     for ct in valid:
         if ct.lower() in out.lower():
@@ -185,8 +194,12 @@ def classify(cfg: AnalyzerLLMConfig, contract_text: str) -> ContractType:
 def _summarize_section(cfg: AnalyzerLLMConfig, text: str) -> str:
     try:
         out, _ = llm_client.call(
-            cfg, prompts.SECTION_SUMMARY_SYSTEM, text,
-            enable_thinking=False, max_new_tokens=512, temperature=0.0,
+            cfg,
+            prompts.SECTION_SUMMARY_SYSTEM,
+            text,
+            enable_thinking=False,
+            max_new_tokens=512,
+            temperature=0.0,
         )
         return out
     except Exception:
@@ -215,13 +228,18 @@ def _maybe_compress(cfg: AnalyzerLLMConfig, contract_text: str) -> str:
 
 
 def _build_ner_llm_call(cfg: AnalyzerLLMConfig):
-    def _call(system: str, user: str, schema: Optional[dict]) -> str:
+    def _call(system: str, user: str, schema: dict | None) -> str:
         out, _ = llm_client.call(
-            cfg, system, user,
-            json_schema=schema, enable_thinking=False,
-            max_new_tokens=2048, temperature=0.0,
+            cfg,
+            system,
+            user,
+            json_schema=schema,
+            enable_thinking=False,
+            max_new_tokens=2048,
+            temperature=0.0,
         )
         return out
+
     return _call
 
 
@@ -235,28 +253,33 @@ def _analyze_one_clause(
 ) -> Clause:
     user = prompts.build_clause_user(clause_id, clause_title, clause_text, contract_type, contract_summary)
     out, _ = llm_client.call(
-        cfg, prompts.CLAUSE_SYSTEM, user,
-        enable_thinking=True, max_thinking_tokens=4096, max_new_tokens=2048,
+        cfg,
+        prompts.CLAUSE_SYSTEM,
+        user,
+        enable_thinking=True,
+        max_thinking_tokens=4096,
+        max_new_tokens=2048,
     )
     parsed = _parse_json_lenient(out)
     if not isinstance(parsed, dict):
-        return Clause(id=clause_id, title=clause_title, text=clause_text,
-                      type="Sonstiges", summary="", issues=[])
+        return Clause(id=clause_id, title=clause_title, text=clause_text, type="Sonstiges", summary="", issues=[])
     issues: list[Issue] = []
     for raw in parsed.get("issues") or []:
         if not isinstance(raw, dict):
             continue
         try:
-            issues.append(Issue(
-                severity=int(raw.get("severity", 3)),
-                title=str(raw.get("title", ""))[:200],
-                description=str(raw.get("description", "")),
-                affected_clauses=raw.get("affected_clauses") or [clause_id],
-                rectify_or_ignore=raw.get("rectify_or_ignore") or "negotiate",
-                rationale=str(raw.get("rationale", "")),
-                suggested_redline=raw.get("suggested_redline"),
-                legal_basis=raw.get("legal_basis") or [],
-            ))
+            issues.append(
+                Issue(
+                    severity=int(raw.get("severity", 3)),
+                    title=str(raw.get("title", ""))[:200],
+                    description=str(raw.get("description", "")),
+                    affected_clauses=raw.get("affected_clauses") or [clause_id],
+                    rectify_or_ignore=raw.get("rectify_or_ignore") or "negotiate",
+                    rationale=str(raw.get("rationale", "")),
+                    suggested_redline=raw.get("suggested_redline"),
+                    legal_basis=raw.get("legal_basis") or [],
+                )
+            )
         except Exception:
             continue
     return Clause(
@@ -276,13 +299,9 @@ def _whole_contract_pass(
     clauses: list[Clause],
     reconciliation_findings_dicts: list[dict],
 ) -> tuple[ContractMetadata, list[CrossClauseFinding], list[Issue]]:
-    clause_summaries = [
-        {"id": c.id, "type": c.type, "title": c.title, "summary": c.summary}
-        for c in clauses
-    ]
+    clause_summaries = [{"id": c.id, "type": c.type, "title": c.title, "summary": c.summary} for c in clauses]
     flagged_verbatim = [
-        {"id": c.id, "title": c.title, "text": c.text}
-        for c in clauses if any(i.severity >= 3 for i in c.issues)
+        {"id": c.id, "title": c.title, "text": c.text} for c in clauses if any(i.severity >= 3 for i in c.issues)
     ]
     user = prompts.build_whole_contract_user(
         contract_type=contract_type,
@@ -292,8 +311,12 @@ def _whole_contract_pass(
         reconciliation_findings=reconciliation_findings_dicts,
     )
     out, _ = llm_client.call(
-        cfg, prompts.WHOLE_CONTRACT_SYSTEM, user,
-        enable_thinking=True, max_thinking_tokens=8192, max_new_tokens=4096,
+        cfg,
+        prompts.WHOLE_CONTRACT_SYSTEM,
+        user,
+        enable_thinking=True,
+        max_thinking_tokens=8192,
+        max_new_tokens=4096,
     )
     parsed = _parse_json_lenient(out) or {}
     if not isinstance(parsed, dict):
@@ -313,14 +336,16 @@ def _whole_contract_pass(
         if not isinstance(raw, dict):
             continue
         try:
-            cross.append(CrossClauseFinding(
-                title=str(raw.get("title", ""))[:200],
-                involved_clauses=raw.get("involved_clauses") or [],
-                description=str(raw.get("description", "")),
-                severity=int(raw.get("severity", 3)),
-                rectify_or_ignore=raw.get("rectify_or_ignore") or "negotiate",
-                rationale=str(raw.get("rationale", "")),
-            ))
+            cross.append(
+                CrossClauseFinding(
+                    title=str(raw.get("title", ""))[:200],
+                    involved_clauses=raw.get("involved_clauses") or [],
+                    description=str(raw.get("description", "")),
+                    severity=int(raw.get("severity", 3)),
+                    rectify_or_ignore=raw.get("rectify_or_ignore") or "negotiate",
+                    rationale=str(raw.get("rationale", "")),
+                )
+            )
         except Exception:
             continue
 
@@ -329,16 +354,18 @@ def _whole_contract_pass(
         if not isinstance(raw, dict):
             continue
         try:
-            missing_from_llm.append(Issue(
-                severity=int(raw.get("severity", 3)),
-                title=str(raw.get("title", ""))[:200],
-                description=str(raw.get("description", "")),
-                affected_clauses=raw.get("affected_clauses") or [],
-                rectify_or_ignore=raw.get("rectify_or_ignore") or "rectify",
-                rationale=str(raw.get("rationale", "")),
-                suggested_redline=raw.get("suggested_redline"),
-                legal_basis=raw.get("legal_basis") or [],
-            ))
+            missing_from_llm.append(
+                Issue(
+                    severity=int(raw.get("severity", 3)),
+                    title=str(raw.get("title", ""))[:200],
+                    description=str(raw.get("description", "")),
+                    affected_clauses=raw.get("affected_clauses") or [],
+                    rectify_or_ignore=raw.get("rectify_or_ignore") or "rectify",
+                    rationale=str(raw.get("rationale", "")),
+                    suggested_redline=raw.get("suggested_redline"),
+                    legal_basis=raw.get("legal_basis") or [],
+                )
+            )
         except Exception:
             continue
 
@@ -349,22 +376,22 @@ def _whole_contract_pass(
     seen_clause_types = {c.type.lower() for c in clauses if c.type}
     # Also include any titles the LLM already flagged as missing — no need
     # to double-flag those.
-    seen_clause_types |= {
-        m.title.replace("Fehlend:", "").strip().lower() for m in missing_from_llm
-    }
+    seen_clause_types |= {m.title.replace("Fehlend:", "").strip().lower() for m in missing_from_llm}
     deterministic: list[Issue] = []
     for topic, reason in PLAYBOOKS.get(contract_type, []):
         if not topic_covered(topic, seen_clause_types):
-            deterministic.append(Issue(
-                severity=severity_for_topic(topic),  # type: ignore[arg-type]
-                title=f"Fehlend: {topic}",
-                description=f"Klausel zum Thema '{topic}' wurde nicht erkannt.",
-                affected_clauses=[],
-                rectify_or_ignore="rectify",
-                rationale=reason,
-                suggested_redline=None,
-                legal_basis=[],
-            ))
+            deterministic.append(
+                Issue(
+                    severity=severity_for_topic(topic),  # type: ignore[arg-type]
+                    title=f"Fehlend: {topic}",
+                    description=f"Klausel zum Thema '{topic}' wurde nicht erkannt.",
+                    affected_clauses=[],
+                    rectify_or_ignore="rectify",
+                    rationale=reason,
+                    suggested_redline=None,
+                    legal_basis=[],
+                )
+            )
     # Merge — LLM findings first (they may carry richer rationale),
     # deterministic ones supplement gaps.
     have = {m.title.lower() for m in missing_from_llm}
@@ -389,7 +416,7 @@ def analyze(
     *,
     cfg: AnalyzerLLMConfig,
     clauses_input: list[dict],
-    docling_tables: Optional[list[dict]] = None,
+    docling_tables: list[dict] | None = None,
     n_pages: int = 0,
     on_progress=None,  # Callable[[dict], None] — invoked at each major step
 ) -> ContractAnalysis:
@@ -417,13 +444,15 @@ def analyze(
         if on_progress is None:
             return
         try:
-            on_progress({
-                "step": step,
-                "current": current,
-                "total": total,
-                "elapsed_s": time.time() - t0,
-                "percent": max(0.0, min(1.0, percent)),
-            })
+            on_progress(
+                {
+                    "step": step,
+                    "current": current,
+                    "total": total,
+                    "elapsed_s": time.time() - t0,
+                    "percent": max(0.0, min(1.0, percent)),
+                }
+            )
         except Exception:
             # Progress is observability only — never let a callback bug
             # take down the analysis.
@@ -438,11 +467,11 @@ def analyze(
     #   whole-contract  → 20%
     PCT_CLASSIFY_DONE = 0.01
     PCT_COMPRESS_DONE = 0.04
-    PCT_RECON_DONE    = 0.06
-    PCT_PARCELS_DONE  = 0.10
-    PCT_CLAUSES_BASE  = 0.10
-    PCT_CLAUSES_END   = 0.80
-    PCT_WHOLE_DONE    = 1.00
+    PCT_RECON_DONE = 0.06
+    PCT_PARCELS_DONE = 0.10
+    PCT_CLAUSES_BASE = 0.10
+    PCT_CLAUSES_END = 0.80
+    PCT_WHOLE_DONE = 1.00
 
     _emit("starting", total=n_clauses_total)
 
@@ -468,7 +497,8 @@ def analyze(
     # 4) Cadastral NER
     _emit("extracting_parcels", percent=PCT_RECON_DONE)
     parcels: list[Parcel] = cadastral_ner.extract_parcels(
-        contract_text, _build_ner_llm_call(cfg),
+        contract_text,
+        _build_ner_llm_call(cfg),
     )
     _emit("parcels_done", current=len(parcels), percent=PCT_PARCELS_DONE)
 
@@ -480,28 +510,38 @@ def analyze(
         text = str(c.get("text", ""))
         if not text.strip():
             continue
-        progress_share = (
-            PCT_CLAUSES_BASE
-            + (PCT_CLAUSES_END - PCT_CLAUSES_BASE)
-              * ((idx - 1) / max(n_clauses_total, 1))
-        )
+        progress_share = PCT_CLAUSES_BASE + (PCT_CLAUSES_END - PCT_CLAUSES_BASE) * ((idx - 1) / max(n_clauses_total, 1))
         _emit("analyzing_clause", current=idx, total=n_clauses_total, percent=progress_share)
         try:
-            clauses_out.append(_analyze_one_clause(
-                cfg, cid, title, text, contract_type, contract_summary,
-            ))
+            clauses_out.append(
+                _analyze_one_clause(
+                    cfg,
+                    cid,
+                    title,
+                    text,
+                    contract_type,
+                    contract_summary,
+                )
+            )
         except Exception as e:
-            clauses_out.append(Clause(
-                id=cid, title=title, text=text, type="Sonstiges",
-                summary=f"[Analyse fehlgeschlagen: {e}]", issues=[],
-            ))
+            clauses_out.append(
+                Clause(
+                    id=cid,
+                    title=title,
+                    text=text,
+                    type="Sonstiges",
+                    summary=f"[Analyse fehlgeschlagen: {e}]",
+                    issues=[],
+                )
+            )
 
     _emit("clauses_done", current=n_clauses_total, total=n_clauses_total, percent=PCT_CLAUSES_END)
 
     # 6) Whole-contract pass
     _emit("whole_contract", percent=PCT_CLAUSES_END)
     metadata, cross_findings, missing = _whole_contract_pass(
-        cfg, contract_type,
+        cfg,
+        contract_type,
         metadata_hint={"first_chars": contract_text[:1000]},
         clauses=clauses_out,
         reconciliation_findings_dicts=recon_dicts,

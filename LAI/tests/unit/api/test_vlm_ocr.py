@@ -12,21 +12,17 @@ from __future__ import annotations
 import os
 
 # serve_rag builds an AuthConfig at import; give it a dummy secret.
-os.environ.setdefault(
-    "LAI_AUTH_JWT_ACCESS_SECRET", "test-secret-vlm-ocr-unit-0123456789abcdef"
-)
+os.environ.setdefault("LAI_AUTH_JWT_ACCESS_SECRET", "test-secret-vlm-ocr-unit-0123456789abcdef")
 
-import time  # noqa: E402
+import time
 
-import pytest  # noqa: E402
+import pytest
 
-from lai.api import serve_rag as sr  # noqa: E402
+from lai.api import serve_rag as sr
 
 
 def test_page_order_preserved_when_completion_is_out_of_order(monkeypatch):
-    monkeypatch.setattr(
-        sr, "_render_pdf_to_images", lambda _b: [f"PNG{i}".encode() for i in range(5)]
-    )
+    monkeypatch.setattr(sr, "_render_pdf_to_images", lambda _b: [f"PNG{i}".encode() for i in range(5)])
 
     def fake_ocr(png: bytes) -> str:
         idx = int(png.decode().removeprefix("PNG"))
@@ -77,7 +73,7 @@ def test_transient_page_failure_is_retried_and_recovered(monkeypatch):
     def flaky(png: bytes) -> str:
         idx = int(png.decode().removeprefix("PNG"))
         calls[idx] = calls.get(idx, 0) + 1
-        if idx == 1 and calls[idx] == 1:      # page 1 times out on first try
+        if idx == 1 and calls[idx] == 1:  # page 1 times out on first try
             raise RuntimeError("Read timed out")
         return f"text-of-page-{idx}"
 
@@ -88,4 +84,4 @@ def test_transient_page_failure_is_retried_and_recovered(monkeypatch):
     for i in range(1, 4):
         assert f"<!-- Seite {i} -->" in md
     assert "text-of-page-1" in md
-    assert calls[1] == 2                       # page 1 was retried once
+    assert calls[1] == 2  # page 1 was retried once

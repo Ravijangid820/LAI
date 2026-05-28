@@ -7,6 +7,7 @@ The keyword table and bboxes were originally in
 backend (which never had access to the DDiQ module) use the same
 authoritative table.
 """
+
 from __future__ import annotations
 
 import re
@@ -34,59 +35,109 @@ __all__ = [
 
 BUNDESLAND_KEYWORDS: Final[dict[str, tuple[str, ...]]] = {
     "niedersachsen": (
-        "niedersachsen", "hannover", "braunschweig", "oldenburg",
-        "osnabrück", "lüneburg", "göttingen", "wolfsburg", "cuxhaven",
-        "hude", "hatten", "lamstedt",
+        "niedersachsen",
+        "hannover",
+        "braunschweig",
+        "oldenburg",
+        "osnabrück",
+        "lüneburg",
+        "göttingen",
+        "wolfsburg",
+        "cuxhaven",
+        "hude",
+        "hatten",
+        "lamstedt",
     ),
     "nordrhein-westfalen": (
-        "nordrhein-westfalen", "nrw", "düsseldorf", "köln", "münster",
-        "detmold", "arnsberg", "dortmund", "essen",
+        "nordrhein-westfalen",
+        "nrw",
+        "düsseldorf",
+        "köln",
+        "münster",
+        "detmold",
+        "arnsberg",
+        "dortmund",
+        "essen",
     ),
     "schleswig-holstein": (
-        "schleswig-holstein", "kiel", "lübeck", "flensburg", "husum",
+        "schleswig-holstein",
+        "kiel",
+        "lübeck",
+        "flensburg",
+        "husum",
         "dithmarschen",
     ),
     "brandenburg": (
-        "brandenburg", "potsdam", "cottbus", "uckermark", "prignitz",
+        "brandenburg",
+        "potsdam",
+        "cottbus",
+        "uckermark",
+        "prignitz",
     ),
     "mecklenburg-vorpommern": (
-        "mecklenburg", "vorpommern", "rostock", "schwerin", "stralsund",
+        "mecklenburg",
+        "vorpommern",
+        "rostock",
+        "schwerin",
+        "stralsund",
         "rügen",
     ),
     "sachsen-anhalt": (
-        "sachsen-anhalt", "magdeburg", "halle", "dessau", "stendal",
+        "sachsen-anhalt",
+        "magdeburg",
+        "halle",
+        "dessau",
+        "stendal",
         "altmark",
     ),
     "bayern": (
-        "bayern", "bavaria", "münchen", "nürnberg", "augsburg",
+        "bayern",
+        "bavaria",
+        "münchen",
+        "nürnberg",
+        "augsburg",
     ),
     "hessen": (
-        "hessen", "wiesbaden", "frankfurt", "kassel", "darmstadt",
+        "hessen",
+        "wiesbaden",
+        "frankfurt",
+        "kassel",
+        "darmstadt",
     ),
     "thüringen": (
-        "thüringen", "erfurt", "jena", "weimar",
+        "thüringen",
+        "erfurt",
+        "jena",
+        "weimar",
     ),
     "sachsen": (
-        "sachsen", "dresden", "leipzig", "chemnitz",
+        "sachsen",
+        "dresden",
+        "leipzig",
+        "chemnitz",
     ),
     "rheinland-pfalz": (
-        "rheinland-pfalz", "mainz", "koblenz", "trier",
+        "rheinland-pfalz",
+        "mainz",
+        "koblenz",
+        "trier",
     ),
     "baden-württemberg": (
-        "baden-württemberg", "stuttgart", "karlsruhe", "freiburg",
+        "baden-württemberg",
+        "stuttgart",
+        "karlsruhe",
+        "freiburg",
     ),
     "saarland": (
-        "saarland", "saarbrücken",
+        "saarland",
+        "saarbrücken",
     ),
     "bremen": (
-        "bremen", "bremerhaven",
+        "bremen",
+        "bremerhaven",
     ),
-    "hamburg": (
-        "hamburg",
-    ),
-    "berlin": (
-        "berlin",
-    ),
+    "hamburg": ("hamburg",),
+    "berlin": ("berlin",),
 }
 
 
@@ -97,22 +148,22 @@ BUNDESLAND_KEYWORDS: Final[dict[str, tuple[str, ...]]] = {
 # in-Bundesland point won't be rejected by GPS / rounding noise.
 
 BUNDESLAND_BBOX: Final[dict[str, tuple[float, float, float, float]]] = {
-    "baden-württemberg":      (47.53, 49.79,  7.51, 10.50),
-    "bayern":                 (47.27, 50.56,  8.98, 13.84),
-    "berlin":                 (52.34, 52.68, 13.09, 13.76),
-    "brandenburg":            (51.36, 53.56, 11.27, 14.77),
-    "bremen":                 (53.01, 53.61,  8.48,  8.99),
-    "hamburg":                (53.39, 53.74,  8.42, 10.33),
-    "hessen":                 (49.39, 51.66,  7.77, 10.24),
+    "baden-württemberg": (47.53, 49.79, 7.51, 10.50),
+    "bayern": (47.27, 50.56, 8.98, 13.84),
+    "berlin": (52.34, 52.68, 13.09, 13.76),
+    "brandenburg": (51.36, 53.56, 11.27, 14.77),
+    "bremen": (53.01, 53.61, 8.48, 8.99),
+    "hamburg": (53.39, 53.74, 8.42, 10.33),
+    "hessen": (49.39, 51.66, 7.77, 10.24),
     "mecklenburg-vorpommern": (53.11, 54.69, 10.59, 14.41),
-    "niedersachsen":          (51.30, 53.89,  6.65, 11.60),
-    "nordrhein-westfalen":    (50.32, 52.53,  5.86,  9.46),
-    "rheinland-pfalz":        (48.97, 50.94,  6.11,  8.51),
-    "saarland":               (49.11, 49.64,  6.36,  7.40),
-    "sachsen":                (50.17, 51.69, 11.87, 15.04),
-    "sachsen-anhalt":         (50.94, 53.04, 10.56, 13.19),
-    "schleswig-holstein":     (53.36, 55.06,  7.86, 11.31),
-    "thüringen":              (50.20, 51.65,  9.87, 12.65),
+    "niedersachsen": (51.30, 53.89, 6.65, 11.60),
+    "nordrhein-westfalen": (50.32, 52.53, 5.86, 9.46),
+    "rheinland-pfalz": (48.97, 50.94, 6.11, 8.51),
+    "saarland": (49.11, 49.64, 6.36, 7.40),
+    "sachsen": (50.17, 51.69, 11.87, 15.04),
+    "sachsen-anhalt": (50.94, 53.04, 10.56, 13.19),
+    "schleswig-holstein": (53.36, 55.06, 7.86, 11.31),
+    "thüringen": (50.20, 51.65, 9.87, 12.65),
 }
 
 
@@ -195,23 +246,17 @@ BUNDESLAND_SPECIFIC_RULES: Final[list[dict]] = [
     {
         "key": "niedersachsen",
         "label": "Niedersächsische Bauordnung (NBauO)",
-        "patterns": (
-            re.compile(r"\bNBauO\b"),
-        ),
+        "patterns": (re.compile(r"\bNBauO\b"),),
     },
     {
         "key": "schleswig-holstein",
         "label": "Landesbauordnung Schleswig-Holstein (LBO SH)",
-        "patterns": (
-            re.compile(r"\bLBO\s*SH\b", re.IGNORECASE),
-        ),
+        "patterns": (re.compile(r"\bLBO\s*SH\b", re.IGNORECASE),),
     },
     {
         "key": "nordrhein-westfalen",
         "label": "Bauordnung Nordrhein-Westfalen (BauO NRW)",
-        "patterns": (
-            re.compile(r"\bBauO\s*NRW\b", re.IGNORECASE),
-        ),
+        "patterns": (re.compile(r"\bBauO\s*NRW\b", re.IGNORECASE),),
     },
 ]
 
@@ -281,12 +326,14 @@ def check_jurisdiction(
             start = max(0, match.start() - max_excerpt_chars // 2)
             end = min(len(answer), match.end() + max_excerpt_chars // 2)
             excerpt = answer[start:end].strip()
-            warnings.append(JurisdictionWarning(
-                rule_label=str(rule["label"]),
-                rule_bundesland=str(rule["key"]),
-                expected_bundesland=expected,
-                excerpt=excerpt,
-            ))
+            warnings.append(
+                JurisdictionWarning(
+                    rule_label=str(rule["label"]),
+                    rule_bundesland=str(rule["key"]),
+                    expected_bundesland=expected,
+                    excerpt=excerpt,
+                )
+            )
             seen_rules.add(str(rule["label"]))
             break  # one warning per rule
     return warnings

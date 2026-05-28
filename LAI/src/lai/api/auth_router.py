@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Annotated, Any, Final
+from typing import Any, Final
 from uuid import UUID
 
 import asyncpg
@@ -63,7 +63,6 @@ from lai.common.auth.repository import (
     RefreshTokenRepository,
     ResetTokenRepository,
     UserRepository,
-    canonical_email,
 )
 
 __all__ = ["AuthDeps", "build_auth_router"]
@@ -76,6 +75,7 @@ _INVALID_CREDENTIALS_DETAIL: Final[str] = "invalid email or password"
 
 
 # ─── Request / response shapes ──────────────────────────────────────────────
+
 
 class SignupBody(BaseModel):
     email: EmailStr
@@ -149,6 +149,7 @@ class MeResponse(BaseModel):
 
 # ─── Dependency bag ─────────────────────────────────────────────────────────
 
+
 class AuthDeps:
     """Bundle of resolved auth dependencies shared with route handlers.
 
@@ -192,6 +193,7 @@ class AuthDeps:
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
+
 
 def _check_password_policy(deps: AuthDeps, password: str) -> None:
     """Apply the configured length policy. Length is the only v1 check.
@@ -259,10 +261,11 @@ def _build_me(user: dict[str, Any] | Any) -> MeResponse:
 
 # ─── Router factory ─────────────────────────────────────────────────────────
 
+
 def build_auth_router(
     deps: AuthDeps,
     *,
-    get_current_user,  # noqa: ANN001 — dependency callable, FastAPI signature
+    get_current_user,
 ) -> APIRouter:
     """Construct the auth router bound to ``deps``.
 
@@ -295,39 +298,43 @@ def build_auth_router(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         password_hash = deps.hasher.hash(body.password)
-        async with deps.pool.acquire() as conn:
-            async with conn.transaction():
-                try:
-                    user = await deps.user_repo.create(
-                        conn,
-                        email=body.email,
-                        password_hash=password_hash,
-                        full_name=body.full_name,
-                        company=body.company,
-                    )
-                except asyncpg.UniqueViolationError as exc:
-                    # Map to 409 without leaking which constraint hit.
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail="an account with this email already exists",
-                    ) from exc
-
-                # New signups are org-less (user.org_id is None) until an
-                # admin places them in a firm — MULTIUSER_PLAN.md §7.
-                access_token, expires_in = deps.issuer.issue_access_token(
-                    user_id=user.id, email=user.email_canonical, role=user.role,
-                    org_id=user.org_id,
-                )
-                refresh = deps.issuer.issue_refresh_token(remember_me=False)
-                await deps.refresh_repo.create(
+        async with deps.pool.acquire() as conn, conn.transaction():
+            try:
+                user = await deps.user_repo.create(
                     conn,
-                    user_id=user.id,
-                    token_hash=refresh.token_hash,
-                    expires_at=refresh.expires_at,
+                    email=body.email,
+                    password_hash=password_hash,
+                    full_name=body.full_name,
+                    company=body.company,
                 )
+            except asyncpg.UniqueViolationError as exc:
+                # Map to 409 without leaking which constraint hit.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="an account with this email already exists",
+                ) from exc
+
+            # New signups are org-less (user.org_id is None) until an
+            # admin places them in a firm — MULTIUSER_PLAN.md §7.
+            access_token, expires_in = deps.issuer.issue_access_token(
+                user_id=user.id,
+                email=user.email_canonical,
+                role=user.role,
+                org_id=user.org_id,
+            )
+            refresh = deps.issuer.issue_refresh_token(remember_me=False)
+            await deps.refresh_repo.create(
+                conn,
+                user_id=user.id,
+                token_hash=refresh.token_hash,
+                expires_at=refresh.expires_at,
+            )
 
         _set_refresh_cookie(
-            response, deps, refresh.raw, int(refresh.expires_at.timestamp()),
+            response,
+            deps,
+            refresh.raw,
+            int(refresh.expires_at.timestamp()),
         )
         return AccessTokenResponse(access_token=access_token, expires_in=expires_in)
 
@@ -363,11 +370,15 @@ def build_auth_router(
             # Opportunistic rehash when the cost floor has been raised.
             if deps.hasher.needs_rehash(user.password_hash):
                 await deps.user_repo.update_password_hash(
-                    conn, user.id, deps.hasher.hash(body.password),
+                    conn,
+                    user.id,
+                    deps.hasher.hash(body.password),
                 )
 
             access_token, expires_in = deps.issuer.issue_access_token(
-                user_id=user.id, email=user.email_canonical, role=user.role,
+                user_id=user.id,
+                email=user.email_canonical,
+                role=user.role,
                 org_id=user.org_id,
             )
             refresh = deps.issuer.issue_refresh_token(remember_me=body.remember_me)
@@ -380,7 +391,10 @@ def build_auth_router(
             await deps.user_repo.touch_last_login(conn, user.id)
 
         _set_refresh_cookie(
-            response, deps, refresh.raw, int(refresh.expires_at.timestamp()),
+            response,
+            deps,
+            refresh.raw,
+            int(refresh.expires_at.timestamp()),
         )
         return AccessTokenResponse(access_token=access_token, expires_in=expires_in)
 
@@ -410,7 +424,9 @@ def build_auth_router(
                 raise HTTPException(status_code=401, detail="refresh token rejected")
 
             access_token, expires_in = deps.issuer.issue_access_token(
-                user_id=user.id, email=user.email_canonical, role=user.role,
+                user_id=user.id,
+                email=user.email_canonical,
+                role=user.role,
                 org_id=user.org_id,
             )
 
@@ -429,7 +445,8 @@ def build_auth_router(
         if cookie_value:
             async with deps.pool.acquire() as conn:
                 await deps.refresh_repo.revoke_by_hash(
-                    conn, hash_refresh_token(cookie_value),
+                    conn,
+                    hash_refresh_token(cookie_value),
                 )
         _clear_refresh_cookie(response, deps)
         # Returning Response directly lets us avoid the 200 wrapper
@@ -507,18 +524,17 @@ def build_auth_router(
         token_hash = hash_refresh_token(body.token)
         new_hash = deps.hasher.hash(body.new_password)
 
-        async with deps.pool.acquire() as conn:
-            async with conn.transaction():
-                row = await deps.reset_repo.consume(conn, token_hash)
-                if row is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="reset token invalid or expired",
-                    )
-                await deps.user_repo.update_password_hash(conn, row.user_id, new_hash)
-                # Force a re-login on every device. v1's stand-in for
-                # a refresh-rotation theft-detection chain.
-                await deps.refresh_repo.revoke_all_for_user(conn, row.user_id)
+        async with deps.pool.acquire() as conn, conn.transaction():
+            row = await deps.reset_repo.consume(conn, token_hash)
+            if row is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="reset token invalid or expired",
+                )
+            await deps.user_repo.update_password_hash(conn, row.user_id, new_hash)
+            # Force a re-login on every device. v1's stand-in for
+            # a refresh-rotation theft-detection chain.
+            await deps.refresh_repo.revoke_all_for_user(conn, row.user_id)
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -532,7 +548,8 @@ def build_auth_router(
         token_hash = hash_refresh_token(token)
         async with deps.pool.acquire() as conn:
             invitation = await deps.invitation_repo.get_active_by_hash(
-                conn, token_hash,
+                conn,
+                token_hash,
             )
             if invitation is None:
                 raise HTTPException(
@@ -577,58 +594,62 @@ def build_auth_router(
         token_hash = hash_refresh_token(body.token)
         password_hash = deps.hasher.hash(body.password)
 
-        async with deps.pool.acquire() as conn:
-            async with conn.transaction():
-                # Atomic consume: returns the row iff it was pending +
-                # unexpired AT THE UPDATE. Two concurrent accepts therefore
-                # observe exactly-one success.
-                invitation = await deps.invitation_repo.accept(conn, token_hash)
-                if invitation is None:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="invitation invalid, expired, or already accepted",
-                    )
-                try:
-                    user = await deps.user_repo.create(
-                        conn,
-                        email=invitation.email_canonical,
-                        password_hash=password_hash,
-                        full_name=body.full_name,
-                        company=None,
-                        role=invitation.role,
-                        org_id=invitation.org_id,
-                    )
-                except asyncpg.UniqueViolationError as exc:
-                    # Should be vanishingly rare — the invitation flow blocks
-                    # invites to existing emails. If it happens (race after a
-                    # parallel signup), the transaction rolls back, including
-                    # the invitation accept, so the token is preserved for a
-                    # later retry.
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail="an account with this email already exists",
-                    ) from exc
-
-                access_token, expires_in = deps.issuer.issue_access_token(
-                    user_id=user.id,
-                    email=user.email_canonical,
-                    role=user.role,
-                    org_id=user.org_id,
+        async with deps.pool.acquire() as conn, conn.transaction():
+            # Atomic consume: returns the row iff it was pending +
+            # unexpired AT THE UPDATE. Two concurrent accepts therefore
+            # observe exactly-one success.
+            invitation = await deps.invitation_repo.accept(conn, token_hash)
+            if invitation is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="invitation invalid, expired, or already accepted",
                 )
-                refresh = deps.issuer.issue_refresh_token(remember_me=False)
-                await deps.refresh_repo.create(
+            try:
+                user = await deps.user_repo.create(
                     conn,
-                    user_id=user.id,
-                    token_hash=refresh.token_hash,
-                    expires_at=refresh.expires_at,
+                    email=invitation.email_canonical,
+                    password_hash=password_hash,
+                    full_name=body.full_name,
+                    company=None,
+                    role=invitation.role,
+                    org_id=invitation.org_id,
                 )
+            except asyncpg.UniqueViolationError as exc:
+                # Should be vanishingly rare — the invitation flow blocks
+                # invites to existing emails. If it happens (race after a
+                # parallel signup), the transaction rolls back, including
+                # the invitation accept, so the token is preserved for a
+                # later retry.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="an account with this email already exists",
+                ) from exc
+
+            access_token, expires_in = deps.issuer.issue_access_token(
+                user_id=user.id,
+                email=user.email_canonical,
+                role=user.role,
+                org_id=user.org_id,
+            )
+            refresh = deps.issuer.issue_refresh_token(remember_me=False)
+            await deps.refresh_repo.create(
+                conn,
+                user_id=user.id,
+                token_hash=refresh.token_hash,
+                expires_at=refresh.expires_at,
+            )
 
         _set_refresh_cookie(
-            response, deps, refresh.raw, int(refresh.expires_at.timestamp()),
+            response,
+            deps,
+            refresh.raw,
+            int(refresh.expires_at.timestamp()),
         )
         _logger.info(
             "auth.accept_invite org=%s user=%s role=%s",
-            invitation.org_id, user.id, invitation.role,
+            invitation.org_id,
+            user.id,
+            invitation.role,
         )
         return AccessTokenResponse(access_token=access_token, expires_in=expires_in)
 
@@ -640,18 +661,21 @@ def build_auth_router(
     return router
 
 
-def register_auth_exception_handlers(app) -> None:  # noqa: ANN001 — FastAPI app type avoided to keep this importable from microservices
+def register_auth_exception_handlers(app) -> None:
     """Register the 401/403 translation for auth-module exceptions.
 
     Mount once on the application alongside ``include_router``.
     """
-    from fastapi import FastAPI  # local import to avoid forcing this module to depend on fastapi at import-of-our-module time
+    from fastapi import (
+        FastAPI,  # local import to avoid forcing this module to depend on fastapi at import-of-our-module time
+    )
 
-    assert isinstance(app, FastAPI)  # noqa: S101 — type guard for the optional callers
+    assert isinstance(app, FastAPI)
 
     @app.exception_handler(InvalidCredentialsError)
     async def _invalid_credentials(_request: Request, exc: InvalidCredentialsError) -> Response:
         from fastapi.responses import JSONResponse
+
         _logger.info("auth.login.invalid_credentials")
         return JSONResponse(
             status_code=401,
@@ -662,6 +686,7 @@ def register_auth_exception_handlers(app) -> None:  # noqa: ANN001 — FastAPI a
     @app.exception_handler(UserDisabledError)
     async def _user_disabled(_request: Request, exc: UserDisabledError) -> Response:
         from fastapi.responses import JSONResponse
+
         _logger.info("auth.login.user_disabled")
         return JSONResponse(
             status_code=401,

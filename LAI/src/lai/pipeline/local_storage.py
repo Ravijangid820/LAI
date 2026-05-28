@@ -16,12 +16,10 @@ Usage:
 """
 
 import io
-import json
 import os
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Generator, Optional
 
 from lai.core.logging import get_logger
 
@@ -118,11 +116,10 @@ class LocalMinIO:
                 raise FileNotFoundError(f"No part files for: {bucket}/{key}")
             data = b"".join(pf.read_bytes() for pf in part_files)
             return _LocalResponse(data)
-        else:
-            path = self.data_dir / bucket / key
-            if not path.is_file():
-                raise FileNotFoundError(f"Object not found: {bucket}/{key}")
-            return _LocalResponse(path.read_bytes())
+        path = self.data_dir / bucket / key
+        if not path.is_file():
+            raise FileNotFoundError(f"Object not found: {bucket}/{key}")
+        return _LocalResponse(path.read_bytes())
 
     def stat_object(self, bucket: str, key: str):
         if self._detect_format(bucket):
@@ -137,8 +134,9 @@ class LocalMinIO:
                 raise FileNotFoundError(f"Object not found: {bucket}/{key}")
         return True
 
-    def put_object(self, bucket: str, key: str, data: io.BytesIO, length: int,
-                   content_type: str = "application/octet-stream"):
+    def put_object(
+        self, bucket: str, key: str, data: io.BytesIO, length: int, content_type: str = "application/octet-stream"
+    ):
         """Write an object. Uses plain-file layout by default (MinIO-compatible
         buckets are read-only in our local mode)."""
         data.seek(0)
@@ -151,6 +149,7 @@ class LocalMinIO:
 
 class _ObjectInfo:
     """Mimics minio.datatypes.Object."""
+
     def __init__(self, name: str, size: int, is_dir: bool = False):
         self.object_name = name
         self.name = name
@@ -161,6 +160,7 @@ class _ObjectInfo:
 
 class _LocalResponse:
     """Mimics urllib3.response.HTTPResponse for MinIO get_object."""
+
     def __init__(self, data: bytes):
         self._data = data
 
@@ -177,6 +177,7 @@ class _LocalResponse:
 # ============================================================
 # Local DB: SQLite replacement for PostgreSQL
 # ============================================================
+
 
 class LocalDB:
     """SQLite-based replacement for the PostgreSQL pipeline database.
@@ -393,6 +394,7 @@ def _pg_to_sqlite(query: str) -> str:
 # Patch CLI to use local storage
 # ============================================================
 
+
 def _find_minio_data_dir() -> str:
     """Auto-detect the MinIO-compatible data directory.
 
@@ -422,8 +424,7 @@ def _find_minio_data_dir() -> str:
         if os.path.isdir(os.path.join(c, "lai-raw")):
             return c
     raise FileNotFoundError(
-        "Cannot find a MinIO-compatible data directory with a lai-raw/ bucket. "
-        "Pass --minio-data-dir explicitly."
+        "Cannot find a MinIO-compatible data directory with a lai-raw/ bucket. Pass --minio-data-dir explicitly."
     )
 
 
@@ -449,6 +450,7 @@ def patch_cli_for_local(minio_data_dir: str | None = None, db_path: str | None =
     - _get_db() / _db_execute / _db_fetch / _db_insert_returning / _db_transaction
     """
     import sys
+
     # When run as `python -m lai.pipeline.cli`, the module is __main__,
     # not lai.pipeline.cli. We need to patch the actual running module.
     if "__main__" in sys.modules and hasattr(sys.modules["__main__"], "_get_minio"):
@@ -620,11 +622,12 @@ def patch_execute_values():
     the execute_values function. If psycopg2 is not installed, creates
     a minimal fake module.
     """
-    import types
     import sys
+    import types
 
     try:
         import psycopg2.extras
+
         psycopg2.extras.execute_values = _sqlite_execute_values
     except ImportError:
         # psycopg2 not installed — create minimal fakes

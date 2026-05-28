@@ -27,13 +27,14 @@ from here, the duplication is gone.
 This module is pure-Python with no I/O — safe to import from anywhere
 in ``lai.common`` consumers.
 """
+
 from __future__ import annotations
 
 from lai.common.jurisdiction.validator import (
     BUNDESLAND_BBOX,
     BUNDESLAND_KEYWORDS,
-    GERMANY_BBOX,
     BUNDESLAND_SPECIFIC_RULES,
+    GERMANY_BBOX,
     JurisdictionWarning,
     check_jurisdiction,
     detect_bundesland,

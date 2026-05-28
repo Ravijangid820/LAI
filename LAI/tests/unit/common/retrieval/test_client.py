@@ -22,7 +22,6 @@ from lai.common.exceptions import (
 from lai.common.retrieval import RetrievalClient, RetrievalConfig, RetrievalMetrics
 from lai.common.retrieval.client import RetrievedChunk, _format_halfvec_literal
 
-
 # ── Fakes ────────────────────────────────────────────────────────────────────
 
 
@@ -97,9 +96,7 @@ class _FakePool:
 def _client_with_pool(pool, *, max_retries=2):
     """Build a client whose ``_ensure_pool`` returns the fake pool."""
     cfg = RetrievalConfig()
-    client = RetrievalClient(
-        cfg, metrics=RetrievalMetrics(registry=CollectorRegistry()), max_retries=max_retries
-    )
+    client = RetrievalClient(cfg, metrics=RetrievalMetrics(registry=CollectorRegistry()), max_retries=max_retries)
     client._pool = pool  # inject; bypass real psycopg2 pool creation
     return client
 

@@ -10,7 +10,7 @@ every existing session out at the cutover. Pure token/dataclass tests; no DB.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -37,7 +37,10 @@ def test_access_token_round_trips_org_id() -> None:
     iss = _issuer()
     uid, org = uuid4(), uuid4()
     token, _ = iss.issue_access_token(
-        user_id=uid, email="a@b.de", role="user", org_id=org,
+        user_id=uid,
+        email="a@b.de",
+        role="user",
+        org_id=org,
     )
     claims = iss.decode_access_token(token)
     assert claims.user_id == uid
@@ -47,7 +50,10 @@ def test_access_token_round_trips_org_id() -> None:
 def test_org_less_user_round_trips_none() -> None:
     iss = _issuer()
     token, _ = iss.issue_access_token(
-        user_id=uuid4(), email="a@b.de", role="user", org_id=None,
+        user_id=uuid4(),
+        email="a@b.de",
+        role="user",
+        org_id=None,
     )
     assert iss.decode_access_token(token).org_id is None
 
@@ -65,7 +71,7 @@ def test_pre_tenancy_token_without_org_claim_decodes_to_none() -> None:
     # still decode (to org_id=None), not be rejected.
     cfg = _cfg()
     iss = TokenIssuer(cfg)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     legacy = jwt.encode(
         {
             "iss": cfg.jwt_issuer,
@@ -85,7 +91,7 @@ def test_malformed_org_id_claim_is_rejected() -> None:
     # A *present but unparseable* org_id is a tampered token → reject.
     cfg = _cfg()
     iss = TokenIssuer(cfg)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     bad = jwt.encode(
         {
             "iss": cfg.jwt_issuer,
@@ -109,7 +115,10 @@ def test_get_current_user_dependency_carries_org_id() -> None:
     iss = _issuer()
     org = uuid4()
     token, _ = iss.issue_access_token(
-        user_id=uuid4(), email="a@b.de", role="admin", org_id=org,
+        user_id=uuid4(),
+        email="a@b.de",
+        role="admin",
+        org_id=org,
     )
     dep = build_get_current_user(iss)
     creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)

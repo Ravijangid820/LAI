@@ -10,7 +10,6 @@ from functools import lru_cache
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 # ---------------------------------------------------------------------------
 # Base config shared by all settings groups
 # ---------------------------------------------------------------------------
@@ -25,6 +24,7 @@ _COMMON_CONFIG = SettingsConfigDict(
 # ---------------------------------------------------------------------------
 # Infrastructure
 # ---------------------------------------------------------------------------
+
 
 class DatabaseSettings(BaseSettings):
     """PostgreSQL + pgvector configuration."""
@@ -41,10 +41,7 @@ class DatabaseSettings(BaseSettings):
 
     @property
     def dsn(self) -> str:
-        return (
-            f"postgresql://{self.user}:{self.password.get_secret_value()}"
-            f"@{self.host}:{self.port}/{self.database}"
-        )
+        return f"postgresql://{self.user}:{self.password.get_secret_value()}@{self.host}:{self.port}/{self.database}"
 
     @property
     def async_dsn(self) -> str:
@@ -91,6 +88,7 @@ class MinIOSettings(BaseSettings):
 # ---------------------------------------------------------------------------
 # ML Services
 # ---------------------------------------------------------------------------
+
 
 class EmbeddingSettings(BaseSettings):
     """Embedding service configuration (Qwen3-Embedding-8B via vLLM).
@@ -143,6 +141,7 @@ class LLMSettings(BaseSettings):
 # Pipeline
 # ---------------------------------------------------------------------------
 
+
 class RetrievalSettings(BaseSettings):
     """Retrieval pipeline configuration."""
 
@@ -155,8 +154,8 @@ class RetrievalSettings(BaseSettings):
 
     # Retrieval counts
     initial_k: int = Field(default=100, ge=1, le=1000)
-    final_k: int = Field(default=7, ge=1, le=50)       # Increased from 5 -> 7
-    max_final_k: int = Field(default=10, ge=1, le=50)   # Increased from 7 -> 10
+    final_k: int = Field(default=7, ge=1, le=50)  # Increased from 5 -> 7
+    max_final_k: int = Field(default=10, ge=1, le=50)  # Increased from 7 -> 10
     min_final_k: int = Field(default=2, ge=1, le=50)
 
     # Quality thresholds
@@ -249,6 +248,7 @@ class PipelineSettings(BaseSettings):
 # External Services
 # ---------------------------------------------------------------------------
 
+
 class BraveSearchSettings(BaseSettings):
     """Brave Search API for web search fallback."""
 
@@ -264,6 +264,7 @@ class BraveSearchSettings(BaseSettings):
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
+
 
 class JWTSettings(BaseSettings):
     """JWT authentication configuration."""
@@ -317,6 +318,7 @@ class SessionSettings(BaseSettings):
 # ---------------------------------------------------------------------------
 # Aggregate settings
 # ---------------------------------------------------------------------------
+
 
 class Settings(BaseSettings):
     """Main settings container - aggregates all settings groups.

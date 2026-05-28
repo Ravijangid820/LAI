@@ -32,8 +32,12 @@ class TestHaversine:
 class TestFilterOutlierPoints:
     def _cluster(self) -> list[tuple[float, float]]:
         return [
-            (53.638, 9.098), (53.637, 9.099), (53.636, 9.100),
-            (53.639, 9.097), (53.640, 9.096), (53.635, 9.101),
+            (53.638, 9.098),
+            (53.637, 9.099),
+            (53.636, 9.100),
+            (53.639, 9.097),
+            (53.640, 9.096),
+            (53.635, 9.101),
             (53.641, 9.095),
         ]
 
@@ -82,16 +86,19 @@ class TestAlkisCircuitBreaker:
     'running' for hours."""
 
     @staticmethod
-    def _park_area() -> "cp.ProjectArea":
+    def _park_area() -> cp.ProjectArea:
         # ~2 km box → a 300 m grid yields far more points than the breaker
         # threshold, so a non-tripping loop would call alkis_query many times.
         lat, lng = 53.636, 9.098
         d = 0.02
-        poly = [(lat - d, lng - d), (lat - d, lng + d),
-                (lat + d, lng + d), (lat + d, lng - d)]
+        poly = [(lat - d, lng - d), (lat - d, lng + d), (lat + d, lng + d), (lat + d, lng - d)]
         return cp.ProjectArea(
-            name="t", polygon=poly, centroid_lat=lat, centroid_lng=lng,
-            area_km2=16.0, source="test",
+            name="t",
+            polygon=poly,
+            centroid_lat=lat,
+            centroid_lng=lng,
+            area_km2=16.0,
+            source="test",
         )
 
     def test_breaker_trips_and_does_not_grind_all_points(self) -> None:

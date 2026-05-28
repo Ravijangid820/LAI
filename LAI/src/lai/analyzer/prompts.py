@@ -6,10 +6,10 @@ no template engine.
 
 See docs/analysis/CONTRACT_ANALYZER_V2.md §9.
 """
+
 from __future__ import annotations
 
 from lai.analyzer.playbooks import PLAYBOOKS
-
 
 # ---------------------------------------------------------------------------
 # Contract-type classifier
@@ -43,11 +43,11 @@ CLAUSE_SYSTEM = (
     "Schwerpunkt Windenergie und Projektfinanzierung. Du prüfst die "
     "folgende Klausel akribisch. Antworte AUSSCHLIESSLICH mit einem "
     "JSON-Objekt nach folgendem Schema; keine Markdown-Codeblöcke:\n\n"
-    '{\n'
+    "{\n"
     '  "type": "<Kurzbezeichnung des Klauselthemas>",\n'
     '  "summary": "<1-2 Sätze: was regelt die Klausel inhaltlich>",\n'
     '  "issues": [\n'
-    '    {\n'
+    "    {\n"
     '      "severity": <1|2|3|4|5>,\n'
     '      "title": "<Kurztitel>",\n'
     '      "description": "<konkretes Problem in 1-3 Sätzen>",\n'
@@ -56,7 +56,7 @@ CLAUSE_SYSTEM = (
     '      "rationale": "<warum diese Disposition; Pflichtfeld>",\n'
     '      "suggested_redline": "<Vorschlag oder null>",\n'
     '      "legal_basis": ["§ ... BGB", "§ ... EEG", ...]\n'
-    '    }\n'
+    "    }\n"
     "  ]\n"
     "}\n\n"
     "Severity-Skala:\n"
@@ -108,24 +108,24 @@ WHOLE_CONTRACT_SYSTEM = (
     "  - die wörtlichen Texte jener Klauseln, die in der Einzelprüfung "
     "Probleme der Schwere ≥ 3 hatten.\n\n"
     "Antworte AUSSCHLIESSLICH mit einem JSON-Objekt nach folgendem Schema:\n"
-    '{\n'
+    "{\n"
     '  "metadata": {\n'
     '    "parties": [...], "effective_date": "...", "signing_date": "...",\n'
     '    "term": "...", "jurisdiction": "..."\n'
-    '  },\n'
+    "  },\n"
     '  "cross_clause_findings": [\n'
     '    {"title": "...", "involved_clauses": ["..."], "description": "...",\n'
     '     "severity": 1-5, "rectify_or_ignore": "...", "rationale": "..."}\n'
-    '  ],\n'
+    "  ],\n"
     '  "missing_required_clauses": [\n'
     '    {"severity": 3-5, "title": "Fehlend: <Topic>", "description": "...",\n'
     '     "affected_clauses": [], "rectify_or_ignore": "rectify",\n'
     '     "rationale": "...", "suggested_redline": null, "legal_basis": []}\n'
-    '  ],\n'
+    "  ],\n"
     '  "reconciliation_interpretation": [\n'
     '    {"table_title": "...", "verdict": "rounding|ocr|real_defect",\n'
     '     "explanation": "..."}\n'
-    '  ]\n'
+    "  ]\n"
     "}\n\n"
     "Keine Markdown-Codeblöcke. Wenn nichts zu melden ist: leere Listen."
 )
@@ -142,19 +142,24 @@ def build_whole_contract_user(
     pb_lines = "\n".join(f"  - {topic}: {reason}" for topic, reason in playbook)
 
     cs_lines = "\n".join(
-        f"  [{c['id']}] ({c.get('type','?')}) {c.get('title','')[:80]} — {c.get('summary','')[:200]}"
+        f"  [{c['id']}] ({c.get('type', '?')}) {c.get('title', '')[:80]} — {c.get('summary', '')[:200]}"
         for c in clause_summaries
     )
 
-    flagged_lines = "\n\n".join(
-        f"### Klausel {c['id']} — {c.get('title','')}\n{c.get('text','')}"
-        for c in flagged_clauses_verbatim
-    ) or "(keine ≥ Schwere-3-Befunde aus Einzelprüfung)"
+    flagged_lines = (
+        "\n\n".join(
+            f"### Klausel {c['id']} — {c.get('title', '')}\n{c.get('text', '')}" for c in flagged_clauses_verbatim
+        )
+        or "(keine ≥ Schwere-3-Befunde aus Einzelprüfung)"
+    )
 
-    recon_lines = "\n".join(
-        f"  - {f['table_title']} ({f['kind']}, severity={f['severity']}): {f['note']}"
-        for f in reconciliation_findings
-    ) or "(keine Diskrepanzen)"
+    recon_lines = (
+        "\n".join(
+            f"  - {f['table_title']} ({f['kind']}, severity={f['severity']}): {f['note']}"
+            for f in reconciliation_findings
+        )
+        or "(keine Diskrepanzen)"
+    )
 
     return (
         f"Vertragstyp: {contract_type}\n"

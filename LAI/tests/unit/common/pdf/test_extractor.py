@@ -321,9 +321,12 @@ class TestQualityGate:
         # 60 chars: above min_chars_per_page=50, below ratio floor=200.
         garbage = "".join(chr(0xE000 + i) for i in range(60))
         _install_fake_document(monkeypatch, _FakeDocument(pages=[_FakePage(garbage)]))
-        e = PdfExtractor(config=PdfExtractorConfig(
-            min_chars_per_page=50, min_chars_for_ratio_check=200,
-        ))
+        e = PdfExtractor(
+            config=PdfExtractorConfig(
+                min_chars_per_page=50,
+                min_chars_for_ratio_check=200,
+            )
+        )
         result = e.extract_bytes(b"%PDF-")
         assert result.pages[0].source is PdfPageSource.EMBEDDED
 
@@ -333,9 +336,12 @@ class TestQualityGate:
         garbled-but-long text is accepted as embedded."""
         garbage = "".join(chr(0xE000 + (i % 50)) for i in range(400))
         _install_fake_document(monkeypatch, _FakeDocument(pages=[_FakePage(garbage)]))
-        e = PdfExtractor(config=PdfExtractorConfig(
-            min_chars_per_page=50, min_alpha_ratio=0.0,
-        ))
+        e = PdfExtractor(
+            config=PdfExtractorConfig(
+                min_chars_per_page=50,
+                min_alpha_ratio=0.0,
+            )
+        )
         result = e.extract_bytes(b"%PDF-")
         assert result.pages[0].source is PdfPageSource.EMBEDDED
 
@@ -345,9 +351,12 @@ class TestQualityGate:
         returned as-is rather than dropped."""
         garbage = "".join(chr(0xE000 + (i % 50)) for i in range(400))
         _install_fake_document(monkeypatch, _FakeDocument(pages=[_FakePage(garbage)]))
-        e = PdfExtractor(config=PdfExtractorConfig(
-            min_chars_per_page=50, enable_ocr=False,
-        ))
+        e = PdfExtractor(
+            config=PdfExtractorConfig(
+                min_chars_per_page=50,
+                enable_ocr=False,
+            )
+        )
         result = e.extract_bytes(b"%PDF-")
         assert result.pages[0].source is PdfPageSource.EMBEDDED
         assert result.pages[0].text == garbage

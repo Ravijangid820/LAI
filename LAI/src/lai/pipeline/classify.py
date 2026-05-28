@@ -23,12 +23,10 @@ Wind-energy due-diligence domains:
 """
 
 import json
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
 
-from lai.core.config import get_settings
 from lai.core.logging import get_logger
 
 logger = get_logger("lai.pipeline.classify")
@@ -69,7 +67,7 @@ def classify_chunk(
     llm_model: str,
     timeout: float = 60.0,
     max_input_chars: int = 4000,
-) -> tuple[List[str], str | None]:
+) -> tuple[list[str], str | None]:
     """Classify a single parent chunk text into domains.
 
     Returns (domains, raw_response) — raw_response is kept for audit trail.
@@ -106,7 +104,7 @@ def classify_chunk(
                 content = content[4:]
 
         # Extract first JSON array — LLM sometimes adds explanation after it
-        match = re.search(r'\[.*?\]', content, re.DOTALL)
+        match = re.search(r"\[.*?\]", content, re.DOTALL)
         if match:
             content = match.group(0)
 
@@ -126,12 +124,12 @@ def classify_chunk(
 
 
 def classify_batch(
-    chunks: List[Dict[str, Any]],
+    chunks: list[dict[str, Any]],
     *,
     llm_url: str,
     llm_model: str,
     max_concurrent: int = 16,
-) -> Dict[int, tuple[List[str], str | None]]:
+) -> dict[int, tuple[list[str], str | None]]:
     """
     Classify a batch of parent chunks concurrently.
 
@@ -140,7 +138,7 @@ def classify_batch(
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    results: Dict[int, tuple[List[str], str | None]] = {}
+    results: dict[int, tuple[list[str], str | None]] = {}
     logger.info(f"Classifying batch of {len(chunks)} parent chunks ({max_concurrent} concurrent)")
 
     def _classify_one(chunk):

@@ -232,10 +232,7 @@ class PdfExtractor:
         # but garbled — a broken embedded font maps glyphs to control
         # bytes / private-use codepoints, so it passes the length check
         # yet is unreadable. In that case we fall through to OCR.
-        if (
-            len(embedded_text) >= self._config.min_chars_per_page
-            and not self._is_low_quality_text(embedded_text)
-        ):
+        if len(embedded_text) >= self._config.min_chars_per_page and not self._is_low_quality_text(embedded_text):
             return PdfPageResult(
                 index=index,
                 text=embedded_text,
@@ -307,10 +304,7 @@ def _readable_char_ratio(text: str) -> float:
     """
     if not text:
         return 0.0
-    readable = sum(
-        1 for ch in text
-        if ch.isalnum() or ch.isspace() or ch in _READABLE_PUNCT
-    )
+    readable = sum(1 for ch in text if ch.isalnum() or ch.isspace() or ch in _READABLE_PUNCT)
     return readable / len(text)
 
 

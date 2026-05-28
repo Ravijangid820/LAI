@@ -39,6 +39,7 @@ _logger = logging.getLogger("lai.admin")
 
 # ─── Request / response shapes ──────────────────────────────────────────────
 
+
 class OrgSummaryOut(BaseModel):
     id: UUID
     name: str
@@ -92,6 +93,7 @@ class InvitationOut(BaseModel):
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
+
 def _scope_for(user: CurrentUser) -> str:
     """Search scope per role: super → every active user; firm admin → only
     org-less users plus the admin's own org members (no rival-firm
@@ -101,11 +103,7 @@ def _scope_for(user: CurrentUser) -> str:
 
 def _can_manage_org(user: CurrentUser, org_id: UUID) -> bool:
     """A super-admin may manage any org; a firm admin only their own."""
-    return user.is_super_admin or (
-        user.is_admin
-        and user.org_id is not None
-        and user.org_id == org_id
-    )
+    return user.is_super_admin or (user.is_admin and user.org_id is not None and user.org_id == org_id)
 
 
 def _to_member_out(rec: UserRecord) -> MemberOut:
@@ -142,10 +140,11 @@ def _to_invitation_out(rec: InvitationRecord) -> InvitationOut:
 
 # ─── Router factory ─────────────────────────────────────────────────────────
 
+
 def build_admin_router(
     deps: AuthDeps,
     *,
-    get_current_user,  # noqa: ANN001 — FastAPI dependency callable
+    get_current_user,
 ) -> APIRouter:
     """Wire the ``/admin`` endpoints. Mirrors the auth_router factory."""
     router = APIRouter(prefix="/admin", tags=["admin"])
@@ -199,10 +198,16 @@ def build_admin_router(
         async with deps.pool.acquire() as conn:
             rec = await deps.org_repo.create(conn, name=body.name.strip())
         _logger.info(
-            "org.create id=%s name=%r by=%s", rec.id, rec.name, user.id,
+            "org.create id=%s name=%r by=%s",
+            rec.id,
+            rec.name,
+            user.id,
         )
         return OrgSummaryOut(
-            id=rec.id, name=rec.name, status=rec.status, member_count=0,
+            id=rec.id,
+            name=rec.name,
+            status=rec.status,
+            member_count=0,
         )
 
     # ── PATCH /admin/orgs/{org_id} (rename) ────────────────────────────
@@ -226,7 +231,7 @@ def build_admin_router(
                 )
             rec = await deps.org_repo.get_by_id(conn, org_id)
             members = await deps.org_repo.list_members(conn, org_id)
-        assert rec is not None  # noqa: S101 — we just confirmed update
+        assert rec is not None
         return OrgSummaryOut(
             id=rec.id,
             name=rec.name,
@@ -282,11 +287,7 @@ def build_admin_router(
             # A firm admin may only ADD an unaffiliated user OR re-confirm an
             # existing member of their own org. They cannot poach another
             # firm's user. Super-admin: no such constraint.
-            if (
-                not user.is_super_admin
-                and target.org_id is not None
-                and target.org_id != org_id
-            ):
+            if not user.is_super_admin and target.org_id is not None and target.org_id != org_id:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="user already belongs to another organisation",
@@ -296,10 +297,13 @@ def build_admin_router(
                 if body.role != target.role:
                     await deps.user_repo.set_role(conn, body.user_id, body.role)
             updated = await deps.user_repo.get_by_id(conn, body.user_id)
-        assert updated is not None  # noqa: S101 — set_org_id just succeeded
+        assert updated is not None
         _logger.info(
             "org.member.add org=%s user=%s by=%s role=%s",
-            org_id, body.user_id, user.id, body.role,
+            org_id,
+            body.user_id,
+            user.id,
+            body.role,
         )
         return _to_member_out(updated)
 
@@ -335,7 +339,9 @@ def build_admin_router(
             await deps.user_repo.set_org_id(conn, user_id, None)
         _logger.info(
             "org.member.remove org=%s user=%s by=%s",
-            org_id, user_id, user.id,
+            org_id,
+            user_id,
+            user.id,
         )
 
     # ── PATCH /admin/orgs/{org_id}/members/{user_id} (change role) ─────
@@ -370,10 +376,13 @@ def build_admin_router(
                 )
             await deps.user_repo.set_role(conn, user_id, body.role)
             updated = await deps.user_repo.get_by_id(conn, user_id)
-        assert updated is not None  # noqa: S101 — set_role just succeeded
+        assert updated is not None
         _logger.info(
             "org.member.role org=%s user=%s by=%s role=%s",
-            org_id, user_id, user.id, body.role,
+            org_id,
+            user_id,
+            user.id,
+            body.role,
         )
         return _to_member_out(updated)
 
@@ -441,10 +450,7 @@ def build_admin_router(
                 # flow so we don't create a duplicate identity via accept.
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        "an account with this email already exists — "
-                        "use the member search to add them"
-                    ),
+                    detail=("an account with this email already exists — use the member search to add them"),
                 )
             invitation = await deps.invitation_repo.upsert_outstanding(
                 conn,
@@ -460,9 +466,7 @@ def build_admin_router(
         # Schedule the email AFTER the response so a Brevo hiccup never blocks
         # the admin UI. ``send_invite_email`` already swallows + logs errors.
         if deps.email_config is not None:
-            inviter_name = (
-                inviter.full_name if inviter is not None else user.email
-            )
+            inviter_name = inviter.full_name if inviter is not None else user.email
             background_tasks.add_task(
                 send_invite_email,
                 deps.email_config,
@@ -474,7 +478,10 @@ def build_admin_router(
             )
         _logger.info(
             "org.invite.create org=%s email=%s by=%s role=%s",
-            org_id, email_canon, user.id, body.role,
+            org_id,
+            email_canon,
+            user.id,
+            body.role,
         )
         return _to_invitation_out(invitation)
 
@@ -494,7 +501,8 @@ def build_admin_router(
             )
         async with deps.pool.acquire() as conn:
             invitations = await deps.invitation_repo.list_pending_for_org(
-                conn, org_id,
+                conn,
+                org_id,
             )
         return [_to_invitation_out(i) for i in invitations]
 
@@ -522,7 +530,9 @@ def build_admin_router(
             )
         _logger.info(
             "org.invite.revoke org=%s invite=%s by=%s",
-            org_id, invite_id, user.id,
+            org_id,
+            invite_id,
+            user.id,
         )
 
     return router

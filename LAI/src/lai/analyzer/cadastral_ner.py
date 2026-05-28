@@ -6,15 +6,15 @@ Two-stage:
 
 See docs/analysis/CONTRACT_ANALYZER_V2.md §8.
 """
+
 from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 from lai.analyzer.schema import Parcel
-
 
 # ---------------------------------------------------------------------------
 # Stage 1 — candidate detection
@@ -36,7 +36,7 @@ _WINDOW = 600
 class _Candidate:
     span: tuple[int, int]
     text: str
-    page: Optional[int]
+    page: int | None
 
 
 def find_candidates(text: str) -> list[_Candidate]:
@@ -80,7 +80,7 @@ NER_SYSTEM = (
     "einem deutschen Vertrag extrahiere ALLE genannten Flurstücke / Parzellen. "
     "Antworte AUSSCHLIESSLICH mit einer JSON-Liste; keine Erklärung, keine "
     "Markdown-Codeblöcke. Format pro Eintrag:\n"
-    '{\n'
+    "{\n"
     '  "gemeinde": "<Stadt/Gemeindename oder null>",\n'
     '  "gemarkung": "<Gemarkungsname oder null>",\n'
     '  "flur": "<z.B. \\"2\\" oder null>",\n'
@@ -117,7 +117,7 @@ JSON_SCHEMA = {
 # Type alias: callable that takes (system_prompt, user_text, json_schema) and
 # returns the raw model output as a string. Caller injects this so we can
 # unit-test without spinning up a model.
-LLMCall = Callable[[str, str, Optional[dict]], str]
+LLMCall = Callable[[str, str, dict | None], str]
 
 
 def _parse_json_lenient(s: str) -> object:
@@ -168,16 +168,18 @@ def extract_parcels(text: str, llm_call: LLMCall) -> list[Parcel]:
             if not isinstance(entry, dict):
                 continue
             try:
-                parcels.append(Parcel(
-                    gemeinde=entry.get("gemeinde"),
-                    gemarkung=entry.get("gemarkung"),
-                    flur=str(entry["flur"]) if entry.get("flur") is not None else None,
-                    flurstueck=str(entry["flurstueck"]) if entry.get("flurstueck") is not None else None,
-                    groesse_m2=entry.get("groesse_m2"),
-                    eigentuemer=entry.get("eigentuemer"),
-                    raw_mention=str(entry.get("raw_mention", ""))[:500],
-                    page=cand.page,
-                ))
+                parcels.append(
+                    Parcel(
+                        gemeinde=entry.get("gemeinde"),
+                        gemarkung=entry.get("gemarkung"),
+                        flur=str(entry["flur"]) if entry.get("flur") is not None else None,
+                        flurstueck=str(entry["flurstueck"]) if entry.get("flurstueck") is not None else None,
+                        groesse_m2=entry.get("groesse_m2"),
+                        eigentuemer=entry.get("eigentuemer"),
+                        raw_mention=str(entry.get("raw_mention", ""))[:500],
+                        page=cand.page,
+                    )
+                )
             except Exception:
                 continue
     return _dedupe(parcels)

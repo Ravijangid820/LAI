@@ -17,10 +17,9 @@ on the path-specific behaviour:
 
 from __future__ import annotations
 
-import pytest
-
 import ddiq.extractors.grundbuch as grundbuch_mod
 import ddiq.extractors.rueckbau as rueckbau_mod
+import pytest
 from ddiq.extractors.grundbuch import check_grundbuch_match
 from ddiq.extractors.rueckbau import extract_rueckbau_bond
 from ddiq.models import CadastralParcel, RueckbauBond
@@ -30,19 +29,31 @@ from ddiq.models import CadastralParcel, RueckbauBond
 def stub_rag(monkeypatch):
     """Pre-patch RAG in BOTH extractor modules so the tests don't
     touch the live embedding / search / rerank chain."""
+
     def fake(doc_ids, question, top_k=5):
-        return ("(stub context)", [
-            {"doc_id": "d1", "filename": "doc.pdf", "text": "..."},
-        ])
+        return (
+            "(stub context)",
+            [
+                {"doc_id": "d1", "filename": "doc.pdf", "text": "..."},
+            ],
+        )
+
     monkeypatch.setattr(rueckbau_mod, "rag_context_with_meta", fake)
     monkeypatch.setattr(grundbuch_mod, "rag_context_with_meta", fake)
 
 
 def _parcel(id_: str, status: str = "secured", normalised: str = "test:1:12") -> CadastralParcel:
     return CadastralParcel(
-        id=id_, parcelNumber="12/4", gemarkung="test", flur=1,
-        polygon=[[53.0, 8.0]], status=status, owner="o", area=1000.0,
-        contractRef="contract-1", normalizedId=normalised,
+        id=id_,
+        parcelNumber="12/4",
+        gemarkung="test",
+        flur=1,
+        polygon=[[53.0, 8.0]],
+        status=status,
+        owner="o",
+        area=1000.0,
+        contractRef="contract-1",
+        normalizedId=normalised,
     )
 
 
@@ -51,16 +62,18 @@ def _parcel(id_: str, status: str = "secured", normalised: str = "test:1:12") ->
 
 class TestRueckbau:
     def test_extracts_full_bond(self, make_llm_json, stub_rag) -> None:
-        make_llm_json({
-            "amount_eur": 250000.0,
-            "provider": "Sparkasse",
-            "beneficiary": "Gemeinde Test",
-            "valid_until": "2030-01-01",
-            "instrument_type": "Bürgschaft",
-            "sufficient": True,
-            "note": "Sufficient at 80k/MW",
-            "evidence_chunks": [1],
-        })
+        make_llm_json(
+            {
+                "amount_eur": 250000.0,
+                "provider": "Sparkasse",
+                "beneficiary": "Gemeinde Test",
+                "valid_until": "2030-01-01",
+                "instrument_type": "Bürgschaft",
+                "sufficient": True,
+                "note": "Sufficient at 80k/MW",
+                "evidence_chunks": [1],
+            }
+        )
         out = extract_rueckbau_bond(doc_ids=["d1"])
         assert isinstance(out, RueckbauBond)
         assert out.amount_eur == 250000.0
@@ -75,23 +88,29 @@ class TestRueckbau:
         """All fields null → returns a :class:`RueckbauBond` with
         just a ``note`` so the UI shows "Rückbaubürgschaft not found"
         instead of silently omitting the section."""
-        make_llm_json({
-            "amount_eur": None,
-            "provider": None,
-            "valid_until": None,
-            "instrument_type": None,
-            "note": "Document set does not mention Rückbau",
-        })
+        make_llm_json(
+            {
+                "amount_eur": None,
+                "provider": None,
+                "valid_until": None,
+                "instrument_type": None,
+                "note": "Document set does not mention Rückbau",
+            }
+        )
         out = extract_rueckbau_bond(doc_ids=["d1"])
         assert out is not None
         assert out.amount_eur is None
         assert out.note == "Document set does not mention Rückbau"
 
     def test_not_found_uses_default_note_when_missing(self, make_llm_json, stub_rag) -> None:
-        make_llm_json({
-            "amount_eur": None, "provider": None,
-            "valid_until": None, "instrument_type": None,
-        })
+        make_llm_json(
+            {
+                "amount_eur": None,
+                "provider": None,
+                "valid_until": None,
+                "instrument_type": None,
+            }
+        )
         out = extract_rueckbau_bond(doc_ids=["d1"])
         assert out is not None
         assert "not found" in (out.note or "").lower()
@@ -105,6 +124,7 @@ class TestRueckbau:
     def test_llm_raise_returns_none(self, monkeypatch, stub_rag) -> None:
         def boom(*a, **kw):
             raise RuntimeError("transport")
+
         monkeypatch.setattr(rueckbau_mod, "llm_json", boom)
         assert extract_rueckbau_bond(doc_ids=["d1"]) is None
 
@@ -161,18 +181,20 @@ class TestGrundbuch:
             assert f'"test:1:{i}"' not in prompt, f"id {i} leaked past cap"
 
     def test_parses_clean_response(self, make_llm_json, stub_rag) -> None:
-        make_llm_json([
-            {
-                "parcel_id": "bremen:1:12_4",
-                "registered_owner": "Müller GmbH",
-                "lessor_name": "Müller GmbH",
-                "owner_match": True,
-                "match_confidence": 0.95,
-                "encumbrances": ["Wegerecht zugunsten Gemeinde"],
-                "note": "match",
-                "evidence_chunks": [1],
-            },
-        ])
+        make_llm_json(
+            [
+                {
+                    "parcel_id": "bremen:1:12_4",
+                    "registered_owner": "Müller GmbH",
+                    "lessor_name": "Müller GmbH",
+                    "owner_match": True,
+                    "match_confidence": 0.95,
+                    "encumbrances": ["Wegerecht zugunsten Gemeinde"],
+                    "note": "match",
+                    "evidence_chunks": [1],
+                },
+            ]
+        )
         out = check_grundbuch_match(
             doc_ids=["d1"],
             parcels=[_parcel("p1", normalised="bremen:1:12_4")],
@@ -184,19 +206,24 @@ class TestGrundbuch:
         assert out[0].encumbrances == ["Wegerecht zugunsten Gemeinde"]
 
     def test_confidence_invalid_float_defaults_zero(self, make_llm_json, stub_rag) -> None:
-        make_llm_json([
-            {"parcel_id": "x", "match_confidence": "high"},  # str → float fails
-        ])
+        make_llm_json(
+            [
+                {"parcel_id": "x", "match_confidence": "high"},  # str → float fails
+            ]
+        )
         out = check_grundbuch_match(
-            doc_ids=["d1"], parcels=[_parcel("p1")],
+            doc_ids=["d1"],
+            parcels=[_parcel("p1")],
         )
         assert out[0].match_confidence == 0.0
 
     def test_empty_parcel_id_dropped(self, make_llm_json, stub_rag) -> None:
-        make_llm_json([
-            {"parcel_id": "", "owner_match": True},
-            {"parcel_id": "real", "owner_match": False},
-        ])
+        make_llm_json(
+            [
+                {"parcel_id": "", "owner_match": True},
+                {"parcel_id": "real", "owner_match": False},
+            ]
+        )
         out = check_grundbuch_match(doc_ids=["d1"], parcels=[_parcel("p1")])
         assert len(out) == 1
         assert out[0].parcel_id == "real"
@@ -209,5 +236,6 @@ class TestGrundbuch:
     def test_llm_raise_returns_empty(self, monkeypatch, stub_rag) -> None:
         def boom(*a, **kw):
             raise RuntimeError("transport")
+
         monkeypatch.setattr(grundbuch_mod, "llm_json", boom)
         assert check_grundbuch_match(doc_ids=["d1"], parcels=[_parcel("p1")]) == []

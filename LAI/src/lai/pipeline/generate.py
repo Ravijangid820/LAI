@@ -20,11 +20,10 @@ Target distribution per parent chunk:
 
 import json
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
 
-from lai.core.config import get_settings
 from lai.core.logging import get_logger
 
 logger = get_logger("lai.pipeline.generate")
@@ -38,31 +37,26 @@ Die Antwort muss ausschließlich auf dem Text basieren und relevante §§ oder K
 
 Format (JSON):
 {{"question": "...", "answer": "..."}}""",
-
     "summarize": """Erstelle eine Aufgabe, bei der der folgende Rechtstext zusammengefasst werden soll.
 Die Zusammenfassung soll die wichtigsten rechtlichen Punkte hervorheben.
 
 Format (JSON):
 {{"question": "Fasse den folgenden Rechtstext zusammen und hebe die wichtigsten rechtlichen Aspekte hervor.", "answer": "..."}}""",
-
     "explain": """Erstelle eine Frage, die einen juristischen Laien betrifft, und erkläre den Inhalt des folgenden Rechtstexts verständlich.
 Die Erklärung soll fachlich korrekt, aber allgemeinverständlich sein.
 
 Format (JSON):
 {{"question": "...", "answer": "..."}}""",
-
     "compare": """Erstelle eine Vergleichsfrage basierend auf dem folgenden Rechtstext.
 Vergleiche zwei Aspekte, Regelungen oder Parteien, die im Text erwähnt werden.
 
 Format (JSON):
 {{"question": "...", "answer": "..."}}""",
-
     "extract": """Erstelle eine Extraktionsaufgabe basierend auf dem folgenden Rechtstext.
 Die Frage soll nach konkreten Fakten fragen: Daten, Fristen, Parteien, Beträge, Klauselnummern.
 
 Format (JSON):
 {{"question": "...", "answer": "..."}}""",
-
     "classify_qa": """Erstelle eine Klassifikationsfrage zum folgenden Rechtstext.
 Die Frage soll nach dem Rechtsgebiet und der rechtlichen Einordnung fragen.
 
@@ -88,13 +82,13 @@ def _generate_sample(
     text: str,
     task_type: str,
     *,
-    domains: Optional[List[str]] = None,
+    domains: list[str] | None = None,
     llm_url: str,
     llm_model: str,
     temperature: float = 0.7,
     max_tokens: int = 1024,
     timeout: float = 120.0,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Generate a single training sample from a parent chunk."""
     is_refusal = task_type == "refusal"
 
@@ -153,7 +147,10 @@ def _generate_sample(
 
         # Build ChatML format
         messages = [
-            {"role": "system", "content": "Du bist ein juristischer KI-Assistent spezialisiert auf deutsches Windenergie-Recht und Due-Diligence-Prüfungen."},
+            {
+                "role": "system",
+                "content": "Du bist ein juristischer KI-Assistent spezialisiert auf deutsches Windenergie-Recht und Due-Diligence-Prüfungen.",
+            },
             {"role": "user", "content": question},
             {"role": "assistant", "content": answer},
         ]
@@ -176,14 +173,14 @@ def _generate_sample(
 
 
 def generate_samples_for_parent(
-    parent: Dict[str, Any],
+    parent: dict[str, Any],
     *,
     llm_url: str,
     llm_model: str,
     temperature: float = 0.7,
     max_tokens: int = 1024,
     refusal_ratio: float = 0.10,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Generate multiple training samples from a single parent chunk.
 
@@ -224,9 +221,14 @@ def generate_samples_for_parent(
     with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
         futures = {
             executor.submit(
-                _generate_sample, text, task_type,
-                domains=domains, llm_url=llm_url, llm_model=llm_model,
-                temperature=temperature, max_tokens=max_tokens,
+                _generate_sample,
+                text,
+                task_type,
+                domains=domains,
+                llm_url=llm_url,
+                llm_model=llm_model,
+                temperature=temperature,
+                max_tokens=max_tokens,
             ): task_type
             for task_type in tasks
         }

@@ -12,17 +12,15 @@ After bulk loading, HNSW and GIN indexes should be created:
 """
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
 
 import httpx
 
-from lai.core.config import get_settings
 from lai.core.logging import get_logger
 
 logger = get_logger("lai.pipeline.embed")
 
 
-def _parse_urls(embed_url) -> List[str]:
+def _parse_urls(embed_url) -> list[str]:
     """embed_url may be a single URL string, a CSV of URLs, or a list."""
     if isinstance(embed_url, (list, tuple)):
         return [u.rstrip("/") for u in embed_url if u]
@@ -31,7 +29,7 @@ def _parse_urls(embed_url) -> List[str]:
     return [embed_url.rstrip("/")]
 
 
-def _post_embed(url: str, model: str, batch: List[str], timeout: float) -> list:
+def _post_embed(url: str, model: str, batch: list[str], timeout: float) -> list:
     payload = {
         "model": model,
         "input": batch,
@@ -48,13 +46,13 @@ def _post_embed(url: str, model: str, batch: List[str], timeout: float) -> list:
 
 
 def embed_batch(
-    texts: List[str],
+    texts: list[str],
     *,
     embed_url,
     embed_model: str,
     batch_size: int = 32,
     timeout: float = 120.0,
-) -> List[List[float]]:
+) -> list[list[float]]:
     """
     Embed a list of texts via OpenAI-compatible /v1/embeddings endpoint(s).
 
@@ -65,12 +63,9 @@ def embed_batch(
     Returns list of embedding vectors (4096-dim each for Qwen3-Embedding-8B).
     """
     urls = _parse_urls(embed_url)
-    all_embeddings: List[List[float]] = [None] * len(texts)  # type: ignore[list-item]
+    all_embeddings: list[list[float]] = [None] * len(texts)  # type: ignore[list-item]
     total_batches = (len(texts) + batch_size - 1) // batch_size
-    logger.info(
-        f"Embedding {len(texts)} texts in {total_batches} batches "
-        f"(model={embed_model}, urls={len(urls)})"
-    )
+    logger.info(f"Embedding {len(texts)} texts in {total_batches} batches (model={embed_model}, urls={len(urls)})")
 
     # Build a list of (start, end) slice indices per batch
     slices = [(i, min(i + batch_size, len(texts))) for i in range(0, len(texts), batch_size)]

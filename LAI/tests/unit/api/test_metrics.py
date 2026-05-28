@@ -37,7 +37,9 @@ def test_default_metrics_registered_against_default_registry() -> None:
     assert isinstance(default_metrics, RagMetrics)
     # Touch one label set so the series exists at scrape time.
     default_metrics.query_total.labels(
-        mode="__test__", language="de", status="success",
+        mode="__test__",
+        language="de",
+        status="success",
     ).inc()
     assert REGISTRY.get_sample_value(
         "lai_rag_query_total",
@@ -47,7 +49,8 @@ def test_default_metrics_registered_against_default_registry() -> None:
 
 @pytest.mark.unit
 def test_query_total_label_combinations(
-    m: RagMetrics, registry: CollectorRegistry,
+    m: RagMetrics,
+    registry: CollectorRegistry,
 ) -> None:
     m.query_total.labels(mode="rag", language="de", status="success").inc()
     m.query_total.labels(mode="rag", language="de", status="success").inc(2)
@@ -65,7 +68,8 @@ def test_query_total_label_combinations(
 
 @pytest.mark.unit
 def test_query_latency_histogram_buckets_extend_to_two_minutes(
-    m: RagMetrics, registry: CollectorRegistry,
+    m: RagMetrics,
+    registry: CollectorRegistry,
 ) -> None:
     """A 95-second observation must fall in the 120s bucket, not +Inf alone."""
     m.query_latency_seconds.labels(mode="rag").observe(95.0)
@@ -83,7 +87,8 @@ def test_query_latency_histogram_buckets_extend_to_two_minutes(
 
 @pytest.mark.unit
 def test_retrieval_chunks_histogram_observes_zero_for_chat_only(
-    m: RagMetrics, registry: CollectorRegistry,
+    m: RagMetrics,
+    registry: CollectorRegistry,
 ) -> None:
     """Chat-only turns return 0 chunks — the zero bucket must accept that."""
     m.retrieval_chunks_returned.observe(0)
@@ -95,7 +100,8 @@ def test_retrieval_chunks_histogram_observes_zero_for_chat_only(
 
 @pytest.mark.unit
 def test_validator_counters_increment_independently(
-    m: RagMetrics, registry: CollectorRegistry,
+    m: RagMetrics,
+    registry: CollectorRegistry,
 ) -> None:
     """``responses_total`` counts *turns with ≥1 flag* while ``sentences_total``
     is a true cumulative — they must not be folded into one collector."""
@@ -119,17 +125,20 @@ def test_validator_counters_increment_independently(
 
 @pytest.mark.unit
 def test_feedback_total_rating_label_is_string_enum(
-    m: RagMetrics, registry: CollectorRegistry,
+    m: RagMetrics,
+    registry: CollectorRegistry,
 ) -> None:
     """Rating label is two-valued: thumbs_up / thumbs_down."""
     m.feedback_total.labels(rating="thumbs_up").inc()
     m.feedback_total.labels(rating="thumbs_up").inc()
     m.feedback_total.labels(rating="thumbs_down").inc()
     assert registry.get_sample_value(
-        "lai_feedback_total", {"rating": "thumbs_up"},
+        "lai_feedback_total",
+        {"rating": "thumbs_up"},
     ) == pytest.approx(2.0)
     assert registry.get_sample_value(
-        "lai_feedback_total", {"rating": "thumbs_down"},
+        "lai_feedback_total",
+        {"rating": "thumbs_down"},
     ) == pytest.approx(1.0)
 
 
@@ -144,8 +153,13 @@ def test_isolated_registry_does_not_collide_with_default(
     assert bundle_a.feedback_total is not bundle_b.feedback_total
     bundle_a.feedback_total.labels(rating="thumbs_up").inc()
     assert registry.get_sample_value(
-        "lai_feedback_total", {"rating": "thumbs_up"},
+        "lai_feedback_total",
+        {"rating": "thumbs_up"},
     ) == pytest.approx(1.0)
-    assert other.get_sample_value(
-        "lai_feedback_total", {"rating": "thumbs_up"},
-    ) is None
+    assert (
+        other.get_sample_value(
+            "lai_feedback_total",
+            {"rating": "thumbs_up"},
+        )
+        is None
+    )

@@ -20,10 +20,10 @@ Usage:
 Per-session uploaded documents live in process-memory only (lost on
 restart). For persistence, add a SQLite session table later.
 """
+
 from __future__ import annotations
 
 import argparse
-import asyncio
 import io
 import json
 import os
@@ -35,7 +35,6 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import httpx
 import numpy as np
@@ -49,20 +48,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # src/lai/api/serve_rag.py → parents[3] is the LAI/ project root.
 LAI_DIR = Path(__file__).resolve().parents[3]
-DB      = LAI_DIR / "processed" / "pipeline_local.db"
+DB = LAI_DIR / "processed" / "pipeline_local.db"
 
-from lai.search.eval import (
-    embed_query, ensure_bm25_fts, retrieve_bm25_ids, rrf_fuse, Reranker,
-)
-from lai.analyzer import pipeline as analyzer_pipeline
-from lai.analyzer import llm_client as analyzer_llm
-from lai.api.metrics import default_metrics as rag_metrics
-from lai.common.retrieval import RetrievalClient, RetrievedChunk
-from lai.common.citation import validate_citations
-from lai.common.exceptions import LlmError
-from lai.common.jurisdiction import check_jurisdiction, detect_bundesland
-from lai.common.llm import ChatMessage, LlmConfig, SyncLlmClient
+from fastapi import Depends
+
 from lai import persistence
+from lai.analyzer import llm_client as analyzer_llm
+from lai.analyzer import pipeline as analyzer_pipeline
+from lai.api.admin_router import build_admin_router
+from lai.api.auth_router import AuthDeps, build_auth_router, register_auth_exception_handlers
+from lai.api.email import EmailConfig as _EmailConfig
+from lai.api.metrics import default_metrics as rag_metrics
+from lai.api.share_router import build_share_router
 
 # ── Auth subsystem (AUTH_PLAN §4.1 + §9 step 4) ─────────────────────────────
 # Module-level construction of the AuthConfig / TokenIssuer /
@@ -79,21 +76,30 @@ from lai.common.auth import (
     build_get_current_user,
 )
 from lai.common.auth.db import create_pool as _create_auth_pool
-from lai.api.admin_router import build_admin_router
-from lai.api.auth_router import AuthDeps, build_auth_router, register_auth_exception_handlers
-from lai.api.share_router import build_share_router
-from lai.api.email import EmailConfig as _EmailConfig
-from fastapi import Depends
+from lai.common.citation import validate_citations
+from lai.common.exceptions import LlmError
+from lai.common.jurisdiction import check_jurisdiction, detect_bundesland
+from lai.common.llm import ChatMessage, LlmConfig, SyncLlmClient
+from lai.common.retrieval import RetrievalClient, RetrievedChunk
+from lai.search.eval import (
+    Reranker,
+    embed_query,
+    ensure_bm25_fts,
+    retrieve_bm25_ids,
+    rrf_fuse,
+)
 
 _auth_config: AuthConfig = AuthConfig()
 _token_issuer: TokenIssuer = TokenIssuer(_auth_config)
 get_current_user = build_get_current_user(_token_issuer)
 
 STATE: dict = {
-    "conn": None, "retrieval_client": None,
+    "conn": None,
+    "retrieval_client": None,
     "reranker": None,
     # Local LLM (transformers) — used if LLM_API_URL is unset
-    "lm": None, "tok": None,
+    "lm": None,
+    "tok": None,
     # Remote LLM (vLLM container, OpenAI-compatible) — preferred when set.
     # ``llm_api_url`` / ``llm_model_name`` are read for diagnostics
     # (``/health``); the real I/O goes through ``llm_client``, a shared
@@ -133,12 +139,12 @@ RAG_SYSTEM = (
     "Urteile, Kommentare — Hintergrund, NICHT der Vertrag des Nutzers).\n"
     "\n"
     "Zitiere bei JEDER inhaltlichen Aussage das passende Handle, "
-    "z.B. \"§ 35 Abs. 5 BauGB verlangt eine Rückbauverpflichtung [C-3]\" "
-    "oder \"§ 7 des Pachtvertrags [M-1]\". Verwende AUSSCHLIESSLICH "
+    'z.B. "§ 35 Abs. 5 BauGB verlangt eine Rückbauverpflichtung [C-3]" '
+    'oder "§ 7 des Pachtvertrags [M-1]". Verwende AUSSCHLIESSLICH '
     "Handles, die unten auch tatsächlich erscheinen — erfinde keine "
     "neuen. Wenn die Frage mit den Quellen nicht eindeutig beantwortet "
     "werden kann, gib das ehrlich an und markiere unbelegte Aussagen "
-    "mit \"(unbelegt)\".\n"
+    'mit "(unbelegt)".\n'
     "\n"
     # ── Statutory grounding (Phase 2A / S-6) ────────────────────────────
     # The behavioural shift that turns dead-ends into actionable DD output.
@@ -149,13 +155,13 @@ RAG_SYSTEM = (
     "Gesetzliche Verankerung bei Lücken: Wenn die Mandatsdokumente "
     "([M-n]) eine Frage NICHT beantworten, aber eine Rechtsquelle "
     "([C-n]) eine einschlägige Anforderung enthält, antworte NICHT mit "
-    "\"keine Information\". Nenne stattdessen die gesetzliche Anforderung, "
+    '"keine Information". Nenne stattdessen die gesetzliche Anforderung, '
     "zitiere die Fundstelle [C-n] und weise darauf hin, dass der "
     "entsprechende Nachweis im Datenraum fehlt und beim Mandanten "
-    "angefordert werden sollte. Beispiel: \"§ 35 Abs. 5 S. 2 BauGB "
+    'angefordert werden sollte. Beispiel: "§ 35 Abs. 5 S. 2 BauGB '
     "verlangt eine Rückbauverpflichtung [C-3]; ein entsprechender "
     "Nachweis ist in den vorliegenden Unterlagen nicht enthalten und "
-    "sollte beim Mandanten angefordert werden.\" So wird aus einer "
+    'sollte beim Mandanten angefordert werden." So wird aus einer '
     "Informationslücke eine konkrete Handlungsempfehlung."
 )
 
@@ -204,7 +210,7 @@ _LANGUAGE_DIRECTIVES: dict[str, str] = {
 }
 
 
-def _language_directive(target_language: Optional[str]) -> str:
+def _language_directive(target_language: str | None) -> str:
     """Return the system-prompt suffix that controls answer language.
 
     With no explicit ``target_language`` (the default now the UI toggle
@@ -223,25 +229,119 @@ def _language_directive(target_language: Optional[str]) -> str:
 # question, which loses when the surrounding prompt (German system prompt,
 # German document manifest, German filenames) drowns out the cue. That is
 # exactly why an English "all the pdfs uploaded?" was answered in German.
-_EN_HINT_WORDS = frozenset((
-    "the", "is", "are", "was", "were", "what", "which", "who", "whom", "how",
-    "when", "where", "why", "and", "or", "of", "to", "in", "for", "on", "do",
-    "does", "did", "you", "your", "this", "that", "these", "those", "all",
-    "any", "please", "can", "could", "would", "should", "show", "list", "give",
-    "tell", "explain", "uploaded", "upload", "document", "documents", "file",
-    "files", "contract", "permit", "turbine", "with", "from", "about",
-))
-_DE_HINT_WORDS = frozenset((
-    "der", "die", "das", "und", "oder", "ist", "sind", "war", "waren",
-    "welche", "welcher", "welches", "wie", "wann", "wo", "warum", "wer",
-    "ein", "eine", "einen", "einem", "einer", "den", "dem", "des", "für",
-    "von", "mit", "auf", "nicht", "auch", "sich", "wird", "werden", "haben",
-    "hochgeladen", "dokument", "dokumente", "datei", "dateien", "vertrag",
-    "bitte", "zeige", "liste", "alle", "habe", "ich", "bin", "über",
-))
+_EN_HINT_WORDS = frozenset(
+    (
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "how",
+        "when",
+        "where",
+        "why",
+        "and",
+        "or",
+        "of",
+        "to",
+        "in",
+        "for",
+        "on",
+        "do",
+        "does",
+        "did",
+        "you",
+        "your",
+        "this",
+        "that",
+        "these",
+        "those",
+        "all",
+        "any",
+        "please",
+        "can",
+        "could",
+        "would",
+        "should",
+        "show",
+        "list",
+        "give",
+        "tell",
+        "explain",
+        "uploaded",
+        "upload",
+        "document",
+        "documents",
+        "file",
+        "files",
+        "contract",
+        "permit",
+        "turbine",
+        "with",
+        "from",
+        "about",
+    )
+)
+_DE_HINT_WORDS = frozenset(
+    (
+        "der",
+        "die",
+        "das",
+        "und",
+        "oder",
+        "ist",
+        "sind",
+        "war",
+        "waren",
+        "welche",
+        "welcher",
+        "welches",
+        "wie",
+        "wann",
+        "wo",
+        "warum",
+        "wer",
+        "ein",
+        "eine",
+        "einen",
+        "einem",
+        "einer",
+        "den",
+        "dem",
+        "des",
+        "für",
+        "von",
+        "mit",
+        "auf",
+        "nicht",
+        "auch",
+        "sich",
+        "wird",
+        "werden",
+        "haben",
+        "hochgeladen",
+        "dokument",
+        "dokumente",
+        "datei",
+        "dateien",
+        "vertrag",
+        "bitte",
+        "zeige",
+        "liste",
+        "alle",
+        "habe",
+        "ich",
+        "bin",
+        "über",
+    )
+)
 
 
-def _detect_question_language(question: str) -> Optional[str]:
+def _detect_question_language(question: str) -> str | None:
     """Best-effort detect ``"en"`` / ``"de"`` from a question, or ``None``
     when the signal is too weak to be sure (caller then falls back to the
     soft mirror directive).
@@ -265,12 +365,13 @@ def _detect_question_language(question: str) -> Optional[str]:
     return None
 
 
-def _effective_language(req_lang: Optional[str], question: str) -> Optional[str]:
+def _effective_language(req_lang: str | None, question: str) -> str | None:
     """Pick the answer language: an explicit client override wins, else the
     detected question language, else ``None`` (soft mirror directive)."""
     if req_lang:
         return req_lang
     return _detect_question_language(question)
+
 
 # Document-only system prompt. Used when a document is uploaded and the
 # user has NOT asked to look beyond it (the default once a Matter exists).
@@ -289,23 +390,23 @@ RAG_SYSTEM_DOC_ONLY = (
     "\n"
     "Jede Quelle trägt ein stabiles Zitations-Handle [M-n] (= ein vom "
     "Nutzer hochgeladenes Dokument des Mandats). Zitiere bei JEDER "
-    "inhaltlichen Aussage das passende Handle, z.B. \"§ 7 des Vertrags "
-    "[M-1]\". Verwende AUSSCHLIESSLICH Handles, die unten tatsächlich "
+    'inhaltlichen Aussage das passende Handle, z.B. "§ 7 des Vertrags '
+    '[M-1]". Verwende AUSSCHLIESSLICH Handles, die unten tatsächlich '
     "erscheinen — erfinde keine neuen.\n"
     "\n"
     "Wenn die hochgeladenen Dokumente die Frage NICHT beantworten, sage "
-    "das klar und unmissverständlich, z.B. \"Diese Information ist in den "
-    "hochgeladenen Unterlagen nicht enthalten.\" Greife NICHT auf externe "
+    'das klar und unmissverständlich, z.B. "Diese Information ist in den '
+    'hochgeladenen Unterlagen nicht enthalten." Greife NICHT auf externe '
     "Rechtsquellen, Gesetzeskommentare, Rechtsprechung oder allgemeines "
     "Wissen zurück und nenne KEINE Zahlen, Fristen oder Klauseln aus "
     "anderen Dokumenten — es sei denn, der Nutzer fragt ausdrücklich "
-    "danach. Lieber ehrlich \"nicht enthalten\" als eine erfundene oder "
+    'danach. Lieber ehrlich "nicht enthalten" als eine erfundene oder '
     "aus fremden Quellen übernommene Antwort.\n"
     "\n"
     "Formatierungsregeln: Strukturiere die Antwort mit Markdown — Überschriften "
     "(##), Aufzählungen, Fettdruck für Schlüsselbegriffe. Wenn der Nutzer "
-    "tabellarische Daten verlangt (\"als Tabelle\", \"in Tabellenform\", "
-    "\"Übersicht\", \"vergleiche … in einer Tabelle\") oder die Daten von Natur "
+    'tabellarische Daten verlangt ("als Tabelle", "in Tabellenform", '
+    '"Übersicht", "vergleiche … in einer Tabelle") oder die Daten von Natur '
     "aus tabellarisch sind (mehrere Parzellen, mehrere Vertragspartner, mehrere "
     "Fristen, mehrere Kennzahlen), gib eine GitHub-Flavored-Markdown-Tabelle "
     "aus. Beispiel:\n"
@@ -331,18 +432,51 @@ RAG_SYSTEM_DOC_ONLY = (
 # document-grounded answer, which is the safe failure.
 _CORPUS_REQUEST_KEYWORDS = (
     # German
-    "korpus", "rechtsprechung", "gesetzeslage", "gesetzlich vorgeschrieben",
-    "üblich", "marktüblich", "branchenüblich", "im allgemeinen", "allgemein",
-    "generell", "vergleich", "verglichen", "andere verträge", "anderen verträgen",
-    "vergleichbare", "datenbank", "wissensdatenbank", "wissensbasis",
-    "außerhalb", "über das dokument hinaus", "deiner kenntnis", "deinem wissen",
-    "rechtslage", "was sagt das gesetz",
+    "korpus",
+    "rechtsprechung",
+    "gesetzeslage",
+    "gesetzlich vorgeschrieben",
+    "üblich",
+    "marktüblich",
+    "branchenüblich",
+    "im allgemeinen",
+    "allgemein",
+    "generell",
+    "vergleich",
+    "verglichen",
+    "andere verträge",
+    "anderen verträgen",
+    "vergleichbare",
+    "datenbank",
+    "wissensdatenbank",
+    "wissensbasis",
+    "außerhalb",
+    "über das dokument hinaus",
+    "deiner kenntnis",
+    "deinem wissen",
+    "rechtslage",
+    "was sagt das gesetz",
     # English
-    "corpus", "case law", "case-law", "statute", "statutory", "market standard",
-    "market practice", "usually", "in general", "generally", "compare",
-    "comparable", "other contracts", "knowledge base", "your knowledge",
-    "beyond the document", "outside the document", "what does the law",
-    "legal requirement", "required by law",
+    "corpus",
+    "case law",
+    "case-law",
+    "statute",
+    "statutory",
+    "market standard",
+    "market practice",
+    "usually",
+    "in general",
+    "generally",
+    "compare",
+    "comparable",
+    "other contracts",
+    "knowledge base",
+    "your knowledge",
+    "beyond the document",
+    "outside the document",
+    "what does the law",
+    "legal requirement",
+    "required by law",
 )
 
 
@@ -375,19 +509,51 @@ _STATUTE_RE = re.compile(
 # "Welche Rückbaupflicht besteht?", "Ist die Anlage genehmigungs-
 # pflichtig?") needs the corpus [C-n]. These tokens flag the latter.
 _LEGAL_KNOWLEDGE_KEYWORDS = (
-    "10h", "10-h", "abstandsregel", "abstandsfläche", "abstandsflaeche",
-    "mindestabstand", "rückbauverpflichtung", "rueckbauverpflichtung",
-    "rückbaupflicht", "rueckbaupflicht", "genehmigungspflicht",
-    "genehmigungsbedürftig", "genehmigungsbeduerftig", "genehmigungspflichtig",
-    "artenschutz", "immissionsschutz", "privilegiert", "privilegierung",
-    "außenbereich", "aussenbereich", "zulässigkeit", "zulaessigkeit",
-    "vorgeschrieben", "gesetzlich", "rechtlich", "vorschrift", "verordnung",
-    "immissionsrichtwert", "richtwert", "schallschutz", "naturschutz",
-    "umweltverträglichkeit", "umweltvertraeglichkeit", "bestandskraft",
-    "widerspruchsfrist", "einschlägig", "einschlaegig",
+    "10h",
+    "10-h",
+    "abstandsregel",
+    "abstandsfläche",
+    "abstandsflaeche",
+    "mindestabstand",
+    "rückbauverpflichtung",
+    "rueckbauverpflichtung",
+    "rückbaupflicht",
+    "rueckbaupflicht",
+    "genehmigungspflicht",
+    "genehmigungsbedürftig",
+    "genehmigungsbeduerftig",
+    "genehmigungspflichtig",
+    "artenschutz",
+    "immissionsschutz",
+    "privilegiert",
+    "privilegierung",
+    "außenbereich",
+    "aussenbereich",
+    "zulässigkeit",
+    "zulaessigkeit",
+    "vorgeschrieben",
+    "gesetzlich",
+    "rechtlich",
+    "vorschrift",
+    "verordnung",
+    "immissionsrichtwert",
+    "richtwert",
+    "schallschutz",
+    "naturschutz",
+    "umweltverträglichkeit",
+    "umweltvertraeglichkeit",
+    "bestandskraft",
+    "widerspruchsfrist",
+    "einschlägig",
+    "einschlaegig",
     # English
-    "setback rule", "permit requirement", "required by law", "species protection",
-    "noise limit", "decommissioning obligation", "legally required",
+    "setback rule",
+    "permit requirement",
+    "required by law",
+    "species protection",
+    "noise limit",
+    "decommissioning obligation",
+    "legally required",
 )
 
 
@@ -432,11 +598,22 @@ CONTRACT_USES_SYSTEM = (
 )
 
 CLAUSE_TYPES = [
-    "Vertragsdauer", "Pacht/Vergütung", "Kündigung", "Verlängerung",
-    "Rückbau", "Genehmigungsrisiko", "Haftung", "Versicherung",
-    "Wegerecht/Zufahrt", "Parzellen/Flurstücke", "Vorkaufsrecht",
-    "Nutzungsausschluss", "Übertragung/Sukzession", "Steuern",
-    "Gerichtsstand", "Sonstiges",
+    "Vertragsdauer",
+    "Pacht/Vergütung",
+    "Kündigung",
+    "Verlängerung",
+    "Rückbau",
+    "Genehmigungsrisiko",
+    "Haftung",
+    "Versicherung",
+    "Wegerecht/Zufahrt",
+    "Parzellen/Flurstücke",
+    "Vorkaufsrecht",
+    "Nutzungsausschluss",
+    "Übertragung/Sukzession",
+    "Steuern",
+    "Gerichtsstand",
+    "Sonstiges",
 ]
 
 CLAUSE_SEGMENT_SYSTEM = (
@@ -444,10 +621,10 @@ CLAUSE_SEGMENT_SYSTEM = (
     "Vertragstext in einzelne Klauseln. Antworte AUSSCHLIESSLICH mit "
     "einer JSON-Liste, in der jeder Eintrag konkrete Werte enthält "
     "(KEINE Platzhalter wie 'Kurztitel'). Format:\n"
-    '[\n'
+    "[\n"
     '  {"id": "1", "title": "<Echter, aussagekräftiger Titel der Klausel>", "text": "<voller Originaltext>"},\n'
     '  {"id": "2", "title": "<…>", "text": "<…>"}\n'
-    ']\n'
+    "]\n"
     "Keine zusätzlichen Erklärungen, keine Markdown-Codeblöcke. "
     "Wenn der Text keine Klauselstruktur hat, gib trotzdem eine "
     "vernünftige Aufteilung zurück."
@@ -460,12 +637,12 @@ CLAUSE_ANALYZE_SYSTEM = (
     "Wiederholung der erlaubten Werte, sondern genau einer davon).\n\n"
     "Erlaubte type-Werte: " + ", ".join(CLAUSE_TYPES) + ".\n\n"
     "Format (Beispielwerte zur Illustration):\n"
-    '{\n'
+    "{\n"
     '  "type": "Haftung",\n'
     '  "summary": "Beschränkt die Haftung des Pächters auf Vorsatz und grobe Fahrlässigkeit.",\n'
     '  "issues": [\n'
     '    {"severity": "high", "description": "Pauschale Haftungsbeschränkung wäre nach § 309 Nr. 7 BGB unwirksam.", "recommendation": "Personenschäden ausnehmen."}\n'
-    '  ],\n'
+    "  ],\n"
     '  "citations": ["§ 309 Nr. 7 BGB"]\n'
     "}\n\n"
     "Keine Markdown-Codeblöcke. Wenn keine Probleme: issues=[]."
@@ -474,23 +651,17 @@ CLAUSE_ANALYZE_SYSTEM = (
 # Minimal playbook for wind-farm Pachtverträge (German lease agreements).
 # Each entry: required clause type + reason it must be present.
 WIND_LEASE_PLAYBOOK = [
-    ("Vertragsdauer",
-     "Wind­farms haben typische Laufzeit von 25-30 Jahren; Fehlen kann "
-     "zu vorzeitiger Beendigung führen."),
-    ("Pacht/Vergütung",
-     "Höhe und Anpassungsmechanismus müssen klar geregelt sein."),
-    ("Rückbau",
-     "Wer trägt nach Betriebsende die Rückbaukosten? Pflicht nach § 35 BauGB."),
-    ("Genehmigungsrisiko",
-     "Allokation des Risikos, falls Genehmigung versagt wird."),
-    ("Wegerecht/Zufahrt",
-     "Zugang zur WEA muss dauerhaft gesichert sein."),
-    ("Übertragung/Sukzession",
-     "Übergang der Rechte/Pflichten bei Eigentümerwechsel."),
-    ("Haftung",
-     "Haftungsverteilung zwischen Verpächter und Betreiber."),
-    ("Vorkaufsrecht",
-     "Schutz des Betreibers bei Veräußerung des Grundstücks."),
+    (
+        "Vertragsdauer",
+        "Wind­farms haben typische Laufzeit von 25-30 Jahren; Fehlen kann zu vorzeitiger Beendigung führen.",
+    ),
+    ("Pacht/Vergütung", "Höhe und Anpassungsmechanismus müssen klar geregelt sein."),
+    ("Rückbau", "Wer trägt nach Betriebsende die Rückbaukosten? Pflicht nach § 35 BauGB."),
+    ("Genehmigungsrisiko", "Allokation des Risikos, falls Genehmigung versagt wird."),
+    ("Wegerecht/Zufahrt", "Zugang zur WEA muss dauerhaft gesichert sein."),
+    ("Übertragung/Sukzession", "Übergang der Rechte/Pflichten bei Eigentümerwechsel."),
+    ("Haftung", "Haftungsverteilung zwischen Verpächter und Betreiber."),
+    ("Vorkaufsrecht", "Schutz des Betreibers bei Veräußerung des Grundstücks."),
 ]
 
 
@@ -536,18 +707,22 @@ META_EXTRACT_SYSTEM = (
 )
 
 
-def _format_session_meta_prefix(meta: Optional[dict]) -> str:
+def _format_session_meta_prefix(meta: dict | None) -> str:
     """Render the pinned session metadata as a system-prompt prefix block.
     Returns '' when there's nothing useful to pin so we don't waste tokens
     on an empty header."""
     if not meta:
         return ""
     parts: list[str] = []
-    if meta.get("user_name"):     parts.append(f"- Name: {meta['user_name']}")
-    if meta.get("organisation"):  parts.append(f"- Organisation: {meta['organisation']}")
-    if meta.get("role"):          parts.append(f"- Role: {meta['role']}")
-    if meta.get("project"):       parts.append(f"- Project / matter: {meta['project']}")
-    for kd in (meta.get("key_dates") or []):
+    if meta.get("user_name"):
+        parts.append(f"- Name: {meta['user_name']}")
+    if meta.get("organisation"):
+        parts.append(f"- Organisation: {meta['organisation']}")
+    if meta.get("role"):
+        parts.append(f"- Role: {meta['role']}")
+    if meta.get("project"):
+        parts.append(f"- Project / matter: {meta['project']}")
+    for kd in meta.get("key_dates") or []:
         if isinstance(kd, dict) and kd.get("date"):
             label = (kd.get("what") or "").strip()
             parts.append(f"- Key date: {kd['date']}" + (f" — {label}" if label else ""))
@@ -559,9 +734,7 @@ def _format_session_meta_prefix(meta: Optional[dict]) -> str:
     return (
         "[Session context — stable facts about this user and conversation; "
         "use these to address the user appropriately and apply continuity. "
-        "Do NOT contradict them.]\n"
-        + "\n".join(parts)
-        + "\n[/Session context]\n\n"
+        "Do NOT contradict them.]\n" + "\n".join(parts) + "\n[/Session context]\n\n"
     )
 
 
@@ -592,8 +765,7 @@ def _maybe_refresh_session_metadata(session_id: str, user_id: str | None = None)
     # Build the extraction context — last N messages, both roles, clipped.
     recent = msgs[-META_EXTRACT_LOOKBACK:]
     convo = "\n".join(
-        f"[{m.get('role')}] {(m.get('content') or '')[:600]}"
-        for m in recent if m.get("role") in ("user", "assistant")
+        f"[{m.get('role')}] {(m.get('content') or '')[:600]}" for m in recent if m.get("role") in ("user", "assistant")
     )
     prompt = (
         "Read this conversation excerpt and identify the user's stable "
@@ -617,7 +789,7 @@ def _maybe_refresh_session_metadata(session_id: str, user_id: str | None = None)
         # at ~10s. 400 is generous headroom — typical output is ~270 tokens.
         msgs = [
             {"role": "system", "content": META_EXTRACT_SYSTEM},
-            {"role": "user",   "content": prompt},
+            {"role": "user", "content": prompt},
         ]
         raw, _, _ = llm_generate(msgs, max_new_tokens=400)
         cleaned = re.sub(r"```json\s*", "", raw)
@@ -625,7 +797,7 @@ def _maybe_refresh_session_metadata(session_id: str, user_id: str | None = None)
         # If the model wrapped the JSON in prose, find the first { and last }.
         start, end = cleaned.find("{"), cleaned.rfind("}")
         if start >= 0 and end > start:
-            cleaned = cleaned[start:end + 1]
+            cleaned = cleaned[start : end + 1]
         result = json.loads(cleaned)
         if not isinstance(result, dict):
             return
@@ -669,7 +841,7 @@ def _load_history(session_id: str | None, user_id: str | None = None) -> list[di
         role = m.get("role")
         if role not in ("user", "assistant"):
             continue
-        content = (m.get("content") or "")
+        content = m.get("content") or ""
         if len(content) > MAX_HIST_CHARS_PER_MSG:
             content = content[:MAX_HIST_CHARS_PER_MSG] + "\n[...truncated]"
         out.append({"role": role, "content": content})
@@ -693,11 +865,14 @@ def _render_sources_block(sources: list[RetrievedSource]) -> str:
     return "\n\n".join(parts)
 
 
-def build_rag_messages(question: str, sources: list[RetrievedSource],
-                       history: list[dict] | None = None,
-                       meta_prefix: str = "",
-                       target_language: Optional[str] = None,
-                       system: str = RAG_SYSTEM) -> list[dict]:
+def build_rag_messages(
+    question: str,
+    sources: list[RetrievedSource],
+    history: list[dict] | None = None,
+    meta_prefix: str = "",
+    target_language: str | None = None,
+    system: str = RAG_SYSTEM,
+) -> list[dict]:
     """Build the chat-completion message list for a RAG turn.
 
     ``sources`` carries the retrieved chunks already tagged with stable
@@ -716,42 +891,40 @@ def build_rag_messages(question: str, sources: list[RetrievedSource],
     src_block = _render_sources_block(sources)
     user = f"Quellen:\n{src_block}\n\nFrage: {question}"
     return [
-        {"role": "system",
-         "content": meta_prefix + system + _language_directive(target_language)},
+        {"role": "system", "content": meta_prefix + system + _language_directive(target_language)},
         *(history or []),
-        {"role": "user",   "content": user},
+        {"role": "user", "content": user},
     ]
 
 
-def build_chat_messages(question: str,
-                        history: list[dict] | None = None,
-                        meta_prefix: str = "",
-                        target_language: Optional[str] = None) -> list[dict]:
+def build_chat_messages(
+    question: str, history: list[dict] | None = None, meta_prefix: str = "", target_language: str | None = None
+) -> list[dict]:
     return [
-        {"role": "system",
-         "content": meta_prefix + CHAT_SYSTEM + _language_directive(target_language)},
+        {"role": "system", "content": meta_prefix + CHAT_SYSTEM + _language_directive(target_language)},
         *(history or []),
-        {"role": "user",   "content": question},
+        {"role": "user", "content": question},
     ]
 
 
 def build_router_messages(question: str) -> list[dict]:
     return [
         {"role": "system", "content": ROUTER_SYSTEM},
-        {"role": "user",   "content": question},
+        {"role": "user", "content": question},
     ]
 
 
 def build_contract_uses_messages(question: str) -> list[dict]:
     return [
         {"role": "system", "content": CONTRACT_USES_SYSTEM},
-        {"role": "user",   "content": question},
+        {"role": "user", "content": question},
     ]
 
 
 # ---------------------------------------------------------------------------
 # LLM helpers
 # ---------------------------------------------------------------------------
+
 
 def _messages_for_remote_model(messages: list[dict], model_path: str) -> list[dict]:
     """Some models (Gemma family) reject the system role in the chat
@@ -773,7 +946,7 @@ def _strip_reasoning_trace(text: str) -> str:
     final answer. Strip that prefix for the user-facing reply."""
     m = re.search(r"</think>\s*", text)
     if m:
-        return text[m.end():].strip()
+        return text[m.end() :].strip()
     return text
 
 
@@ -829,17 +1002,21 @@ def llm_generate(messages: list[dict], max_new_tokens: int = 400) -> tuple[str, 
         return text.strip(), _approx_token_count_from_chars(prompt_chars), _approx_token_count(text)
 
     # Local transformers path
-    tok = STATE["tok"]; model = STATE["lm"]
+    tok = STATE["tok"]
+    model = STATE["lm"]
     text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inp = tok(text, return_tensors="pt", truncation=True, max_length=8192).to(model.device)
     prompt_tokens = int(inp.input_ids.shape[1])
     with torch.no_grad():
         out = model.generate(
-            **inp, max_new_tokens=max_new_tokens, do_sample=False,
-            temperature=1.0, repetition_penalty=1.05,
+            **inp,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=1.0,
+            repetition_penalty=1.05,
             pad_token_id=tok.pad_token_id,
         )
-    gen_ids = out[0][inp.input_ids.shape[1]:]
+    gen_ids = out[0][inp.input_ids.shape[1] :]
     completion_tokens = int(gen_ids.shape[0])
     return tok.decode(gen_ids, skip_special_tokens=True).strip(), prompt_tokens, completion_tokens
 
@@ -928,7 +1105,7 @@ def _matter_cite_id(n: int) -> str:
     return f"M-{n}"
 
 
-def _org_or_none(user: CurrentUser) -> Optional[str]:
+def _org_or_none(user: CurrentUser) -> str | None:
     """Phase B scope helper — stringified ``org_id`` for the persistence /
     DDiQ visibility filters, or ``None`` for an org-less user (open signup
     landing state) whose reads naturally return empty everywhere."""
@@ -936,8 +1113,9 @@ def _org_or_none(user: CurrentUser) -> Optional[str]:
 
 
 def _all_matter_handles(
-    sid: str, uid: Optional[str],
-    focus_doc_indexes: Optional[list[int]] = None,
+    sid: str,
+    uid: str | None,
+    focus_doc_indexes: list[int] | None = None,
 ) -> set[str]:
     """Every uploaded matter document's ``[M-n]`` handle for this session.
 
@@ -967,7 +1145,7 @@ def _all_matter_handles(
             in_scope = set(focus_doc_indexes)
             docs = [d for d in docs if d["doc_index"] in in_scope]
         return {_matter_cite_id(d["doc_index"]) for d in docs}
-    except Exception as exc:  # noqa: BLE001 — validation must never raise
+    except Exception as exc:
         print(f"[citation] matter-handle widen failed sid={sid}: {exc}", flush=True)
         return set()
 
@@ -1025,7 +1203,8 @@ _MAX_PASSAGES_RANKED = 60
 
 
 def _rank_passages(
-    question: str, passages: list[tuple[int | None, str]],
+    question: str,
+    passages: list[tuple[int | None, str]],
 ) -> list[tuple[float, int, int | None, str]]:
     """Rank ``passages`` ([(page, text)]) by relevance to ``question``.
 
@@ -1041,6 +1220,7 @@ def _rank_passages(
         return [(0.0, i, p, t) for i, (p, t) in enumerate(capped)]
     try:
         from lai.search.eval import _get_embedding_client, embed_query
+
         qvec = embed_query(question, with_prefix=True)
         results = _get_embedding_client().embed([t for _, t in capped])
         scored: list[tuple[float, int, int | None, str]] = []
@@ -1051,18 +1231,17 @@ def _rank_passages(
                 pv = pv / n
             scored.append((float(qvec @ pv), i, page, t))
         return sorted(scored, key=lambda x: (-x[0], x[1]))
-    except Exception as e:  # noqa: BLE001 — degrade, never fail the turn
+    except Exception as e:
         print(f"[matter] embedding passage-rank failed ({e}); lexical fallback", flush=True)
         q_tokens = {t.lower() for t in _WORD_RE.findall(question)}
-        scored = [
-            (float(_score_passage_lexical(q_tokens, t)), i, page, t)
-            for i, (page, t) in enumerate(capped)
-        ]
+        scored = [(float(_score_passage_lexical(q_tokens, t)), i, page, t) for i, (page, t) in enumerate(capped)]
         return sorted(scored, key=lambda x: (-x[0], x[1]))
 
 
 def _select_relevant_passages(
-    question: str, doc_text: str, budget: int,
+    question: str,
+    doc_text: str,
+    budget: int,
 ) -> tuple[str, int | None, str]:
     """Choose what the model reads and what the citation panel shows.
 
@@ -1153,10 +1332,12 @@ def _matter_adaptive_sizes(n_docs: int) -> tuple[int, int]:
 
 
 def _matter_pgvector_context(
-    sid: str, question: str,
-    candidate_k: int = _MATTER_CANDIDATE_K, final_k: int = _MATTER_FINAL_K,
-    focus_doc_indexes: Optional[list[int]] = None,
-) -> tuple[list["RetrievedSource"], list["ChunkOut"], str] | None:
+    sid: str,
+    question: str,
+    candidate_k: int = _MATTER_CANDIDATE_K,
+    final_k: int = _MATTER_FINAL_K,
+    focus_doc_indexes: list[int] | None = None,
+) -> tuple[list[RetrievedSource], list[ChunkOut], str] | None:
     """Scalable matter retrieval: dense KNN over the per-session pgvector
     index + rerank, grouped back into one ``[M-doc_index]`` source per
     document so a data room of any size yields a bounded, citation-ready
@@ -1189,7 +1370,7 @@ def _matter_pgvector_context(
             n_docs_in_scope = sum(1 for d in all_docs if d["doc_index"] in fset)
         else:
             n_docs_in_scope = sum(1 for d in all_docs if d.get("status") != "failed")
-    except Exception:  # noqa: BLE001 — degrade to defaults if count fails
+    except Exception:
         n_docs_in_scope = 0
     adaptive_candidate_k, adaptive_cap = _matter_adaptive_sizes(n_docs_in_scope)
     # Caller overrides win (default is the module constant; anything else
@@ -1198,7 +1379,7 @@ def _matter_pgvector_context(
     try:
         qvec = embed_query(question, with_prefix=True)
         hits = rc.matter_dense_search(sid, qvec, top_k=effective_candidate_k)
-    except Exception as e:  # noqa: BLE001 — fall back, never fail the turn
+    except Exception as e:
         print(f"[matter] pgvector search failed ({e}); using fallback", flush=True)
         return None
     if not hits:
@@ -1228,7 +1409,7 @@ def _matter_pgvector_context(
             rscores = [float(scores[j]) for j in order]
         else:
             rscores = [h.similarity for h in hits]
-    except Exception as exc:  # noqa: BLE001 — degrade to dense order
+    except Exception as exc:
         print(f"[matter] rerank failed ({exc}); dense order", flush=True)
         rscores = [h.similarity for h in hits]
     # ── Per-document fairness selection ─────────────────────────────────
@@ -1304,11 +1485,17 @@ def _matter_pgvector_context(
 
     by_doc: dict[int, dict] = {}
     for rank, (h, rs) in enumerate(zip(hits, rscores)):
-        info = by_doc.setdefault(h.doc_index, {
-            "filename": h.filename, "best_rank": rank,
-            "best_sim": h.similarity, "best_rerank": rs, "best_page": h.page,
-            "passages": [],
-        })
+        info = by_doc.setdefault(
+            h.doc_index,
+            {
+                "filename": h.filename,
+                "best_rank": rank,
+                "best_sim": h.similarity,
+                "best_rerank": rs,
+                "best_page": h.page,
+                "passages": [],
+            },
+        )
         info["passages"].append(_tag(h.page, h.content))
 
     matter_sources: list[RetrievedSource] = []
@@ -1319,15 +1506,27 @@ def _matter_pgvector_context(
         cite = _matter_cite_id(doc_index)
         prompt_text = "\n\n".join(info["passages"])
         label = f"[M-{doc_index}] {info['filename']}" if info["filename"] else f"Dokument M-{doc_index}"
-        matter_sources.append(RetrievedSource(
-            cite_id=cite, source_kind="matter", text=prompt_text, label=label,
-        ))
-        matter_chunks.append(ChunkOut(
-            text=prompt_text[:2500], section=info["filename"] or label,
-            law_refs=[], sources=["upload"], similarity=info["best_sim"],
-            rerank_score=info["best_rerank"], cite_id=cite, source_kind="matter",
-            page=info["best_page"],
-        ))
+        matter_sources.append(
+            RetrievedSource(
+                cite_id=cite,
+                source_kind="matter",
+                text=prompt_text,
+                label=label,
+            )
+        )
+        matter_chunks.append(
+            ChunkOut(
+                text=prompt_text[:2500],
+                section=info["filename"] or label,
+                law_refs=[],
+                sources=["upload"],
+                similarity=info["best_sim"],
+                rerank_score=info["best_rerank"],
+                cite_id=cite,
+                source_kind="matter",
+                page=info["best_page"],
+            )
+        )
         combined_parts.append(prompt_text)
 
     # Focus-mode full-text fallback: when ``focus_doc_indexes`` is set
@@ -1352,7 +1551,8 @@ def _matter_pgvector_context(
             missing = [di for di in focus_set if di not in by_doc]
             if missing:
                 docs_with_text = persistence.list_matter_documents(
-                    sid, include_text=True,
+                    sid,
+                    include_text=True,
                 )
                 by_di = {d["doc_index"]: d for d in docs_with_text}
                 for di in missing:
@@ -1364,27 +1564,36 @@ def _matter_pgvector_context(
                         continue  # Doc legitimately has no content yet.
                     fname = d.get("filename") or ""
                     cite = _matter_cite_id(di)
-                    label = (
-                        f"[M-{di}] {fname}" if fname else f"Dokument M-{di}"
-                    )
+                    label = f"[M-{di}] {fname}" if fname else f"Dokument M-{di}"
                     # Cap to ~8 KB so a freak 100-page doc can't blow the
                     # prompt; images / single-page scans land at 2-5 KB.
                     trimmed = text[:8000]
-                    matter_sources.append(RetrievedSource(
-                        cite_id=cite, source_kind="matter",
-                        text=trimmed, label=label,
-                    ))
-                    matter_chunks.append(ChunkOut(
-                        text=trimmed[:2500], section=fname or label,
-                        law_refs=[], sources=["upload"],
-                        similarity=1.0, rerank_score=1.0,
-                        cite_id=cite, source_kind="matter", page=1,
-                    ))
+                    matter_sources.append(
+                        RetrievedSource(
+                            cite_id=cite,
+                            source_kind="matter",
+                            text=trimmed,
+                            label=label,
+                        )
+                    )
+                    matter_chunks.append(
+                        ChunkOut(
+                            text=trimmed[:2500],
+                            section=fname or label,
+                            law_refs=[],
+                            sources=["upload"],
+                            similarity=1.0,
+                            rerank_score=1.0,
+                            cite_id=cite,
+                            source_kind="matter",
+                            page=1,
+                        )
+                    )
                     combined_parts.append(trimmed)
                     # Mark in by_doc so the baseline-chunk fill below
                     # doesn't replace this with a "no passage" placeholder.
                     by_doc[di] = {"_synthetic": True}
-        except Exception as e:  # noqa: BLE001 — degrade silently
+        except Exception as e:
             print(f"[matter] focus full-text fallback failed ({e})", flush=True)
 
     # Baseline chunks for the other documents IN SCOPE this turn (those
@@ -1406,22 +1615,32 @@ def _matter_pgvector_context(
             if in_scope is not None and di not in in_scope:
                 continue
             fname = d.get("filename") or ""
-            matter_chunks.append(ChunkOut(
-                text=(f"{fname} — für diese Frage wurde keine spezifische "
-                      "Textstelle gefunden. Klicken Sie, um das Dokument zu öffnen."),
-                section=fname or f"Dokument M-{di}", law_refs=[], sources=["upload"],
-                similarity=0.0, rerank_score=0.0, cite_id=_matter_cite_id(di),
-                source_kind="matter", page=1,
-            ))
-    except Exception as e:  # noqa: BLE001
+            matter_chunks.append(
+                ChunkOut(
+                    text=(
+                        f"{fname} — für diese Frage wurde keine spezifische "
+                        "Textstelle gefunden. Klicken Sie, um das Dokument zu öffnen."
+                    ),
+                    section=fname or f"Dokument M-{di}",
+                    law_refs=[],
+                    sources=["upload"],
+                    similarity=0.0,
+                    rerank_score=0.0,
+                    cite_id=_matter_cite_id(di),
+                    source_kind="matter",
+                    page=1,
+                )
+            )
+    except Exception as e:
         print(f"[matter] baseline chunk fill failed ({e})", flush=True)
 
     return matter_sources, matter_chunks, "\n\n".join(combined_parts)
 
 
 def _matter_manifest_prefix(
-    sid: str, uid: str | None,
-    focus_doc_indexes: Optional[list[int]] = None,
+    sid: str,
+    uid: str | None,
+    focus_doc_indexes: list[int] | None = None,
 ) -> str:
     """A short list of the documents in this Matter, prepended to the system
     prompt so the model ALWAYS knows what the user has uploaded — even for
@@ -1484,10 +1703,7 @@ def _matter_manifest_prefix(
         scope_hint = ""
     return (
         f"Der Nutzer hat {len(docs)} Dokument(e) in dieses Mandat (Matter) "
-        "hochgeladen; sie sind durchsuchbar und per [M-n] zitierbar:\n"
-        + "\n".join(lines)
-        + scope_hint
-        + "\n\n"
+        "hochgeladen; sie sind durchsuchbar und per [M-n] zitierbar:\n" + "\n".join(lines) + scope_hint + "\n\n"
     )
 
 
@@ -1519,7 +1735,7 @@ def _empty_grounding_guard(
     if sources:
         return None  # we have grounded content — generate normally
 
-    en = (lang == "en")
+    en = lang == "en"
     try:
         docs = persistence.list_matter_documents(sid, user_id=uid)
     except Exception:
@@ -1537,11 +1753,7 @@ def _empty_grounding_guard(
     # effectively a failure (the live "ALT F III" case).
     still_processing = [d for d in docs if _status(d) in ("queued", "processing", "uploading")]
     usable = [d for d in docs if _status(d) in ("done", "ready") and _chunks(d) > 0]
-    failed = [
-        d for d in docs
-        if _status(d) == "failed"
-        or (_status(d) in ("done", "ready") and _chunks(d) == 0)
-    ]
+    failed = [d for d in docs if _status(d) == "failed" or (_status(d) in ("done", "ready") and _chunks(d) == 0)]
 
     # 1. Something is still ingesting → tell the user to wait, with the live
     #    page count. Scanned PDFs are OCR'd page-by-page (slow), so this is
@@ -1613,10 +1825,7 @@ def _matter_is_processing(sid: str, uid: str | None) -> bool:
         docs = persistence.list_matter_documents(sid, user_id=uid)
     except Exception:
         return False
-    return any(
-        (d.get("status") or "").lower() in ("queued", "processing", "uploading")
-        for d in docs
-    )
+    return any((d.get("status") or "").lower() in ("queued", "processing", "uploading") for d in docs)
 
 
 def _await_matter_ready(sid: str, uid: str | None, timeout_s: float) -> bool:
@@ -1640,11 +1849,7 @@ def _await_matter_ready(sid: str, uid: str | None, timeout_s: float) -> bool:
         docs = persistence.list_matter_documents(sid, user_id=uid)
     except Exception:
         docs = []
-    return any(
-        (d.get("status") or "").lower() in ("done", "ready")
-        and (d.get("n_chunks") or 0) > 0
-        for d in docs
-    )
+    return any((d.get("status") or "").lower() in ("done", "ready") and (d.get("n_chunks") or 0) > 0 for d in docs)
 
 
 def _matter_progress(sid: str, uid: str | None) -> tuple[int, int]:
@@ -1655,10 +1860,7 @@ def _matter_progress(sid: str, uid: str | None) -> tuple[int, int]:
         docs = persistence.list_matter_documents(sid, user_id=uid)
     except Exception:
         return 0, 0
-    proc = [
-        d for d in docs
-        if (d.get("status") or "").lower() in ("queued", "processing", "uploading")
-    ]
+    proc = [d for d in docs if (d.get("status") or "").lower() in ("queued", "processing", "uploading")]
     return (
         sum(int(d.get("pages_done") or 0) for d in proc),
         sum(int(d.get("pages_total") or 0) for d in proc),
@@ -1666,32 +1868,45 @@ def _matter_progress(sid: str, uid: str | None) -> tuple[int, int]:
 
 
 def _build_turn_msgs(
-    use_rag: bool, use_contract: bool, question: str,
-    rag_sources: list, matter_sources: list, history, meta_prefix, answer_lang,
+    use_rag: bool,
+    use_contract: bool,
+    question: str,
+    rag_sources: list,
+    matter_sources: list,
+    history,
+    meta_prefix,
+    answer_lang,
 ) -> tuple[str, list]:
     """Pick the chat mode and assemble the LLM messages for one turn. Shared
     by /query and /query/stream (and re-used after an in-stream OCR wait) so
     the two paths can't drift."""
     if use_rag and use_contract:
         return "rag+contract", build_rag_messages(
-            question, rag_sources, history=history, meta_prefix=meta_prefix,
-            target_language=answer_lang)
+            question, rag_sources, history=history, meta_prefix=meta_prefix, target_language=answer_lang
+        )
     if use_rag:
         return "rag", build_rag_messages(
-            question, rag_sources, history=history, meta_prefix=meta_prefix,
-            target_language=answer_lang)
+            question, rag_sources, history=history, meta_prefix=meta_prefix, target_language=answer_lang
+        )
     if use_contract:
         return "contract", build_rag_messages(
-            question, matter_sources, history=history, meta_prefix=meta_prefix,
-            target_language=answer_lang, system=RAG_SYSTEM_DOC_ONLY)
-    return "chat", build_chat_messages(
-        question, history=history, meta_prefix=meta_prefix, target_language=answer_lang)
+            question,
+            matter_sources,
+            history=history,
+            meta_prefix=meta_prefix,
+            target_language=answer_lang,
+            system=RAG_SYSTEM_DOC_ONLY,
+        )
+    return "chat", build_chat_messages(question, history=history, meta_prefix=meta_prefix, target_language=answer_lang)
 
 
 def _build_matter_context(
-    sid: str, uid: str | None, use_contract: bool, question: str = "",
-    focus_doc_indexes: Optional[list[int]] = None,
-) -> tuple[list["RetrievedSource"], list["ChunkOut"], str]:
+    sid: str,
+    uid: str | None,
+    use_contract: bool,
+    question: str = "",
+    focus_doc_indexes: list[int] | None = None,
+) -> tuple[list[RetrievedSource], list[ChunkOut], str]:
     """Assemble the matter side of a chat turn.
 
     Primary path: :func:`_matter_pgvector_context` — dense retrieval over
@@ -1734,14 +1949,27 @@ def _build_matter_context(
             label = f"Hochgeladenes Dokument — {fname}" if fname else "Hochgeladenes Dokument"
             cite = _matter_cite_id(1)
             prompt_text, page, display = _select_relevant_passages(question, full, 16000)
-            matter_sources.append(RetrievedSource(
-                cite_id=cite, source_kind="matter", text=prompt_text, label=label,
-            ))
-            matter_chunks.append(ChunkOut(
-                text=display[:2500], section=label, law_refs=[], sources=["upload"],
-                similarity=1.0, rerank_score=1.0, cite_id=cite, source_kind="matter",
-                page=page,
-            ))
+            matter_sources.append(
+                RetrievedSource(
+                    cite_id=cite,
+                    source_kind="matter",
+                    text=prompt_text,
+                    label=label,
+                )
+            )
+            matter_chunks.append(
+                ChunkOut(
+                    text=display[:2500],
+                    section=label,
+                    law_refs=[],
+                    sources=["upload"],
+                    similarity=1.0,
+                    rerank_score=1.0,
+                    cite_id=cite,
+                    source_kind="matter",
+                    page=page,
+                )
+            )
             combined_parts.append(full)
         return matter_sources, matter_chunks, "\n\n".join(combined_parts)
 
@@ -1758,14 +1986,27 @@ def _build_matter_context(
         label = f"[M-{d['doc_index']}] {fname}" if fname else f"Dokument M-{d['doc_index']}"
         cite = _matter_cite_id(d["doc_index"])
         prompt_text, page, display = _select_relevant_passages(question, full, per_doc_budget)
-        matter_sources.append(RetrievedSource(
-            cite_id=cite, source_kind="matter", text=prompt_text, label=label,
-        ))
-        matter_chunks.append(ChunkOut(
-            text=display[:2500], section=label, law_refs=[], sources=["upload"],
-            similarity=1.0, rerank_score=1.0, cite_id=cite, source_kind="matter",
-            page=page,
-        ))
+        matter_sources.append(
+            RetrievedSource(
+                cite_id=cite,
+                source_kind="matter",
+                text=prompt_text,
+                label=label,
+            )
+        )
+        matter_chunks.append(
+            ChunkOut(
+                text=display[:2500],
+                section=label,
+                law_refs=[],
+                sources=["upload"],
+                similarity=1.0,
+                rerank_score=1.0,
+                cite_id=cite,
+                source_kind="matter",
+                page=page,
+            )
+        )
         combined_parts.append(full)
     return matter_sources, matter_chunks, "\n\n".join(combined_parts)
 
@@ -1939,7 +2180,8 @@ def _pdf_has_text_layer(file_bytes: bytes) -> bool:
         try:
             out = _subprocess.run(
                 ["pdftotext", "-q", tmp_path, "-"],
-                capture_output=True, timeout=60,
+                capture_output=True,
+                timeout=60,
             )
             text = out.stdout.decode("utf-8", errors="replace")
             # A real text layer yields hundreds of chars; a scan yields a
@@ -1961,7 +2203,9 @@ def _render_pdf_to_images(file_bytes: bytes, dpi: int = _VLM_OCR_DPI) -> list[by
         prefix = Path(tmpdir) / "pg"
         _subprocess.run(
             ["pdftoppm", "-png", "-r", str(dpi), str(pdf_path), str(prefix)],
-            capture_output=True, timeout=600, check=True,
+            capture_output=True,
+            timeout=600,
+            check=True,
         )
         pngs = sorted(Path(tmpdir).glob("pg*.png"))
         return [p.read_bytes() for p in pngs]
@@ -1984,14 +2228,15 @@ def _vlm_ocr_image(png_bytes: bytes, prompt: str | None = None) -> str:
     b64 = _base64.b64encode(png_bytes).decode()
     body = {
         "model": STATE["llm_model_name"],
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt or _VLM_OCR_PROMPT},
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            ],
-        }],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt or _VLM_OCR_PROMPT},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ],
+            }
+        ],
         "max_tokens": 4096,
         "temperature": 0.0,
         "chat_template_kwargs": {"enable_thinking": False},
@@ -2003,7 +2248,9 @@ def _vlm_ocr_image(png_bytes: bytes, prompt: str | None = None) -> str:
 
 
 def _vlm_ocr_image_file(
-    file_bytes: bytes, filename: str, on_progress=None,
+    file_bytes: bytes,
+    filename: str,
+    on_progress=None,
 ) -> tuple[str, int, list[dict]]:
     """OCR a raw image file (.png, .jpg, .webp, .tiff, .bmp) with the vision LLM.
 
@@ -2032,7 +2279,7 @@ def _vlm_ocr_image_file(
     """
     # Local PIL import keeps Pillow off the cold-path import graph —
     # nothing else in this file needs it.
-    from PIL import Image, ImageSequence  # noqa: PLC0415
+    from PIL import Image, ImageSequence
 
     _MAX_EDGE_PX = 2400
     img = Image.open(io.BytesIO(file_bytes))
@@ -2080,12 +2327,9 @@ def _vlm_ocr_image_file(
                     done += 1
                     if on_progress is not None:
                         on_progress(done, total)
-            except Exception as exc:  # noqa: BLE001 — retried; final attempt propagates
+            except Exception as exc:
                 if attempt == _VLM_OCR_PAGE_ATTEMPTS:
-                    raise RuntimeError(
-                        f"VLM OCR failed for image {filename!r} "
-                        f"page {idx + 1}/{total}: {exc}"
-                    ) from exc
+                    raise RuntimeError(f"VLM OCR failed for image {filename!r} page {idx + 1}/{total}: {exc}") from exc
                 failed.append(idx)
         pending = failed
 
@@ -2134,7 +2378,7 @@ def _vlm_ocr_pdf(file_bytes: bytes, on_progress=None) -> tuple[str, int, list[di
     for attempt in range(1, _VLM_OCR_PAGE_ATTEMPTS + 1):
         if not pending:
             break
-        workers = (min(_VLM_OCR_WORKERS, len(pending)) if attempt == 1 else 1)
+        workers = min(_VLM_OCR_WORKERS, len(pending)) if attempt == 1 else 1
         failed: list[int] = []
         # The as_completed loop runs in this (calling) thread, so ``done`` and
         # ``on_progress`` need no lock — only ``_vlm_ocr_image`` runs on workers.
@@ -2144,10 +2388,9 @@ def _vlm_ocr_pdf(file_bytes: bytes, on_progress=None) -> tuple[str, int, list[di
                 idx = fut_to_idx[fut]
                 try:
                     page_text = fut.result()
-                except Exception as exc:  # noqa: BLE001 — transient; retried below
+                except Exception as exc:
                     failed.append(idx)
-                    print(f"[ingest] VLM OCR page {idx + 1}/{total} attempt "
-                          f"{attempt} failed: {exc}", flush=True)
+                    print(f"[ingest] VLM OCR page {idx + 1}/{total} attempt {attempt} failed: {exc}", flush=True)
                     continue
                 parts[idx] = f"<!-- Seite {idx + 1} -->\n{page_text}"
                 done += 1
@@ -2201,7 +2444,8 @@ def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int, list[di
     if _DOCLING_CONVERTER is None:
         from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import (
-            PdfPipelineOptions, TesseractCliOcrOptions,
+            PdfPipelineOptions,
+            TesseractCliOcrOptions,
         )
         from docling.document_converter import DocumentConverter, PdfFormatOption
 
@@ -2249,21 +2493,18 @@ def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int, list[di
             result = _DOCLING_CONVERTER.convert(tmp_path)
             md = result.document.export_to_markdown()
             try:
-                num_pages = (
-                    len(result.document.pages) if hasattr(result.document, "pages") else 0
-                )
+                num_pages = len(result.document.pages) if hasattr(result.document, "pages") else 0
             except Exception:
                 num_pages = 0
             tables = _extract_docling_tables(result.document)
             return md, num_pages, tables
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last_err = e
             msg = str(e).lower()
             transient = "is not valid" in msg or "input document" in msg
             if attempt == 1 and transient:
                 print(
-                    f"[docling] convert failed transiently on attempt {attempt} "
-                    f"for {filename!r} ({e}) — retrying once",
+                    f"[docling] convert failed transiently on attempt {attempt} for {filename!r} ({e}) — retrying once",
                     flush=True,
                 )
                 continue
@@ -2278,7 +2519,9 @@ _IMAGE_OCR_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp"}
 
 
 def convert_document(
-    file_bytes: bytes, filename: str, on_progress=None,
+    file_bytes: bytes,
+    filename: str,
+    on_progress=None,
 ) -> tuple[str, int, list[dict]]:
     """Top-level ingestion entry point. Routes scanned PDFs and raw images
     through the vision-LLM OCR path (accurate on degraded German scans
@@ -2310,41 +2553,33 @@ def convert_document(
         try:
             md, num_pages, tables = _vlm_ocr_pdf(file_bytes, on_progress=on_progress)
             if md.strip():
-                print(f"[ingest] VLM OCR: {num_pages} page(s) transcribed for "
-                      f"{filename!r}", flush=True)
+                print(f"[ingest] VLM OCR: {num_pages} page(s) transcribed for {filename!r}", flush=True)
                 return md, num_pages, tables
-            print(f"[ingest] VLM OCR returned empty for {filename!r} — "
-                  "falling back to docling", flush=True)
-        except Exception as e:  # noqa: BLE001 — degrade to docling, never fail upload
-            print(f"[ingest] VLM OCR failed for {filename!r} ({e}) — "
-                  "falling back to docling", flush=True)
-    elif (
-        _VLM_OCR_ENABLED
-        and suffix in _IMAGE_OCR_EXTS
-        and STATE["llm_api_url"] is not None
-    ):
+            print(f"[ingest] VLM OCR returned empty for {filename!r} — falling back to docling", flush=True)
+        except Exception as e:
+            print(f"[ingest] VLM OCR failed for {filename!r} ({e}) — falling back to docling", flush=True)
+    elif _VLM_OCR_ENABLED and suffix in _IMAGE_OCR_EXTS and STATE["llm_api_url"] is not None:
         # Image-only ingestion. Docling can't usefully OCR a raw PNG/JPG
         # without an extra OCR engine wired in; the VLM path already
         # handles scanned-PDF pages as images, so reusing it for raw
         # images is the minimal-surface route.
         try:
             md, num_pages, tables = _vlm_ocr_image_file(
-                file_bytes, filename, on_progress=on_progress,
+                file_bytes,
+                filename,
+                on_progress=on_progress,
             )
             if md.strip():
-                print(f"[ingest] VLM OCR (image): {num_pages} page(s) "
-                      f"transcribed for {filename!r}", flush=True)
+                print(f"[ingest] VLM OCR (image): {num_pages} page(s) transcribed for {filename!r}", flush=True)
                 return md, num_pages, tables
-            print(f"[ingest] VLM OCR (image) returned empty for "
-                  f"{filename!r}", flush=True)
+            print(f"[ingest] VLM OCR (image) returned empty for {filename!r}", flush=True)
             # No useful text — return empty markdown so the chip flips
             # to "done" with n_chunks=0 (honest). The previous sentinel
             # ``<!-- Seite 1 -->`` got indexed as a phantom passage and
             # made the chip claim 1 chunk that wasn't searchable.
             return "", num_pages or 1, []
-        except Exception as e:  # noqa: BLE001 — record + degrade, never crash
-            print(f"[ingest] VLM OCR (image) failed for {filename!r} "
-                  f"({e})", flush=True)
+        except Exception as e:
+            print(f"[ingest] VLM OCR (image) failed for {filename!r} ({e})", flush=True)
             # Re-raise so ``_ingest_document_job`` marks the doc 'failed'
             # with a real error message — docling has no usable fallback
             # for a raw image here, and silently returning empty would
@@ -2375,23 +2610,23 @@ def index_matter_document(sid: str, doc_index: int, filename: str, md: str) -> i
         return 0
     passages = _split_into_passages(md)
     rows: list[tuple[int | None, str]] = [
-        (page, text[:_PASSAGE_EMBED_MAXLEN])
-        for page, text in passages
-        if text.strip()
+        (page, text[:_PASSAGE_EMBED_MAXLEN]) for page, text in passages if text.strip()
     ]
     if not rows:
         return 0
     try:
         from lai.search.eval import _get_embedding_client
+
         results = _get_embedding_client().embed([t for _, t in rows])
         indexed = rc.index_matter_document(
-            sid, doc_index, filename,
+            sid,
+            doc_index,
+            filename,
             [(page, text, r.embedding) for (page, text), r in zip(rows, results)],
         )
-        print(f"[ingest] indexed {indexed} passage(s) for [M-{doc_index}] "
-              f"{filename!r} in session {sid}", flush=True)
+        print(f"[ingest] indexed {indexed} passage(s) for [M-{doc_index}] {filename!r} in session {sid}", flush=True)
         return indexed
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(f"[ingest] matter indexing failed for {filename!r} ({e})", flush=True)
         return 0
 
@@ -2411,12 +2646,17 @@ _INGEST_WORKERS = int(os.environ.get("LAI_INGEST_WORKERS", "4"))
 import concurrent.futures as _futures
 
 _INGEST_EXECUTOR = _futures.ThreadPoolExecutor(
-    max_workers=_INGEST_WORKERS, thread_name_prefix="ingest",
+    max_workers=_INGEST_WORKERS,
+    thread_name_prefix="ingest",
 )
 
 
 def _ingest_document_job(
-    sid: str, doc_id: int, doc_index: int, filename: str, is_first: bool,
+    sid: str,
+    doc_id: int,
+    doc_index: int,
+    filename: str,
+    is_first: bool,
 ) -> None:
     """Background job: OCR (with live progress) → store text → embed+index.
 
@@ -2450,15 +2690,20 @@ def _ingest_document_job(
         if is_first:
             try:
                 persistence.set_session_contract(sid, md, num_pages)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 print(f"[ingest] contract mirror failed for {sid}: {e}", flush=True)
         n_chunks = index_matter_document(sid, doc_index, filename, md)
         persistence.finalize_matter_document(
-            doc_id, doc_text=md, n_pages=num_pages, n_chunks=n_chunks,
+            doc_id,
+            doc_text=md,
+            n_pages=num_pages,
+            n_chunks=n_chunks,
         )
-        print(f"[ingest] done [M-{doc_index}] {filename!r} session={sid}: "
-              f"{num_pages} page(s), {n_chunks} chunk(s)", flush=True)
-    except Exception as e:  # noqa: BLE001 — record on the row, never crash the worker
+        print(
+            f"[ingest] done [M-{doc_index}] {filename!r} session={sid}: {num_pages} page(s), {n_chunks} chunk(s)",
+            flush=True,
+        )
+    except Exception as e:
         print(f"[ingest] FAILED [M-{doc_index}] {filename!r} session={sid}: {e}", flush=True)
         try:
             persistence.fail_matter_document(doc_id, str(e))
@@ -2467,11 +2712,20 @@ def _ingest_document_job(
 
 
 def _enqueue_ingestion(
-    sid: str, doc_id: int, doc_index: int, filename: str, is_first: bool,
+    sid: str,
+    doc_id: int,
+    doc_index: int,
+    filename: str,
+    is_first: bool,
 ) -> None:
     """Submit a document to the background ingestion pool."""
     _INGEST_EXECUTOR.submit(
-        _ingest_document_job, sid, doc_id, doc_index, filename, is_first,
+        _ingest_document_job,
+        sid,
+        doc_id,
+        doc_index,
+        filename,
+        is_first,
     )
 
 
@@ -2484,14 +2738,17 @@ def _recover_unfinished_ingestion() -> None:
     will be harmlessly re-set)."""
     try:
         pending = persistence.list_unfinished_matter_documents()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(f"[ingest] recovery scan failed: {e}", flush=True)
         return
     for d in pending:
-        print(f"[ingest] recovering [M-{d['doc_index']}] {d['filename']!r} "
-              f"session={d['session_id']}", flush=True)
+        print(f"[ingest] recovering [M-{d['doc_index']}] {d['filename']!r} session={d['session_id']}", flush=True)
         _enqueue_ingestion(
-            d["session_id"], d["id"], d["doc_index"], d["filename"] or "", False,
+            d["session_id"],
+            d["id"],
+            d["doc_index"],
+            d["filename"] or "",
+            False,
         )
 
 
@@ -2527,6 +2784,7 @@ def _extract_docling_tables(doc) -> list[dict]:
 # Clause segmentation + analysis
 # ---------------------------------------------------------------------------
 
+
 def segment_clauses(contract_text: str, max_chars: int = 8000) -> list[dict]:
     """Use the LLM to split contract text into clauses. For very long
     contracts, segment in windows and concatenate.
@@ -2560,19 +2818,21 @@ def segment_clauses(contract_text: str, max_chars: int = 8000) -> list[dict]:
     for wi, win in enumerate(windows):
         msgs = [
             {"role": "system", "content": CLAUSE_SEGMENT_SYSTEM},
-            {"role": "user",   "content": win},
+            {"role": "user", "content": win},
         ]
         out, _, _ = llm_generate(msgs, max_new_tokens=6000)
         parsed = parse_json_lenient(out)
         if isinstance(parsed, list):
             for c in parsed:
                 if isinstance(c, dict) and c.get("text"):
-                    cid = f"{wi}.{c.get('id', len(clauses)+1)}"
-                    clauses.append({
-                        "id": cid,
-                        "title": c.get("title", "")[:200],
-                        "text": c.get("text", ""),
-                    })
+                    cid = f"{wi}.{c.get('id', len(clauses) + 1)}"
+                    clauses.append(
+                        {
+                            "id": cid,
+                            "title": c.get("title", "")[:200],
+                            "text": c.get("text", ""),
+                        }
+                    )
     return clauses
 
 
@@ -2580,7 +2840,7 @@ def analyze_clause(clause_text: str) -> dict:
     """One LLM call to classify + identify issues for a clause."""
     msgs = [
         {"role": "system", "content": CLAUSE_ANALYZE_SYSTEM},
-        {"role": "user",   "content": clause_text},
+        {"role": "user", "content": clause_text},
     ]
     out, _, _ = llm_generate(msgs, max_new_tokens=400)
     parsed = parse_json_lenient(out)
@@ -2600,12 +2860,14 @@ def check_playbook(clause_types_present: set[str]) -> list[dict]:
     missing = []
     for required, reason in WIND_LEASE_PLAYBOOK:
         if required not in clause_types_present:
-            missing.append({
-                "severity": "high",
-                "type": required,
-                "description": f"Klausel zum Thema '{required}' fehlt im Vertrag.",
-                "reason": reason,
-            })
+            missing.append(
+                {
+                    "severity": "high",
+                    "type": required,
+                    "description": f"Klausel zum Thema '{required}' fehlt im Vertrag.",
+                    "reason": reason,
+                }
+            )
     return missing
 
 
@@ -2613,19 +2875,20 @@ def check_playbook(clause_types_present: set[str]) -> list[dict]:
 # Pydantic schemas
 # ---------------------------------------------------------------------------
 
+
 class QueryReq(BaseModel):
     question: str
-    session_id: Optional[str] = None
+    session_id: str | None = None
     top_k: int = 3
     candidate_k: int = 30
-    force_mode: Optional[str] = None  # "rag" | "chat" | None (auto)
+    force_mode: str | None = None  # "rag" | "chat" | None (auto)
     # Optional answer-language override. ``None`` / ``"de"`` keeps the
     # default German prompts; ``"en"`` switches the model to English
     # while keeping German statute / contract quotations verbatim (see
     # ``_language_directive``). Unknown codes fall back to German so a
     # forward-compat frontend can ship new codes without crashing the
     # backend mid-rollout.
-    target_language: Optional[str] = None
+    target_language: str | None = None
     # Per-turn focus: when the FE just attached one or more documents in
     # the chat composer, it sends their doc_indexes here so this answer is
     # scoped to ONLY those documents — the manifest, retrieval, and the
@@ -2633,7 +2896,7 @@ class QueryReq(BaseModel):
     # silently pulling in pre-existing project docs when the user asks
     # "analyse this document". ``None``/empty ⇒ full session is in scope
     # (the prior behaviour).
-    focus_doc_indexes: Optional[list[int]] = None
+    focus_doc_indexes: list[int] | None = None
 
 
 class ChunkOut(BaseModel):
@@ -2770,9 +3033,9 @@ class SessionCreatedResp(BaseModel):
 class IssueOut(BaseModel):
     severity: str
     description: str
-    recommendation: Optional[str] = None
-    reason: Optional[str] = None
-    type: Optional[str] = None
+    recommendation: str | None = None
+    reason: str | None = None
+    type: str | None = None
 
 
 class ClauseOut(BaseModel):
@@ -2787,7 +3050,7 @@ class ClauseOut(BaseModel):
 
 class AnalyzeReq(BaseModel):
     session_id: str
-    version: Optional[str] = None  # "1" | "2" | None (defaults to env-driven)
+    version: str | None = None  # "1" | "2" | None (defaults to env-driven)
 
 
 class AnalyzeResp(BaseModel):
@@ -2803,6 +3066,7 @@ class AnalyzeResp(BaseModel):
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -2838,16 +3102,15 @@ async def lifespan(app: FastAPI):
         try:
             retrieval_client.ensure_matter_table()
             print("[startup]   matter_chunks table ready", flush=True)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"[startup]   WARNING matter_chunks ensure failed: {e}", flush=True)
     else:
-        print("[startup]   WARNING pgvector not reachable yet — first /query "
-              "will retry/fail cleanly", flush=True)
-    print(f"[startup]   retrieval wiring: {time.time()-t0:.1f}s", flush=True)
+        print("[startup]   WARNING pgvector not reachable yet — first /query will retry/fail cleanly", flush=True)
+    print(f"[startup]   retrieval wiring: {time.time() - t0:.1f}s", flush=True)
 
     t0 = time.time()
     reranker = Reranker("Qwen/Qwen3-Reranker-8B")
-    print(f"[startup]   reranker: {time.time()-t0:.1f}s", flush=True)
+    print(f"[startup]   reranker: {time.time() - t0:.1f}s", flush=True)
 
     # Default to the 27B analyzer container running locally — Qwen3.6-27B
     # with thinking-mode is the only model approved for chat. The 7B legal
@@ -2867,19 +3130,31 @@ async def lifespan(app: FastAPI):
         # Explicitly requested local-load path — verify the user actually
         # meant it and warn loudly that this isn't the default.
         t0 = time.time()
-        print(f"[startup]   LLM: loading LOCAL model from {LLM_LOCAL_PATH} "
-              "(opt-in via LLM_LOCAL_PATH; remote endpoint disabled)", flush=True)
+        print(
+            f"[startup]   LLM: loading LOCAL model from {LLM_LOCAL_PATH} "
+            "(opt-in via LLM_LOCAL_PATH; remote endpoint disabled)",
+            flush=True,
+        )
         tok = AutoTokenizer.from_pretrained(LLM_LOCAL_PATH, trust_remote_code=True)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         lm = AutoModelForCausalLM.from_pretrained(
-            LLM_LOCAL_PATH, torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True,
+            LLM_LOCAL_PATH,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+            trust_remote_code=True,
         ).eval()
-        print(f"[startup]   LLM ready in {time.time()-t0:.1f}s", flush=True)
-        STATE.update(conn=conn, retrieval_client=retrieval_client,
-                     reranker=reranker, lm=lm, tok=tok,
-                     llm_api_url=None, llm_model_name=LLM_LOCAL_PATH,
-                     llm_client=None)
+        print(f"[startup]   LLM ready in {time.time() - t0:.1f}s", flush=True)
+        STATE.update(
+            conn=conn,
+            retrieval_client=retrieval_client,
+            reranker=reranker,
+            lm=lm,
+            tok=tok,
+            llm_api_url=None,
+            llm_model_name=LLM_LOCAL_PATH,
+            llm_client=None,
+        )
     else:
         # Remote vLLM endpoint (default) — verify it's reachable; no in-process load.
         print(f"[startup]   LLM: remote endpoint {LLM_API_URL} (model={LLM_MODEL})", flush=True)
@@ -2914,10 +3189,16 @@ async def lifespan(app: FastAPI):
                 thinking_mode_enabled=False,
             ),
         )
-        STATE.update(conn=conn, retrieval_client=retrieval_client,
-                     reranker=reranker, lm=None, tok=None,
-                     llm_api_url=LLM_API_URL, llm_model_name=LLM_MODEL,
-                     llm_client=llm_client)
+        STATE.update(
+            conn=conn,
+            retrieval_client=retrieval_client,
+            reranker=reranker,
+            lm=None,
+            tok=None,
+            llm_api_url=LLM_API_URL,
+            llm_model_name=LLM_MODEL,
+            llm_client=llm_client,
+        )
 
     # Analyzer V2 config — optional. If env not set, V2 is unavailable
     # and /analyze-contract falls back to V1 regardless of `version` flag.
@@ -2943,7 +3224,7 @@ async def lifespan(app: FastAPI):
             [{"role": "user", "content": "Hallo"}],
             max_new_tokens=8,
         )
-        print(f"[startup]   LLM warmup: {time.time()-t0:.1f}s", flush=True)
+        print(f"[startup]   LLM warmup: {time.time() - t0:.1f}s", flush=True)
     except Exception as e:
         print(f"[startup]   LLM warmup failed (non-fatal): {e}", flush=True)
 
@@ -2961,12 +3242,11 @@ async def lifespan(app: FastAPI):
     # reset tokens but nothing is mailed (logged loudly).
     print("[startup] auth: wiring router...", flush=True)
     try:
-        email_config: Optional[_EmailConfig] = _EmailConfig()
+        email_config: _EmailConfig | None = _EmailConfig()
         print("[startup]   auth: email config loaded (Brevo enabled)", flush=True)
     except Exception as e:
         email_config = None
-        print(f"[startup]   auth: email config NOT loaded ({e}) — /auth/forgot-password will not mail",
-              flush=True)
+        print(f"[startup]   auth: email config NOT loaded ({e}) — /auth/forgot-password will not mail", flush=True)
     auth_pool = await _create_auth_pool()
     auth_deps = AuthDeps(
         auth_config=_auth_config,
@@ -2987,6 +3267,7 @@ async def lifespan(app: FastAPI):
     # pipeline /upload uses. Gated client-side by VITE_RESUMABLE_UPLOAD.
     # See LAI/docs/UPLOAD_RESUMABLE_DESIGN.md.
     from lai.api.upload_tus import build_tus_router, gc_stale_uploads
+
     app.include_router(
         build_tus_router(
             get_current_user=get_current_user,
@@ -3001,7 +3282,7 @@ async def lifespan(app: FastAPI):
         purged = gc_stale_uploads()
         if purged:
             print(f"[startup]   tus: gc'd {purged} stale upload(s)", flush=True)
-    except Exception as e:  # noqa: BLE001 — best effort
+    except Exception as e:
         print(f"[startup]   tus: gc skipped ({e})", flush=True)
     print("[startup]   tus: router mounted at /tus/files/*", flush=True)
 
@@ -3064,6 +3345,7 @@ app.add_middleware(
 # /query signal we actually care about.
 try:
     from prometheus_fastapi_instrumentator import Instrumentator
+
     Instrumentator(
         should_group_status_codes=False,
         should_ignore_untemplated=True,
@@ -3079,6 +3361,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health")
 def health():
@@ -3126,10 +3409,7 @@ def _is_readable_passage(text: str) -> bool:
         return False
     if _GARBLE_RE.search(text):
         return False
-    readable = sum(
-        1 for ch in text
-        if ch.isalnum() or ch.isspace() or ch in ".,;:!?()[]{}§%-–/€$\"'„“”’"
-    )
+    readable = sum(1 for ch in text if ch.isalnum() or ch.isspace() or ch in ".,;:!?()[]{}§%-–/€$\"'„“”’")
     if readable / len(text) < 0.7:
         return False
     # Letter-salad guard: a passage long enough to be a real chunk must
@@ -3140,7 +3420,9 @@ def _is_readable_passage(text: str) -> bool:
 
 
 def _do_rag(
-    question: str, top_k: int, candidate_k: int,
+    question: str,
+    top_k: int,
+    candidate_k: int,
 ) -> tuple[list[ChunkOut], list[RetrievedSource], TimingsOut]:
     """Run hybrid+rerank retrieval, return chunks, prompt-ready sources, timings.
 
@@ -3193,11 +3475,7 @@ def _do_rag(
     # quotes the parent passage. Both come from pgvector now, fetched in
     # one batched query keyed by the candidates' parent_ids.
     t0 = time.time()
-    parent_ids = [
-        dense_by_child[cid].parent_id
-        for cid in cand_ids
-        if dense_by_child[cid].parent_id is not None
-    ]
+    parent_ids = [dense_by_child[cid].parent_id for cid in cand_ids if dense_by_child[cid].parent_id is not None]
     parent_text = retrieval.fetch_parent_texts(parent_ids)
 
     # Rerank against parent text (falls back to child content for orphan
@@ -3233,7 +3511,7 @@ def _do_rag(
         else:
             reranked_ids = list(cand_ids)
             reranked_scores = [0.0] * len(cand_ids)
-    except Exception as exc:  # noqa: BLE001 — graceful degradation, see below
+    except Exception as exc:
         # If the reranker fails — most commonly a CUDA OutOfMemoryError
         # when this in-process reranker shares a GPU with the analyzer
         # vLLM + the Step-6 embedding job — DO NOT let corpus retrieval
@@ -3244,10 +3522,14 @@ def _do_rag(
         # lawyer still gets cited [C-n] corpus passages, just without the
         # reranker's final re-ordering. Free the CUDA cache so a transient
         # spike doesn't wedge subsequent queries.
-        print(f"[_do_rag] reranker.score failed ({type(exc).__name__}: {exc}); "
-              f"falling back to RRF order — corpus retrieval continues", flush=True)
+        print(
+            f"[_do_rag] reranker.score failed ({type(exc).__name__}: {exc}); "
+            f"falling back to RRF order — corpus retrieval continues",
+            flush=True,
+        )
         try:
             import torch as _torch
+
             if _torch.cuda.is_available():
                 _torch.cuda.empty_cache()
         except Exception:
@@ -3277,38 +3559,42 @@ def _do_rag(
         score = reranked_scores[rank_pos]
         in_dense = cid in dense_id_set
         in_bm25 = cid in bm25_id_set
-        srcs = (
-            ["dense", "bm25"] if in_dense and in_bm25
-            else ["dense"] if in_dense
-            else ["bm25"]
-        )
-        section = (
-            f"Parent {chunk.parent_id}" if chunk.parent_id is not None
-            else f"Child {cid}"
-        )
+        srcs = ["dense", "bm25"] if in_dense and in_bm25 else ["dense"] if in_dense else ["bm25"]
+        section = f"Parent {chunk.parent_id}" if chunk.parent_id is not None else f"Child {cid}"
         cite_id = _corpus_cite_id(len(chunks_out) + 1)
-        chunks_out.append(ChunkOut(
-            text=passage, section=section, law_refs=[],
-            sources=srcs,
-            similarity=score,
-            rerank_score=score,
-            cite_id=cite_id,
-            source_kind="corpus",
-        ))
-        sources.append(RetrievedSource(
-            cite_id=cite_id,
-            source_kind="corpus",
-            text=passage,
-            label="Rechtskorpus",
-        ))
+        chunks_out.append(
+            ChunkOut(
+                text=passage,
+                section=section,
+                law_refs=[],
+                sources=srcs,
+                similarity=score,
+                rerank_score=score,
+                cite_id=cite_id,
+                source_kind="corpus",
+            )
+        )
+        sources.append(
+            RetrievedSource(
+                cite_id=cite_id,
+                source_kind="corpus",
+                text=passage,
+                label="Rechtskorpus",
+            )
+        )
         if len(chunks_out) >= top_k:
             break
 
-    return chunks_out, sources, TimingsOut(
-        embed_s=round(embed_s, 3),
-        retrieve_s=round(retrieve_s, 3),
-        rerank_s=round(rerank_s, 3),
-        generate_s=0.0, total_s=0.0,
+    return (
+        chunks_out,
+        sources,
+        TimingsOut(
+            embed_s=round(embed_s, 3),
+            retrieve_s=round(retrieve_s, 3),
+            rerank_s=round(rerank_s, 3),
+            generate_s=0.0,
+            total_s=0.0,
+        ),
     )
 
 
@@ -3360,12 +3646,13 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
 
     corpus_chunks: list[ChunkOut] = []
     corpus_sources: list[RetrievedSource] = []
-    timings = TimingsOut(embed_s=0.0, retrieve_s=0.0, rerank_s=0.0,
-                        generate_s=0.0, total_s=0.0)
+    timings = TimingsOut(embed_s=0.0, retrieve_s=0.0, rerank_s=0.0, generate_s=0.0, total_s=0.0)
 
     if use_rag:
         corpus_chunks, corpus_sources, t = _do_rag(
-            req.question, req.top_k, req.candidate_k,
+            req.question,
+            req.top_k,
+            req.candidate_k,
         )
         timings.embed_s = t.embed_s
         timings.retrieve_s = t.retrieve_s
@@ -3375,7 +3662,10 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # session ("Matter"), not just one. ``combined_text`` is the
     # concatenation used only for Bundesland detection below.
     matter_sources, matter_chunks, contract_text = _build_matter_context(
-        sid, uid, use_contract, req.question,
+        sid,
+        uid,
+        use_contract,
+        req.question,
         focus_doc_indexes=req.focus_doc_indexes,
     )
 
@@ -3386,11 +3676,16 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # (timeout/failure), the empty-retrieval guard below gives the honest
     # message. (Endpoints are sync/threadpool, so the blocking wait is safe.)
     if use_contract and not matter_sources and _matter_is_processing(sid, uid):
-        print(f"[wait] session={sid} doc still ingesting — waiting up to "
-              f"{int(_MATTER_WAIT_S)}s before answering", flush=True)
+        print(
+            f"[wait] session={sid} doc still ingesting — waiting up to {int(_MATTER_WAIT_S)}s before answering",
+            flush=True,
+        )
         if _await_matter_ready(sid, uid, _MATTER_WAIT_S):
             matter_sources, matter_chunks, contract_text = _build_matter_context(
-                sid, uid, use_contract, req.question,
+                sid,
+                uid,
+                use_contract,
+                req.question,
                 focus_doc_indexes=req.focus_doc_indexes,
             )
 
@@ -3406,7 +3701,9 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # rolling window. Cheap when the session is short or when the previous
     # extraction is still fresh; the refresh fires AFTER persisting the new
     # turn (below) so the freshly stated facts make it into the next refresh.
-    meta_prefix = _matter_manifest_prefix(sid, uid, focus_doc_indexes=req.focus_doc_indexes) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
+    meta_prefix = _matter_manifest_prefix(
+        sid, uid, focus_doc_indexes=req.focus_doc_indexes
+    ) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
 
     # Matter sources come first so the LLM sees the user's own document
     # before the supporting corpus excerpts — and so the [M-n] handles
@@ -3415,25 +3712,27 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
 
     if use_rag and use_contract:
         mode = "rag+contract"
-        msgs = build_rag_messages(req.question, rag_sources,
-                                  history=history, meta_prefix=meta_prefix,
-                                  target_language=answer_lang)
+        msgs = build_rag_messages(
+            req.question, rag_sources, history=history, meta_prefix=meta_prefix, target_language=answer_lang
+        )
     elif use_rag:
         mode = "rag"
-        msgs = build_rag_messages(req.question, rag_sources,
-                                  history=history, meta_prefix=meta_prefix,
-                                  target_language=answer_lang)
+        msgs = build_rag_messages(
+            req.question, rag_sources, history=history, meta_prefix=meta_prefix, target_language=answer_lang
+        )
     elif use_contract:
         mode = "contract"
-        msgs = build_rag_messages(req.question, matter_sources,
-                                  history=history, meta_prefix=meta_prefix,
-                                  target_language=answer_lang,
-                                  system=RAG_SYSTEM_DOC_ONLY)
+        msgs = build_rag_messages(
+            req.question,
+            matter_sources,
+            history=history,
+            meta_prefix=meta_prefix,
+            target_language=answer_lang,
+            system=RAG_SYSTEM_DOC_ONLY,
+        )
     else:
         mode = "chat"
-        msgs = build_chat_messages(req.question, history=history,
-                                   meta_prefix=meta_prefix,
-                                   target_language=answer_lang)
+        msgs = build_chat_messages(req.question, history=history, meta_prefix=meta_prefix, target_language=answer_lang)
 
     chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
 
@@ -3442,13 +3741,17 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # of an LLM answer fabricated from general knowledge. See
     # :func:`_empty_grounding_guard`.
     guard_msg = _empty_grounding_guard(
-        mode, matter_sources, rag_sources, sid, uid, answer_lang,
+        mode,
+        matter_sources,
+        rag_sources,
+        sid,
+        uid,
+        answer_lang,
     )
 
     t0 = time.time()
     if guard_msg is not None:
-        print(f"[guard] session={sid} mode={mode} empty-retrieval → honest "
-              "refusal (no LLM call)", flush=True)
+        print(f"[guard] session={sid} mode={mode} empty-retrieval → honest refusal (no LLM call)", flush=True)
         answer, prompt_tokens, completion_tokens = guard_msg, 0, 0
     else:
         answer, prompt_tokens, completion_tokens = llm_generate(
@@ -3469,7 +3772,9 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         # (the manifest invites citing any [M-n], retrieved or not) — see
         # _all_matter_handles. Prevents real-document citations being stripped
         # as fabricated / mislabelled (unbelegt).
-        allowed_handles = {src.cite_id for src in rag_sources} | _all_matter_handles(sid, uid, focus_doc_indexes=req.focus_doc_indexes)
+        allowed_handles = {src.cite_id for src in rag_sources} | _all_matter_handles(
+            sid, uid, focus_doc_indexes=req.focus_doc_indexes
+        )
         validation = validate_citations(answer, allowed_handles)
         if validation.fabricated:
             print(
@@ -3496,9 +3801,16 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     # against an [C-n] in the prompt and still be JURISDICTIONALLY
     # wrong if the cited statute is from the wrong Bundesland). Skipped
     # for a guard message (deterministic text, no statutes to check).
-    jurisdiction_warnings = [] if guard_msg is not None else _run_jurisdiction_check(
-        answer=answer, contract_text=contract_text, question=req.question,
-        mode=mode, sid=sid,
+    jurisdiction_warnings = (
+        []
+        if guard_msg is not None
+        else _run_jurisdiction_check(
+            answer=answer,
+            contract_text=contract_text,
+            question=req.question,
+            mode=mode,
+            sid=sid,
+        )
     )
 
     timings.total_s = round(time.time() - t_total0, 3)
@@ -3511,24 +3823,28 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     assistant_message_id: int | None = None
     try:
         if not persistence.session_exists(sid, user_id=uid):
-            persistence.save_session(sid, {
-                "user_id": uid,           # Phase B: created_by (attribution).
-                "org_id": org_id,         # Phase B: firm-tenant visibility key.
-                "filename": None,         # chat-only session, no upload
-                "contract_text": None,
-                "n_pages": 0,
-                "tables": [],
-                "uploaded_at": time.time(),
-                "clauses": None,
-                "analysis": None,
-            })
+            persistence.save_session(
+                sid,
+                {
+                    "user_id": uid,  # Phase B: created_by (attribution).
+                    "org_id": org_id,  # Phase B: firm-tenant visibility key.
+                    "filename": None,  # chat-only session, no upload
+                    "contract_text": None,
+                    "n_pages": 0,
+                    "tables": [],
+                    "uploaded_at": time.time(),
+                    "clauses": None,
+                    "analysis": None,
+                },
+            )
         persistence.add_message(sid, "user", req.question, mode=mode, user_id=uid)
         # Capture the assistant row id so QueryResp can hand it to the
         # UI for POST /feedback wiring. ``add_message`` returns 0 only
         # on the ownership-check failure path (shouldn't fire here —
         # we just save_session'd above) which we map to None.
-        _aid = persistence.add_message(sid, "assistant", answer, mode=mode, user_id=uid,
-                                       chunks=[c.model_dump() for c in chunks_out])
+        _aid = persistence.add_message(
+            sid, "assistant", answer, mode=mode, user_id=uid, chunks=[c.model_dump() for c in chunks_out]
+        )
         assistant_message_id = _aid if _aid > 0 else None
     except Exception as e:
         print(f"[warn] failed to persist messages for {sid}: {e}", flush=True)
@@ -3556,9 +3872,12 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     )
 
     return QueryResp(
-        answer=answer, chunks=chunks_out, timings=timings,
+        answer=answer,
+        chunks=chunks_out,
+        timings=timings,
         tokens=TokensOut(prompt=prompt_tokens, completion=completion_tokens),
-        session_id=sid, mode=mode,
+        session_id=sid,
+        mode=mode,
         citation_validation=citation_validation_out,
         jurisdiction_warnings=jurisdiction_warnings,
         message_id=assistant_message_id,
@@ -3583,7 +3902,7 @@ def _emit_query_metrics(
     chunks_returned: int,
     citation_validation: CitationValidationOut | None,
     jurisdiction_warnings: list[JurisdictionWarningOut],
-    focus_doc_indexes: Optional[list[int]] = None,
+    focus_doc_indexes: list[int] | None = None,
 ) -> None:
     """Bump every domain-level counter / histogram for one completed turn, and
     emit a structured slow-query record when the turn crosses _SLOW_QUERY_S.
@@ -3593,16 +3912,16 @@ def _emit_query_metrics(
     dashboard the moment a user switched between JSON and SSE.
     """
     rag_metrics.query_total.labels(
-        mode=mode, language=language, status="success",
+        mode=mode,
+        language=language,
+        status="success",
     ).inc()
     rag_metrics.query_latency_seconds.labels(mode=mode).observe(timings.total_s)
     rag_metrics.retrieval_chunks_returned.observe(chunks_returned)
 
     if citation_validation and citation_validation.sentences_flagged > 0:
         rag_metrics.citation_unbelegt_responses_total.inc()
-        rag_metrics.citation_unbelegt_sentences_total.inc(
-            citation_validation.sentences_flagged
-        )
+        rag_metrics.citation_unbelegt_sentences_total.inc(citation_validation.sentences_flagged)
 
     if jurisdiction_warnings:
         rag_metrics.jurisdiction_warnings_responses_total.inc()
@@ -3613,18 +3932,23 @@ def _emit_query_metrics(
     # rerank_ms points straight at the reranker (e.g. CPU fallback), whereas
     # all generate_ms points at the LLM.
     if timings.total_s >= _SLOW_QUERY_S:
-        print(json.dumps({
-            "event": "slow_query",
-            "session_id": session_id,
-            "mode": mode,
-            "focus_doc_indexes": focus_doc_indexes,
-            "embed_ms": round(timings.embed_s * 1000),
-            "retrieve_ms": round(timings.retrieve_s * 1000),
-            "rerank_ms": round(timings.rerank_s * 1000),
-            "generate_ms": round(timings.generate_s * 1000),
-            "total_ms": round(timings.total_s * 1000),
-            "chunks_returned": chunks_returned,
-        }), flush=True)
+        print(
+            json.dumps(
+                {
+                    "event": "slow_query",
+                    "session_id": session_id,
+                    "mode": mode,
+                    "focus_doc_indexes": focus_doc_indexes,
+                    "embed_ms": round(timings.embed_s * 1000),
+                    "retrieve_ms": round(timings.retrieve_s * 1000),
+                    "rerank_ms": round(timings.rerank_s * 1000),
+                    "generate_ms": round(timings.generate_s * 1000),
+                    "total_ms": round(timings.total_s * 1000),
+                    "chunks_returned": chunks_returned,
+                }
+            ),
+            flush=True,
+        )
 
 
 def _run_jurisdiction_check(
@@ -3642,18 +3966,14 @@ def _run_jurisdiction_check(
     first (most reliable), the user's question second, falling back to
     None — which disables the check.
     """
-    detected = (
-        detect_bundesland(contract_text or "")
-        or detect_bundesland(question)
-    )
+    detected = detect_bundesland(contract_text or "") or detect_bundesland(question)
     if detected is None:
         return []
     warnings = check_jurisdiction(answer, detected)
     if not warnings:
         return []
     print(
-        f"[jurisdiction] session={sid} mode={mode} expected={detected} "
-        f"warnings={[w.rule_label for w in warnings]}",
+        f"[jurisdiction] session={sid} mode={mode} expected={detected} warnings={[w.rule_label for w in warnings]}",
         flush=True,
     )
     return [
@@ -3703,7 +4023,7 @@ def _sse_event(event: str, data: object) -> bytes:
     terminated with a blank line. Always UTF-8.
     """
     payload = json.dumps(data, ensure_ascii=False)
-    return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
+    return f"event: {event}\ndata: {payload}\n\n".encode()
 
 
 def _stream_vllm_chat(
@@ -3846,44 +4166,64 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         #    so the user sees activity instead of dead air before the first
         #    token. Variables are local to the generator; the in-stream OCR
         #    wait below rebinds them after re-retrieval.
-        yield _sse_event("status", {
-            "state": "retrieving",
-            "message": "Durchsuche Dokumente und Wissensbasis…",
-        })
+        yield _sse_event(
+            "status",
+            {
+                "state": "retrieving",
+                "message": "Durchsuche Dokumente und Wissensbasis…",
+            },
+        )
         corpus_chunks: list[ChunkOut] = []
         corpus_sources: list[RetrievedSource] = []
-        timings = TimingsOut(embed_s=0.0, retrieve_s=0.0, rerank_s=0.0,
-                             generate_s=0.0, total_s=0.0)
+        timings = TimingsOut(embed_s=0.0, retrieve_s=0.0, rerank_s=0.0, generate_s=0.0, total_s=0.0)
         try:
             if use_rag:
                 corpus_chunks, corpus_sources, t = _do_rag(
-                    req.question, req.top_k, req.candidate_k,
+                    req.question,
+                    req.top_k,
+                    req.candidate_k,
                 )
                 timings.embed_s = t.embed_s
                 timings.retrieve_s = t.retrieve_s
                 timings.rerank_s = t.rerank_s
             # Matter side: [M-1]..[M-n] across every document in the session.
             matter_sources, matter_chunks, contract_text = _build_matter_context(
-                sid, uid, use_contract, req.question,
+                sid,
+                uid,
+                use_contract,
+                req.question,
                 focus_doc_indexes=req.focus_doc_indexes,
             )
-        except Exception as exc:  # noqa: BLE001 — surface as an SSE error, don't break the stream
+        except Exception as exc:
             yield _sse_event("error", {"detail": f"retrieval: {exc}"})
             return
 
         history = _load_history(sid, user_id=uid)
-        meta_prefix = _matter_manifest_prefix(sid, uid, focus_doc_indexes=req.focus_doc_indexes) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
+        meta_prefix = _matter_manifest_prefix(
+            sid, uid, focus_doc_indexes=req.focus_doc_indexes
+        ) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
         rag_sources = matter_sources + corpus_sources
         mode, msgs = _build_turn_msgs(
-            use_rag, use_contract, req.question, rag_sources, matter_sources,
-            history, meta_prefix, answer_lang,
+            use_rag,
+            use_contract,
+            req.question,
+            rag_sources,
+            matter_sources,
+            history,
+            meta_prefix,
+            answer_lang,
         )
         chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
         max_new_tokens = 3000 if (use_rag or use_contract) else 1800
         # Empty-retrieval guard: a doc-scoped turn with no grounded sources is
         # answered with an honest message, not an LLM fabrication.
         guard_msg = _empty_grounding_guard(
-            mode, matter_sources, rag_sources, sid, uid, answer_lang,
+            mode,
+            matter_sources,
+            rag_sources,
+            sid,
+            uid,
+            answer_lang,
         )
 
         # In-stream wait-and-answer: if a doc-scoped turn has no matter content
@@ -3893,8 +4233,10 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         # doesn't time out the wait. Then re-retrieve + reassemble the turn so
         # the answer streams in automatically. Guard handles timeout/failure.
         if use_contract and not matter_sources and _matter_is_processing(sid, uid):
-            print(f"[wait] session={sid} stream=1 doc ingesting — streaming progress "
-                  f"up to {int(_MATTER_WAIT_S)}s", flush=True)
+            print(
+                f"[wait] session={sid} stream=1 doc ingesting — streaming progress up to {int(_MATTER_WAIT_S)}s",
+                flush=True,
+            )
             deadline = time.time() + _MATTER_WAIT_S
             _notice_sent = False
             while time.time() < deadline and _matter_is_processing(sid, uid):
@@ -3902,51 +4244,65 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
                 # 'status' event: live page progress (rendered once the client
                 # handles 'status') AND a real SSE frame that keeps a reverse
                 # proxy from timing out the wait.
-                yield _sse_event("status", {
-                    "state": "processing",
-                    "pages_done": pdone,
-                    "pages_total": ptotal,
-                    "message": (f"Dokument wird verarbeitet… Seite {pdone}/{ptotal}"
-                                if ptotal else "Dokument wird verarbeitet…"),
-                })
+                yield _sse_event(
+                    "status",
+                    {
+                        "state": "processing",
+                        "pages_done": pdone,
+                        "pages_total": ptotal,
+                        "message": (
+                            f"Dokument wird verarbeitet… Seite {pdone}/{ptotal}"
+                            if ptotal
+                            else "Dokument wird verarbeitet…"
+                        ),
+                    },
+                )
                 # The client's 60s stall-watchdog is re-armed only on 'token'
                 # events, so emit one here too. The first carries a visible
                 # notice; the rest are empty (re-arm only). These are streamed
                 # but NOT added to ``accumulated`` — the saved/validated answer
                 # stays clean (the client replaces the bubble on 'complete').
                 if not _notice_sent:
-                    yield _sse_event("token", {"delta": (
-                        "⏳ *Ihr Dokument wird noch verarbeitet — einen Moment, "
-                        "ich beantworte Ihre Frage automatisch, sobald es bereit ist.*\n\n"
-                    )})
+                    yield _sse_event(
+                        "token",
+                        {
+                            "delta": (
+                                "⏳ *Ihr Dokument wird noch verarbeitet — einen Moment, "
+                                "ich beantworte Ihre Frage automatisch, sobald es bereit ist.*\n\n"
+                            )
+                        },
+                    )
                     _notice_sent = True
                 else:
                     yield _sse_event("token", {"delta": ""})
                 time.sleep(_MATTER_WAIT_POLL_S)
             matter_sources, matter_chunks, contract_text = _build_matter_context(
-                sid, uid, use_contract, req.question,
-                focus_doc_indexes=req.focus_doc_indexes)
+                sid, uid, use_contract, req.question, focus_doc_indexes=req.focus_doc_indexes
+            )
             rag_sources = matter_sources + corpus_sources
             mode, msgs = _build_turn_msgs(
-                use_rag, use_contract, req.question, rag_sources, matter_sources,
-                history, meta_prefix, answer_lang)
+                use_rag, use_contract, req.question, rag_sources, matter_sources, history, meta_prefix, answer_lang
+            )
             chunks_out = matter_chunks + corpus_chunks
-            guard_msg = _empty_grounding_guard(
-                mode, matter_sources, rag_sources, sid, uid, answer_lang)
+            guard_msg = _empty_grounding_guard(mode, matter_sources, rag_sources, sid, uid, answer_lang)
 
         if guard_msg is not None:
-            print(f"[guard] session={sid} mode={mode} stream=1 empty-retrieval → "
-                  "honest refusal (no LLM call)", flush=True)
+            print(
+                f"[guard] session={sid} mode={mode} stream=1 empty-retrieval → honest refusal (no LLM call)", flush=True
+            )
             accumulated.append(guard_msg)
             yield _sse_event("token", {"delta": guard_msg})
         else:
             # Retrieval/rerank is done; bridge the LLM time-to-first-token gap
             # so the bubble shows "formulating" rather than reverting to bare
             # dots (self-suppresses on the FE once the first token arrives).
-            yield _sse_event("status", {
-                "state": "generating",
-                "message": "Formuliere Antwort…",
-            })
+            yield _sse_event(
+                "status",
+                {
+                    "state": "generating",
+                    "message": "Formuliere Antwort…",
+                },
+            )
             try:
                 for delta in _stream_vllm_chat(msgs, max_new_tokens):
                     # ``<think>`` traces only appear when thinking mode is
@@ -3961,11 +4317,14 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
                 yield _sse_event("error", {"detail": f"transport: {exc}"})
                 return
             except httpx.HTTPStatusError as exc:
-                yield _sse_event("error", {
-                    "detail": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
-                })
+                yield _sse_event(
+                    "error",
+                    {
+                        "detail": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+                    },
+                )
                 return
-            except Exception as exc:  # noqa: BLE001 — last-line defence; surface anything else cleanly
+            except Exception as exc:
                 yield _sse_event("error", {"detail": str(exc)})
                 return
 
@@ -3983,7 +4342,9 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
             # document (the manifest invites citing any [M-n], retrieved or
             # not) — see _all_matter_handles. Prevents real-document citations
             # being stripped as fabricated / mislabelled (unbelegt).
-            allowed = {src.cite_id for src in rag_sources} | _all_matter_handles(sid, uid, focus_doc_indexes=req.focus_doc_indexes)
+            allowed = {src.cite_id for src in rag_sources} | _all_matter_handles(
+                sid, uid, focus_doc_indexes=req.focus_doc_indexes
+            )
             validation = validate_citations(answer, allowed)
             if validation.fabricated:
                 print(
@@ -4000,9 +4361,16 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
                 sentences_flagged=validation.sentences_flagged,
             )
 
-        jurisdiction_warnings = [] if guard_msg is not None else _run_jurisdiction_check(
-            answer=answer, contract_text=contract_text, question=req.question,
-            mode=mode, sid=sid,
+        jurisdiction_warnings = (
+            []
+            if guard_msg is not None
+            else _run_jurisdiction_check(
+                answer=answer,
+                contract_text=contract_text,
+                question=req.question,
+                mode=mode,
+                sid=sid,
+            )
         )
 
         timings.total_s = round(time.time() - t_total0, 3)
@@ -4012,21 +4380,26 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         assistant_message_id: int | None = None
         try:
             if not persistence.session_exists(sid, user_id=uid):
-                persistence.save_session(sid, {
-                    "user_id": uid,
-                    "org_id": org_id,
-                    "filename": None,
-                    "contract_text": None,
-                    "n_pages": 0,
-                    "tables": [],
-                    "uploaded_at": time.time(),
-                    "clauses": None, "analysis": None,
-                })
+                persistence.save_session(
+                    sid,
+                    {
+                        "user_id": uid,
+                        "org_id": org_id,
+                        "filename": None,
+                        "contract_text": None,
+                        "n_pages": 0,
+                        "tables": [],
+                        "uploaded_at": time.time(),
+                        "clauses": None,
+                        "analysis": None,
+                    },
+                )
             persistence.add_message(sid, "user", req.question, mode=mode, user_id=uid)
-            _aid = persistence.add_message(sid, "assistant", answer, mode=mode, user_id=uid,
-                                       chunks=[c.model_dump() for c in chunks_out])
+            _aid = persistence.add_message(
+                sid, "assistant", answer, mode=mode, user_id=uid, chunks=[c.model_dump() for c in chunks_out]
+            )
             assistant_message_id = _aid if _aid > 0 else None
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(f"[warn] stream: failed to persist messages for {sid}: {exc}", flush=True)
 
         _maybe_refresh_session_metadata(sid, user_id=uid)
@@ -4052,9 +4425,7 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         complete_payload: dict[str, object] = {
             "answer": answer,
             "chunks": [c.model_dump() for c in chunks_out],
-            "citation_validation": (
-                citation_validation_out.model_dump() if citation_validation_out else None
-            ),
+            "citation_validation": (citation_validation_out.model_dump() if citation_validation_out else None),
             "jurisdiction_warnings": [w.model_dump() for w in jurisdiction_warnings],
             "timings": timings.model_dump(),
             "tokens": {
@@ -4102,22 +4473,27 @@ async def create_session(
     stamped from their JWT.
     """
     sid = str(uuid.uuid4())
-    persistence.save_session(sid, {
-        "user_id": str(user.id),
-        "org_id": _org_or_none(user),
-        "filename": None,
-        "contract_text": None,
-        "n_pages": 0,
-        "tables": [],
-        "uploaded_at": time.time(),
-        "clauses": None,
-        "analysis": None,
-    })
+    persistence.save_session(
+        sid,
+        {
+            "user_id": str(user.id),
+            "org_id": _org_or_none(user),
+            "filename": None,
+            "contract_text": None,
+            "n_pages": 0,
+            "tables": [],
+            "uploaded_at": time.time(),
+            "clauses": None,
+            "analysis": None,
+        },
+    )
     return SessionCreatedResp(session_id=sid)
 
 
 def _finalize_tus_upload(
-    user: CurrentUser, info: dict, file_bytes: bytes,
+    user: CurrentUser,
+    info: dict,
+    file_bytes: bytes,
 ) -> dict:
     """Completion hook for the tus router. Mirrors the synchronous half of
     POST /upload — validate session ownership, register a matter_documents
@@ -4155,15 +4531,30 @@ def _finalize_tus_upload(
         else (Path(fname).suffix.lower() or ".bin")
     )
     if is_legacy_first_upload:
-        persistence.save_session(sid, {
-            "user_id": uid, "org_id": org_id, "filename": fname,
-            "contract_text": None, "n_pages": 0, "tables": [],
-            "uploaded_at": time.time(), "clauses": None, "analysis": None,
-            "upload_ext": upload_ext,
-        })
+        persistence.save_session(
+            sid,
+            {
+                "user_id": uid,
+                "org_id": org_id,
+                "filename": fname,
+                "contract_text": None,
+                "n_pages": 0,
+                "tables": [],
+                "uploaded_at": time.time(),
+                "clauses": None,
+                "analysis": None,
+                "upload_ext": upload_ext,
+            },
+        )
     doc = persistence.add_matter_document(
-        sid, filename=fname, doc_text="", n_pages=0,
-        upload_ext=upload_ext, user_id=uid, org_id=org_id, status="queued",
+        sid,
+        filename=fname,
+        doc_text="",
+        n_pages=0,
+        upload_ext=upload_ext,
+        user_id=uid,
+        org_id=org_id,
+        status="queued",
     )
     if doc is None:
         raise HTTPException(404, "session_id not found")
@@ -4185,10 +4576,9 @@ def _finalize_tus_upload(
         if rc is not None:
             try:
                 rc.delete_matter_chunks(sid, doc_index=int(doc["doc_index"]))
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 print(
-                    f"[retry] matter_chunks cleanup failed for "
-                    f"{sid}/M-{doc['doc_index']}: {exc}",
+                    f"[retry] matter_chunks cleanup failed for {sid}/M-{doc['doc_index']}: {exc}",
                     flush=True,
                 )
         persistence.reset_matter_document_for_retry(doc["id"])
@@ -4267,22 +4657,31 @@ async def upload(
     if is_legacy_first_upload:
         # Session created with empty contract_text; the worker fills it
         # from the first document once OCR completes.
-        persistence.save_session(sid, {
-            "user_id": uid,
-            "org_id": org_id,
-            "filename": fname,
-            "contract_text": None,
-            "n_pages": 0,
-            "tables": [],
-            "uploaded_at": time.time(),
-            "clauses": None,
-            "analysis": None,
-            "upload_ext": upload_ext,
-        })
+        persistence.save_session(
+            sid,
+            {
+                "user_id": uid,
+                "org_id": org_id,
+                "filename": fname,
+                "contract_text": None,
+                "n_pages": 0,
+                "tables": [],
+                "uploaded_at": time.time(),
+                "clauses": None,
+                "analysis": None,
+                "upload_ext": upload_ext,
+            },
+        )
 
     doc = persistence.add_matter_document(
-        sid, filename=fname, doc_text="", n_pages=0,
-        upload_ext=upload_ext, user_id=uid, org_id=org_id, status="queued",
+        sid,
+        filename=fname,
+        doc_text="",
+        n_pages=0,
+        upload_ext=upload_ext,
+        user_id=uid,
+        org_id=org_id,
+        status="queued",
     )
     if doc is None:
         raise HTTPException(404, "session_id not found")
@@ -4296,14 +4695,13 @@ async def upload(
     # optimistic chip "ready" without re-uploading.
     if doc.get("__dedup_existing"):
         return UploadResp(
-            session_id=sid, filename=fname,
-            pages=int(doc.get("n_pages") or 0), chunks=0,
+            session_id=sid,
+            filename=fname,
+            pages=int(doc.get("n_pages") or 0),
+            chunks=0,
             doc_index=doc["doc_index"],
             deduplicated=True,
-            message=(
-                f"„{fname}“ ist bereits im Matter ([M-{doc['doc_index']}]) — "
-                f"erneutes Hochladen übersprungen."
-            ),
+            message=(f"„{fname}“ ist bereits im Matter ([M-{doc['doc_index']}]) — erneutes Hochladen übersprungen."),
         )
     # Same-name match against a FAILED row — user is retrying after the
     # previous attempt died (commonly: 0-byte multipart, corrupted bytes,
@@ -4318,10 +4716,9 @@ async def upload(
         if rc is not None:
             try:
                 rc.delete_matter_chunks(sid, doc_index=int(doc["doc_index"]))
-            except Exception as exc:  # noqa: BLE001 — proceed with reset
+            except Exception as exc:
                 print(
-                    f"[retry] matter_chunks cleanup failed for "
-                    f"{sid}/M-{doc['doc_index']}: {exc}",
+                    f"[retry] matter_chunks cleanup failed for {sid}/M-{doc['doc_index']}: {exc}",
                     flush=True,
                 )
         persistence.reset_matter_document_for_retry(doc["id"])
@@ -4345,11 +4742,12 @@ async def upload(
     _enqueue_ingestion(sid, doc["id"], doc["doc_index"], fname, True)
 
     return UploadResp(
-        session_id=sid, filename=fname, pages=0, chunks=0,
+        session_id=sid,
+        filename=fname,
+        pages=0,
+        chunks=0,
         doc_index=doc["doc_index"],
-        message=(
-            f"Dokument [M-{doc['doc_index']}] hochgeladen — wird verarbeitet…"
-        ),
+        message=(f"Dokument [M-{doc['doc_index']}] hochgeladen — wird verarbeitet…"),
     )
 
 
@@ -4368,8 +4766,7 @@ def _v1_issue_to_out(i: dict) -> IssueOut:
     rec = i.get("suggested_redline") or i.get("recommendation")
     rationale = i.get("rationale") or i.get("reason")
     typ = i.get("type") or (i.get("title", "")[:80] if i.get("title") else None)
-    return IssueOut(severity=sev_s, description=desc, recommendation=rec,
-                    reason=rationale, type=typ)
+    return IssueOut(severity=sev_s, description=desc, recommendation=rec, reason=rationale, type=typ)
 
 
 def _analyze_v1(req: AnalyzeReq, uid: str | None) -> AnalyzeResp:
@@ -4386,15 +4783,17 @@ def _analyze_v1(req: AnalyzeReq, uid: str | None) -> AnalyzeResp:
     for c in clauses_raw:
         analysis = analyze_clause(c["text"])
         types_present.add(analysis["type"])
-        clauses_out.append(ClauseOut(
-            id=c["id"],
-            title=c["title"],
-            text=c["text"],
-            type=analysis["type"],
-            summary=analysis["summary"],
-            issues=[IssueOut(**i) for i in analysis["issues"] if isinstance(i, dict)],
-            citations=analysis["citations"],
-        ))
+        clauses_out.append(
+            ClauseOut(
+                id=c["id"],
+                title=c["title"],
+                text=c["text"],
+                type=analysis["type"],
+                summary=analysis["summary"],
+                issues=[IssueOut(**i) for i in analysis["issues"] if isinstance(i, dict)],
+                citations=analysis["citations"],
+            )
+        )
 
     missing = [IssueOut(**m) for m in check_playbook(types_present)]
     sess["clauses"] = [c.model_dump() for c in clauses_out]
@@ -4472,12 +4871,17 @@ def _analyze_v2(req: AnalyzeReq, uid: str | None) -> AnalyzeResp:
     # Project V2 result onto the existing AnalyzeResp shape — UI keeps working.
     clauses_out: list[ClauseOut] = []
     for c in result.clauses:
-        clauses_out.append(ClauseOut(
-            id=c.id, title=c.title, text=c.text, type=c.type,
-            summary=c.summary,
-            issues=[_v1_issue_to_out(i.model_dump()) for i in c.issues],
-            citations=[],  # V2 carries legal_basis on each Issue instead
-        ))
+        clauses_out.append(
+            ClauseOut(
+                id=c.id,
+                title=c.title,
+                text=c.text,
+                type=c.type,
+                summary=c.summary,
+                issues=[_v1_issue_to_out(i.model_dump()) for i in c.issues],
+                citations=[],  # V2 carries legal_basis on each Issue instead
+            )
+        )
     missing = [_v1_issue_to_out(i.model_dump()) for i in result.missing_required_clauses]
 
     # Surface extraction-quality warning at the top of missing-clauses so
@@ -4485,28 +4889,29 @@ def _analyze_v2(req: AnalyzeReq, uid: str | None) -> AnalyzeResp:
     # high-severity flag — bad extraction is genuinely high-impact for the
     # downstream interpretation, even though no individual clause is broken.
     if result.extraction_quality and result.extraction_quality.confidence == "low":
-        missing.insert(0, IssueOut(
-            severity="high",
-            type="Extraktionsqualität",
-            description=(
-                "⚠️ Niedrige Extraktionsqualität — die folgenden 'Fehlt'-Befunde "
-                "sind möglicherweise falsch positiv. " + result.extraction_quality.reason
+        missing.insert(
+            0,
+            IssueOut(
+                severity="high",
+                type="Extraktionsqualität",
+                description=(
+                    "⚠️ Niedrige Extraktionsqualität — die folgenden 'Fehlt'-Befunde "
+                    "sind möglicherweise falsch positiv. " + result.extraction_quality.reason
+                ),
+                recommendation=(
+                    "PDF-Extraktion prüfen (z.B. besseren OCR-Pass oder Original-Quelle nutzen), "
+                    "bevor fehlende Klauseln als tatsächlich fehlend behandelt werden."
+                ),
+                reason=None,
             ),
-            recommendation=(
-                "PDF-Extraktion prüfen (z.B. besseren OCR-Pass oder Original-Quelle nutzen), "
-                "bevor fehlende Klauseln als tatsächlich fehlend behandelt werden."
-            ),
-            reason=None,
-        ))
+        )
 
     # Persist the full V2 result on the session for richer UI consumption later.
     # Phase B: ``sess`` already carries user_id (created_by) AND org_id from
     # _row_to_session, so save_session preserves both via the COALESCE upsert.
     sess["clauses"] = [c.model_dump() for c in clauses_out]
     sess["analysis"] = result.model_dump()
-    sess["extraction_quality"] = (
-        result.extraction_quality.model_dump() if result.extraction_quality else None
-    )
+    sess["extraction_quality"] = result.extraction_quality.model_dump() if result.extraction_quality else None
     persistence.save_session(req.session_id, sess)
 
     # Mark progress as complete so any final UI poll sees a clean done state.
@@ -4578,6 +4983,7 @@ def analyze_contract_full(session_id: str, user: CurrentUser = Depends(get_curre
 # Session listing + rehydration endpoints (UI persistence across refresh)
 # ---------------------------------------------------------------------------
 
+
 @app.get("/sessions")
 def list_sessions(limit: int = 50, user: CurrentUser = Depends(get_current_user)):
     """Recent sessions for a sidebar — light payload, no contract_text.
@@ -4619,9 +5025,9 @@ def get_session_messages(session_id: str, user: CurrentUser = Depends(get_curren
 
 
 class AppendMessageReq(BaseModel):
-    role: str   # "user" | "assistant"
+    role: str  # "user" | "assistant"
     content: str
-    mode: Optional[str] = None  # free-form: "chat" | "rag" | "upload" | "analyze" | ...
+    mode: str | None = None  # free-form: "chat" | "rag" | "upload" | "analyze" | ...
 
 
 @app.post("/sessions/{session_id}/messages")
@@ -4645,7 +5051,11 @@ def append_session_message(
     if not req.content.strip():
         raise HTTPException(400, "content required")
     msg_id = persistence.add_message(
-        session_id, req.role, req.content, mode=req.mode, user_id=uid,
+        session_id,
+        req.role,
+        req.content,
+        mode=req.mode,
+        user_id=uid,
     )
     return {"ok": True, "id": msg_id}
 
@@ -4674,6 +5084,7 @@ class FeedbackReq(BaseModel):
         comment: Optional free text, capped at 2 KB to keep the
             SQLite row size in check.
     """
+
     session_id: str
     message_id: int | None = None
     rating: int
@@ -4685,19 +5096,22 @@ class FeedbackReq(BaseModel):
 # against this set so a typo-introduced new tag doesn't silently land
 # in the table (which would break downstream aggregation queries).
 # ``None`` is also valid — feedback may carry no reason.
-_FEEDBACK_REASONS: frozenset[str] = frozenset({
-    "wrong-citation",
-    "wrong-jurisdiction",
-    "hallucination",
-    "incomplete",
-    "tone",
-    "other",
-})
+_FEEDBACK_REASONS: frozenset[str] = frozenset(
+    {
+        "wrong-citation",
+        "wrong-jurisdiction",
+        "hallucination",
+        "incomplete",
+        "tone",
+        "other",
+    }
+)
 
 
 @app.post("/feedback")
 def submit_feedback(
-    req: FeedbackReq, user: CurrentUser = Depends(get_current_user),
+    req: FeedbackReq,
+    user: CurrentUser = Depends(get_current_user),
 ):
     """Capture a lawyer's verdict on an assistant turn.
 
@@ -4717,9 +5131,7 @@ def submit_feedback(
     if req.rating not in (-1, 1):
         raise HTTPException(400, "rating must be -1 or 1")
     if req.reason is not None and req.reason not in _FEEDBACK_REASONS:
-        raise HTTPException(
-            400, f"reason must be one of {sorted(_FEEDBACK_REASONS)} or null"
-        )
+        raise HTTPException(400, f"reason must be one of {sorted(_FEEDBACK_REASONS)} or null")
     if req.comment is not None and len(req.comment) > 2048:
         raise HTTPException(400, "comment must be ≤ 2048 characters")
 
@@ -4729,13 +5141,14 @@ def submit_feedback(
         # 404 (not 403) so we don't leak existence across tenants.
         raise HTTPException(404, "session_id not found")
     if req.message_id is not None and not persistence.message_belongs_to_session(
-        req.message_id, req.session_id,
+        req.message_id,
+        req.session_id,
     ):
         raise HTTPException(404, "message_id does not belong to session_id")
 
     row_id = persistence.record_feedback(
         session_id=req.session_id,
-        user_id=uid,     # author + visibility check (Phase B reverted).
+        user_id=uid,  # author + visibility check (Phase B reverted).
         rating=req.rating,
         message_id=req.message_id,
         reason=req.reason,
@@ -4760,7 +5173,8 @@ def submit_feedback(
 
 @app.get("/sessions/{session_id}/feedback")
 def get_session_feedback(
-    session_id: str, user: CurrentUser = Depends(get_current_user),
+    session_id: str,
+    user: CurrentUser = Depends(get_current_user),
 ):
     """All feedback rows the calling user has left on a session.
 
@@ -4830,18 +5244,18 @@ def get_session_document(
     # inline preview, which is the right behaviour for anything we
     # can't render.
     media_type = {
-        ".pdf":  "application/pdf",
+        ".pdf": "application/pdf",
         ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ".doc":  "application/msword",
-        ".txt":  "text/plain; charset=utf-8",
-        ".md":   "text/markdown; charset=utf-8",
-        ".png":  "image/png",
-        ".jpg":  "image/jpeg",
+        ".doc": "application/msword",
+        ".txt": "text/plain; charset=utf-8",
+        ".md": "text/markdown; charset=utf-8",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
         ".jpeg": "image/jpeg",
         ".webp": "image/webp",
-        ".tif":  "image/tiff",
+        ".tif": "image/tiff",
         ".tiff": "image/tiff",
-        ".bmp":  "image/bmp",
+        ".bmp": "image/bmp",
     }.get(ext, "application/octet-stream")
 
     # Filename for the inline disposition. Falls back to the session id
@@ -4857,31 +5271,32 @@ def get_session_document(
 
 
 _MEDIA_TYPES = {
-    ".pdf":  "application/pdf",
+    ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".doc":  "application/msword",
-    ".txt":  "text/plain; charset=utf-8",
-    ".md":   "text/markdown; charset=utf-8",
-    ".png":  "image/png",
-    ".jpg":  "image/jpeg",
+    ".doc": "application/msword",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
-    ".tif":  "image/tiff",
+    ".tif": "image/tiff",
     ".tiff": "image/tiff",
-    ".bmp":  "image/bmp",
+    ".bmp": "image/bmp",
 }
 
 
 class MatterDocumentOut(BaseModel):
     """One document in a Matter, as the UI document list renders it."""
-    doc_index: int           # the n in [M-n]
-    cite_id: str             # "M-1", "M-2", …
+
+    doc_index: int  # the n in [M-n]
+    cite_id: str  # "M-1", "M-2", …
     filename: str
     n_pages: int
     created_at: float
     # Async-ingestion status so the UI can show a live progress bar while a
     # document is OCR'd/indexed and a checkmark when it's ready.
-    status: str = "done"     # queued | processing | done | failed
+    status: str = "done"  # queued | processing | done | failed
     pages_done: int = 0
     pages_total: int = 0
     n_chunks: int = 0
@@ -4890,7 +5305,8 @@ class MatterDocumentOut(BaseModel):
 
 @app.get("/sessions/{session_id}/documents")
 def list_matter_documents_endpoint(
-    session_id: str, user: CurrentUser = Depends(get_current_user),
+    session_id: str,
+    user: CurrentUser = Depends(get_current_user),
 ):
     """Every document attached to a Matter, ordered by ``[M-n]``.
 
@@ -4924,7 +5340,8 @@ def list_matter_documents_endpoint(
 
 @app.get("/sessions/{session_id}/documents/{doc_index}")
 def get_matter_document_endpoint(
-    session_id: str, doc_index: int,
+    session_id: str,
+    doc_index: int,
     user: CurrentUser = Depends(get_current_user),
 ):
     """Stream one Matter document's bytes by its ``[M-n]`` index.
@@ -4956,7 +5373,8 @@ def get_matter_document_endpoint(
 
 @app.delete("/sessions/{session_id}/documents/{doc_index}")
 def delete_matter_document_endpoint(
-    session_id: str, doc_index: int,
+    session_id: str,
+    doc_index: int,
     user: CurrentUser = Depends(get_current_user),
 ):
     """Hard-delete one matter document from a session.
@@ -4983,11 +5401,12 @@ def delete_matter_document_endpoint(
     if rc is not None:
         try:
             rc.delete_matter_chunks(session_id, doc_index=int(doc_index))
-        except Exception as e:  # noqa: BLE001 — proceed with DB delete anyway
-            print(f"[delete] matter_chunks cleanup failed for "
-                  f"{session_id}/M-{doc_index}: {e}", flush=True)
+        except Exception as e:
+            print(f"[delete] matter_chunks cleanup failed for {session_id}/M-{doc_index}: {e}", flush=True)
     info = persistence.delete_matter_document(
-        session_id, int(doc_index), user_id=uid,
+        session_id,
+        int(doc_index),
+        user_id=uid,
     )
     if info is None:
         raise HTTPException(404, "document not found in this session")
@@ -5009,7 +5428,7 @@ def delete_session_endpoint(session_id: str, user: CurrentUser = Depends(get_cur
     if rc is not None:
         try:
             rc.delete_matter_chunks(session_id)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"[delete] matter_chunks cleanup failed for {session_id}: {e}", flush=True)
     return {"ok": True}
 
@@ -5020,7 +5439,9 @@ class RenameReq(BaseModel):
 
 @app.patch("/sessions/{session_id}")
 def rename_session(
-    session_id: str, req: RenameReq, user: CurrentUser = Depends(get_current_user),
+    session_id: str,
+    req: RenameReq,
+    user: CurrentUser = Depends(get_current_user),
 ):
     """Set a user-facing title for the conversation. Empty string clears
     the override and the display title falls back to filename / first
@@ -5033,6 +5454,7 @@ def rename_session(
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+
 
 def main():
     p = argparse.ArgumentParser()

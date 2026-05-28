@@ -3,12 +3,12 @@
 The schema is the contract with the LLM (via guided JSON decoding) and
 with the API consumer. See docs/analysis/CONTRACT_ANALYZER_V2.md §5.
 """
+
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, Field
-
 
 ContractType = Literal[
     "Pachtvertrag",
@@ -35,26 +35,22 @@ ReconSeverity = Literal["info", "low", "medium", "high"]
 
 
 class Parcel(BaseModel):
-    gemeinde: Optional[str] = None
-    gemarkung: Optional[str] = None
-    flur: Optional[str] = None
-    flurstueck: Optional[str] = Field(
-        default=None, description="Cadastral parcel number, e.g. '47/3'"
-    )
-    groesse_m2: Optional[float] = None
-    eigentuemer: Optional[str] = None
+    gemeinde: str | None = None
+    gemarkung: str | None = None
+    flur: str | None = None
+    flurstueck: str | None = Field(default=None, description="Cadastral parcel number, e.g. '47/3'")
+    groesse_m2: float | None = None
+    eigentuemer: str | None = None
     raw_mention: str = Field(description="Original text span the parcel was extracted from")
-    page: Optional[int] = None
+    page: int | None = None
 
 
 class FinancialTable(BaseModel):
     title: str
     rows: list[dict] = Field(default_factory=list, description="Normalized rows from Docling")
-    stated_total: Optional[float] = None
-    computed_total: Optional[float] = None
-    discrepancy: Optional[float] = Field(
-        default=None, description="stated - computed; null if either side is missing"
-    )
+    stated_total: float | None = None
+    computed_total: float | None = None
+    discrepancy: float | None = Field(default=None, description="stated - computed; null if either side is missing")
     currency: str = "EUR"
 
 
@@ -75,9 +71,12 @@ class Issue(BaseModel):
     affected_clauses: list[str] = Field(default_factory=list, description="Clause IDs")
     rectify_or_ignore: Disposition
     rationale: str = Field(description="Why this disposition; required so judgment is auditable")
-    suggested_redline: Optional[str] = None
+    suggested_redline: str | None = None
     legal_basis: list[str] = Field(default_factory=list, description="§/Art references where applicable")
-    low_confidence: bool = Field(default=False, description="True when extraction quality may have caused this finding (e.g. missing-clause from a poorly-OCR'd PDF)")
+    low_confidence: bool = Field(
+        default=False,
+        description="True when extraction quality may have caused this finding (e.g. missing-clause from a poorly-OCR'd PDF)",
+    )
 
 
 class Clause(BaseModel):
@@ -100,10 +99,10 @@ class CrossClauseFinding(BaseModel):
 
 class ContractMetadata(BaseModel):
     parties: list[str] = Field(default_factory=list)
-    effective_date: Optional[str] = None
-    signing_date: Optional[str] = None
-    term: Optional[str] = None
-    jurisdiction: Optional[str] = None
+    effective_date: str | None = None
+    signing_date: str | None = None
+    term: str | None = None
+    jurisdiction: str | None = None
 
 
 class ExtractionQuality(BaseModel):
@@ -113,6 +112,7 @@ class ExtractionQuality(BaseModel):
     When that happens, missing-clause findings are over-confident — we
     surface this so reviewers can recognize the noise.
     """
+
     confidence: Literal["high", "medium", "low"]
     chars_per_page: float
     total_chars: int
@@ -129,7 +129,7 @@ class ContractAnalysis(BaseModel):
     clauses: list[Clause] = Field(default_factory=list)
     cross_clause_findings: list[CrossClauseFinding] = Field(default_factory=list)
     missing_required_clauses: list[Issue] = Field(default_factory=list)
-    extraction_quality: Optional[ExtractionQuality] = None
+    extraction_quality: ExtractionQuality | None = None
     degraded: bool = False
     model: str
     thinking_tokens: int = 0

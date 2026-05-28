@@ -38,12 +38,11 @@ from uuid import UUID
 
 import asyncpg  # noqa: F401 — only for typing exposure
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
-
-from lai.api.auth_router import AuthDeps
-from lai.common.auth import CurrentUser
+from pydantic import BaseModel
 
 from lai import persistence
+from lai.api.auth_router import AuthDeps
+from lai.common.auth import CurrentUser
 
 __all__ = ["build_share_router"]
 
@@ -52,8 +51,10 @@ _logger = logging.getLogger("lai.share")
 
 # ─── Wire shapes ────────────────────────────────────────────────────────────
 
+
 class ShareUserOut(BaseModel):
     """Enriched share row — what the SPA needs to render the share list."""
+
     user_id: UUID
     email: str
     full_name: str
@@ -66,12 +67,14 @@ class AddShareBody(BaseModel):
 
 class ShareTargetOut(BaseModel):
     """Result row for the share-target typeahead."""
+
     id: UUID
     email: str
     full_name: str
 
 
 # ─── Authorization helper ───────────────────────────────────────────────────
+
 
 def _can_manage_shares(session_id: str, user: CurrentUser) -> bool:
     """Owner of the session OR super-admin. Used by the share-management
@@ -84,10 +87,11 @@ def _can_manage_shares(session_id: str, user: CurrentUser) -> bool:
 
 # ─── Router factory ─────────────────────────────────────────────────────────
 
+
 def build_share_router(
     deps: AuthDeps,
     *,
-    get_current_user,  # noqa: ANN001 — FastAPI dependency callable
+    get_current_user,
 ) -> APIRouter:
     router = APIRouter(tags=["share"])
 
@@ -120,12 +124,14 @@ def build_share_router(
                 # Defensive: user was deleted between the share-add and now.
                 # Silently skip rather than 500 the whole list.
                 continue
-            out.append(ShareUserOut(
-                user_id=u["id"],
-                email=u["email"],
-                full_name=u["full_name"],
-                granted_at=r["created_at"],
-            ))
+            out.append(
+                ShareUserOut(
+                    user_id=u["id"],
+                    email=u["email"],
+                    full_name=u["full_name"],
+                    granted_at=r["created_at"],
+                )
+            )
         return out
 
     # ── POST /sessions/{sid}/shares ───────────────────────────────────
@@ -159,10 +165,12 @@ def build_share_router(
                     "SELECT id, email, full_name FROM users WHERE id = $1",
                     user.id,
                 )
-            assert me is not None  # noqa: S101 — caller's row must exist
+            assert me is not None
             return ShareUserOut(
-                user_id=me["id"], email=me["email"],
-                full_name=me["full_name"], granted_at=0.0,
+                user_id=me["id"],
+                email=me["email"],
+                full_name=me["full_name"],
+                granted_at=0.0,
             )
 
         # Validate the target user exists AND is in the caller's org. The
@@ -195,7 +203,9 @@ def build_share_router(
         else:
             grantor = str(user.id)
         share_id = persistence.add_session_share(
-            session_id, str(body.user_id), granted_by=grantor,
+            session_id,
+            str(body.user_id),
+            granted_by=grantor,
         )
         if share_id is None:
             raise HTTPException(
@@ -204,15 +214,19 @@ def build_share_router(
             )
         _logger.info(
             "session.share.add session=%s target=%s by=%s",
-            session_id, body.user_id, user.id,
+            session_id,
+            body.user_id,
+            user.id,
         )
         # Re-read the row so the response carries the real created_at.
         # add_session_share returned id=0 for self-share (handled above).
         for r in persistence.list_session_shares(session_id):
             if r["user_id"] == str(body.user_id):
                 return ShareUserOut(
-                    user_id=target["id"], email=target["email"],
-                    full_name=target["full_name"], granted_at=r["created_at"],
+                    user_id=target["id"],
+                    email=target["email"],
+                    full_name=target["full_name"],
+                    granted_at=r["created_at"],
                 )
         # Unreachable if add_session_share returned non-None.
         raise HTTPException(500, "share persisted but not readable")
@@ -241,7 +255,9 @@ def build_share_router(
         else:
             grantor = str(user.id)
         ok = persistence.revoke_session_share(
-            session_id, str(user_id), granted_by=grantor,
+            session_id,
+            str(user_id),
+            granted_by=grantor,
         )
         if not ok:
             # Either the share didn't exist, or the auth gate above missed
@@ -252,7 +268,9 @@ def build_share_router(
             )
         _logger.info(
             "session.share.revoke session=%s target=%s by=%s",
-            session_id, user_id, user.id,
+            session_id,
+            user_id,
+            user.id,
         )
 
     # ── GET /share-targets/search?q=&exclude_session_id= ─────────────
@@ -313,9 +331,6 @@ def build_share_router(
                 q_norm,
                 limit,
             )
-        return [
-            ShareTargetOut(id=r["id"], email=r["email"], full_name=r["full_name"])
-            for r in rows
-        ]
+        return [ShareTargetOut(id=r["id"], email=r["email"], full_name=r["full_name"]) for r in rows]
 
     return router

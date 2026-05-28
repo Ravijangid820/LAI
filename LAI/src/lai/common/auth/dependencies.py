@@ -46,8 +46,7 @@ def _unauthorized(detail: str, *, expired: bool = False) -> HTTPException:
         # RFC 6750 §3 — hint the reason so the SPA refresh client can
         # branch without parsing the body.
         headers["WWW-Authenticate"] = (
-            'Bearer realm="lai", error="invalid_token", '
-            'error_description="The access token expired"'
+            'Bearer realm="lai", error="invalid_token", error_description="The access token expired"'
         )
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,

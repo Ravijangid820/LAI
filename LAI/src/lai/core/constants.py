@@ -7,10 +7,10 @@ used across the LAI platform. Consolidated from V3 constants.py and V4 constants
 import re
 from enum import Enum
 
-
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
+
 
 class DocumentType(str, Enum):
     LEGISLATION = "legislation"
@@ -24,10 +24,10 @@ class DocumentType(str, Enum):
 
 
 class CourtLevel(int, Enum):
-    FEDERAL = 1        # BVerfG, BGH, BVerwG, BAG, BSG, BFH
+    FEDERAL = 1  # BVerfG, BGH, BVerwG, BAG, BSG, BFH
     HIGHER_REGIONAL = 2  # OLG, OVG, VGH, LAG, LSG, FG
-    REGIONAL = 3       # LG, VG, ArbG, SG
-    LOCAL = 4          # AG
+    REGIONAL = 3  # LG, VG, ArbG, SG
+    LOCAL = 4  # AG
 
 
 class ProcessingStatus(str, Enum):
@@ -64,58 +64,162 @@ class FeedbackType(str, Enum):
 
 GERMAN_LAW_CODES: set[str] = {
     # Major codes
-    "BGB", "StGB", "ZPO", "StPO", "GG", "HGB", "AO", "InsO",
-    "VwGO", "FGO", "GVG", "BVerfGG", "GewO", "BImSchG",
+    "BGB",
+    "StGB",
+    "ZPO",
+    "StPO",
+    "GG",
+    "HGB",
+    "AO",
+    "InsO",
+    "VwGO",
+    "FGO",
+    "GVG",
+    "BVerfGG",
+    "GewO",
+    "BImSchG",
     # Civil law
-    "EGBGB", "WEG", "MietNovG", "ErbbauRG", "AGG", "ProdHaftG",
+    "EGBGB",
+    "WEG",
+    "MietNovG",
+    "ErbbauRG",
+    "AGG",
+    "ProdHaftG",
     # Labor law
-    "ArbGG", "KSchG", "BetrVG", "TzBfG", "ArbZG", "MuSchG",
-    "BEEG", "EntgFG", "AUG", "MiLoG",
+    "ArbGG",
+    "KSchG",
+    "BetrVG",
+    "TzBfG",
+    "ArbZG",
+    "MuSchG",
+    "BEEG",
+    "EntgFG",
+    "AUG",
+    "MiLoG",
     # Commercial / corporate
-    "GmbHG", "AktG", "UmwG", "GenG", "PartGG",
+    "GmbHG",
+    "AktG",
+    "UmwG",
+    "GenG",
+    "PartGG",
     # Administrative
-    "VwVfG", "BauGB", "PolG", "OWiG", "AsylG", "AufenthG",
+    "VwVfG",
+    "BauGB",
+    "PolG",
+    "OWiG",
+    "AsylG",
+    "AufenthG",
     # Social law (SGB books)
-    "SGB I", "SGB II", "SGB III", "SGB IV", "SGB V",
-    "SGB VI", "SGB VII", "SGB VIII", "SGB IX", "SGB X",
-    "SGB XI", "SGB XII", "SGB XIV",
+    "SGB I",
+    "SGB II",
+    "SGB III",
+    "SGB IV",
+    "SGB V",
+    "SGB VI",
+    "SGB VII",
+    "SGB VIII",
+    "SGB IX",
+    "SGB X",
+    "SGB XI",
+    "SGB XII",
+    "SGB XIV",
     # Tax
-    "EStG", "UStG", "KStG", "GewStG", "BewG",
+    "EStG",
+    "UStG",
+    "KStG",
+    "GewStG",
+    "BewG",
     # IP / Media
-    "UrhG", "MarkenG", "PatG", "TMG", "TTDSG",
+    "UrhG",
+    "MarkenG",
+    "PatG",
+    "TMG",
+    "TTDSG",
     # Data protection
-    "BDSG", "DSGVO",
+    "BDSG",
+    "DSGVO",
     # EU
-    "AEUV", "EUV",
+    "AEUV",
+    "EUV",
     # Energy / wind specific
-    "EEG", "WindSeeG", "NABEG", "EnWG", "LuftVG",
+    "EEG",
+    "WindSeeG",
+    "NABEG",
+    "EnWG",
+    "LuftVG",
     # Other
-    "StVG", "StVO", "BtMG", "WaffG", "TierSchG", "UWG", "BNatSchG",
+    "StVG",
+    "StVO",
+    "BtMG",
+    "WaffG",
+    "TierSchG",
+    "UWG",
+    "BNatSchG",
 }
 
 SGB_BOOKS: dict[str, str] = {
-    "1": "SGB I", "2": "SGB II", "3": "SGB III", "4": "SGB IV",
-    "5": "SGB V", "6": "SGB VI", "7": "SGB VII", "8": "SGB VIII",
-    "9": "SGB IX", "10": "SGB X", "11": "SGB XI", "12": "SGB XII",
+    "1": "SGB I",
+    "2": "SGB II",
+    "3": "SGB III",
+    "4": "SGB IV",
+    "5": "SGB V",
+    "6": "SGB VI",
+    "7": "SGB VII",
+    "8": "SGB VIII",
+    "9": "SGB IX",
+    "10": "SGB X",
+    "11": "SGB XI",
+    "12": "SGB XII",
     "14": "SGB XIV",
-    "I": "SGB I", "II": "SGB II", "III": "SGB III", "IV": "SGB IV",
-    "V": "SGB V", "VI": "SGB VI", "VII": "SGB VII", "VIII": "SGB VIII",
-    "IX": "SGB IX", "X": "SGB X", "XI": "SGB XI", "XII": "SGB XII",
+    "I": "SGB I",
+    "II": "SGB II",
+    "III": "SGB III",
+    "IV": "SGB IV",
+    "V": "SGB V",
+    "VI": "SGB VI",
+    "VII": "SGB VII",
+    "VIII": "SGB VIII",
+    "IX": "SGB IX",
+    "X": "SGB X",
+    "XI": "SGB XI",
+    "XII": "SGB XII",
     "XIV": "SGB XIV",
 }
 
 COURT_NAME_TO_LEVEL: dict[str, int] = {
-    "BVerfG": 1, "BGH": 1, "BVerwG": 1, "BAG": 1,
-    "BSG": 1, "BFH": 1, "BPatG": 1,
-    "OLG": 2, "OVG": 2, "VGH": 2, "LAG": 2, "LSG": 2, "FG": 2,
-    "LG": 3, "VG": 3, "ArbG": 3, "SG": 3,
+    "BVerfG": 1,
+    "BGH": 1,
+    "BVerwG": 1,
+    "BAG": 1,
+    "BSG": 1,
+    "BFH": 1,
+    "BPatG": 1,
+    "OLG": 2,
+    "OVG": 2,
+    "VGH": 2,
+    "LAG": 2,
+    "LSG": 2,
+    "FG": 2,
+    "LG": 3,
+    "VG": 3,
+    "ArbG": 3,
+    "SG": 3,
     "AG": 4,
 }
 
 GERMAN_MONTH_TO_NUM: dict[str, int] = {
-    "Januar": 1, "Februar": 2, "Marz": 3, "April": 4,
-    "Mai": 5, "Juni": 6, "Juli": 7, "August": 8,
-    "September": 9, "Oktober": 10, "November": 11, "Dezember": 12,
+    "Januar": 1,
+    "Februar": 2,
+    "Marz": 3,
+    "April": 4,
+    "Mai": 5,
+    "Juni": 6,
+    "Juli": 7,
+    "August": 8,
+    "September": 9,
+    "Oktober": 10,
+    "November": 11,
+    "Dezember": 12,
 }
 
 
@@ -164,25 +268,55 @@ DATE_PATTERN_WRITTEN = re.compile(
 # ---------------------------------------------------------------------------
 
 COMPARISON_KEYWORDS = {
-    "vergleich", "unterschied", "differenz", "gegenuberstellung",
-    "versus", "vs", "im vergleich", "anders als", "abgrenzung",
-    "sowohl", "einerseits", "andererseits",
+    "vergleich",
+    "unterschied",
+    "differenz",
+    "gegenuberstellung",
+    "versus",
+    "vs",
+    "im vergleich",
+    "anders als",
+    "abgrenzung",
+    "sowohl",
+    "einerseits",
+    "andererseits",
 }
 
 DEFINITION_KEYWORDS = {
-    "definition", "was ist", "was sind", "was bedeutet", "bedeutung",
-    "was versteht man", "begriff", "legaldefinition",
+    "definition",
+    "was ist",
+    "was sind",
+    "was bedeutet",
+    "bedeutung",
+    "was versteht man",
+    "begriff",
+    "legaldefinition",
 }
 
 PROCEDURE_KEYWORDS = {
-    "verfahren", "ablauf", "vorgehen", "schritt", "frist",
-    "antrag", "klage erheben", "rechtsmittel", "berufung",
-    "revision", "beschwerde", "widerspruch",
+    "verfahren",
+    "ablauf",
+    "vorgehen",
+    "schritt",
+    "frist",
+    "antrag",
+    "klage erheben",
+    "rechtsmittel",
+    "berufung",
+    "revision",
+    "beschwerde",
+    "widerspruch",
 }
 
 HISTORICAL_KEYWORDS = {
-    "fruher", "damals", "alte fassung", "a.f.", "a. f.",
-    "vor der reform", "bis zum", "gultig bis",
+    "fruher",
+    "damals",
+    "alte fassung",
+    "a.f.",
+    "a. f.",
+    "vor der reform",
+    "bis zum",
+    "gultig bis",
 }
 
 COMPLEX_QUERY_PATTERNS = [
@@ -327,8 +461,7 @@ REFUSAL_LOW_CONFIDENCE = (
 )
 
 REFUSAL_UNVERIFIED_CITATION = (
-    "Die Antwort konnte nicht verifiziert werden, da nicht alle "
-    "Zitate im Kontext gefunden wurden."
+    "Die Antwort konnte nicht verifiziert werden, da nicht alle Zitate im Kontext gefunden wurden."
 )
 
 # Trusted legal domains for web search fallback

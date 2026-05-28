@@ -214,10 +214,9 @@ class TestManifestCitedDocumentsSurvive:
     @pytest.mark.unit
     def test_non_retrieved_real_docs_are_not_stripped(self) -> None:
         answer = (
-            "Übersicht: [M-1] Netzanschluss, [M-2] Darlehen, [M-3] Wartung, "
-            "[M-4] Urteil, [M-5] Änderungsgenehmigung."
+            "Übersicht: [M-1] Netzanschluss, [M-2] Darlehen, [M-3] Wartung, [M-4] Urteil, [M-5] Änderungsgenehmigung."
         )
-        retrieved_only = {"M-1", "M-2"}                 # matter_sources (the bug)
+        retrieved_only = {"M-1", "M-2"}  # matter_sources (the bug)
         all_real_docs = {"M-1", "M-2", "M-3", "M-4", "M-5"}  # _all_matter_handles
 
         bug = validate_citations(answer, retrieved_only)
@@ -243,7 +242,10 @@ class TestResultShape:
     @pytest.mark.unit
     def test_result_is_frozen(self) -> None:
         result = CitationValidationResult(
-            text="x", emitted=("C-1",), fabricated=(), sentences_flagged=0,
+            text="x",
+            emitted=("C-1",),
+            fabricated=(),
+            sentences_flagged=0,
         )
         with pytest.raises((AttributeError, TypeError)):
             result.text = "y"  # type: ignore[misc]

@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
 
@@ -141,7 +141,7 @@ class TokenIssuer:
             integer seconds until ``exp``, suitable for return in the
             ``{ access_token, expires_in }`` response body.
         """
-        issued = now or datetime.now(timezone.utc)
+        issued = now or datetime.now(UTC)
         ttl = timedelta(minutes=self._config.jwt_access_ttl_minutes)
         expires = issued + ttl
         claims: dict[str, Any] = {
@@ -214,8 +214,8 @@ class TokenIssuer:
             email=email_raw,
             role=role_raw,
             org_id=org_id,
-            issued_at=datetime.fromtimestamp(payload["iat"], tz=timezone.utc),
-            expires_at=datetime.fromtimestamp(payload["exp"], tz=timezone.utc),
+            issued_at=datetime.fromtimestamp(payload["iat"], tz=UTC),
+            expires_at=datetime.fromtimestamp(payload["exp"], tz=UTC),
         )
 
     # ── Refresh token ───────────────────────────────────────────────────
@@ -238,12 +238,8 @@ class TokenIssuer:
             cookied to the client) and the sha256 hash + expiry (to be
             inserted into ``refresh_tokens``).
         """
-        issued = now or datetime.now(timezone.utc)
-        days = (
-            self._config.jwt_refresh_ttl_days_remember_me
-            if remember_me
-            else self._config.jwt_refresh_ttl_days
-        )
+        issued = now or datetime.now(UTC)
+        days = self._config.jwt_refresh_ttl_days_remember_me if remember_me else self._config.jwt_refresh_ttl_days
         raw = secrets.token_urlsafe(_REFRESH_TOKEN_NBYTES)
         return RefreshToken(
             raw=raw,
@@ -274,7 +270,7 @@ class TokenIssuer:
             value object as :meth:`issue_reset_token` since the shape is
             identical; only the persistence table differs.
         """
-        issued = now or datetime.now(timezone.utc)
+        issued = now or datetime.now(UTC)
         raw = secrets.token_urlsafe(_REFRESH_TOKEN_NBYTES)
         return RefreshToken(
             raw=raw,
@@ -298,7 +294,7 @@ class TokenIssuer:
             the ``password_reset_tokens`` row. The raw value is what
             goes into the reset-link query parameter.
         """
-        issued = now or datetime.now(timezone.utc)
+        issued = now or datetime.now(UTC)
         raw = secrets.token_urlsafe(_REFRESH_TOKEN_NBYTES)
         return RefreshToken(
             raw=raw,

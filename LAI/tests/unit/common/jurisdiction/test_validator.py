@@ -178,10 +178,7 @@ class TestCheckJurisdictionEdgeCases:
     def test_multiple_rule_types_each_warn_once(self) -> None:
         # Answer cites both Bayern's 10H AND Niedersachsen's NBauO.
         # If the matter is in NRW, BOTH rules should warn — one each.
-        answer = (
-            "Beachte 10H BayBO sowie die NBauO-Abstandsregeln für "
-            "den Nachbarschaftsschutz."
-        )
+        answer = "Beachte 10H BayBO sowie die NBauO-Abstandsregeln für den Nachbarschaftsschutz."
         warnings = check_jurisdiction(answer, "nordrhein-westfalen")
         assert len(warnings) == 2
         rule_states = {w.rule_bundesland for w in warnings}
@@ -192,8 +189,10 @@ class TestResultShape:
     @pytest.mark.unit
     def test_warning_is_frozen(self) -> None:
         w = JurisdictionWarning(
-            rule_label="x", rule_bundesland="bayern",
-            expected_bundesland="hessen", excerpt="x",
+            rule_label="x",
+            rule_bundesland="bayern",
+            expected_bundesland="hessen",
+            excerpt="x",
         )
         with pytest.raises((AttributeError, TypeError)):
             w.rule_label = "y"  # type: ignore[misc]

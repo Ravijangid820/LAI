@@ -1,7 +1,6 @@
 """German legal sentence splitter with abbreviation awareness."""
 
 import re
-from typing import List, Tuple
 
 from lai.core.logging import get_logger
 
@@ -10,28 +9,129 @@ logger = get_logger("lai.pipeline.utils.german_splitter")
 # Abbreviations that end with a period but are NOT sentence endings
 _ABBREVS = {
     # Legal references
-    "abs", "art", "nr", "s", "rn", "rz", "hs", "var", "lit", "ziff",
-    "anh", "anl", "bd", "begr", "erl",
+    "abs",
+    "art",
+    "nr",
+    "s",
+    "rn",
+    "rz",
+    "hs",
+    "var",
+    "lit",
+    "ziff",
+    "anh",
+    "anl",
+    "bd",
+    "begr",
+    "erl",
     # Common legal
-    "vgl", "bzw", "bzgl", "ggf", "gem", "sog", "u.a", "z.b", "d.h",
-    "i.v.m", "i.s.d", "i.s.v", "a.a.o", "a.f", "n.f", "m.w.n",
-    "m.e", "h.m", "h.l", "a.a", "e.v", "o.g", "u.u", "i.d.r",
-    "i.e.s", "i.w.s", "a.e", "z.t", "u.ä",
+    "vgl",
+    "bzw",
+    "bzgl",
+    "ggf",
+    "gem",
+    "sog",
+    "u.a",
+    "z.b",
+    "d.h",
+    "i.v.m",
+    "i.s.d",
+    "i.s.v",
+    "a.a.o",
+    "a.f",
+    "n.f",
+    "m.w.n",
+    "m.e",
+    "h.m",
+    "h.l",
+    "a.a",
+    "e.v",
+    "o.g",
+    "u.u",
+    "i.d.r",
+    "i.e.s",
+    "i.w.s",
+    "a.e",
+    "z.t",
+    "u.ä",
     # Courts
-    "bgh", "bverwg", "bverfg", "bag", "bsg", "bfh", "olg", "lg",
-    "ag", "vg", "ovg", "fg", "lsg", "arbg", "lag", "sg",
+    "bgh",
+    "bverwg",
+    "bverfg",
+    "bag",
+    "bsg",
+    "bfh",
+    "olg",
+    "lg",
+    "ag",
+    "vg",
+    "ovg",
+    "fg",
+    "lsg",
+    "arbg",
+    "lag",
+    "sg",
     # Legal codes
-    "bimschg", "baugb", "bnatschg", "uvpg", "baunutzvo", "roeiv",
-    "bverfgg", "vwgo", "vwvfg", "zpo", "stpo", "bgb", "stgb",
-    "hgb", "gmbhg", "aktg", "gwb", "eeg", "enwg", "bimschv",
-    "ta", "windseeg", "lwg", "whg", "fig",
+    "bimschg",
+    "baugb",
+    "bnatschg",
+    "uvpg",
+    "baunutzvo",
+    "roeiv",
+    "bverfgg",
+    "vwgo",
+    "vwvfg",
+    "zpo",
+    "stpo",
+    "bgb",
+    "stgb",
+    "hgb",
+    "gmbhg",
+    "aktg",
+    "gwb",
+    "eeg",
+    "enwg",
+    "bimschv",
+    "ta",
+    "windseeg",
+    "lwg",
+    "whg",
+    "fig",
     # Titles & misc
-    "dr", "prof", "dipl", "ing", "mr", "mrs", "jr", "sr",
-    "ca", "etc", "st", "inkl", "excl", "max", "min", "zzgl",
-    "abschn", "kap", "aufl", "hrsg", "verl",
+    "dr",
+    "prof",
+    "dipl",
+    "ing",
+    "mr",
+    "mrs",
+    "jr",
+    "sr",
+    "ca",
+    "etc",
+    "st",
+    "inkl",
+    "excl",
+    "max",
+    "min",
+    "zzgl",
+    "abschn",
+    "kap",
+    "aufl",
+    "hrsg",
+    "verl",
     # Months
-    "jan", "feb", "mär", "apr", "mai", "jun", "jul", "aug",
-    "sep", "okt", "nov", "dez",
+    "jan",
+    "feb",
+    "mär",
+    "apr",
+    "mai",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "okt",
+    "nov",
+    "dez",
 }
 
 _ABBREV_PATTERN = re.compile(
@@ -48,7 +148,7 @@ SECTION_PATTERNS = [
 ]
 
 
-def split_sentences(text: str) -> List[str]:
+def split_sentences(text: str) -> list[str]:
     """Split German legal text into sentences, respecting abbreviations."""
     if not text:
         return []
@@ -69,7 +169,7 @@ def split_sentences(text: str) -> List[str]:
     return [s for s in sentences if s]
 
 
-def find_section_boundaries(text: str) -> List[Tuple[int, str]]:
+def find_section_boundaries(text: str) -> list[tuple[int, str]]:
     """Find legal section boundaries. Returns (char_position, title) tuples."""
     boundaries = []
     for pattern in SECTION_PATTERNS:

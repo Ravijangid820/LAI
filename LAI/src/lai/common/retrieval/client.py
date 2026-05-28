@@ -102,8 +102,7 @@ def _format_halfvec_literal(vector: Sequence[float], index_dim: int) -> str:
     n = len(vector)
     if n < index_dim:
         raise RetrievalDimensionError(
-            f"query vector has {n} dims but the index expects at least "
-            f"{index_dim}; cannot truncate up",
+            f"query vector has {n} dims but the index expects at least {index_dim}; cannot truncate up",
             expected=index_dim,
             actual=n,
         )
@@ -183,8 +182,7 @@ class RetrievalClient:
                 )
             except psycopg2.Error as exc:
                 raise RetrievalConnectionError(
-                    f"failed to open pgvector connection pool to "
-                    f"{cfg.host}:{cfg.port}/{cfg.dbname}: {exc}",
+                    f"failed to open pgvector connection pool to {cfg.host}:{cfg.port}/{cfg.dbname}: {exc}",
                 ) from exc
             return self._pool
 
@@ -212,10 +210,9 @@ class RetrievalClient:
         probe can degrade gracefully rather than 500.
         """
         try:
-            with self._borrow() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
+            with self._borrow() as conn, conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
             return True
         except (RetrievalError, psycopg2.Error):
             return False
@@ -345,30 +342,32 @@ class RetrievalClient:
         ) from last_exc
 
     def _run_dense_query(
-        self, vec_literal: str, k: int, ef: int,
+        self,
+        vec_literal: str,
+        k: int,
+        ef: int,
     ) -> list[RetrievedChunk]:
         """Execute one dense ANN query. Maps psycopg2 errors to our types."""
         cfg = self._config
         try:
-            with self._borrow() as conn:
-                with conn.cursor() as cur:
-                    # Per-query session knobs. ef_search drives HNSW recall;
-                    # statement_timeout bounds a pathological scan.
-                    cur.execute("SET LOCAL hnsw.ef_search = %s", (ef,))
-                    if cfg.statement_timeout_ms > 0:
-                        cur.execute(
-                            "SET LOCAL statement_timeout = %s",
-                            (cfg.statement_timeout_ms,),
-                        )
+            with self._borrow() as conn, conn.cursor() as cur:
+                # Per-query session knobs. ef_search drives HNSW recall;
+                # statement_timeout bounds a pathological scan.
+                cur.execute("SET LOCAL hnsw.ef_search = %s", (ef,))
+                if cfg.statement_timeout_ms > 0:
                     cur.execute(
-                        "SELECT id, parent_id, content, "
-                        "       1 - (embedding <=> %s::halfvec) AS similarity "
-                        "FROM corpus_child_chunks "
-                        "ORDER BY embedding <=> %s::halfvec "
-                        "LIMIT %s",
-                        (vec_literal, vec_literal, k),
+                        "SET LOCAL statement_timeout = %s",
+                        (cfg.statement_timeout_ms,),
                     )
-                    fetched = cur.fetchall()
+                cur.execute(
+                    "SELECT id, parent_id, content, "
+                    "       1 - (embedding <=> %s::halfvec) AS similarity "
+                    "FROM corpus_child_chunks "
+                    "ORDER BY embedding <=> %s::halfvec "
+                    "LIMIT %s",
+                    (vec_literal, vec_literal, k),
+                )
+                fetched = cur.fetchall()
         except psycopg2.OperationalError as exc:
             # Connection-level: server gone, timeout, dropped socket.
             raise RetrievalConnectionError(
@@ -431,7 +430,8 @@ class RetrievalClient:
         ) from last_exc
 
     def fetch_children_by_id(
-        self, child_ids: Sequence[int],
+        self,
+        child_ids: Sequence[int],
     ) -> dict[int, RetrievedChunk]:
         """Return ``{child_id: RetrievedChunk}`` for the given child ids.
 
@@ -472,14 +472,12 @@ class RetrievalClient:
 
     def _run_children_query(self, child_ids: list[int]) -> dict[int, RetrievedChunk]:
         try:
-            with self._borrow() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT id, parent_id, content FROM corpus_child_chunks "
-                        "WHERE id = ANY(%s)",
-                        (child_ids,),
-                    )
-                    fetched = cur.fetchall()
+            with self._borrow() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, parent_id, content FROM corpus_child_chunks WHERE id = ANY(%s)",
+                    (child_ids,),
+                )
+                fetched = cur.fetchall()
         except psycopg2.OperationalError as exc:
             raise RetrievalConnectionError(
                 f"pgvector child fetch connection error: {exc}",
@@ -500,14 +498,12 @@ class RetrievalClient:
 
     def _run_parent_query(self, parent_ids: list[int]) -> dict[int, str]:
         try:
-            with self._borrow() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT id, content FROM corpus_parent_chunks "
-                        "WHERE id = ANY(%s)",
-                        (parent_ids,),
-                    )
-                    fetched = cur.fetchall()
+            with self._borrow() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, content FROM corpus_parent_chunks WHERE id = ANY(%s)",
+                    (parent_ids,),
+                )
+                fetched = cur.fetchall()
         except psycopg2.OperationalError as exc:
             raise RetrievalConnectionError(
                 f"pgvector parent fetch connection error: {exc}",
@@ -546,8 +542,7 @@ class RetrievalClient:
             "  embedding   halfvec(4000) NOT NULL,"
             "  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()"
             ");",
-            "CREATE INDEX IF NOT EXISTS idx_matter_chunks_session "
-            "  ON matter_chunks(session_id);",
+            "CREATE INDEX IF NOT EXISTS idx_matter_chunks_session   ON matter_chunks(session_id);",
         )
         try:
             with self._borrow() as conn:
@@ -654,27 +649,29 @@ class RetrievalClient:
         ) from last_exc
 
     def _run_matter_query(
-        self, session_id: str, vec_literal: str, k: int,
+        self,
+        session_id: str,
+        vec_literal: str,
+        k: int,
     ) -> list[RetrievedMatterChunk]:
         cfg = self._config
         try:
-            with self._borrow() as conn:
-                with conn.cursor() as cur:
-                    if cfg.statement_timeout_ms > 0:
-                        cur.execute(
-                            "SET LOCAL statement_timeout = %s",
-                            (cfg.statement_timeout_ms,),
-                        )
+            with self._borrow() as conn, conn.cursor() as cur:
+                if cfg.statement_timeout_ms > 0:
                     cur.execute(
-                        "SELECT id, doc_index, filename, page, content, "
-                        "       1 - (embedding <=> %s::halfvec) AS similarity "
-                        "FROM matter_chunks "
-                        "WHERE session_id = %s "
-                        "ORDER BY embedding <=> %s::halfvec "
-                        "LIMIT %s",
-                        (vec_literal, session_id, vec_literal, k),
+                        "SET LOCAL statement_timeout = %s",
+                        (cfg.statement_timeout_ms,),
                     )
-                    fetched = cur.fetchall()
+                cur.execute(
+                    "SELECT id, doc_index, filename, page, content, "
+                    "       1 - (embedding <=> %s::halfvec) AS similarity "
+                    "FROM matter_chunks "
+                    "WHERE session_id = %s "
+                    "ORDER BY embedding <=> %s::halfvec "
+                    "LIMIT %s",
+                    (vec_literal, session_id, vec_literal, k),
+                )
+                fetched = cur.fetchall()
         except psycopg2.OperationalError as exc:
             raise RetrievalConnectionError(
                 f"matter query connection error: {exc}",
@@ -696,7 +693,9 @@ class RetrievalClient:
         ]
 
     def delete_matter_chunks(
-        self, session_id: str, doc_index: int | None = None,
+        self,
+        session_id: str,
+        doc_index: int | None = None,
     ) -> int:
         """Delete a Matter's indexed passages (whole session, or one doc).
 

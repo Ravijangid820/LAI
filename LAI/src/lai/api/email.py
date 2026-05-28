@@ -277,10 +277,7 @@ async def send_invite_email(
         ttl_days: Lifetime of the invitation, used in the body copy
             so the user knows how long they have to accept.
     """
-    invite_url = (
-        f"{str(config.public_app_base_url).rstrip('/')}"
-        f"/accept-invite?token={raw_invite_token}"
-    )
+    invite_url = f"{str(config.public_app_base_url).rstrip('/')}/accept-invite?token={raw_invite_token}"
     subject = _INVITE_TEMPLATE_SUBJECT.format(org_name=org_name)
     body = _INVITE_TEMPLATE_BODY.format(
         org_name=org_name,
@@ -347,10 +344,7 @@ async def send_report_ready_email(
     follow the link without standing up Brevo; production swallows +
     structured-logs Brevo failures rather than crashing the worker.
     """
-    report_url = (
-        f"{str(config.public_app_base_url).rstrip('/')}"
-        f"/dashboard/documents?report={report_id}"
-    )
+    report_url = f"{str(config.public_app_base_url).rstrip('/')}/dashboard/documents?report={report_id}"
     subject = _REPORT_READY_TEMPLATE_SUBJECT.format(project_name=project_name)
     body = _REPORT_READY_TEMPLATE_BODY.format(
         full_name=recipient_name or recipient_email,
@@ -375,7 +369,8 @@ async def send_report_ready_email(
     except (httpx.HTTPError, RetryError) as exc:
         status_code = (
             exc.response.status_code  # type: ignore[union-attr]
-            if isinstance(exc, httpx.HTTPStatusError) else None
+            if isinstance(exc, httpx.HTTPStatusError)
+            else None
         )
         _logger.error(
             "email.send_failed",
@@ -428,7 +423,8 @@ async def send_report_failed_email(
     except (httpx.HTTPError, RetryError) as exc:
         status_code = (
             exc.response.status_code  # type: ignore[union-attr]
-            if isinstance(exc, httpx.HTTPStatusError) else None
+            if isinstance(exc, httpx.HTTPStatusError)
+            else None
         )
         _logger.error(
             "email.send_failed",

@@ -5,12 +5,12 @@ Separate from serve_rag.py's llm_generate so the analyzer can:
   - turn thinking mode on/off per call,
   - request guided JSON decoding.
 """
+
 from __future__ import annotations
 
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 import httpx
 
@@ -23,7 +23,7 @@ class AnalyzerLLMConfig:
     default_temperature: float = 0.2
 
 
-def from_env() -> Optional[AnalyzerLLMConfig]:
+def from_env() -> AnalyzerLLMConfig | None:
     url = os.environ.get("ANALYZER_LLM_API_URL")
     if not url:
         return None
@@ -45,11 +45,11 @@ def call(
     system: str,
     user: str,
     *,
-    json_schema: Optional[dict] = None,
+    json_schema: dict | None = None,
     enable_thinking: bool = True,
     max_thinking_tokens: int = 8192,
     max_new_tokens: int = 4096,
-    temperature: Optional[float] = None,
+    temperature: float | None = None,
 ) -> tuple[str, int]:
     """Single chat completion. Returns (content_without_thinking, thinking_tokens).
 

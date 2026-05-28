@@ -39,7 +39,6 @@ from typing import Any
 
 import pytest
 
-
 # ── sys.path bootstrap ───────────────────────────────────────────────
 # Tests run with the repo root as cwd, but ``ddiq`` lives in
 # ``LAI/micro-services/``. Prepend that to sys.path so ``import ddiq``
@@ -132,6 +131,7 @@ class _FakeLlmClient:
         max_tokens: int = 2048,
     ) -> str:
         from lai.common.exceptions import LlmError
+
         # messages is list[ChatMessage]; first is system, second is user.
         system = messages[0].content if len(messages) > 0 else ""
         user = messages[1].content if len(messages) > 1 else ""
@@ -159,13 +159,16 @@ class _FakeEmbeddingClient:
         # Match SyncEmbeddingClient.embed's return shape:
         # list[EmbeddingResult(index, embedding)].
         from types import SimpleNamespace
+
         out: list[Any] = []
         for i, t in enumerate(texts):
             self.calls.append(t)
-            out.append(SimpleNamespace(
-                index=i,
-                embedding=[i / 100.0] * self.dimension,
-            ))
+            out.append(
+                SimpleNamespace(
+                    index=i,
+                    embedding=[i / 100.0] * self.dimension,
+                )
+            )
         return out
 
     def embed_one(self, text: str) -> list[float]:
@@ -216,6 +219,7 @@ def patch_llm_singletons(
 def isolated_metric_registry():
     """Isolated Prometheus :class:`CollectorRegistry` per test."""
     from prometheus_client import CollectorRegistry
+
     return CollectorRegistry()
 
 
@@ -261,6 +265,7 @@ def make_llm_json(monkeypatch: pytest.MonkeyPatch):
     directly. For a queue, pass a list and a counter is maintained
     internally.
     """
+
     def patch(response: Any, *, queue: bool = False) -> list[tuple[str, str]]:
         """Patch ``llm_json`` (in ddiq.llm AND in every extractor
         module that has already imported it). Returns a list that
@@ -301,6 +306,7 @@ def make_llm_json(monkeypatch: pytest.MonkeyPatch):
         # in the consumer's namespace, so patching ddiq.llm alone
         # misses them).
         import ddiq.llm
+
         monkeypatch.setattr(ddiq.llm, "llm_json", _stub)
 
         for modname in (

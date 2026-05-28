@@ -32,6 +32,13 @@ from lai.common.citation import (
     extract_citations,
     validate_citations,
 )
+from lai.common.embedding import (
+    EmbeddingClient,
+    EmbeddingConfig,
+    EmbeddingMetrics,
+    EmbeddingResult,
+    SyncEmbeddingClient,
+)
 from lai.common.jurisdiction import (
     BUNDESLAND_BBOX,
     BUNDESLAND_KEYWORDS,
@@ -40,13 +47,6 @@ from lai.common.jurisdiction import (
     check_jurisdiction,
     detect_bundesland,
     point_in_bbox,
-)
-from lai.common.embedding import (
-    EmbeddingClient,
-    EmbeddingConfig,
-    EmbeddingMetrics,
-    EmbeddingResult,
-    SyncEmbeddingClient,
 )
 from lai.common.llm import (
     ChatMessage,
@@ -74,6 +74,7 @@ __all__: list[str] = [
     "BUNDESLAND_BBOX",
     "BUNDESLAND_KEYWORDS",
     "CITATION_PATTERN",
+    "GERMANY_BBOX",
     "ChatMessage",
     "Chunk",
     "Chunker",
@@ -83,7 +84,6 @@ __all__: list[str] = [
     "EmbeddingConfig",
     "EmbeddingMetrics",
     "EmbeddingResult",
-    "GERMANY_BBOX",
     "JurisdictionWarning",
     "LlmClient",
     "LlmConfig",

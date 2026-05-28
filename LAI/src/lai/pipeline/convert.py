@@ -21,7 +21,7 @@ import hashlib
 import io
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from lai.core.logging import get_logger
 from lai.pipeline.utils.text_cleaner import clean_text
@@ -32,23 +32,23 @@ logger = get_logger("lai.pipeline.convert")
 # Language & doc_type inference from MinIO path
 # ============================================================
 
-_PATH_RULES: List[Tuple[str, str, str]] = [
-    ("de/gesetzes/",             "de", "gesetz"),
-    ("de/TA ",                   "de", "technische_anleitung"),
-    ("en/english/",              "en", "regulation"),
-    ("DD Reports/",              "de", "dd_report"),
-    ("VDRs/",                    "de", "vdr"),
-    ("Libary/",                  "de", "fachbuch"),
-    ("rss/",                     "de", "bgbl_update"),
-    ("legal_data/hf_cases/",     "de", "urteil"),
+_PATH_RULES: list[tuple[str, str, str]] = [
+    ("de/gesetzes/", "de", "gesetz"),
+    ("de/TA ", "de", "technische_anleitung"),
+    ("en/english/", "en", "regulation"),
+    ("DD Reports/", "de", "dd_report"),
+    ("VDRs/", "de", "vdr"),
+    ("Libary/", "de", "fachbuch"),
+    ("rss/", "de", "bgbl_update"),
+    ("legal_data/hf_cases/", "de", "urteil"),
     ("legal_data/openlegaldata", "de", "urteil"),
-    ("legal_data/gerdalir",      "de", "legal_corpus"),
-    ("legal_data/german_ler",    "de", "ner_corpus"),
+    ("legal_data/gerdalir", "de", "legal_corpus"),
+    ("legal_data/german_ler", "de", "ner_corpus"),
     ("legal_data/multilegalpile", "multi", "legal_corpus"),
 ]
 
 
-def infer_language_doctype(file_path: str) -> Tuple[str, str]:
+def infer_language_doctype(file_path: str) -> tuple[str, str]:
     """Infer language and doc_type from the MinIO object path."""
     for prefix, lang, dtype in _PATH_RULES:
         if file_path.startswith(prefix):
@@ -59,6 +59,7 @@ def infer_language_doctype(file_path: str) -> Tuple[str, str]:
 # ============================================================
 # Helpers for reading MinIO part-files
 # ============================================================
+
 
 def read_json(source: io.BytesIO) -> Any:
     """Read JSON, handling MinIO part-file binary headers."""
@@ -71,7 +72,7 @@ def read_json(source: io.BytesIO) -> Any:
     return json.loads(raw[start:].decode("utf-8", errors="replace"))
 
 
-def read_jsonl_lines(source: io.BytesIO) -> List[str]:
+def read_jsonl_lines(source: io.BytesIO) -> list[str]:
     """Read JSONL lines, handling binary header."""
     raw = source.getvalue()
     start = raw.find(b"{")
@@ -129,13 +130,13 @@ def _get_docling_converter():
     global _CONVERTER
     if _CONVERTER is None:
         logger.info("Initializing Docling DocumentConverter (first call in this process)")
-        from docling.document_converter import DocumentConverter, PdfFormatOption
         from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import (
             PdfPipelineOptions,
             TableFormerMode,
             TesseractCliOcrOptions,
         )
+        from docling.document_converter import DocumentConverter, PdfFormatOption
 
         pdf_opts = PdfPipelineOptions()
         pdf_opts.do_ocr = True
@@ -147,14 +148,12 @@ def _get_docling_converter():
         pdf_opts.ocr_options = TesseractCliOcrOptions(lang=["deu", "eng"])
         logger.info("OCR engine: Tesseract CLI (languages: deu, eng)")
 
-        _CONVERTER = DocumentConverter(
-            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
-        )
+        _CONVERTER = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)})
         logger.info("Docling DocumentConverter ready (Tesseract OCR)")
     return _CONVERTER
 
 
-def _normalize_docling_document(doc_dict: Dict, source_filename: str) -> List[Dict[str, Any]]:
+def _normalize_docling_document(doc_dict: dict, source_filename: str) -> list[dict[str, Any]]:
     """Traverse Docling document dict → flat list of text segments with metadata."""
     texts_map = {f"#/texts/{i}": item for i, item in enumerate(doc_dict.get("texts", []))}
     tables_map = {f"#/tables/{i}": item for i, item in enumerate(doc_dict.get("tables", []))}
@@ -163,10 +162,10 @@ def _normalize_docling_document(doc_dict: Dict, source_filename: str) -> List[Di
     pictures_map = {f"#/pictures/{i}": item for i, item in enumerate(doc_dict.get("pictures", []))}
     kv_map = {f"#/key_value_items/{i}": item for i, item in enumerate(doc_dict.get("key_value_items", []))}
 
-    segments: List[Dict[str, Any]] = []
+    segments: list[dict[str, Any]] = []
     current_section = "General"
 
-    def process_ref(ref_obj: Dict):
+    def process_ref(ref_obj: dict):
         nonlocal current_section
         ref = ref_obj.get("$ref")
         if not ref:
@@ -227,13 +226,15 @@ def _normalize_docling_document(doc_dict: Dict, source_filename: str) -> List[Di
 
         content = clean_text(content)
         if content and len(content) >= 5:
-            segments.append({
-                "text": content,
-                "section": current_section,
-                "page_start": min(pages) if pages else None,
-                "page_end": max(pages) if pages else None,
-                "type": seg_type,
-            })
+            segments.append(
+                {
+                    "text": content,
+                    "section": current_section,
+                    "page_start": min(pages) if pages else None,
+                    "page_end": max(pages) if pages else None,
+                    "type": seg_type,
+                }
+            )
 
     for child in doc_dict.get("body", {}).get("children", []):
         process_ref(child)
@@ -241,7 +242,7 @@ def _normalize_docling_document(doc_dict: Dict, source_filename: str) -> List[Di
     return segments
 
 
-def _table_to_markdown(table_obj: Dict) -> str:
+def _table_to_markdown(table_obj: dict) -> str:
     """Convert Docling table object to Markdown."""
     try:
         grid = table_obj.get("data", {}).get("grid", [])
@@ -258,7 +259,7 @@ def _table_to_markdown(table_obj: Dict) -> str:
         return "[Table]"
 
 
-def convert_docling(file_bytes: io.BytesIO, filename: str) -> List[Dict[str, Any]]:
+def convert_docling(file_bytes: io.BytesIO, filename: str) -> list[dict[str, Any]]:
     """Convert a document via Docling → list of text segments."""
     from docling.datamodel.base_models import DocumentStream
 
@@ -285,7 +286,8 @@ def convert_docling(file_bytes: io.BytesIO, filename: str) -> List[Dict[str, Any
 # JSON/JSONL converters
 # ============================================================
 
-def convert_hf_case(source: io.BytesIO, filename: str) -> List[Dict[str, Any]]:
+
+def convert_hf_case(source: io.BytesIO, filename: str) -> list[dict[str, Any]]:
     """Single JSON court case → one document."""
     data = read_json(source)
     if not data or not isinstance(data, dict):
@@ -296,6 +298,7 @@ def convert_hf_case(source: io.BytesIO, filename: str) -> List[Dict[str, Any]]:
         text = data["markdown_content"]
     elif data.get("content"):
         from bs4 import BeautifulSoup
+
         text = BeautifulSoup(data["content"], "html.parser").get_text(" ", strip=True)
     elif data.get("text"):
         text = data["text"]
@@ -304,19 +307,22 @@ def convert_hf_case(source: io.BytesIO, filename: str) -> List[Dict[str, Any]]:
     if not text or len(text) < 20:
         return []
 
-    return [{
-        "text": text,
-        "section": "Content",
-        "type": "text",
-        "extra_metadata": {
-            k: v for k, v in data.items()
-            if k not in ("content", "markdown_content", "text", "results")
-            and isinstance(v, (str, int, float, bool, type(None)))
-        },
-    }]
+    return [
+        {
+            "text": text,
+            "section": "Content",
+            "type": "text",
+            "extra_metadata": {
+                k: v
+                for k, v in data.items()
+                if k not in ("content", "markdown_content", "text", "results")
+                and isinstance(v, (str, int, float, bool, type(None)))
+            },
+        }
+    ]
 
 
-def convert_openlegaldata(source: io.BytesIO, filename: str) -> List[Dict[str, Any]]:
+def convert_openlegaldata(source: io.BytesIO, filename: str) -> list[dict[str, Any]]:
     """OpenLegalData JSON dump → multiple documents."""
     data = read_json(source)
     if not data:
@@ -337,6 +343,7 @@ def convert_openlegaldata(source: io.BytesIO, filename: str) -> List[Dict[str, A
             text = case["markdown_content"]
         elif case.get("content"):
             from bs4 import BeautifulSoup
+
             text = BeautifulSoup(case["content"], "html.parser").get_text(" ", strip=True)
         elif case.get("text"):
             text = case["text"]
@@ -346,23 +353,25 @@ def convert_openlegaldata(source: io.BytesIO, filename: str) -> List[Dict[str, A
             continue
 
         court_info = case.get("court", {})
-        documents.append({
-            "text": text,
-            "section": "Content",
-            "type": "text",
-            "case_id": str(case.get("id", "")),
-            "extra_metadata": {
-                "court_name": court_info.get("name") if isinstance(court_info, dict) else None,
-                "date": case.get("date"),
-                "file_number": case.get("file_number"),
-                "ecli": case.get("ecli"),
-            },
-        })
+        documents.append(
+            {
+                "text": text,
+                "section": "Content",
+                "type": "text",
+                "case_id": str(case.get("id", "")),
+                "extra_metadata": {
+                    "court_name": court_info.get("name") if isinstance(court_info, dict) else None,
+                    "date": case.get("date"),
+                    "file_number": case.get("file_number"),
+                    "ecli": case.get("ecli"),
+                },
+            }
+        )
 
     return documents
 
 
-def convert_multilegalpile_line(record: Dict) -> Optional[Dict[str, Any]]:
+def convert_multilegalpile_line(record: dict) -> dict[str, Any] | None:
     """One MultiLegalPile record → segment (None if non-German)."""
     lang = record.get("language", "")
     if lang and lang.lower() not in ("de", "german", "deu"):
@@ -383,7 +392,7 @@ def convert_multilegalpile_line(record: Dict) -> Optional[Dict[str, Any]]:
     }
 
 
-def convert_gerdalir_line(record: Dict) -> Optional[Dict[str, Any]]:
+def convert_gerdalir_line(record: dict) -> dict[str, Any] | None:
     """One Gerdalir record → segment."""
     text = clean_text(record.get("text", ""))
     if not text or len(text) < 20:
@@ -397,7 +406,7 @@ def convert_gerdalir_line(record: Dict) -> Optional[Dict[str, Any]]:
     }
 
 
-def convert_german_ler_line(record: Dict) -> Optional[Dict[str, Any]]:
+def convert_german_ler_line(record: dict) -> dict[str, Any] | None:
     """One GermanLER record (tokens list) → segment."""
     tokens = record.get("tokens", [])
     if not tokens or not isinstance(tokens, list):
@@ -416,7 +425,7 @@ def convert_german_ler_line(record: Dict) -> Optional[Dict[str, Any]]:
     return {"text": text, "section": "NER_Sentence", "type": "text"}
 
 
-def convert_jsonl_file(source: io.BytesIO, line_converter) -> List[Dict[str, Any]]:
+def convert_jsonl_file(source: io.BytesIO, line_converter) -> list[dict[str, Any]]:
     """Convert JSONL using a per-line converter function."""
     lines = read_jsonl_lines(source)
     segments = []
@@ -441,47 +450,49 @@ def convert_jsonl_file(source: io.BytesIO, line_converter) -> List[Dict[str, Any
 # Main dispatch
 # ============================================================
 
-def convert_file(file_bytes: io.BytesIO, file_path: str) -> List[Dict[str, Any]]:
+
+def convert_file(file_bytes: io.BytesIO, file_path: str) -> list[dict[str, Any]]:
     """Convert a single raw file to a list of document segments."""
     source_type = get_source_type(file_path)
     logger.info(f"Converting {file_path} (type={source_type})")
 
     if source_type == "docling":
         return convert_docling(file_bytes, file_path)
-    elif source_type == "legacy":
+    if source_type == "legacy":
         logger.warning(f"Legacy format (.doc/.ppt/.xls) not supported, skipping: {file_path}")
         return []
-    elif source_type == "hf_cases":
+    if source_type == "hf_cases":
         return convert_hf_case(file_bytes, file_path)
-    elif source_type == "openlegaldata":
+    if source_type == "openlegaldata":
         return convert_openlegaldata(file_bytes, file_path)
-    elif source_type == "multilegalpile":
+    if source_type == "multilegalpile":
         return convert_jsonl_file(file_bytes, convert_multilegalpile_line)
-    elif source_type == "gerdalir":
+    if source_type == "gerdalir":
         return convert_jsonl_file(file_bytes, convert_gerdalir_line)
-    elif source_type == "german_ler":
+    if source_type == "german_ler":
         return convert_jsonl_file(file_bytes, convert_german_ler_line)
-    elif source_type == "json_generic":
+    if source_type == "json_generic":
         return convert_hf_case(file_bytes, file_path)
-    elif source_type == "jsonl_generic":
+    if source_type == "jsonl_generic":
+
         def generic_line(record):
             for key in ("text", "content", "body", "document_text"):
                 if key in record and isinstance(record[key], str) and len(record[key]) > 20:
                     return {"text": clean_text(record[key]), "section": "Content", "type": "text"}
             return None
+
         return convert_jsonl_file(file_bytes, generic_line)
-    else:
-        logger.warning(f"Unsupported file type: {file_path}")
-        raise ValueError(f"Unsupported file type: {file_path}")
+    logger.warning(f"Unsupported file type: {file_path}")
+    raise ValueError(f"Unsupported file type: {file_path}")
 
 
 def build_output_documents(
     file_path: str,
     source_type: str,
-    raw_segments: List[Dict[str, Any]],
+    raw_segments: list[dict[str, Any]],
     language: str,
     doc_type: str,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Package raw segments into output document records."""
     logger.debug(f"Packaging {len(raw_segments)} segments from {file_path} (type={source_type}, lang={language})")
     documents = []
@@ -490,28 +501,32 @@ def build_output_documents(
         for idx, seg in enumerate(raw_segments):
             doc_id = hashlib.md5(f"{file_path}:{idx}".encode()).hexdigest()[:16]
             extra = seg.pop("extra_metadata", {})
-            documents.append({
-                "doc_id": doc_id,
-                "source_file": file_path,
-                "language": language,
-                "doc_type": doc_type,
-                "segments": [seg],
-                "metadata": extra,
-            })
+            documents.append(
+                {
+                    "doc_id": doc_id,
+                    "source_file": file_path,
+                    "language": language,
+                    "doc_type": doc_type,
+                    "segments": [seg],
+                    "metadata": extra,
+                }
+            )
 
     elif source_type == "openlegaldata":
         for idx, seg in enumerate(raw_segments):
             case_id = seg.pop("case_id", str(idx))
             extra = seg.pop("extra_metadata", {})
             doc_id = hashlib.md5(f"old:{case_id}:{file_path}".encode()).hexdigest()[:16]
-            documents.append({
-                "doc_id": doc_id,
-                "source_file": file_path,
-                "language": language,
-                "doc_type": doc_type,
-                "segments": [seg],
-                "metadata": extra,
-            })
+            documents.append(
+                {
+                    "doc_id": doc_id,
+                    "source_file": file_path,
+                    "language": language,
+                    "doc_type": doc_type,
+                    "segments": [seg],
+                    "metadata": extra,
+                }
+            )
 
     else:
         doc_id = hashlib.md5(file_path.encode()).hexdigest()[:16]
@@ -519,14 +534,16 @@ def build_output_documents(
         for seg in raw_segments:
             if "extra_metadata" in seg:
                 extra.update(seg.pop("extra_metadata"))
-        documents.append({
-            "doc_id": doc_id,
-            "source_file": file_path,
-            "language": language,
-            "doc_type": doc_type,
-            "segments": raw_segments,
-            "metadata": extra,
-        })
+        documents.append(
+            {
+                "doc_id": doc_id,
+                "source_file": file_path,
+                "language": language,
+                "doc_type": doc_type,
+                "segments": raw_segments,
+                "metadata": extra,
+            }
+        )
 
     return documents
 
@@ -536,6 +553,7 @@ def release_gpu_memory():
     gc.collect()
     try:
         import torch
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except ImportError:

@@ -35,8 +35,9 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
@@ -57,7 +58,7 @@ TUS_STAGING_DIR.mkdir(parents=True, exist_ok=True)
 # ─── Metadata helpers ───────────────────────────────────────────────────────
 
 
-def _decode_upload_metadata(header: Optional[str]) -> dict[str, str]:
+def _decode_upload_metadata(header: str | None) -> dict[str, str]:
     """Parse a tus ``Upload-Metadata`` header into a dict.
 
     Format per spec: ``key1 base64-value1,key2 base64-value2`` (no '=').
@@ -103,7 +104,7 @@ def _upload_dir(upload_id: str) -> Path:
     return TUS_STAGING_DIR / upload_id
 
 
-def _read_info(upload_id: str) -> Optional[dict[str, Any]]:
+def _read_info(upload_id: str) -> dict[str, Any] | None:
     p = _upload_dir(upload_id) / "info.json"
     if not p.exists():
         return None
@@ -121,7 +122,7 @@ def _write_info(upload_id: str, info: dict[str, Any]) -> None:
     os.replace(tmp, p)
 
 
-def _tenant_guard(info: Optional[dict[str, Any]], user_id: str) -> dict[str, Any]:
+def _tenant_guard(info: dict[str, Any] | None, user_id: str) -> dict[str, Any]:
     """Confirm an upload exists AND belongs to the calling user. 404 (not
     403) on cross-user — never leak the existence of another user's upload."""
     if not info or info.get("user_id") != user_id:
@@ -149,7 +150,7 @@ def build_tus_router(
     """
     r = APIRouter(tags=["Resumable Upload"])
 
-    def _tus_headers(extra: Optional[dict[str, str]] = None) -> dict[str, str]:
+    def _tus_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
         h: dict[str, str] = {
             "Tus-Resumable": TUS_VERSION,
             "Cache-Control": "no-store",
@@ -164,15 +165,17 @@ def build_tus_router(
         client (``tus-js-client``) probes this before the first upload."""
         return Response(
             status_code=204,
-            headers=_tus_headers({
-                "Tus-Version": TUS_VERSION,
-                "Tus-Max-Size": str(TUS_MAX_SIZE),
-                # Only the ``creation`` extension is needed for our use
-                # case. We don't implement concatenation, expiration
-                # endpoints, or termination-as-extension (DELETE works
-                # but is core, not announced as the extension).
-                "Tus-Extension": "creation,creation-with-upload",
-            }),
+            headers=_tus_headers(
+                {
+                    "Tus-Version": TUS_VERSION,
+                    "Tus-Max-Size": str(TUS_MAX_SIZE),
+                    # Only the ``creation`` extension is needed for our use
+                    # case. We don't implement concatenation, expiration
+                    # endpoints, or termination-as-extension (DELETE works
+                    # but is core, not announced as the extension).
+                    "Tus-Extension": "creation,creation-with-upload",
+                }
+            ),
         )
 
     @r.post("/files/")
@@ -243,7 +246,8 @@ def build_tus_router(
             if data:
                 if len(data) > length:
                     raise HTTPException(
-                        413, "Initial chunk longer than declared Upload-Length",
+                        413,
+                        "Initial chunk longer than declared Upload-Length",
                     )
                 (d / "data.bin").write_bytes(data)
                 info["offset"] = len(data)
@@ -256,18 +260,20 @@ def build_tus_router(
         if body_offset_after == length:
             try:
                 finalize_result = finalize(
-                    user, info, (d / "data.bin").read_bytes(),
+                    user,
+                    info,
+                    (d / "data.bin").read_bytes(),
                 )
-                result_meta = {
-                    k: str(v) for k, v in (finalize_result or {}).items()
-                }
+                result_meta = {k: str(v) for k, v in (finalize_result or {}).items()}
             finally:
                 _cleanup(upload_id)
 
-        headers = _tus_headers({
-            "Location": location,
-            "Upload-Offset": str(body_offset_after),
-        })
+        headers = _tus_headers(
+            {
+                "Location": location,
+                "Upload-Offset": str(body_offset_after),
+            }
+        )
         if result_meta:
             headers["Upload-Metadata"] = _encode_upload_metadata(result_meta)
         return Response(status_code=201, headers=headers)
@@ -290,14 +296,18 @@ def build_tus_router(
             raise HTTPException(404, "Upload not found")
         return Response(
             status_code=200,
-            headers=_tus_headers({
-                "Upload-Offset": str(info["offset"]),
-                "Upload-Length": str(info["length"]),
-                "Upload-Metadata": _encode_upload_metadata({
-                    "filename": info["filename"],
-                    "sessionId": info.get("session_id") or "",
-                }),
-            }),
+            headers=_tus_headers(
+                {
+                    "Upload-Offset": str(info["offset"]),
+                    "Upload-Length": str(info["length"]),
+                    "Upload-Metadata": _encode_upload_metadata(
+                        {
+                            "filename": info["filename"],
+                            "sessionId": info.get("session_id") or "",
+                        }
+                    ),
+                }
+            ),
         )
 
     @r.patch("/files/{upload_id}")
@@ -360,12 +370,11 @@ def build_tus_router(
         if new_offset == info["length"]:
             try:
                 finalize_result = finalize(
-                    user, info,
+                    user,
+                    info,
                     (_upload_dir(upload_id) / "data.bin").read_bytes(),
                 )
-                result_meta = {
-                    k: str(v) for k, v in (finalize_result or {}).items()
-                }
+                result_meta = {k: str(v) for k, v in (finalize_result or {}).items()}
             finally:
                 _cleanup(upload_id)
 

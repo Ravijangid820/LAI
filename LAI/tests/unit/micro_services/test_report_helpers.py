@@ -17,7 +17,6 @@ from types import SimpleNamespace
 
 import ddiq_report
 
-
 # ── clean_value ──────────────────────────────────────────────────────
 
 
@@ -53,14 +52,23 @@ class TestCleanValue:
 class TestGetSectionValue:
     def _sections(self):
         from ddiq.models import AusgabeblattRow, AusgabeblattSection
+
         return [
-            AusgabeblattSection(id="overview", title="Übersicht", rows=[
-                AusgabeblattRow(label="Location", value="Cuxhaven, Niedersachsen"),
-                AusgabeblattRow(label="Project Name", value="Windpark Test"),
-            ]),
-            AusgabeblattSection(id="land", title="Land", rows=[
-                AusgabeblattRow(label="Term", value="25 Jahre"),
-            ]),
+            AusgabeblattSection(
+                id="overview",
+                title="Übersicht",
+                rows=[
+                    AusgabeblattRow(label="Location", value="Cuxhaven, Niedersachsen"),
+                    AusgabeblattRow(label="Project Name", value="Windpark Test"),
+                ],
+            ),
+            AusgabeblattSection(
+                id="land",
+                title="Land",
+                rows=[
+                    AusgabeblattRow(label="Term", value="25 Jahre"),
+                ],
+            ),
         ]
 
     def test_finds_value(self) -> None:
@@ -173,14 +181,17 @@ class TestPlausibleRatedKw:
 
 class TestSignalsUndeterminable:
     def test_real_lamstedt_capacity_cell(self) -> None:
-        cell = ("Unbekannt (unzureichende Daten im Kontext, um die gesamte MW "
-                "zu summieren; teilweiser Verweis auf 2 MW pro Einheit für 10 "
-                "Einheiten in der Änderung von 2007)")
+        cell = (
+            "Unbekannt (unzureichende Daten im Kontext, um die gesamte MW "
+            "zu summieren; teilweiser Verweis auf 2 MW pro Einheit für 10 "
+            "Einheiten in der Änderung von 2007)"
+        )
         assert ddiq_report._signals_undeterminable(cell) is True
 
     def test_real_lamstedt_count_cell(self) -> None:
-        cell = ("Die vorliegenden Dokumente erlauben keine vollständige "
-                "Aufstellung aller Windenergieanlagen des Projekts.")
+        cell = (
+            "Die vorliegenden Dokumente erlauben keine vollständige Aufstellung aller Windenergieanlagen des Projekts."
+        )
         assert ddiq_report._signals_undeterminable(cell) is True
 
     def test_clean_cell_is_determinable(self) -> None:
@@ -213,8 +224,14 @@ class TestParseExplicitParkSize:
 
 class TestDeadlineKindGate:
     def test_genuine_deadline_kinds_promote(self) -> None:
-        for kind in ("permit_expiry", "renewal_deadline", "objection_window",
-                     "lease_term_end", "bond_validity", "warranty_end"):
+        for kind in (
+            "permit_expiry",
+            "renewal_deadline",
+            "objection_window",
+            "lease_term_end",
+            "bond_validity",
+            "warranty_end",
+        ):
             assert ddiq_report._DEADLINE_KIND_RE.search(kind), kind
 
     def test_informational_kinds_do_not_promote(self) -> None:
@@ -228,8 +245,14 @@ class TestDeadlineKindGate:
 
 class TestContentlessFinding:
     def test_bare_not_in_documents_is_dropped(self) -> None:
-        for txt in ("Nicht in den vorgelegten Dokumenten enthalten.",
-                    "Nicht enthalten", "Keine Angaben", "N/A", "", "   "):
+        for txt in (
+            "Nicht in den vorgelegten Dokumenten enthalten.",
+            "Nicht enthalten",
+            "Keine Angaben",
+            "N/A",
+            "",
+            "   ",
+        ):
             assert ddiq_report._is_contentless_finding(SimpleNamespace(text=txt)) is True
 
     def test_real_findings_are_kept(self) -> None:
@@ -259,10 +282,16 @@ class TestDetectParksInText:
 class TestBuildParkFacts:
     def _wea(self, name: str, park: str | None, **kw):
         from ddiq.models import WEAStatus
+
         return WEAStatus(
-            name=name, ampel="green", owner=kw.get("owner", "DWP GmbH"),
-            parcel="", contract="Not specified",
-            lat=0.0, lng=0.0, address="Lamstedt",
+            name=name,
+            ampel="green",
+            owner=kw.get("owner", "DWP GmbH"),
+            parcel="",
+            contract="Not specified",
+            lat=0.0,
+            lng=0.0,
+            address="Lamstedt",
             rated_power_kw=kw.get("kw", 2000.0),
             model=kw.get("model", "E-70 E4"),
             status_code=kw.get("status", "errichtet"),
@@ -270,10 +299,8 @@ class TestBuildParkFacts:
         )
 
     def test_groups_two_parks_with_primary_by_name_match(self) -> None:
-        weas = [self._wea(f"WEA L {i}", "Windpark Lamstedt")
-                for i in (1, 2, 3, 4, 5, 6, 7, 9, 15, 16)] + [
-            self._wea(f"WEA Zodel {i}", "Windpark Zodel", owner="ZWP", kw=None)
-            for i in range(1, 9)
+        weas = [self._wea(f"WEA L {i}", "Windpark Lamstedt") for i in (1, 2, 3, 4, 5, 6, 7, 9, 15, 16)] + [
+            self._wea(f"WEA Zodel {i}", "Windpark Zodel", owner="ZWP", kw=None) for i in range(1, 9)
         ]
         parks = ddiq_report._build_park_facts(weas, "Windpark Zodel")
         assert [p.name for p in parks] == ["Windpark Zodel", "Windpark Lamstedt"]
@@ -300,9 +327,7 @@ class TestBuildParkFacts:
         assert not any(p.isPrimary for p in parks)
 
     def test_single_park_is_primary_regardless_of_name_match(self) -> None:
-        parks = ddiq_report._build_park_facts(
-            [self._wea("WEA Z 1", "Windpark Zodel")], "Windpark Lamstedt"
-        )
+        parks = ddiq_report._build_park_facts([self._wea("WEA Z 1", "Windpark Zodel")], "Windpark Lamstedt")
         assert len(parks) == 1 and parks[0].isPrimary
 
 
@@ -457,9 +482,9 @@ class TestBackfillWeaOwner:
 
     def _weas(self, owners: list[str]):
         from ddiq.models import WEAStatus
+
         return [
-            WEAStatus(name=f"WEA {i}", ampel="green", owner=o, parcel="", contract="",
-                      lat=53.0, lng=8.0, address="")
+            WEAStatus(name=f"WEA {i}", ampel="green", owner=o, parcel="", contract="", lat=53.0, lng=8.0, address="")
             for i, o in enumerate(owners)
         ]
 
@@ -494,15 +519,20 @@ class TestApplyCanonicalSpecs:
 
     def _wea(self, **kw):
         from ddiq.models import WEAStatus
-        base = dict(name="WEA 1", ampel="green", owner="o", parcel="", contract="",
-                    lat=53.0, lng=8.0, address="")
+
+        base = dict(name="WEA 1", ampel="green", owner="o", parcel="", contract="", lat=53.0, lng=8.0, address="")
         base.update(kw)
         return WEAStatus(**base)
 
     def test_fills_null_fields(self) -> None:
         weas = [self._wea(), self._wea()]
-        specs = {"manufacturer": "Enercon", "model": "E-138 EP3",
-                 "hub_height_m": 131, "rotor_diameter_m": 138.6, "rated_power_kw": 4200}
+        specs = {
+            "manufacturer": "Enercon",
+            "model": "E-138 EP3",
+            "hub_height_m": 131,
+            "rotor_diameter_m": 138.6,
+            "rated_power_kw": 4200,
+        }
         fills = ddiq_report._apply_canonical_specs(weas, specs)
         # 5 fields × 2 turbines, all null → 10 fills.
         assert fills == 10
@@ -512,8 +542,7 @@ class TestApplyCanonicalSpecs:
 
     def test_does_not_overwrite_real_values(self) -> None:
         weas = [self._wea(manufacturer="Vestas", hub_height_m=149.0)]
-        specs = {"manufacturer": "Enercon", "hub_height_m": 131,
-                 "rotor_diameter_m": 138.6}
+        specs = {"manufacturer": "Enercon", "hub_height_m": 131, "rotor_diameter_m": 138.6}
         fills = ddiq_report._apply_canonical_specs(weas, specs)
         # manufacturer + hub_height already set → not touched; only
         # rotor_diameter (+ the two still-null fields stay null since
@@ -549,7 +578,8 @@ class TestRelanguageText:
     def test_returns_llm_output(self, patch_llm_singletons) -> None:
         patch_llm_singletons.responses = ["Die Genehmigung wurde erteilt."]
         out = ddiq_report._relanguage_text(
-            "The Genehmigung wurde erteilt.", target_language="de",
+            "The Genehmigung wurde erteilt.",
+            target_language="de",
         )
         assert out == "Die Genehmigung wurde erteilt."
         # System prompt must name the target language + the preserve rule.
@@ -571,6 +601,7 @@ class TestRelanguageText:
 
     def test_llm_failure_returns_original(self, monkeypatch, mock_llm_client) -> None:
         import ddiq.llm as ddiq_llm
+
         mock_llm_client.raise_on_call = True
         monkeypatch.setattr(ddiq_llm, "_LLM_CLIENT", mock_llm_client)
         original = "The Genehmigung wurde erteilt."
@@ -617,11 +648,15 @@ class TestProjectFacts:
 
     def test_construct_and_dump(self) -> None:
         from ddiq.models import ProjectFacts
+
         f = ProjectFacts(
-            projectName="Windpark Lamstedt", preparedFor="Investor AG",
+            projectName="Windpark Lamstedt",
+            preparedFor="Investor AG",
             projectCompany="Lamstedt GmbH & Co. KG",
             projectCenter={"lat": 53.62, "lng": 9.15},
-            bundesland="niedersachsen", turbineCount=6, totalCapacityMw=25.2,
+            bundesland="niedersachsen",
+            turbineCount=6,
+            totalCapacityMw=25.2,
         )
         d = f.model_dump()
         assert d["totalCapacityMw"] == 25.2
@@ -631,8 +666,10 @@ class TestProjectFacts:
 
     def test_unknown_values_stay_none(self) -> None:
         from ddiq.models import ProjectFacts
+
         f = ProjectFacts(
-            projectName="P", preparedFor="C",
+            projectName="P",
+            preparedFor="C",
             projectCenter={"lat": 0.0, "lng": 0.0},
         )
         assert f.projectCompany is None
@@ -644,7 +681,10 @@ class TestProjectFacts:
 class TestSectionQuestions:
     def test_has_four_sections(self) -> None:
         assert set(ddiq_report.SECTION_QUESTIONS) == {
-            "overview", "land", "permits", "economics",
+            "overview",
+            "land",
+            "permits",
+            "economics",
         }
 
     def test_every_question_has_required_keys(self) -> None:
@@ -681,17 +721,19 @@ class TestDropGeocodeOutlierWeas:
         return [self._w(53.63 + 0.001 * i, 9.10 + 0.001 * i) for i in range(n)]
 
     def test_drops_far_outliers(self) -> None:
-        weas = self._cluster(8) + [self._w(53.09, 8.78),   # Bremen ~60 km
-                                   self._w(48.14, 11.58),   # Munich
-                                   self._w(52.52, 13.40)]   # Berlin
+        weas = self._cluster(8) + [
+            self._w(53.09, 8.78),  # Bremen ~60 km
+            self._w(48.14, 11.58),  # Munich
+            self._w(52.52, 13.40),
+        ]  # Berlin
         kept = ddiq_report._drop_geocode_outlier_weas(weas)
         assert len(kept) == 8
 
     def test_keeps_ungeocoded_drops_outlier(self) -> None:
         weas = self._cluster(5) + [self._w(48.14, 11.58)] + [self._w(0.0, 0.0)]
         kept = ddiq_report._drop_geocode_outlier_weas(weas)
-        assert len(kept) == 6                                 # 5 cluster + ungeocoded
-        assert any(w.lat == 0 for w in kept)                  # ungeocoded kept
+        assert len(kept) == 6  # 5 cluster + ungeocoded
+        assert any(w.lat == 0 for w in kept)  # ungeocoded kept
         assert not any(abs(w.lat - 48.14) < 0.01 for w in kept)  # Munich dropped
 
     def test_two_or_fewer_geocoded_unchanged(self) -> None:
@@ -709,10 +751,15 @@ class TestSetSectionValue:
 
     @staticmethod
     def _sections():
-        return [SimpleNamespace(id="overview", rows=[
-            SimpleNamespace(label="Project Status", value="old"),
-            SimpleNamespace(label="Number of WEA", value="8"),
-        ])]
+        return [
+            SimpleNamespace(
+                id="overview",
+                rows=[
+                    SimpleNamespace(label="Project Status", value="old"),
+                    SimpleNamespace(label="Number of WEA", value="8"),
+                ],
+            )
+        ]
 
     def test_sets_existing_cell(self) -> None:
         secs = self._sections()
@@ -728,6 +775,7 @@ class TestSetSectionValue:
 
     def test_commissioned_field_on_facts_ledger(self) -> None:
         from ddiq.models import ProjectFacts
+
         f = ProjectFacts(projectName="Windpark X", preparedFor="Client")
         assert f.commissionedWeaCount == 0  # defaults to 0 (unknown)
         f2 = ProjectFacts(projectName="X", preparedFor="C", commissionedWeaCount=8)

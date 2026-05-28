@@ -24,7 +24,6 @@ from __future__ import annotations
 import ddiq_report
 from ddiq.models import DDiQReportData
 
-
 # ── _compute_fingerprint ─────────────────────────────────────────────
 
 
@@ -147,8 +146,10 @@ class TestUpdateReportProgress:
     def test_db_error_swallowed(self, monkeypatch) -> None:
         """A best-effort progress write must never raise — the
         pipeline keeps going even if the row update fails."""
+
         def boom():
             raise RuntimeError("pool exhausted")
+
         monkeypatch.setattr(ddiq_report, "get_conn", boom)
         # Should not raise.
         ddiq_report._update_report_progress("r-1", step="x")
@@ -160,14 +161,22 @@ class TestUpdateReportProgress:
 class TestPersistReportJsonb:
     def _report(self) -> DDiQReportData:
         return DDiQReportData(
-            projectName="P", preparedBy="b", preparedFor="f",
-            date="2026-05-19", projectCenter={"lat": 53.0, "lng": 8.0},
+            projectName="P",
+            preparedBy="b",
+            preparedFor="f",
+            date="2026-05-19",
+            projectCenter={"lat": 53.0, "lng": 8.0},
         )
 
     def test_upsert_writes_report_data(self, fake_db) -> None:
         conn, cur = fake_db()
         ddiq_report._persist_report_jsonb(
-            "r-1", "Proj", ["d1"], "full", self._report(), "user-1",
+            "r-1",
+            "Proj",
+            ["d1"],
+            "full",
+            self._report(),
+            "user-1",
         )
         sql, params = cur.executed[0]
         assert "INSERT INTO ddiq_reports" in sql
@@ -178,9 +187,16 @@ class TestPersistReportJsonb:
     def test_db_error_swallowed(self, monkeypatch) -> None:
         """A checkpoint failure must not kill the pipeline — the next
         checkpoint or the final UPSERT catches up."""
+
         def boom():
             raise RuntimeError("disk full")
+
         monkeypatch.setattr(ddiq_report, "get_conn", boom)
         ddiq_report._persist_report_jsonb(
-            "r-1", "P", ["d1"], "full", self._report(), "u1",
+            "r-1",
+            "P",
+            ["d1"],
+            "full",
+            self._report(),
+            "u1",
         )  # no raise

@@ -13,10 +13,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-
 # ---------------------------------------------------------------------------
 # Formatters
 # ---------------------------------------------------------------------------
+
 
 class StructuredFormatter(logging.Formatter):
     """Log formatter with consistent structure for parsing and monitoring."""
@@ -40,6 +40,7 @@ class StructuredFormatter(logging.Formatter):
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
+
 
 def setup_logging(
     level: int = logging.INFO,
@@ -123,6 +124,7 @@ def get_logger(name: str) -> logging.Logger:
 # Token tracking
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class TokenUsage:
     """Token usage from an LLM call."""
@@ -165,13 +167,19 @@ class OperationMetrics:
 # Tracing context manager
 # ---------------------------------------------------------------------------
 
+
 class _OperationContext:
     """Internal context for a traced operation."""
 
     __slots__ = (
-        "operation_name", "request_id",
-        "_start_time", "_end_time",
-        "_token_usage", "_success", "_error", "_warnings",
+        "_end_time",
+        "_error",
+        "_start_time",
+        "_success",
+        "_token_usage",
+        "_warnings",
+        "operation_name",
+        "request_id",
     )
 
     def __init__(self, operation_name: str, request_id: str) -> None:
@@ -196,7 +204,9 @@ class _OperationContext:
         self._warnings.append(msg)
         _logger.warning(
             "[%s] %s WARNING: %s",
-            self.request_id[:8], self.operation_name, msg,
+            self.request_id[:8],
+            self.operation_name,
+            msg,
         )
 
     @property

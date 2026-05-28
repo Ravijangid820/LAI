@@ -45,6 +45,7 @@ def canonical_email(raw: str) -> str:
 
 # ── User ────────────────────────────────────────────────────────────────────
 
+
 @dataclass(frozen=True, slots=True)
 class UserRecord:
     """A row from the ``users`` table.
@@ -85,7 +86,7 @@ class UserRepository:
 
     async def get_by_id(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         user_id: UUID,
     ) -> UserRecord | None:
         row = await conn.fetchrow(
@@ -96,7 +97,7 @@ class UserRepository:
 
     async def get_by_email(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         email: str,
     ) -> UserRecord | None:
         row = await conn.fetchrow(
@@ -107,7 +108,7 @@ class UserRepository:
 
     async def create(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         *,
         email: str,
         password_hash: str,
@@ -141,12 +142,12 @@ class UserRepository:
             role,
             org_id,
         )
-        assert row is not None  # noqa: S101 — RETURNING always yields a row
+        assert row is not None
         return _row_to_user(row)
 
     async def update_password_hash(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         user_id: UUID,
         password_hash: str,
     ) -> None:
@@ -158,7 +159,7 @@ class UserRepository:
 
     async def touch_last_login(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         user_id: UUID,
     ) -> None:
         await conn.execute(
@@ -168,7 +169,7 @@ class UserRepository:
 
     async def set_org_id(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         user_id: UUID,
         org_id: UUID | None,
     ) -> bool:
@@ -189,7 +190,7 @@ class UserRepository:
 
     async def set_role(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         user_id: UUID,
         role: str,
     ) -> bool:
@@ -205,7 +206,7 @@ class UserRepository:
 
     async def search(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         *,
         q: str,
         scope: str,
@@ -273,7 +274,7 @@ class UserRepository:
         return [_row_to_user(r) for r in rows]
 
 
-def _row_to_user(row: "asyncpg.Record") -> UserRecord:
+def _row_to_user(row: asyncpg.Record) -> UserRecord:
     return UserRecord(
         id=row["id"],
         email=row["email"],
@@ -291,6 +292,7 @@ def _row_to_user(row: "asyncpg.Record") -> UserRecord:
 
 
 # ── Refresh token ───────────────────────────────────────────────────────────
+
 
 @dataclass(frozen=True, slots=True)
 class RefreshTokenRecord:
@@ -315,7 +317,7 @@ class RefreshTokenRepository:
 
     async def create(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         *,
         user_id: UUID,
         token_hash: str,
@@ -331,12 +333,12 @@ class RefreshTokenRepository:
             token_hash,
             expires_at,
         )
-        assert row is not None  # noqa: S101
+        assert row is not None
         return _row_to_refresh(row)
 
     async def get_active_by_hash(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         token_hash: str,
     ) -> RefreshTokenRecord | None:
         row = await conn.fetchrow(
@@ -351,7 +353,7 @@ class RefreshTokenRepository:
 
     async def revoke_by_hash(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         token_hash: str,
     ) -> None:
         await conn.execute(
@@ -365,7 +367,7 @@ class RefreshTokenRepository:
 
     async def revoke_all_for_user(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         user_id: UUID,
     ) -> None:
         """Revoke every active refresh token for a user.
@@ -383,7 +385,7 @@ class RefreshTokenRepository:
         )
 
 
-def _row_to_refresh(row: "asyncpg.Record") -> RefreshTokenRecord:
+def _row_to_refresh(row: asyncpg.Record) -> RefreshTokenRecord:
     return RefreshTokenRecord(
         id=row["id"],
         user_id=row["user_id"],
@@ -395,6 +397,7 @@ def _row_to_refresh(row: "asyncpg.Record") -> RefreshTokenRecord:
 
 
 # ── Password reset token ────────────────────────────────────────────────────
+
 
 @dataclass(frozen=True, slots=True)
 class ResetTokenRecord:
@@ -419,7 +422,7 @@ class ResetTokenRepository:
 
     async def create(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         *,
         user_id: UUID,
         token_hash: str,
@@ -435,12 +438,12 @@ class ResetTokenRepository:
             token_hash,
             expires_at,
         )
-        assert row is not None  # noqa: S101
+        assert row is not None
         return _row_to_reset(row)
 
     async def consume(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         token_hash: str,
     ) -> ResetTokenRecord | None:
         """Atomically mark a reset token consumed.
@@ -464,7 +467,7 @@ class ResetTokenRepository:
         return _row_to_reset(row) if row is not None else None
 
 
-def _row_to_reset(row: "asyncpg.Record") -> ResetTokenRecord:
+def _row_to_reset(row: asyncpg.Record) -> ResetTokenRecord:
     return ResetTokenRecord(
         id=row["id"],
         user_id=row["user_id"],
@@ -476,6 +479,7 @@ def _row_to_reset(row: "asyncpg.Record") -> ResetTokenRecord:
 
 
 # ── Organization ────────────────────────────────────────────────────────────
+
 
 @dataclass(frozen=True, slots=True)
 class OrganizationRecord:
@@ -518,7 +522,7 @@ class OrganizationRepository:
 
     async def create(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         *,
         name: str,
     ) -> OrganizationRecord:
@@ -530,12 +534,12 @@ class OrganizationRepository:
             f"INSERT INTO organizations (name) VALUES ($1) RETURNING {_ORG_COLS}",
             name,
         )
-        assert row is not None  # noqa: S101 — RETURNING always yields a row
+        assert row is not None
         return _row_to_org(row)
 
     async def get_by_id(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         org_id: UUID,
     ) -> OrganizationRecord | None:
         row = await conn.fetchrow(
@@ -546,7 +550,7 @@ class OrganizationRepository:
 
     async def list_all(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
     ) -> list[OrganizationSummary]:
         """Every organisation with its current member count. Super-admin
         only — a firm admin gets just their own org via :meth:`get_by_id`."""
@@ -573,20 +577,19 @@ class OrganizationRepository:
 
     async def list_members(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         org_id: UUID,
     ) -> list[UserRecord]:
         """All active members of an organisation, ordered by display name."""
         rows = await conn.fetch(
-            f"SELECT {_USER_COLS} FROM users "
-            "WHERE org_id = $1 AND status = 'active' ORDER BY full_name",
+            f"SELECT {_USER_COLS} FROM users WHERE org_id = $1 AND status = 'active' ORDER BY full_name",
             org_id,
         )
         return [_row_to_user(r) for r in rows]
 
     async def rename(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         org_id: UUID,
         name: str,
     ) -> bool:
@@ -603,7 +606,7 @@ class OrganizationRepository:
         return res.endswith(" 1")
 
 
-def _row_to_org(row: "asyncpg.Record") -> OrganizationRecord:
+def _row_to_org(row: asyncpg.Record) -> OrganizationRecord:
     return OrganizationRecord(
         id=row["id"],
         name=row["name"],
@@ -614,6 +617,7 @@ def _row_to_org(row: "asyncpg.Record") -> OrganizationRecord:
 
 
 # ── Org invitations (Phase C.1) ─────────────────────────────────────────────
+
 
 @dataclass(frozen=True, slots=True)
 class InvitationRecord:
@@ -642,8 +646,7 @@ class InvitationRecord:
 
 
 _INVITATION_COLS: Final[str] = (
-    "id, org_id, email_canonical, role, invited_by, token_hash, "
-    "expires_at, accepted_at, created_at"
+    "id, org_id, email_canonical, role, invited_by, token_hash, expires_at, accepted_at, created_at"
 )
 
 
@@ -660,7 +663,7 @@ class InvitationRepository:
 
     async def upsert_outstanding(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         *,
         org_id: UUID,
         email_canonical: str,
@@ -701,12 +704,12 @@ class InvitationRepository:
             token_hash,
             expires_at,
         )
-        assert row is not None  # noqa: S101 — RETURNING always yields a row
+        assert row is not None
         return _row_to_invitation(row)
 
     async def get_active_by_hash(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         token_hash: str,
     ) -> InvitationRecord | None:
         """Look up a pending, unexpired invitation by sha256 token hash."""
@@ -724,7 +727,7 @@ class InvitationRepository:
 
     async def list_pending_for_org(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         org_id: UUID,
     ) -> list[InvitationRecord]:
         """All outstanding (unaccepted, unexpired) invitations for an org,
@@ -745,7 +748,7 @@ class InvitationRepository:
 
     async def accept(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         token_hash: str,
     ) -> InvitationRecord | None:
         """Atomically mark an invitation accepted.
@@ -770,7 +773,7 @@ class InvitationRepository:
 
     async def revoke(
         self,
-        conn: "asyncpg.Connection",
+        conn: asyncpg.Connection,
         invitation_id: UUID,
         org_id: UUID,
     ) -> bool:
@@ -779,15 +782,14 @@ class InvitationRepository:
         the WHERE clause makes a cross-firm revoke a no-op (route maps
         the False return to a 404, never 403)."""
         res = await conn.execute(
-            "DELETE FROM org_invitations "
-            "WHERE id = $1 AND org_id = $2 AND accepted_at IS NULL",
+            "DELETE FROM org_invitations WHERE id = $1 AND org_id = $2 AND accepted_at IS NULL",
             invitation_id,
             org_id,
         )
         return res.endswith(" 1")
 
 
-def _row_to_invitation(row: "asyncpg.Record") -> InvitationRecord:
+def _row_to_invitation(row: asyncpg.Record) -> InvitationRecord:
     return InvitationRecord(
         id=row["id"],
         org_id=row["org_id"],

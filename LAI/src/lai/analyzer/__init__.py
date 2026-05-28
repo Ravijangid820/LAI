@@ -1,22 +1,23 @@
 """Contract Analyzer V2 — see docs/analysis/CONTRACT_ANALYZER_V2.md."""
+
 from lai.analyzer.schema import (
+    Clause,
     ContractAnalysis,
     ContractType,
-    Clause,
+    CrossClauseFinding,
+    FinancialTable,
     Issue,
     Parcel,
-    FinancialTable,
     ReconciliationFinding,
-    CrossClauseFinding,
 )
 
 __all__ = [
+    "Clause",
     "ContractAnalysis",
     "ContractType",
-    "Clause",
+    "CrossClauseFinding",
+    "FinancialTable",
     "Issue",
     "Parcel",
-    "FinancialTable",
     "ReconciliationFinding",
-    "CrossClauseFinding",
 ]

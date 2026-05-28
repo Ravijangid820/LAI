@@ -25,11 +25,20 @@ def db(tmp_path: Path):
     persistence._STATE["conn"] = None
     persistence._STATE["uploads_dir"] = None
     persistence.init(tmp_path / "t.db", tmp_path / "uploads")
-    persistence.save_session(SID, {
-        "user_id": UID, "filename": "lease.pdf", "contract_text": "lease",
-        "n_pages": 3, "tables": [], "uploaded_at": time.time(),
-        "clauses": None, "analysis": None, "upload_ext": ".pdf",
-    })
+    persistence.save_session(
+        SID,
+        {
+            "user_id": UID,
+            "filename": "lease.pdf",
+            "contract_text": "lease",
+            "n_pages": 3,
+            "tables": [],
+            "uploaded_at": time.time(),
+            "clauses": None,
+            "analysis": None,
+            "upload_ext": ".pdf",
+        },
+    )
     yield
     conn = persistence._STATE.get("conn")
     if conn is not None:
@@ -48,7 +57,9 @@ def test_doc_index_is_stable_and_sequential(db) -> None:
 
 @pytest.mark.unit
 def test_list_omits_text_by_default_includes_on_request(db) -> None:
-    persistence.add_matter_document(SID, filename="a.pdf", doc_text="secret text", n_pages=1, upload_ext=".pdf", user_id=UID)
+    persistence.add_matter_document(
+        SID, filename="a.pdf", doc_text="secret text", n_pages=1, upload_ext=".pdf", user_id=UID
+    )
     light = persistence.list_matter_documents(SID, user_id=UID)
     assert "doc_text" not in light[0]
     heavy = persistence.list_matter_documents(SID, user_id=UID, include_text=True)
@@ -66,7 +77,12 @@ def test_list_ordered_by_doc_index(db) -> None:
 
 @pytest.mark.unit
 def test_cross_tenant_add_and_list_blocked(db) -> None:
-    assert persistence.add_matter_document(SID, filename="a.pdf", doc_text="A", n_pages=1, upload_ext=".pdf", user_id=OTHER) is None
+    assert (
+        persistence.add_matter_document(
+            SID, filename="a.pdf", doc_text="A", n_pages=1, upload_ext=".pdf", user_id=OTHER
+        )
+        is None
+    )
     persistence.add_matter_document(SID, filename="a.pdf", doc_text="A", n_pages=1, upload_ext=".pdf", user_id=UID)
     assert persistence.list_matter_documents(SID, user_id=OTHER) == []
     assert len(persistence.list_matter_documents(SID, user_id=UID)) == 1
@@ -83,7 +99,9 @@ def test_get_matter_document_by_index(db) -> None:
 
 @pytest.mark.unit
 def test_file_path_roundtrip(db) -> None:
-    d = persistence.add_matter_document(SID, filename="permit.pdf", doc_text="x", n_pages=1, upload_ext=".pdf", user_id=UID)
+    d = persistence.add_matter_document(
+        SID, filename="permit.pdf", doc_text="x", n_pages=1, upload_ext=".pdf", user_id=UID
+    )
     persistence.save_matter_upload(SID, d["id"], b"%PDF-1.4 fake", "permit.pdf")
     p = persistence.matter_document_path(SID, d["id"], ".pdf")
     assert p is not None and p.exists()
