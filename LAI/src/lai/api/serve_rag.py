@@ -3547,7 +3547,9 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     _emit_query_metrics(
         mode=mode,
         language=answer_lang or "de",
-        latency_s=timings.total_s,
+        timings=timings,
+        session_id=sid,
+        focus_doc_indexes=req.focus_doc_indexes,
         chunks_returned=len(chunks_out),
         citation_validation=citation_validation_out,
         jurisdiction_warnings=jurisdiction_warnings,
@@ -3563,16 +3565,28 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     )
 
 
+# Slow-query telemetry threshold (Phase 1.5). A turn whose end-to-end latency
+# meets or exceeds this emits one structured JSON line to stdout (→
+# logs/host/serve_rag.log) with the per-stage breakdown, so a regression like
+# the reranker silently falling back to CPU (which shows up as a huge
+# rerank_ms) is visible in the logs before a user complains. Override with
+# LAI_SLOW_QUERY_S.
+_SLOW_QUERY_S = float(os.getenv("LAI_SLOW_QUERY_S", "30"))
+
+
 def _emit_query_metrics(
     *,
     mode: str,
     language: str,
-    latency_s: float,
+    timings: TimingsOut,
+    session_id: str,
     chunks_returned: int,
     citation_validation: CitationValidationOut | None,
     jurisdiction_warnings: list[JurisdictionWarningOut],
+    focus_doc_indexes: Optional[list[int]] = None,
 ) -> None:
-    """Bump every domain-level counter / histogram for one completed turn.
+    """Bump every domain-level counter / histogram for one completed turn, and
+    emit a structured slow-query record when the turn crosses _SLOW_QUERY_S.
 
     Centralised so the two query endpoints (/query and /query/stream)
     emit identical metrics — divergence would silently break the Grafana
@@ -3581,7 +3595,7 @@ def _emit_query_metrics(
     rag_metrics.query_total.labels(
         mode=mode, language=language, status="success",
     ).inc()
-    rag_metrics.query_latency_seconds.labels(mode=mode).observe(latency_s)
+    rag_metrics.query_latency_seconds.labels(mode=mode).observe(timings.total_s)
     rag_metrics.retrieval_chunks_returned.observe(chunks_returned)
 
     if citation_validation and citation_validation.sentences_flagged > 0:
@@ -3593,6 +3607,24 @@ def _emit_query_metrics(
     if jurisdiction_warnings:
         rag_metrics.jurisdiction_warnings_responses_total.inc()
         rag_metrics.jurisdiction_warnings_total.inc(len(jurisdiction_warnings))
+
+    # Slow-query structured log — one JSON line per slow turn (Phase 1.5). The
+    # per-stage breakdown is what makes it actionable: a slow turn that is all
+    # rerank_ms points straight at the reranker (e.g. CPU fallback), whereas
+    # all generate_ms points at the LLM.
+    if timings.total_s >= _SLOW_QUERY_S:
+        print(json.dumps({
+            "event": "slow_query",
+            "session_id": session_id,
+            "mode": mode,
+            "focus_doc_indexes": focus_doc_indexes,
+            "embed_ms": round(timings.embed_s * 1000),
+            "retrieve_ms": round(timings.retrieve_s * 1000),
+            "rerank_ms": round(timings.rerank_s * 1000),
+            "generate_ms": round(timings.generate_s * 1000),
+            "total_ms": round(timings.total_s * 1000),
+            "chunks_returned": chunks_returned,
+        }), flush=True)
 
 
 def _run_jurisdiction_check(
@@ -3993,7 +4025,9 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         _emit_query_metrics(
             mode=mode,
             language=answer_lang or "de",
-            latency_s=timings.total_s,
+            timings=timings,
+            session_id=sid,
+            focus_doc_indexes=req.focus_doc_indexes,
             chunks_returned=len(chunks_out),
             citation_validation=citation_validation_out,
             jurisdiction_warnings=jurisdiction_warnings,
