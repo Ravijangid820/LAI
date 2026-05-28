@@ -10,7 +10,7 @@ Mount: from ddiq_report import router as ddiq_router
 """
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 from uuid import UUID
@@ -260,7 +260,6 @@ from ddiq.extractors import (  # noqa: E402 — re-exported for legacy callers
     generate_findings,
 )
 from ddiq import vlm_ocr  # noqa: E402 — scanned-PDF OCR via the vision LLM
-from ddiq.docx_export import build_report_docx  # noqa: E402 — GET /report/{id}/export.docx
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3425,42 +3424,6 @@ def get_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
     if not row: raise HTTPException(404, "Not found")
     return {"report_id": str(row["id"]), "created_at": row["created_at"].isoformat(),
             "project_name": row["project_name"], "report": row["report_data"]}
-
-
-def _safe_docx_filename(name: Optional[str]) -> str:
-    """ASCII-safe download filename stem for the Content-Disposition header."""
-    base = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "ddiq-report").strip())
-    return (base.strip("_") or "ddiq-report")[:80]
-
-
-@router.get("/report/{report_id}/export.docx")
-def export_report_docx(report_id: str, user: CurrentUser = Depends(get_current_user)):
-    """Render a stored report as a Word (.docx) deliverable a lawyer can send.
-
-    Read access mirrors GET /report/{id}: the owner OR a user the report is
-    shared with. Cross-user / unknown id → 404 (never leak existence).
-    """
-    conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(
-        """SELECT project_name, report_data FROM ddiq_reports
-           WHERE id = %s
-             AND (user_id = %s
-                  OR EXISTS (SELECT 1 FROM ddiq_report_shares s
-                             WHERE s.report_id = ddiq_reports.id
-                               AND s.user_id = %s))""",
-        (report_id, str(user.id), str(user.id)),
-    )
-    row = cur.fetchone(); cur.close(); conn.close()
-    if not row:
-        raise HTTPException(404, "Not found")
-
-    data = build_report_docx(row["report_data"] or {}, row["project_name"])
-    fname = _safe_docx_filename(row["project_name"]) + ".docx"
-    return Response(
-        content=data,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
-    )
 
 
 class RenameReportRequest(BaseModel):
