@@ -3831,55 +3831,60 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     else:
         use_rag = needs_rag(req.question)
 
-    corpus_chunks: list[ChunkOut] = []
-    corpus_sources: list[RetrievedSource] = []
-    timings = TimingsOut(embed_s=0.0, retrieve_s=0.0, rerank_s=0.0,
-                         generate_s=0.0, total_s=0.0)
-    if use_rag:
-        corpus_chunks, corpus_sources, t = _do_rag(
-            req.question, req.top_k, req.candidate_k,
-        )
-        timings.embed_s = t.embed_s
-        timings.retrieve_s = t.retrieve_s
-        timings.rerank_s = t.rerank_s
-
-    # Matter side: [M-1]..[M-n] across every document in the session.
-    matter_sources, matter_chunks, contract_text = _build_matter_context(
-        sid, uid, use_contract, req.question,
-        focus_doc_indexes=req.focus_doc_indexes,
-    )
-
-    # NOTE: the wait-for-OCR happens INSIDE the generator below (not here), so
-    # it can stream live progress + heartbeats while waiting (proxy-safe).
-
-    history = _load_history(sid, user_id=uid)
-    meta_prefix = _matter_manifest_prefix(sid, uid, focus_doc_indexes=req.focus_doc_indexes) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
-    rag_sources = matter_sources + corpus_sources
-
-    mode, msgs = _build_turn_msgs(
-        use_rag, use_contract, req.question, rag_sources, matter_sources,
-        history, meta_prefix, answer_lang,
-    )
-
-    chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
-    max_new_tokens = 3000 if (use_rag or use_contract) else 1800
-
-    # Empty-retrieval guard (same as /query): a doc-scoped turn with no
-    # grounded sources is answered with an honest message, not an LLM
-    # fabrication. Computed here so the generator can short-circuit.
-    guard_msg = _empty_grounding_guard(
-        mode, matter_sources, rag_sources, sid, uid, answer_lang,
-    )
+    # Heavy retrieval (embed + dense/BM25 + rerank) and matter assembly run
+    # INSIDE the generator below — not here — so the SSE response starts
+    # immediately and we can emit ``status`` frames during that (rerank-bound)
+    # window instead of leaving the client on "thinking…" dots until the first
+    # token. A status frame doubles as a watchdog re-arm on the client.
 
     def _generator():
         """Yield SSE bytes for the lifetime of the request."""
-        # Rebound after an in-stream OCR wait so the rest of the generator
-        # (stream, citation/jurisdiction checks, persist, complete) uses the
-        # freshly-retrieved sources.
-        nonlocal matter_sources, matter_chunks, contract_text
-        nonlocal rag_sources, mode, msgs, chunks_out, guard_msg
         t0 = time.time()
         accumulated: list[str] = []
+
+        # ── Retrieval + matter assembly. Narrate it: emit "searching" first
+        #    so the user sees activity instead of dead air before the first
+        #    token. Variables are local to the generator; the in-stream OCR
+        #    wait below rebinds them after re-retrieval.
+        yield _sse_event("status", {
+            "state": "retrieving",
+            "message": "Durchsuche Dokumente und Wissensbasis…",
+        })
+        corpus_chunks: list[ChunkOut] = []
+        corpus_sources: list[RetrievedSource] = []
+        timings = TimingsOut(embed_s=0.0, retrieve_s=0.0, rerank_s=0.0,
+                             generate_s=0.0, total_s=0.0)
+        try:
+            if use_rag:
+                corpus_chunks, corpus_sources, t = _do_rag(
+                    req.question, req.top_k, req.candidate_k,
+                )
+                timings.embed_s = t.embed_s
+                timings.retrieve_s = t.retrieve_s
+                timings.rerank_s = t.rerank_s
+            # Matter side: [M-1]..[M-n] across every document in the session.
+            matter_sources, matter_chunks, contract_text = _build_matter_context(
+                sid, uid, use_contract, req.question,
+                focus_doc_indexes=req.focus_doc_indexes,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as an SSE error, don't break the stream
+            yield _sse_event("error", {"detail": f"retrieval: {exc}"})
+            return
+
+        history = _load_history(sid, user_id=uid)
+        meta_prefix = _matter_manifest_prefix(sid, uid, focus_doc_indexes=req.focus_doc_indexes) + _format_session_meta_prefix(persistence.get_session_meta(sid, user_id=uid))
+        rag_sources = matter_sources + corpus_sources
+        mode, msgs = _build_turn_msgs(
+            use_rag, use_contract, req.question, rag_sources, matter_sources,
+            history, meta_prefix, answer_lang,
+        )
+        chunks_out: list[ChunkOut] = matter_chunks + corpus_chunks
+        max_new_tokens = 3000 if (use_rag or use_contract) else 1800
+        # Empty-retrieval guard: a doc-scoped turn with no grounded sources is
+        # answered with an honest message, not an LLM fabrication.
+        guard_msg = _empty_grounding_guard(
+            mode, matter_sources, rag_sources, sid, uid, answer_lang,
+        )
 
         # In-stream wait-and-answer: if a doc-scoped turn has no matter content
         # yet because the upload is still being OCR'd, emit a ``status`` event
@@ -3935,6 +3940,13 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
             accumulated.append(guard_msg)
             yield _sse_event("token", {"delta": guard_msg})
         else:
+            # Retrieval/rerank is done; bridge the LLM time-to-first-token gap
+            # so the bubble shows "formulating" rather than reverting to bare
+            # dots (self-suppresses on the FE once the first token arrives).
+            yield _sse_event("status", {
+                "state": "generating",
+                "message": "Formuliere Antwort…",
+            })
             try:
                 for delta in _stream_vllm_chat(msgs, max_new_tokens):
                     # ``<think>`` traces only appear when thinking mode is
