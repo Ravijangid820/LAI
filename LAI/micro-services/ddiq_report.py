@@ -305,6 +305,41 @@ def _looks_like_address(name: Optional[str]) -> bool:
     return bool(_ADDRESS_TAIL.search(s)) or "straße" in low or low.endswith("str.")
 
 
+# When the LLM can't find a value it answers with a phrase like "Nicht im
+# Kontext enthalten" — an honest refusal that must never be stored as if
+# it were the actual value. Caught one in the wild on KS's first report
+# where the project_name row in the DB read "Nicht im Kontext enthalten".
+_REFUSAL_PATTERNS = re.compile(
+    r"(?i)("
+    r"nicht\s+(?:im\s+kontext|in\s+den\s+(?:dokumenten|unterlagen))(?:\s+enthalten)?"
+    r"|nicht\s+verf[üu]gbar"
+    r"|nicht\s+angegeben"
+    r"|nicht\s+spezifiziert"
+    r"|nicht\s+ermittelbar"
+    r"|nicht\s+bekannt"
+    r"|keine\s+angaben?"
+    r"|unbekannt"
+    r"|not\s+(?:in\s+(?:the\s+)?(?:context|documents)|provided|specified|available|known|mentioned)"
+    r"|no\s+information"
+    r"|i\s+(?:do\s+not|don['’]?t)\s+know"
+    r"|cannot\s+(?:determine|be\s+determined)"
+    r"|insufficient\s+(?:context|information)"
+    r")"
+)
+
+
+def _looks_like_refusal(value: Optional[str]) -> bool:
+    """True when ``value`` is an LLM honest-refusal phrase, not a real value.
+
+    Used to gate header fields where a refusal would look like garbage to
+    the reader (e.g. project name displayed in the report title). Content
+    fields can keep refusals — they are useful as ampel=null hints.
+    """
+    if not value:
+        return False
+    return bool(_REFUSAL_PATTERNS.search(str(value).strip()))
+
+
 # Onshore WEA rated power tops out near 7 MW in this corpus; an order of
 # magnitude above (e.g. 22000 kW reported for an Enercon E-70, which is
 # really ~2300 kW) is an extraction error. Letting it through made 8
@@ -897,7 +932,19 @@ SECTION_QUESTIONS = {
         {"label": "Project Name", "anchor": "Genehmigungsbescheid / Pachtvertrag",
          "question": "What is the project name (Windpark-Bezeichnung) as it appears on the Genehmigungsbescheid title or Pachtvertrag preamble?"},
         {"label": "Location", "anchor": "Lageplan / Erläuterungsbericht",
-         "question": "Project site: Bundesland, Landkreis, Gemeinde, Gemarkung. Cite the Lageplan or Erläuterungsbericht."},
+         "question": (
+             "Project site: Bundesland, Landkreis, Gemeinde, Gemarkung. "
+             "Cite the Lageplan or Erläuterungsbericht. "
+             "Return ONLY the location where the wind turbines stand or are "
+             "planned to stand. Do NOT return a party's registered office "
+             "(Sitz, Geschäftsadresse, HRB-Sitz, Hauptsitz, "
+             "Postanschrift) of the Pächterin / Verpächter / Eigentümer / "
+             "Projektgesellschaft / Käuferin / Verkäuferin — those usually "
+             "appear in party preambles (§§ 1–2 of Pacht-/Kaufverträge) "
+             "and on company letterheads, NOT on the Lageplan. If the doc "
+             "only gives a corporate office and no site address, return "
+             "null rather than the office."
+         )},
         {"label": "Project Status", "anchor": "BImSchG §§4, 6, 10, 15",
          "question": "Current status under BImSchG: §10 Antrag eingereicht / Auslegung / §6 erteilt (bestandskräftig?) / §15 Inbetriebnahme angezeigt? Distinguish formal permit status from construction status."},
         {"label": "Project Type", "anchor": "EEG bestehende-Anlage rules",
@@ -1393,6 +1440,11 @@ Rules:
             permit_ref=w.get("permit_ref") or None,
             warranty_end=w.get("warranty_end") or None,
             park=(str(w.get("park")).strip() or None) if w.get("park") else None,
+            # Carry the geocode-gating bundesland onto the row so the
+            # per-park address picker can use it. ``wea_bl`` was just
+            # computed above as ``project_bl or detect_bundesland(geo_query)``
+            # — same value, lowercased downstream by the picker.
+            bundesland=(wea_bl or None),
         ))
 
     # Scatter duplicate coordinates so the map doesn't stack pins.
@@ -1468,7 +1520,7 @@ def _detect_parks_in_text(*texts: str) -> set[str]:
     return found
 
 
-def _build_park_facts(weas: list, project_name: str) -> list:
+def _build_park_facts(weas: list, project_name: str, expected_bundesland: Optional[str] = None) -> list:
     """Group turbines by their ``park`` tag and compute per-park aggregates.
 
     Returns a (possibly empty) list of :class:`ParkFacts`, sorted with the
@@ -1512,12 +1564,55 @@ def _build_park_facts(weas: list, project_name: str) -> list:
         owners = [w.owner for w in ts
                   if w.owner and w.owner.strip().lower() not in _PLACEHOLDER_OWNERS]
         company = owners[0] if owners else None
-        location = next((w.address for w in ts if w.address), None)
+
+        # Pick the park's address + bundesland with a bundesland-consistency
+        # gate instead of "first WEA wins". Failure mode this guards against:
+        # the WEAs of a Niedersachsen park get tagged by an LLM that sees
+        # references to a different German wind region elsewhere in the
+        # documents (e.g. a court ruling that cites Reußenköge / Schleswig-
+        # Holstein as comparable case law), so the FIRST WEA's address ends
+        # up being SH while the rest are NI. The previous ``next((w.address
+        # ...))`` returned the SH outlier and the park header read
+        # "Reußenköge, Schleswig-Holstein" for a Niedersachsen wind park —
+        # directly contradicting the bundesland badge and the geocoded
+        # projectCenter.
+        wea_bundeslands = [
+            (w.bundesland or "").strip().lower()
+            for w in ts
+            if (w.bundesland or "").strip()
+        ]
+        # The park's own bundesland: prefer the most-common across its
+        # WEAs (defends against a single odd-one-out). Fall back to the
+        # project's expected bundesland when no WEA carries one.
+        park_bl: Optional[str] = None
+        if wea_bundeslands:
+            from collections import Counter
+            park_bl = Counter(wea_bundeslands).most_common(1)[0][0]
+        if not park_bl:
+            park_bl = (expected_bundesland or "").strip().lower() or None
+
+        # Address: when we have a park bundesland, take the first WEA
+        # whose bundesland matches — the others are extraction noise.
+        # Only fall back to the unfiltered first-WEA address when we
+        # have no bundesland at all to gate on.
+        def _matches_bl(w) -> bool:
+            wb = (getattr(w, "bundesland", "") or "").strip().lower()
+            return bool(park_bl) and wb == park_bl
+        location: Optional[str] = None
+        if park_bl:
+            location = next(
+                (w.address for w in ts if w.address and _matches_bl(w)),
+                None,
+            )
+        if location is None:
+            location = next((w.address for w in ts if w.address), None)
+
         nl = name.lower()
         is_primary = bool(primary_lc) and (nl in primary_lc or primary_lc in nl)
         parks.append(ParkFacts(
             name=name,
             projectCompany=company,
+            bundesland=park_bl,
             location=location,
             turbineCount=len(ts),
             totalCapacityMw=total_mw,
@@ -2143,6 +2238,26 @@ def generate_report_async(req: GenerateReportRequest, user: CurrentUser = Depend
     pname = req.project_name or "Wind Energy Project"
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Recycle any failed row with the same fingerprint. The dedup
+            # helper above intentionally ignores failed rows so a retry
+            # actually retries instead of returning the stale failure —
+            # but the row IS still in the table and holds the unique
+            # request_fingerprint, so a fresh INSERT would 500 on the
+            # constraint. Clear the carcass (and its FK-less sub-table
+            # rows, mirroring DELETE /report/{id}) before inserting.
+            # Bounded by user_id so we never touch another user's row.
+            cur.execute(
+                "SELECT id FROM ddiq_reports "
+                "WHERE request_fingerprint = %s AND user_id = %s AND status = 'failed'",
+                (fp, uid),
+            )
+            stale_ids = [r[0] for r in cur.fetchall()]
+            for stale_id in stale_ids:
+                cur.execute("DELETE FROM ddiq_classified_parcels WHERE report_id = %s", (stale_id,))
+                cur.execute("DELETE FROM ddiq_contracts WHERE report_id = %s", (stale_id,))
+                cur.execute("DELETE FROM ddiq_project_areas WHERE report_id = %s", (stale_id,))
+                cur.execute("DELETE FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                            (stale_id, uid))
             cur.execute(
                 """INSERT INTO ddiq_reports (id, user_id, org_id, project_name, document_ids, preset,
                                               report_data, status, started_at, progress_step, progress_percent,
@@ -2265,9 +2380,17 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
     T["meta_s"] = round(time.time()-t, 2)
     # Triple fallback: explicit request → LLM-extracted metadata → hard default.
     # The middle term can be None when the LLM returns {"projectName": null}, so
-    # we can't rely on dict.get's default arg here.
-    pname = req.project_name or meta.get("projectName") or "Wind Energy Project"
-    pfor = req.prepared_for or meta.get("preparedFor") or "Client"
+    # we can't rely on dict.get's default arg here. Also reject a refusal
+    # phrase ("Nicht im Kontext enthalten") leaking through as the name —
+    # caught one in KS's first report.
+    _meta_pname = meta.get("projectName")
+    if _looks_like_refusal(_meta_pname) or _looks_like_address(_meta_pname):
+        _meta_pname = None
+    pname = req.project_name or _meta_pname or "Wind Energy Project"
+    _meta_pfor = meta.get("preparedFor")
+    if _looks_like_refusal(_meta_pfor):
+        _meta_pfor = None
+    pfor = req.prepared_for or _meta_pfor or "Client"
     progress("metadata", 0.05)
 
     # ── Build the report object up-front and persist it incrementally as
@@ -2313,7 +2436,8 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
 
         def _usable_name(n: Optional[str]) -> bool:
             return bool(n) and n not in ("Wind Energy Project", "Not specified in documents") \
-                and not _looks_like_address(n)
+                and not _looks_like_address(n) \
+                and not _looks_like_refusal(n)
 
         if _usable_name(_section_pname):
             new_pname = _section_pname
@@ -2490,6 +2614,17 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
         turbine_count = llm_wea_count or doc_count or 0
     report.turbineCount = int(turbine_count or 0)
 
+    # Capture the count divergence so the report can SURFACE it as a note,
+    # not just trust-doc-silently. Lawyer sees header=11 but parks[primary]=7
+    # otherwise reads as a contradiction; with a note attached, it reads as
+    # "doc says 11, we have structural data on 7 — go look for the other 4".
+    count_divergence: Optional[tuple[int, int]] = (
+        (doc_count, llm_wea_count)
+        if (doc_count and llm_wea_count and
+            abs(llm_wea_count - doc_count) > max(2, round(0.25 * doc_count)))
+        else None
+    )
+
     # bundesland: keyword scan on the location string vs. bbox derivation
     # from the geocoded project_center. The bbox derivation is grounded
     # in real coordinates from Nominatim, so it gets the "cadastral"
@@ -2547,7 +2682,10 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
     # composite that merges two parks' specs. Single-park rooms are
     # unaffected: park_facts_list is empty or one entry, multi_park is
     # False, the existing reconciler stands.
-    park_facts_list = _build_park_facts(report.weaStatuses, pname)
+    park_facts_list = _build_park_facts(
+        report.weaStatuses, pname,
+        expected_bundesland=report.bundesland,
+    )
     text_parks = _detect_parks_in_text(
         get_section_value(sections, "overview", "Project Name"),
         get_section_value(sections, "overview", "Number of WEA"),
@@ -2661,6 +2799,22 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
                 + _peer_tail(peers)
             )
 
+    # Single-park or multi-park, an extraction-vs-document count divergence
+    # is a real signal lawyers care about. Don't let it ride silently as a
+    # parks[].turbineCount-vs-header.turbineCount contradiction with no
+    # explanation — surface the gap so a probing reviewer ("you say 11, the
+    # park breakdown says 7?") gets the honest answer ("11 mentioned, 7 with
+    # extracted coordinates"). Skip when the multi-park branch already wrote
+    # a turbineCount note (its degrade-to-unknown narrative trumps this).
+    if count_divergence and "turbineCount" not in multi_park_notes:
+        dc, lc = count_divergence
+        multi_park_notes["turbineCount"] = (
+            f"Im Dokument genannt: {dc} WEA. Strukturiert extrahiert (mit "
+            f"Koordinaten / IDs): {lc} WEA. Die übrigen {dc - lc} sind nur "
+            f"im Fließtext erwähnt und konnten nicht in den WEA-Status "
+            f"übernommen werden."
+        )
+
     facts = ProjectFacts(
         projectName=pname,
         preparedFor=pfor,
@@ -2746,6 +2900,72 @@ def _generate_report_core(rid: str, req: "GenerateReportRequest", user_id, org_i
     report.crossDocFindings = cross_doc_findings
     report.rueckbauBond = rueckbau
     report.grundbuchChecks = grundbuch_checks
+
+    # Path B widened multiPark detection: re-trip ``multiParkDetected`` if
+    # the cross-doc analyzer named a wind park the WEA-tag scan didn't
+    # already know about. Failure mode this guards against: extraction
+    # tags all 7 turbines as Lamstedt, so ``distinct_parks`` had only
+    # one entry → multi_park=False. But the cross-doc analyzer (which
+    # runs over MORE text and catches discrepancies) caught 8 red
+    # findings flagging the Lamstedt/Zodel contamination — and that
+    # signal was being thrown away because ``multiParkDetected`` had
+    # already been frozen earlier. Now any "Windpark X" mention in a
+    # cross-doc finding that ISN'T the already-known set trips the flag,
+    # so the UI's multi-park warning + the contextual-notes degrade
+    # actually fire when they should.
+    if not report.multiParkDetected:
+        xdoc_text = " ".join(
+            (f.text or "")
+            for f in cross_doc_findings
+            if getattr(f, "text", None)
+        )
+        if xdoc_text:
+            xdoc_parks = _detect_parks_in_text(xdoc_text)
+            already_known = {p.name for p in report.parks} | {pname or ""}
+            new_parks = {
+                p for p in xdoc_parks
+                if p not in already_known and p.lower() not in (pname or "").lower()
+            }
+            if new_parks:
+                report.multiParkDetected = True
+                # Cross-doc-only parks (e.g. a neighbouring Windpark whose
+                # documents are scan-based with broken OCR) get NO WEA tags,
+                # so _build_park_facts produced no ParkFacts for them. The
+                # FINDINGS pipeline picks them up just fine (they appear in
+                # crossDocFindings tagged with the park name), but parks[]
+                # was silent — so the UI/lawyer saw "multiParkDetected: true"
+                # with only the subject in parks[], and no place to attach
+                # the other park's findings. Append name-only stubs so each
+                # cross-doc-named park has a row in parks[], even if the
+                # structural fields stay default (we don't fabricate counts).
+                for park_name in sorted(new_parks):
+                    report.parks.append(ParkFacts(
+                        name=park_name,
+                        isPrimary=False,
+                    ))
+                # projectFacts.notes was already written at the earlier
+                # persistence point (single-park assumption). Patch it now
+                # to acknowledge the multi-park context the late signal
+                # revealed, so the UI footer note reads honestly. Keep any
+                # prior notes (e.g. the turbineCount divergence note).
+                xdoc_park_list = ", ".join(sorted(new_parks))
+                if isinstance(report.projectFacts, dict):
+                    pf_notes = dict(report.projectFacts.get("notes") or {})
+                    pf_notes.setdefault("multiParkDetected", (
+                        f"Weitere Parks aus Querverweis-Befunden: "
+                        f"{xdoc_park_list}. Strukturierte WEA-Daten dieser "
+                        f"Parks konnten nicht aus den vorgelegten Dokumenten "
+                        f"extrahiert werden (z. B. scannbasierte Unterlagen "
+                        f"mit unzureichendem OCR). Befunde zu diesen Parks "
+                        f"finden sich im Abschnitt „Dokumentübergreifende "
+                        f"Befunde“ (crossDocFindings)."
+                    ))
+                    report.projectFacts["notes"] = pf_notes
+                logger.info(
+                    "multiParkDetected re-tripped by cross-doc signal: %s "
+                    "(added %d stub ParkFacts)",
+                    sorted(new_parks), len(new_parks),
+                )
     _persist_report_jsonb(rid, pname, req.document_ids, req.preset, report, user_id, org_id)
 
     # Promote material timeline events (urgent / expired) into Findings so
@@ -3056,6 +3276,24 @@ def generate_report(req: GenerateReportRequest, user: CurrentUser = Depends(get_
     # claim: the loser does no pipeline work.
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Recycle any failed row with the same fingerprint, same as the
+            # async path does. Without this the ON CONFLICT below silently
+            # claims nothing → caller hits the 409 race-loser branch even
+            # though there's no race. Real symptom: user clicks Generate
+            # after a failed run on the same docs+preset and gets a 409
+            # (sync path) or 500 (async path) instead of a fresh retry.
+            cur.execute(
+                "SELECT id FROM ddiq_reports "
+                "WHERE request_fingerprint = %s AND user_id = %s AND status = 'failed'",
+                (fp, str(user.id)),
+            )
+            stale_ids = [r[0] for r in cur.fetchall()]
+            for stale_id in stale_ids:
+                cur.execute("DELETE FROM ddiq_classified_parcels WHERE report_id = %s", (stale_id,))
+                cur.execute("DELETE FROM ddiq_contracts WHERE report_id = %s", (stale_id,))
+                cur.execute("DELETE FROM ddiq_project_areas WHERE report_id = %s", (stale_id,))
+                cur.execute("DELETE FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                            (stale_id, str(user.id)))
             cur.execute(
                 """INSERT INTO ddiq_reports
                        (id, user_id, project_name, document_ids, preset,
@@ -3188,6 +3426,49 @@ def get_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
             "project_name": row["project_name"], "report": row["report_data"]}
 
 
+class RenameReportRequest(BaseModel):
+    """Body for PATCH /ddiq/report/{id} — rename a report's project_name."""
+    project_name: str
+
+
+@router.patch("/report/{report_id}")
+def rename_report(report_id: str, body: RenameReportRequest,
+                  user: CurrentUser = Depends(get_current_user)):
+    """User-driven rename of a DDiQ report's project_name.
+
+    The auto-extracted name can be wrong on thin inputs (teaser PDFs,
+    NDAs) — this lets the user fix it without re-running the pipeline.
+    Also updates the projectName field inside report_data so the JSON
+    payload stays consistent with the column.
+
+    Auth: only the owner can rename. Cross-user → 404 (never leak existence).
+    """
+    name = body.project_name.strip()
+    if not name:
+        raise HTTPException(400, "project_name must not be empty")
+    if len(name) > 200:
+        raise HTTPException(400, "project_name too long (max 200 chars)")
+    uid = str(user.id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                (report_id, uid),
+            )
+            if not cur.fetchone():
+                raise HTTPException(404, "Report not found")
+            # Keep the JSONB report_data.projectName in lockstep with the
+            # column. jsonb_set handles missing keys idempotently.
+            cur.execute(
+                """UPDATE ddiq_reports
+                   SET project_name = %s,
+                       report_data = jsonb_set(report_data, '{projectName}', to_jsonb(%s::text), true)
+                   WHERE id = %s AND user_id = %s""",
+                (name, name, report_id, uid),
+            )
+    return {"report_id": report_id, "project_name": name}
+
+
 @router.delete("/report/{report_id}")
 def delete_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
     """Hard-delete a report and all its cadastral artifacts. Idempotent —
@@ -3206,17 +3487,26 @@ def delete_report(report_id: str, user: CurrentUser = Depends(get_current_user))
     delete is structurally impossible.
     """
     uid = str(user.id)
+    celery_task_id: Optional[str] = None
     with get_conn() as conn:
         with conn.cursor() as cur:
             # Phase B-revert: visibility is per-user. The report must
             # belong to the caller; 404 (not 403) on cross-user so we
-            # never leak existence.
+            # never leak existence. Grab celery_task_id while we're
+            # there — if the report is still being generated we need to
+            # revoke the worker task too, otherwise the deleted row's
+            # background LLM calls keep hammering vllm for ~hour and
+            # starve every other user's chat (real incident 2026-05-24:
+            # an orphaned task held vllm at 8 running / 54 waiting for
+            # 33+ minutes after the row was deleted).
             cur.execute(
-                "SELECT 1 FROM ddiq_reports WHERE id = %s AND user_id = %s",
+                "SELECT celery_task_id FROM ddiq_reports WHERE id = %s AND user_id = %s",
                 (report_id, uid),
             )
-            if not cur.fetchone():
+            row = cur.fetchone()
+            if not row:
                 raise HTTPException(404, "Report not found")
+            celery_task_id = row[0]
             # Sub-table cleanup: scope by report_id (unique). The row was
             # already confirmed to belong to the caller above.
             cur.execute(
@@ -3235,6 +3525,19 @@ def delete_report(report_id: str, user: CurrentUser = Depends(get_current_user))
                 "DELETE FROM ddiq_reports WHERE id = %s AND user_id = %s",
                 (report_id, uid),
             )
+    # Best-effort Celery revoke AFTER the DB commit so a Celery outage
+    # never blocks the user's delete. ``terminate=True`` kills the worker
+    # process running this task; Celery auto-respawns the worker so the
+    # ddiq queue keeps draining other tasks.
+    if celery_task_id:
+        try:
+            from worker import app as _celery_app  # type: ignore[import-not-found]
+            _celery_app.control.revoke(celery_task_id, terminate=True, signal="SIGTERM")
+            logger.info("revoked celery task %s for deleted report %s",
+                        celery_task_id, report_id)
+        except Exception as e:  # noqa: BLE001 — best effort; DB row already gone
+            logger.warning("celery revoke failed for task %s (report %s): %s",
+                           celery_task_id, report_id, e)
     return {"deleted": True, "report_id": report_id}
 
 

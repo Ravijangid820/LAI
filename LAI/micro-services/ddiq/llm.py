@@ -168,7 +168,14 @@ Rules:
   Empty array if you have no source. Never fabricate citations.
 - Use null for unknown optional fields. Don't guess monetary amounts or dates.
 - Distinguish formal status (BImSchG §6 erteilt) from construction status (errichtet)
-  from operational status (in Betrieb genommen) — these are different things."""
+  from operational status (in Betrieb genommen) — these are different things.
+- A project / wind farm / WEA SITE address is the geographic location where the
+  turbines stand or are planned (Lageplan, Erläuterungsbericht, Standort,
+  Gemarkung). It is NOT the same as a party's registered office (Sitz,
+  Geschäftsadresse, HRB-Sitz, Hauptsitz, Postanschrift) of the
+  Pächterin/Verpächter/Eigentümer/Projektgesellschaft. When asked for a site or
+  project location, NEVER return a corporate office address — return null if
+  the doc only mentions the office and no site location."""
 
 
 # ── Chat completions ─────────────────────────────────────────────────

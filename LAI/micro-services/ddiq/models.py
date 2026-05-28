@@ -136,6 +136,12 @@ class WEAStatus(BaseModel):
     # data room covering several neighbouring sites doesn't get its facts
     # merged into one false-precise total.
     park: Optional[str] = None
+    # Bundesland this turbine sits in (e.g. "niedersachsen"). Drives the
+    # per-park "most-common bundesland" gate in the address picker, so a
+    # single outlier WEA tagged with the wrong region by the extractor
+    # can't drag the park header into a foreign state. Always lowercase
+    # when set. None when the documents don't pin it down.
+    bundesland: Optional[str] = None
 
 
 class ParkFacts(BaseModel):
@@ -214,6 +220,23 @@ class Finding(BaseModel):
     # a generic legal-basis observation that applies to any park) or the LLM
     # couldn't tell.
     park: Optional[str] = None
+    # Traffic-light alias of ``severity``. Section rows / WEA rows / consistency
+    # rows all carry a separate ``ampel`` field, so consumers (FE, docx export,
+    # CSV export, future JSON API consumers) hit a 50/50 chance of looking for
+    # ``ampel`` here too — and saw ``ampel: null`` on every finding. This is a
+    # serialization-only mirror of ``severity`` so both names resolve to the
+    # same traffic-light value. NOT a separate input — never set this field;
+    # always returns whatever ``severity`` is. The validator below makes the
+    # Pydantic serializer emit it.
+
+    @property
+    def ampel(self) -> Optional[str]:
+        return self.severity if self.severity in ("red", "yellow", "green") else None
+
+    def model_dump(self, **kwargs):  # type: ignore[override]
+        d = super().model_dump(**kwargs)
+        d["ampel"] = self.ampel
+        return d
 
 
 # ── Timeline (P0 #2) ─────────────────────────────────────────────────
