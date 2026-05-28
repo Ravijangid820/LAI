@@ -578,13 +578,13 @@ def _maybe_refresh_session_metadata(session_id: str, user_id: str | None = None)
     if not session_id:
         return
     try:
-        msgs = persistence.list_messages(session_id, user_id=uid)
+        msgs = persistence.list_messages(session_id, user_id=user_id)
     except Exception:
         return
     user_turn_count = sum(1 for m in msgs if m.get("role") == "user")
     if user_turn_count < 1:
         return
-    existing = persistence.get_session_meta(session_id, user_id=uid) or {}
+    existing = persistence.get_session_meta(session_id, user_id=user_id) or {}
     last_n = int(existing.get("_refreshed_at_n_user_turns", 0))
     if user_turn_count - last_n < META_REFRESH_EVERY_N_USER_TURNS and last_n > 0:
         return  # not stale enough, skip
@@ -642,7 +642,7 @@ def _maybe_refresh_session_metadata(session_id: str, user_id: str | None = None)
             if result.get(k):
                 merged[k] = result[k]
         merged["_refreshed_at_n_user_turns"] = user_turn_count
-        persistence.set_session_meta(session_id, merged, user_id=uid)
+        persistence.set_session_meta(session_id, merged, user_id=user_id)
     except Exception as e:
         print(f"[meta] session meta refresh for {session_id} failed: {e}", flush=True)
 
@@ -659,7 +659,7 @@ def _load_history(session_id: str | None, user_id: str | None = None) -> list[di
     if not session_id:
         return []
     try:
-        msgs = persistence.list_messages(session_id, user_id=uid)
+        msgs = persistence.list_messages(session_id, user_id=user_id)
     except Exception:
         return []
     # Keep only the most recent window. Filter to user/assistant (drop any
