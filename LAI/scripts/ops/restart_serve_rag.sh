@@ -216,7 +216,16 @@ restart_ddiq_backend() {
     ( cd "$DDIQ_COMPOSE_DIR" && docker compose build backend worker ) \
         || { log "ddiq: build FAILED — see output above"; return 1; }
     log "ddiq: recreating lai-backend + lai-worker containers..."
-    ( cd "$DDIQ_COMPOSE_DIR" && docker compose up -d --force-recreate backend worker ) \
+    # ``down --remove-orphans`` THEN ``up`` rather than ``up --force-recreate``:
+    # an interrupted force-recreate leaves a half-renamed container holding the
+    # name ("Conflict: container name \"<hash>_lai-backend\" is already in use"),
+    # which then breaks every later recreate until removed by hand. ``down``
+    # clears that. Safe scope: lai_network is external (compose won't remove it)
+    # and the runtime stack (postgres/redis/vLLM) is a SEPARATE compose project,
+    # so this only touches lai-backend + lai-worker.
+    ( cd "$DDIQ_COMPOSE_DIR" \
+        && docker compose down --remove-orphans \
+        && docker compose up -d backend worker ) \
         || { log "ddiq: recreate FAILED — see output above"; return 1; }
     log "ddiq: waiting for /health on :${DDIQ_BACKEND_PORT} (timeout ${DDIQ_HEALTH_TIMEOUT_S}s)..."
     local waited=0
