@@ -1109,9 +1109,47 @@ def _select_relevant_passages(
 # Matter retrieval tuning. ``candidate_k`` passages are pulled by dense
 # KNN, reranked, then the top ``final_k`` are kept and grouped by document.
 # Bounded regardless of data-room size — this is what lets a Matter scale
-# from 3 PDFs to a 300-document VDR with the same prompt budget.
+# from 3 PDFs to a 5000-document VDR with the same prompt budget.
 _MATTER_CANDIDATE_K = 40
 _MATTER_FINAL_K = 12
+
+
+def _matter_adaptive_sizes(n_docs: int) -> tuple[int, int]:
+    """Pick ``(candidate_k, fairness_cap)`` based on session doc count.
+
+    Why this exists: at the original fixed ``candidate_k=40``, a session
+    with 5000 docs × ~10 chunks each = 50K chunks → the top-40 candidates
+    sample 0.08% of the matter, leaving most docs unreachable by retrieval
+    regardless of how cleverly we select from the pool. The fairness pass
+    can only redistribute chunks that made it INTO the pool. So as the
+    matter grows we need a bigger pool, and a bigger per-doc cap.
+
+    Latency budget: the cross-encoder reranker (Qwen3-Reranker-8B on GPU)
+    runs at ~10ms per pair. 250 pairs = ~2.5s — tolerable as the heaviest
+    item on the first-token path. We don't grow beyond that.
+
+    Context budget: each surfaced doc adds ~250-500 tokens of chunk text.
+    At ``fairness_cap=50`` that's ~25K tokens of matter context, plus
+    manifest + corpus + question + system prompt. Stays inside the 32K
+    window; above 50 we'd start squeezing other parts of the prompt.
+
+    Returns ``(candidate_k, fairness_cap)``.
+    """
+    if n_docs <= 12:
+        # Small matter: the legacy budget is already enough to cover
+        # every doc with chunks to spare. Don't pay the rerank cost.
+        return (40, 12)
+    if n_docs <= 30:
+        return (60, 24)
+    if n_docs <= 100:
+        return (120, 36)
+    if n_docs <= 500:
+        return (180, 48)
+    # 500+ docs (true VDR scale): rerank up to 250 pairs, surface up to
+    # 50 docs in the prompt. The remaining docs are accurately reported
+    # as "not surveyed for this question" in the manifest so the LLM
+    # tells the user the truth instead of pretending it covered them.
+    return (250, 50)
 
 
 def _matter_pgvector_context(
@@ -1137,9 +1175,29 @@ def _matter_pgvector_context(
     rc = STATE.get("retrieval_client")
     if rc is None or not question.strip():
         return None
+    # Adaptive sizing: in-scope doc count drives both the candidate pool
+    # and the per-doc fairness cap. Small matters keep tight prompts and
+    # fast latency; VDR-scale matters (hundreds-to-thousands of docs)
+    # get a proportionally larger pool so the dense KNN can actually
+    # reach docs at the tail of the relevance ranking. Only pay this
+    # cost when the caller didn't pin candidate_k themselves.
+    n_docs_in_scope = 0
+    try:
+        all_docs = persistence.list_matter_documents(sid)
+        if focus_doc_indexes:
+            fset = set(focus_doc_indexes)
+            n_docs_in_scope = sum(1 for d in all_docs if d["doc_index"] in fset)
+        else:
+            n_docs_in_scope = sum(1 for d in all_docs if d.get("status") != "failed")
+    except Exception:  # noqa: BLE001 — degrade to defaults if count fails
+        n_docs_in_scope = 0
+    adaptive_candidate_k, adaptive_cap = _matter_adaptive_sizes(n_docs_in_scope)
+    # Caller overrides win (default is the module constant; anything else
+    # came from a deliberate caller, e.g. a thin-context test path).
+    effective_candidate_k = candidate_k if candidate_k != _MATTER_CANDIDATE_K else adaptive_candidate_k
     try:
         qvec = embed_query(question, with_prefix=True)
-        hits = rc.matter_dense_search(sid, qvec, top_k=candidate_k)
+        hits = rc.matter_dense_search(sid, qvec, top_k=effective_candidate_k)
     except Exception as e:  # noqa: BLE001 — fall back, never fail the turn
         print(f"[matter] pgvector search failed ({e}); using fallback", flush=True)
         return None
@@ -1173,8 +1231,70 @@ def _matter_pgvector_context(
     except Exception as exc:  # noqa: BLE001 — degrade to dense order
         print(f"[matter] rerank failed ({exc}); dense order", flush=True)
         rscores = [h.similarity for h in hits]
-    hits = hits[:final_k]
-    rscores = rscores[:final_k]
+    # ── Per-document fairness selection ─────────────────────────────────
+    # The OLD behaviour was ``hits = hits[:final_k]`` — a flat global cut.
+    # In a session with many docs that all have hits, the highest-scoring
+    # ~4-5 docs would dominate the top-12 and the rest never made it into
+    # the prompt. The LLM then honestly told the user "Dok 6, 8, 9, 16,
+    # 17… are left off from the provided source text" (real bug 2026-05-24,
+    # 20-doc Lamstedt session — the chat handle was right, the retrieval
+    # didn't feed it). Since the manifest still listed all docs, the user
+    # was rightly confused: "I uploaded these — why can't you answer?"
+    #
+    # New behaviour: every doc that has at least one rerank hit gets at
+    # least one chunk in the final set, up to a generous per-session cap.
+    # Phase 1 picks the best-scoring chunk from each doc (in order of that
+    # doc's top score). Phase 2 fills any remaining budget with the
+    # next-best chunks regardless of doc. Total budget is the MAX of the
+    # legacy ``final_k`` (12) and the number of docs with hits, capped at
+    # 24 so a 100-doc session can't blow the prompt budget. Within these
+    # bounds an N-doc session yields ~N relevant snippets — bounded,
+    # citation-ready, and no doc is silently dropped.
+    if hits:
+        # Build doc → list of indexes-into-(hits, rscores), preserving the
+        # reranker's order so [0] is each doc's best-scoring chunk.
+        by_doc_pre: dict[int, list[int]] = {}
+        for idx, h in enumerate(hits):
+            by_doc_pre.setdefault(h.doc_index, []).append(idx)
+
+        # Per-doc-fairness upper bound, driven by the adaptive sizing
+        # helper. Small matters use a tight cap (12); VDR-scale matters
+        # grow to ~50, which is the most we can fit without crowding out
+        # corpus context. The pool size grew in lockstep above so up to
+        # ``cap`` distinct docs can plausibly appear in the candidates.
+        fairness_cap = adaptive_cap
+        target_budget = max(final_k, min(len(by_doc_pre), fairness_cap))
+
+        # Phase 1: at least one chunk per doc, doc order = best score.
+        docs_by_score = sorted(
+            by_doc_pre.keys(),
+            key=lambda di: -rscores[by_doc_pre[di][0]],
+        )
+        picked: list[int] = []
+        picked_set: set[int] = set()
+        for di in docs_by_score:
+            if len(picked) >= target_budget:
+                break
+            best_idx = by_doc_pre[di][0]
+            picked.append(best_idx)
+            picked_set.add(best_idx)
+
+        # Phase 2: fill remaining slots with the next-best chunks (any doc).
+        # This lets a high-relevance doc contribute more than one chunk
+        # once everyone has had a turn.
+        if len(picked) < target_budget:
+            for idx in range(len(hits)):
+                if idx in picked_set:
+                    continue
+                picked.append(idx)
+                picked_set.add(idx)
+                if len(picked) >= target_budget:
+                    break
+
+        # Re-order by original rerank rank so "best overall" reads first.
+        picked.sort()
+        hits = [hits[i] for i in picked]
+        rscores = [rscores[i] for i in picked]
 
     # Group the retrieved passages back under their document so the handle
     # stays ``[M-doc_index]`` — consistent with the document list and the
@@ -1209,6 +1329,63 @@ def _matter_pgvector_context(
             page=info["best_page"],
         ))
         combined_parts.append(prompt_text)
+
+    # Focus-mode full-text fallback: when ``focus_doc_indexes`` is set
+    # and a focused doc didn't surface any chunks in the dense top-K
+    # (because the question's embedding ranked OTHER docs in this matter
+    # higher globally), pull the focused doc's full ``doc_text`` straight
+    # from storage and add it as a real prompt source.
+    #
+    # Why this matters: the user explicitly attached a doc and said
+    # "what's in this?" — they expect the model to see THAT doc's
+    # content. Without this fallback, a 26-doc matter where the question
+    # doesn't match the focused doc's vocabulary leaves the LLM with
+    # zero focused content; it correctly refuses ("the content of this
+    # image is not contained in the provided text excerpts"). This is
+    # exactly the bug surfaced when a user attached a WhatsApp screenshot
+    # and asked about it — the dense search returned 30 chunks of legal
+    # contracts (which ranked higher embedding-wise for the generic
+    # question) and the image's 5 chunks never made it in.
+    if focus_doc_indexes:
+        try:
+            focus_set = set(focus_doc_indexes)
+            missing = [di for di in focus_set if di not in by_doc]
+            if missing:
+                docs_with_text = persistence.list_matter_documents(
+                    sid, include_text=True,
+                )
+                by_di = {d["doc_index"]: d for d in docs_with_text}
+                for di in missing:
+                    d = by_di.get(di)
+                    if not d:
+                        continue
+                    text = (d.get("doc_text") or "").strip()
+                    if not text:
+                        continue  # Doc legitimately has no content yet.
+                    fname = d.get("filename") or ""
+                    cite = _matter_cite_id(di)
+                    label = (
+                        f"[M-{di}] {fname}" if fname else f"Dokument M-{di}"
+                    )
+                    # Cap to ~8 KB so a freak 100-page doc can't blow the
+                    # prompt; images / single-page scans land at 2-5 KB.
+                    trimmed = text[:8000]
+                    matter_sources.append(RetrievedSource(
+                        cite_id=cite, source_kind="matter",
+                        text=trimmed, label=label,
+                    ))
+                    matter_chunks.append(ChunkOut(
+                        text=trimmed[:2500], section=fname or label,
+                        law_refs=[], sources=["upload"],
+                        similarity=1.0, rerank_score=1.0,
+                        cite_id=cite, source_kind="matter", page=1,
+                    ))
+                    combined_parts.append(trimmed)
+                    # Mark in by_doc so the baseline-chunk fill below
+                    # doesn't replace this with a "no passage" placeholder.
+                    by_doc[di] = {"_synthetic": True}
+        except Exception as e:  # noqa: BLE001 — degrade silently
+            print(f"[matter] focus full-text fallback failed ({e})", flush=True)
 
     # Baseline chunks for the other documents IN SCOPE this turn (those
     # with no retrieved passage). Without these, [M-n] handles the LLM
@@ -1286,10 +1463,30 @@ def _matter_manifest_prefix(
     extra = len(docs) - cap
     if extra > 0:
         lines.append(f"- … und {extra} weitere Dokumente")
+    # Honest scope-limitation hint at VDR scale. With 5000 docs in a
+    # matter the per-question retrieval can realistically only surface
+    # ~50 docs in the prompt (~25k tokens of chunk text already pushes
+    # the context window). Without this note the LLM answers as if it
+    # had read all 5000 — confident but unverified for the long tail.
+    # Mirrors what ``_matter_adaptive_sizes`` actually surfaces for the
+    # turn so the LLM's framing matches the underlying retrieval budget.
+    n = len(docs)
+    if n > 50 and not focus_doc_indexes:
+        _, _surveyed = _matter_adaptive_sizes(n)
+        scope_hint = (
+            f"\n\nWICHTIG zum Umfang: Bei dieser Mandatsgröße ({n} Dokumente) "
+            f"werden pro Frage die ~{_surveyed} relevantesten Dokumente "
+            "untersucht. Wenn Ihre Antwort sich auf eine Stichprobe stützt, "
+            "machen Sie das transparent — nicht so tun, als sei das gesamte "
+            "Datenraum geprüft worden."
+        )
+    else:
+        scope_hint = ""
     return (
         f"Der Nutzer hat {len(docs)} Dokument(e) in dieses Mandat (Matter) "
         "hochgeladen; sie sind durchsuchbar und per [M-n] zitierbar:\n"
         + "\n".join(lines)
+        + scope_hint
         + "\n\n"
     )
 
@@ -1686,6 +1883,49 @@ _VLM_OCR_PROMPT = (
     "Gib ausschließlich die reine Transkription aus."
 )
 
+# Image-upload prompt — used by ``_vlm_ocr_image_file`` for raw .png / .jpg /
+# .webp / .tiff / .bmp uploads. Two reasons it can't share ``_VLM_OCR_PROMPT``:
+#
+#   1. Pure OCR returns an EMPTY string on a no-text image (a photo of a
+#      wind turbine, a diagram, a site map) — which then indexes zero
+#      passages, retrieval finds nothing, and the model refuses to answer
+#      "what is in this image?". Useless for the demo.
+#   2. An image upload is the user's deliberate way of saying "look at
+#      THIS thing" — they want the model to understand the visual content,
+#      not just transcribe pixels-as-glyphs. Scanned PDFs (handled by the
+#      strict OCR prompt above) have the opposite contract: be faithful
+#      to the printed text, don't editorialize.
+#
+# The prompt asks for BOTH a sober visual description AND a verbatim
+# transcription of any visible text, in one Markdown response — so the
+# resulting passages cover "what does the image depict?" and "what does
+# the visible text say?" with one ingestion pass and one embed.
+_VLM_IMAGE_DESCRIBE_PROMPT = (
+    "Du analysierst ein hochgeladenes Bild für ein deutsches Rechts- und "
+    "Energierecht-RAG-System (Schwerpunkt Windenergie, Genehmigungen, "
+    "Verträge). Erzeuge eine vollständige Markdown-Beschreibung, die "
+    "zwei Aufgaben erfüllt:\n"
+    "\n"
+    "1. **Visueller Inhalt** — beschreibe sachlich, was zu sehen ist: "
+    "Objekte, Personen, Szenen, technische Anlagen, Gebäude, Fahrzeuge, "
+    "Diagramme, Karten, Tabellen, Layouts. Nenne Hersteller, Anlagen- "
+    "oder Modelltypen, Standorte, wenn erkennbar.\n"
+    "2. **Sichtbarer Text** — transkribiere JEDEN sichtbaren Text exakt: "
+    "Schilder, Beschriftungen, Stempel, Unterschriften, Vertragsinhalt, "
+    "Tabellen, Formulare. Strukturiere als Markdown (Überschriften, "
+    "Tabellen, Listen wie im Bild sichtbar).\n"
+    "\n"
+    "Regeln:\n"
+    "- Antworte auf Deutsch.\n"
+    "- Erfinde NICHTS — wenn etwas unklar oder unleserlich ist, schreibe "
+    "das ehrlich.\n"
+    "- Übersetze nicht, kommentiere nicht über das Beschriebene hinaus.\n"
+    "- Wenn ein Abschnitt nicht zutrifft (z.B. kein sichtbarer Text, "
+    "oder keine identifizierbaren Objekte), lass ihn weg.\n"
+    "- Wenn das Bild leer, schwarz, oder völlig unleserlich ist, gib "
+    "exakt zurück: 'Bild ist nicht interpretierbar.'"
+)
+
 
 def _pdf_has_text_layer(file_bytes: bytes) -> bool:
     """True if the PDF carries an extractable text layer (i.e. it is NOT a
@@ -1727,10 +1967,17 @@ def _render_pdf_to_images(file_bytes: bytes, dpi: int = _VLM_OCR_DPI) -> list[by
         return [p.read_bytes() for p in pngs]
 
 
-def _vlm_ocr_image(png_bytes: bytes) -> str:
-    """Transcribe one page image with the on-prem vision LLM. Returns the
-    page's text as Markdown. Raises on transport / HTTP error so the caller
-    can fall back to docling."""
+def _vlm_ocr_image(png_bytes: bytes, prompt: str | None = None) -> str:
+    """Run one image through the on-prem vision LLM. Returns the model's
+    response as Markdown text. Raises on transport / HTTP error so the
+    caller can fall back to docling.
+
+    ``prompt`` selects the task:
+      • ``None`` / omitted → :data:`_VLM_OCR_PROMPT` (strict OCR for a
+        scanned-PDF page; this is the legacy ``_vlm_ocr_pdf`` path).
+      • :data:`_VLM_IMAGE_DESCRIBE_PROMPT` → describe + transcribe for a
+        raw image upload, so non-text images yield indexable content.
+    """
     if STATE["llm_api_url"] is None:
         raise RuntimeError("VLM OCR requires the remote vLLM endpoint")
     url = STATE["llm_api_url"].rstrip("/") + "/v1/chat/completions"
@@ -1740,7 +1987,7 @@ def _vlm_ocr_image(png_bytes: bytes) -> str:
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": _VLM_OCR_PROMPT},
+                {"type": "text", "text": prompt or _VLM_OCR_PROMPT},
                 {"type": "image_url",
                  "image_url": {"url": f"data:image/png;base64,{b64}"}},
             ],
@@ -1753,6 +2000,108 @@ def _vlm_ocr_image(png_bytes: bytes) -> str:
     r.raise_for_status()
     obj = r.json()
     return (obj["choices"][0]["message"]["content"] or "").strip()
+
+
+def _vlm_ocr_image_file(
+    file_bytes: bytes, filename: str, on_progress=None,
+) -> tuple[str, int, list[dict]]:
+    """OCR a raw image file (.png, .jpg, .webp, .tiff, .bmp) with the vision LLM.
+
+    Single-page formats produce a 1-page transcription; multi-page TIFFs
+    are iterated frame-by-frame so a scanned-and-faxed multi-page TIFF
+    works the same as a scanned PDF would. The output mirrors
+    :func:`_vlm_ocr_pdf`: ``(markdown, num_pages, tables)`` with each page
+    prefixed by a ``<!-- Seite N -->`` marker so the existing chunker /
+    citation pipeline attaches a page number to every passage. Tables
+    are left empty (the analyzer already lifts Markdown tables out of
+    the OCR markdown when present).
+
+    Normalization details:
+      • Decoded via Pillow → converted to RGB (drop alpha; some VLMs
+        choke on RGBA / palette mode).
+      • Downsized to a 2400 px longest edge so a giant phone photo
+        doesn't blow the VLM's input-token budget while preserving
+        legible glyph detail.
+      • Re-encoded as PNG before being handed to ``_vlm_ocr_image`` —
+        which is hard-coded to send ``data:image/png;base64``. Doing the
+        normalization here lets that function stay unchanged.
+
+    Failure modes match :func:`_vlm_ocr_pdf`: if a page transcription
+    raises, retry up to ``_VLM_OCR_PAGE_ATTEMPTS`` times; only if it
+    STILL fails do we propagate so the caller can degrade to docling.
+    """
+    # Local PIL import keeps Pillow off the cold-path import graph —
+    # nothing else in this file needs it.
+    from PIL import Image, ImageSequence  # noqa: PLC0415
+
+    _MAX_EDGE_PX = 2400
+    img = Image.open(io.BytesIO(file_bytes))
+    # Materialize all frames up-front. Pillow's ImageSequence.Iterator is
+    # lazy and shares the underlying file handle; copying each frame
+    # decouples them so a sequence-rewind can't corrupt later reads.
+    frames: list = [frame.copy() for frame in ImageSequence.Iterator(img)]
+    total = len(frames) or 1
+    if on_progress is not None:
+        on_progress(0, total)
+
+    def _to_png_bytes(frame) -> bytes:
+        # Drop alpha / palette quirks → RGB only.
+        if frame.mode not in ("RGB", "L"):
+            frame = frame.convert("RGB")
+        # Downsize if oversized — thumbnail() preserves aspect ratio and
+        # is a no-op when the image is already within bounds.
+        w, h = frame.size
+        if max(w, h) > _MAX_EDGE_PX:
+            frame.thumbnail((_MAX_EDGE_PX, _MAX_EDGE_PX), Image.LANCZOS)
+        buf = io.BytesIO()
+        frame.save(buf, format="PNG", optimize=False)
+        return buf.getvalue()
+
+    parts: list[str] = [""] * total
+    pending = list(range(total))
+    done = 0
+    for attempt in range(1, _VLM_OCR_PAGE_ATTEMPTS + 1):
+        if not pending:
+            break
+        failed: list[int] = []
+        # For images we run the pages serially — most uploads are one
+        # page (single photo / single scan), and even a multi-page TIFF
+        # is usually short. A worker pool would only matter at >5 pages
+        # and we'd want to share the same retry contract as ``_vlm_ocr_pdf``.
+        for idx in pending:
+            try:
+                png = _to_png_bytes(frames[idx])
+                # Image uploads use the describe-AND-transcribe prompt so a
+                # non-text image (photo of an anlage, a diagram, a map)
+                # still yields indexable text — strict OCR would return
+                # empty markdown and the model would have nothing to cite.
+                parts[idx] = _vlm_ocr_image(png, prompt=_VLM_IMAGE_DESCRIBE_PROMPT)
+                if attempt == 1:
+                    done += 1
+                    if on_progress is not None:
+                        on_progress(done, total)
+            except Exception as exc:  # noqa: BLE001 — retried; final attempt propagates
+                if attempt == _VLM_OCR_PAGE_ATTEMPTS:
+                    raise RuntimeError(
+                        f"VLM OCR failed for image {filename!r} "
+                        f"page {idx + 1}/{total}: {exc}"
+                    ) from exc
+                failed.append(idx)
+        pending = failed
+
+    # Only emit a page marker for pages that produced real content. If a
+    # page came back empty (e.g. the model judged the frame "nicht
+    # interpretierbar"), suppress its marker so ``_split_into_passages``
+    # doesn't index a hollow ``<!-- Seite N -->`` HTML comment as a
+    # phantom passage — that previously made the chip flip to "done"
+    # with ``n_chunks=1`` even though there was nothing searchable.
+    md_parts: list[str] = []
+    for i in range(total):
+        text = (parts[i] or "").strip()
+        if not text:
+            continue
+        md_parts.append(f"<!-- Seite {i + 1} -->\n{text}")
+    return "\n\n".join(md_parts), total, []
 
 
 def _vlm_ocr_pdf(file_bytes: bytes, on_progress=None) -> tuple[str, int, list[dict]]:
@@ -1828,6 +2177,19 @@ def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int, list[di
     Returns (markdown_text, num_pages, tables).
         tables: list of {"title", "rows": [{col_label: cell, ...}, ...]}
     """
+    # Early empty-bytes guard. Without this, an empty file (zero bytes
+    # received from the multipart, or a 0-byte file on disk) flows into
+    # Docling/pdfium which surfaces the cryptic "Input document /tmp/…
+    # is not valid." — same message Docling uses for genuinely corrupt
+    # PDFs. The retry below then dutifully repeats the failure with a
+    # second meaningless temp path. Make the actual cause loud so the
+    # error reaches the chip + log as "PDF is empty (0 bytes)" instead.
+    if not file_bytes:
+        raise RuntimeError(
+            f"Uploaded file '{filename}' is empty (0 bytes) — "
+            "nothing to parse. The file was likely truncated or aborted "
+            "mid-upload; please try again."
+        )
     suffix = Path(filename).suffix.lower()
     if suffix in (".txt", ".md", ".markdown"):
         try:
@@ -1912,17 +2274,31 @@ def docling_convert(file_bytes: bytes, filename: str) -> tuple[str, int, list[di
     raise RuntimeError(f"docling_convert exhausted retries: {last_err}")
 
 
+_IMAGE_OCR_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp"}
+
+
 def convert_document(
     file_bytes: bytes, filename: str, on_progress=None,
 ) -> tuple[str, int, list[dict]]:
-    """Top-level ingestion entry point. Routes scanned PDFs through the
-    vision-LLM OCR path (accurate on degraded German scans where Tesseract
-    fails) and everything else through docling.
+    """Top-level ingestion entry point. Routes scanned PDFs and raw images
+    through the vision-LLM OCR path (accurate on degraded German scans
+    where Tesseract fails) and everything else through docling.
 
     Returns ``(markdown, num_pages, tables)`` — same contract as
     :func:`docling_convert`, so callers are unaffected. ``on_progress(done,
     total)`` is forwarded to the page-by-page OCR loop when the scanned-PDF
-    path is taken (the docling path has no per-page hook).
+    or image path is taken (the docling path has no per-page hook).
+
+    Routing matrix:
+      • ``.pdf`` with no text layer → :func:`_vlm_ocr_pdf` (per-page VLM).
+      • ``.png/.jpg/.jpeg/.webp/.tiff/.bmp`` → :func:`_vlm_ocr_image_file`
+        (one VLM call per image / TIFF frame). Docling has no robust
+        image-input pipeline pre-configured here, so the VLM is the
+        only safe path — and on a failure we degrade gracefully (the
+        ingestion row is marked ``failed`` upstream so the user sees
+        a red chip instead of a silently-empty doc).
+      • Everything else (text-layer PDF, .docx, .xlsx, .txt, .csv, .md)
+        → docling, unchanged.
     """
     suffix = Path(filename).suffix.lower()
     if (
@@ -1942,6 +2318,38 @@ def convert_document(
         except Exception as e:  # noqa: BLE001 — degrade to docling, never fail upload
             print(f"[ingest] VLM OCR failed for {filename!r} ({e}) — "
                   "falling back to docling", flush=True)
+    elif (
+        _VLM_OCR_ENABLED
+        and suffix in _IMAGE_OCR_EXTS
+        and STATE["llm_api_url"] is not None
+    ):
+        # Image-only ingestion. Docling can't usefully OCR a raw PNG/JPG
+        # without an extra OCR engine wired in; the VLM path already
+        # handles scanned-PDF pages as images, so reusing it for raw
+        # images is the minimal-surface route.
+        try:
+            md, num_pages, tables = _vlm_ocr_image_file(
+                file_bytes, filename, on_progress=on_progress,
+            )
+            if md.strip():
+                print(f"[ingest] VLM OCR (image): {num_pages} page(s) "
+                      f"transcribed for {filename!r}", flush=True)
+                return md, num_pages, tables
+            print(f"[ingest] VLM OCR (image) returned empty for "
+                  f"{filename!r}", flush=True)
+            # No useful text — return empty markdown so the chip flips
+            # to "done" with n_chunks=0 (honest). The previous sentinel
+            # ``<!-- Seite 1 -->`` got indexed as a phantom passage and
+            # made the chip claim 1 chunk that wasn't searchable.
+            return "", num_pages or 1, []
+        except Exception as e:  # noqa: BLE001 — record + degrade, never crash
+            print(f"[ingest] VLM OCR (image) failed for {filename!r} "
+                  f"({e})", flush=True)
+            # Re-raise so ``_ingest_document_job`` marks the doc 'failed'
+            # with a real error message — docling has no usable fallback
+            # for a raw image here, and silently returning empty would
+            # mask the failure in the UI.
+            raise
     return docling_convert(file_bytes, filename)
 
 
@@ -2020,7 +2428,15 @@ def _ingest_document_job(
     """
     try:
         persistence.update_matter_progress(doc_id, status="processing")
-        path = persistence.matter_document_path(sid, doc_id)
+        # Pass the exact extension derived from the filename instead of
+        # letting ``matter_document_path`` guess. Without this, image
+        # uploads (.jpeg/.png/.webp/.tiff/.bmp) failed at ingestion with
+        # "uploaded file not found on disk" because the fallback list
+        # only knew document extensions. With ``ext`` passed explicitly
+        # we always look up the right path regardless of which formats
+        # the fallback list knows about.
+        ext_hint = Path(filename).suffix.lower() or None
+        path = persistence.matter_document_path(sid, doc_id, ext=ext_hint)
         if path is None:
             raise RuntimeError("uploaded file not found on disk")
         contents = path.read_bytes()
@@ -2337,6 +2753,18 @@ class UploadResp(BaseModel):
     # send ``focus_doc_indexes=[n]`` — scoping the answer to ONLY the
     # docs the user just attached, instead of every prior matter doc.
     doc_index: int
+    # Set when the upload was a same-name match against an existing
+    # matter_documents row. The FE pre-filter blocks most duplicates
+    # already; this flag covers the second-tab / direct-API / race
+    # cases where the bytes still hit the server. When true the server
+    # SKIPPED save_matter_upload + _enqueue_ingestion (no double bytes,
+    # no double chunks), so the row's state is whatever it already was,
+    # and the FE renders a "already in the project" toast.
+    deduplicated: bool = False
+
+
+class SessionCreatedResp(BaseModel):
+    session_id: str
 
 
 class IssueOut(BaseModel):
@@ -2554,6 +2982,29 @@ async def lifespan(app: FastAPI):
     app.state.get_current_user = get_current_user
     print("[startup]   auth: router mounted at /auth/*", flush=True)
 
+    # ── Resumable upload (tus 1.0) — Phase 2 of upload reliability ──────
+    # Self-contained impl; the completion hook calls the same ingest
+    # pipeline /upload uses. Gated client-side by VITE_RESUMABLE_UPLOAD.
+    # See LAI/docs/UPLOAD_RESUMABLE_DESIGN.md.
+    from lai.api.upload_tus import build_tus_router, gc_stale_uploads
+    app.include_router(
+        build_tus_router(
+            get_current_user=get_current_user,
+            finalize=_finalize_tus_upload,
+        ),
+        prefix="/tus",
+    )
+    # Best-effort cleanup of any uploads abandoned across a serve_rag
+    # restart. Safe to run synchronously — typically a no-op or a handful
+    # of orphan dirs.
+    try:
+        purged = gc_stale_uploads()
+        if purged:
+            print(f"[startup]   tus: gc'd {purged} stale upload(s)", flush=True)
+    except Exception as e:  # noqa: BLE001 — best effort
+        print(f"[startup]   tus: gc skipped ({e})", flush=True)
+    print("[startup]   tus: router mounted at /tus/files/*", flush=True)
+
     print("[startup] READY", flush=True)
     try:
         yield
@@ -2583,6 +3034,20 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # tus 1.0 returns several headers the browser must let the SPA read.
+    # Without this list, fetch() on the same origin works but cross-origin
+    # tus calls (dev → 192.168.x.y) see ``upload.url`` as null and the
+    # ``Upload-Metadata`` round-trip silently drops the doc_index.
+    expose_headers=[
+        "Location",
+        "Upload-Offset",
+        "Upload-Length",
+        "Upload-Metadata",
+        "Tus-Resumable",
+        "Tus-Version",
+        "Tus-Max-Size",
+        "Tus-Extension",
+    ],
 )
 
 # ── Prometheus HTTP-level instrumentation (TRACK_B_TIMING §6) ───────────────
@@ -3572,6 +4037,121 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
     )
 
 
+@app.post("/sessions", response_model=SessionCreatedResp)
+async def create_session(
+    user: CurrentUser = Depends(get_current_user),
+) -> SessionCreatedResp:
+    """Mint an empty session row and return its id.
+
+    Why: the folder/multi-file drop flow needs to know ``session_id``
+    BEFORE any upload's response arrives, so the FE can fire all N
+    uploads in parallel against ONE session. Without this, parallel
+    uploads to a brand-new conversation each race to create their own
+    session and N files scatter across N data rooms.
+
+    The row is created empty (no filename / contract_text). The first
+    upload that follows treats it exactly like a pre-existing session —
+    no legacy ``save_session`` overwrite of the filename, no soft race
+    on the legacy single-doc disk blob. Owner is the caller; org is
+    stamped from their JWT.
+    """
+    sid = str(uuid.uuid4())
+    persistence.save_session(sid, {
+        "user_id": str(user.id),
+        "org_id": _org_or_none(user),
+        "filename": None,
+        "contract_text": None,
+        "n_pages": 0,
+        "tables": [],
+        "uploaded_at": time.time(),
+        "clauses": None,
+        "analysis": None,
+    })
+    return SessionCreatedResp(session_id=sid)
+
+
+def _finalize_tus_upload(
+    user: CurrentUser, info: dict, file_bytes: bytes,
+) -> dict:
+    """Completion hook for the tus router. Mirrors the synchronous half of
+    POST /upload — validate session ownership, register a matter_documents
+    row, persist the blob, enqueue background ingestion — and returns
+    ``{"doc_index", "session_id"}`` for the client.
+
+    Kept inline in serve_rag (not in upload_tus.py) because it touches
+    nearly every module-local helper (persistence, _enqueue_ingestion,
+    _org_or_none) — moving it would force a bunch of cross-imports for
+    no readability gain. The legacy /upload body could be refactored to
+    share this helper later; for now they are intentional duplicates so
+    a fix to one doesn't accidentally break the other.
+    """
+    uid = str(user.id)
+    org_id = _org_or_none(user)
+    sid = info.get("session_id") or str(uuid.uuid4())
+    session_already_exists = persistence.session_exists(sid, user_id=uid)
+    if info.get("session_id") and not session_already_exists:
+        raise HTTPException(404, "session_id not found")
+    if len(file_bytes) == 0:
+        # Same guard as POST /upload — refuse to register a matter row
+        # for a zero-byte upload. The tus router shouldn't normally let
+        # a 0-byte upload reach completion (Upload-Length=0 is rejected
+        # at create), but a half-aborted PATCH leaving 0 bytes can
+        # technically still land here.
+        raise HTTPException(422, "Uploaded file is empty (0 bytes received)")
+    if len(file_bytes) > 100 * 1024 * 1024:
+        raise HTTPException(413, "File too large (max 100 MB)")
+    fname = Path(info.get("filename") or "uploaded.bin").name or "uploaded.bin"
+
+    is_legacy_first_upload = not session_already_exists
+    upload_ext = (
+        persistence.save_upload(sid, file_bytes, fname)
+        if is_legacy_first_upload
+        else (Path(fname).suffix.lower() or ".bin")
+    )
+    if is_legacy_first_upload:
+        persistence.save_session(sid, {
+            "user_id": uid, "org_id": org_id, "filename": fname,
+            "contract_text": None, "n_pages": 0, "tables": [],
+            "uploaded_at": time.time(), "clauses": None, "analysis": None,
+            "upload_ext": upload_ext,
+        })
+    doc = persistence.add_matter_document(
+        sid, filename=fname, doc_text="", n_pages=0,
+        upload_ext=upload_ext, user_id=uid, org_id=org_id, status="queued",
+    )
+    if doc is None:
+        raise HTTPException(404, "session_id not found")
+    # See POST /upload above — same rationale: skip blob copy and
+    # ingestion enqueue when add_matter_document reported a same-name
+    # hit, so we don't overwrite the on-disk bytes or duplicate the
+    # matter_chunks rows for the existing [M-n].
+    if doc.get("__dedup_existing"):
+        return {
+            "doc_index": str(doc["doc_index"]),
+            "session_id": sid,
+            "deduplicated": True,
+        }
+    # Failed-row retry — wipe pgvector chunks (defensive), reset state,
+    # then fall through to overwrite the blob + re-enqueue ingestion.
+    # See POST /upload for the long rationale.
+    if doc.get("__dedup_failed_retry"):
+        rc = STATE.get("retrieval_client")
+        if rc is not None:
+            try:
+                rc.delete_matter_chunks(sid, doc_index=int(doc["doc_index"]))
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[retry] matter_chunks cleanup failed for "
+                    f"{sid}/M-{doc['doc_index']}: {exc}",
+                    flush=True,
+                )
+        persistence.reset_matter_document_for_retry(doc["id"])
+    persistence.save_matter_upload(sid, doc["id"], file_bytes, fname)
+    persistence.set_session_filename_if_unset(sid, fname)
+    _enqueue_ingestion(sid, doc["id"], doc["doc_index"], fname, True)
+    return {"doc_index": str(doc["doc_index"]), "session_id": sid}
+
+
 @app.post("/upload", response_model=UploadResp)
 async def upload(
     file: UploadFile = File(...),
@@ -3582,13 +4162,37 @@ async def upload(
     org_id = _org_or_none(user)
     sid = session_id or str(uuid.uuid4())
     # If the caller supplied an existing session_id, it MUST be theirs.
-    if session_id and not persistence.session_exists(sid, user_id=uid):
+    session_already_exists = persistence.session_exists(sid, user_id=uid)
+    if session_id and not session_already_exists:
         raise HTTPException(404, "session_id not found")
 
     contents = await file.read()
+    if len(contents) == 0:
+        # Reject empty uploads BEFORE the matter row is created. The
+        # browser sometimes sends a multipart with a 0-byte body (drag
+        # cancelled mid-stream, file was concurrently deleted on disk,
+        # or a flaky network closed the stream after headers but before
+        # bytes). Without this guard the row gets created, an empty
+        # file gets persisted, Docling chokes 30s later with the
+        # cryptic "Input document … is not valid", and the user sees
+        # "Fehlgeschlagen" with no actionable reason. 422 is the right
+        # status — the request was syntactically valid but semantically
+        # rejected.
+        raise HTTPException(422, "Uploaded file is empty (0 bytes received)")
     if len(contents) > 100 * 1024 * 1024:
         raise HTTPException(413, "File too large (max 100 MB)")
-    fname = file.filename or "uploaded.pdf"
+    # ``Path(...).name`` strips any folder prefix the browser may have baked
+    # into the multipart filename. Observed in Chromium on macOS when a user
+    # drags a FOLDER: the resulting ``File.name`` was the relative path
+    # (e.g. ``lai-test-drop/01_foo.pdf``) instead of the leaf. The prefix
+    # then flowed through to ``matter_documents.filename`` and the FE chip's
+    # filename⇄backend lookup missed (filenames didn't match), so every file
+    # showed "Not in this session — upload again" forever. Normalizing here
+    # makes the leaf canonical regardless of which browser or drag-source
+    # built the multipart. The FE has the same leaf-rebuild in the folder
+    # walker (``lib/dropFiles.ts``); this is the server-side belt to its
+    # client-side suspenders.
+    fname = Path(file.filename or "uploaded.pdf").name or "uploaded.pdf"
 
     # ── Non-blocking ingestion ──────────────────────────────────────────
     # We do ONLY the fast, synchronous work here (save bytes, create the
@@ -3596,16 +4200,25 @@ async def upload(
     # The slow OCR + embed + index runs in the background pool so a single
     # upload — or 2000 of them — never hangs the UI. The client polls
     # GET /sessions/{id}/documents for per-document status + progress.
-    existing = persistence.list_matter_documents(sid, user_id=uid) if persistence.session_exists(sid, user_id=uid) else []
-    is_first = len(existing) == 0
+    #
+    # Legacy single-doc bookkeeping (the ``<sid><ext>`` blob on disk +
+    # ``sessions.filename``) is only relevant when this /upload is the
+    # one creating the session — i.e. the historical "POST /upload with
+    # no session_id" flow. When the caller pre-created the session via
+    # POST /sessions (the parallel-upload flow), we skip both: writing
+    # them concurrently from N parallel uploads would race on
+    # ``sessions.filename`` (last-write-wins) and on the legacy disk
+    # path. ``add_matter_document`` itself is race-safe (atomic
+    # MAX(doc_index)+1 under the connection lock + a UNIQUE index).
+    is_legacy_first_upload = not session_already_exists
 
-    # Legacy single-file blob on disk (first doc only — preserves the old
-    # <sid><ext> path the existing preview endpoint reads).
-    upload_ext = persistence.save_upload(sid, contents, fname) if is_first else (
-        Path(fname).suffix.lower() or ".bin"
+    upload_ext = (
+        persistence.save_upload(sid, contents, fname)
+        if is_legacy_first_upload
+        else (Path(fname).suffix.lower() or ".bin")
     )
 
-    if is_first:
+    if is_legacy_first_upload:
         # Session created with empty contract_text; the worker fills it
         # from the first document once OCR completes.
         persistence.save_session(sid, {
@@ -3620,8 +4233,6 @@ async def upload(
             "analysis": None,
             "upload_ext": upload_ext,
         })
-    elif not persistence.session_exists(sid, user_id=uid):
-        raise HTTPException(404, "session_id not found")
 
     doc = persistence.add_matter_document(
         sid, filename=fname, doc_text="", n_pages=0,
@@ -3629,12 +4240,63 @@ async def upload(
     )
     if doc is None:
         raise HTTPException(404, "session_id not found")
+    # Same-name dedup hit — the file is already in this matter. Skip the
+    # blob copy + ingestion enqueue so we don't (a) overwrite the on-disk
+    # bytes with whatever the second caller uploaded (which may be
+    # different content under the same name — silent overwrite is worse
+    # than rejecting), and (b) re-index the doc, which would append a
+    # second set of chunks to matter_chunks under the same doc_id.
+    # Returns the existing [M-n] handle so the FE can mark its
+    # optimistic chip "ready" without re-uploading.
+    if doc.get("__dedup_existing"):
+        return UploadResp(
+            session_id=sid, filename=fname,
+            pages=int(doc.get("n_pages") or 0), chunks=0,
+            doc_index=doc["doc_index"],
+            deduplicated=True,
+            message=(
+                f"„{fname}“ ist bereits im Matter ([M-{doc['doc_index']}]) — "
+                f"erneutes Hochladen übersprungen."
+            ),
+        )
+    # Same-name match against a FAILED row — user is retrying after the
+    # previous attempt died (commonly: 0-byte multipart, corrupted bytes,
+    # Docling exception). Defensively wipe any stale pgvector entries
+    # (failed rows usually never indexed, but partial chunking is
+    # possible), reset the row's state to 'queued', then fall through
+    # to the normal save + enqueue path so the worker re-processes the
+    # fresh bytes. ``doc_index`` is preserved so the FE chip / any open
+    # citations don't shift.
+    if doc.get("__dedup_failed_retry"):
+        rc = STATE.get("retrieval_client")
+        if rc is not None:
+            try:
+                rc.delete_matter_chunks(sid, doc_index=int(doc["doc_index"]))
+            except Exception as exc:  # noqa: BLE001 — proceed with reset
+                print(
+                    f"[retry] matter_chunks cleanup failed for "
+                    f"{sid}/M-{doc['doc_index']}: {exc}",
+                    flush=True,
+                )
+        persistence.reset_matter_document_for_retry(doc["id"])
     # Per-document file copy on disk — the worker reads this back for OCR,
     # and every [M-n] has a previewable original.
     persistence.save_matter_upload(sid, doc["id"], contents, fname)
+    # Sidebar-title fallback. For sessions minted via POST /sessions we
+    # skipped the legacy save_session above; without this, the sidebar
+    # would show "Untitled chat" because COALESCE(title, filename, …)
+    # has no filename. Race-safe across parallel uploads (UPDATE …
+    # WHERE filename IS NULL → first-arriving wins, rest no-op).
+    persistence.set_session_filename_if_unset(sid, fname)
 
-    # Hand off to the background pool and return at once.
-    _enqueue_ingestion(sid, doc["id"], doc["doc_index"], fname, is_first)
+    # Hand off to the background pool and return at once. Pass
+    # ``is_first=True`` unconditionally — :func:`persistence.set_session_contract`
+    # is guarded by ``WHERE contract_text IS NULL`` so only the first
+    # ingestion to finish actually writes it; subsequent calls are
+    # no-ops. This preserves the legacy analyze-contract path on
+    # pre-created sessions (POST /sessions then a single /upload) while
+    # staying race-safe under parallel uploads to one session.
+    _enqueue_ingestion(sid, doc["id"], doc["doc_index"], fname, True)
 
     return UploadResp(
         session_id=sid, filename=fname, pages=0, chunks=0,
@@ -4127,6 +4789,13 @@ def get_session_document(
         ".doc":  "application/msword",
         ".txt":  "text/plain; charset=utf-8",
         ".md":   "text/markdown; charset=utf-8",
+        ".png":  "image/png",
+        ".jpg":  "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".tif":  "image/tiff",
+        ".tiff": "image/tiff",
+        ".bmp":  "image/bmp",
     }.get(ext, "application/octet-stream")
 
     # Filename for the inline disposition. Falls back to the session id
@@ -4147,6 +4816,13 @@ _MEDIA_TYPES = {
     ".doc":  "application/msword",
     ".txt":  "text/plain; charset=utf-8",
     ".md":   "text/markdown; charset=utf-8",
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".tif":  "image/tiff",
+    ".tiff": "image/tiff",
+    ".bmp":  "image/bmp",
 }
 
 
@@ -4230,6 +4906,46 @@ def get_matter_document_endpoint(
         media_type=media_type,
         headers={"Content-Disposition": f'inline; filename="{display_name}"'},
     )
+
+
+@app.delete("/sessions/{session_id}/documents/{doc_index}")
+def delete_matter_document_endpoint(
+    session_id: str, doc_index: int,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Hard-delete one matter document from a session.
+
+    Removes three things atomically-from-the-user's-perspective:
+      1. The pgvector embeddings for that ``[M-n]`` (so retrieval can no
+         longer surface its passages on later turns).
+      2. The ``matter_documents`` row.
+      3. The on-disk file bytes.
+
+    Owner-only — sharing is view-only in v1 (Path A Step 2), so a shared
+    collaborator gets a 404 (no existence leak). The ``doc_index`` value
+    is NOT reused after deletion: ``add_matter_document`` always
+    allocates ``MAX(doc_index)+1``, so any existing ``[M-n]`` citations
+    in old chat history won't silently re-point at a different doc.
+
+    Order matters: embeddings come down BEFORE the row, so a concurrent
+    query can't briefly retrieve passages from a doc whose row has
+    already vanished (it would render in the citation panel as
+    "not available" — confusing). Disk file last (best-effort).
+    """
+    uid = str(user.id)
+    rc = STATE.get("retrieval_client")
+    if rc is not None:
+        try:
+            rc.delete_matter_chunks(session_id, doc_index=int(doc_index))
+        except Exception as e:  # noqa: BLE001 — proceed with DB delete anyway
+            print(f"[delete] matter_chunks cleanup failed for "
+                  f"{session_id}/M-{doc_index}: {e}", flush=True)
+    info = persistence.delete_matter_document(
+        session_id, int(doc_index), user_id=uid,
+    )
+    if info is None:
+        raise HTTPException(404, "document not found in this session")
+    return {"ok": True, "doc_index": int(doc_index), "filename": info.get("filename")}
 
 
 @app.delete("/sessions/{session_id}")

@@ -27,6 +27,7 @@ Public API
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -383,17 +384,45 @@ def save_session(sid: str, data: dict) -> None:
         )
 
 
+def set_session_filename_if_unset(sid: str, fname: str) -> None:
+    """Set the session's ``filename`` field iff it hasn't been set yet.
+
+    The sidebar title resolves via COALESCE(title, filename, first message,
+    'Untitled chat') — for sessions minted by POST /sessions (where
+    /upload's legacy save_session is intentionally skipped to dodge a
+    parallel-upload race), ``filename`` would otherwise stay null and the
+    sidebar would show "Untitled chat" for an upload-only session. This
+    fills in the first-arriving filename so the user sees something
+    meaningful. ``WHERE filename IS NULL`` makes it race-safe across
+    parallel uploads: only the first to land wins, the rest no-op."""
+    with _STATE["lock"]:
+        _conn().execute(
+            "UPDATE sessions SET filename = ?, updated_at = ? "
+            "WHERE id = ? AND filename IS NULL",
+            (fname, time.time(), sid),
+        )
+
+
 def set_session_contract(sid: str, contract_text: str, n_pages: int) -> None:
     """Fill a session's ``contract_text`` / ``n_pages`` after async ingestion.
 
-    The first uploaded document mirrors into these columns so the legacy
+    The FIRST uploaded document mirrors into these columns so the legacy
     single-document paths (analyze-contract, the old document preview)
     keep working. Done from the background worker once OCR finishes —
-    upload() now creates the session row with empty contract_text so it can
-    return immediately."""
+    upload() creates the session row with empty contract_text so it can
+    return immediately.
+
+    Race-safe: the UPDATE is guarded by ``WHERE contract_text IS NULL``
+    so concurrent ingestion jobs for a multi-doc session (parallel
+    uploads after POST /sessions) cannot stomp each other — only the
+    first one to finish wins and subsequent calls are no-ops. Without
+    this guard a folder drop of N files could leave ``contract_text``
+    set to an arbitrary (last-arriving) doc's content, and a follow-up
+    upload would silently overwrite the legacy mirror."""
     with _STATE["lock"]:
         _conn().execute(
-            "UPDATE sessions SET contract_text = ?, n_pages = ?, updated_at = ? WHERE id = ?",
+            "UPDATE sessions SET contract_text = ?, n_pages = ?, updated_at = ? "
+            "WHERE id = ? AND contract_text IS NULL",
             (contract_text, n_pages, time.time(), sid),
         )
 
@@ -817,7 +846,64 @@ def add_matter_document(
     """
     if user_id is not None and not session_owned_by(session_id, user_id):
         return None
+    # Normalize to the LEAF filename for both the dedup probe and the
+    # INSERT. Callers SHOULD pass a leaf (Path(filename).name), and both
+    # POST /upload and the tus completion hook do — but some legacy rows
+    # in the wild carry a folder prefix (``lai-test-drop/foo.pdf``) from
+    # an older Chromium folder-drag quirk. That made the same file
+    # collide under TWO different ``filename`` strings: prefix-form vs
+    # leaf-form, both stored separately. Normalizing here means the
+    # SELECT below can't be bypassed by a caller that forgot to strip,
+    # and we never write a new row whose name carries a path component.
+    filename = Path(filename).name or filename
     with _STATE["lock"]:
+        # Same-name dedup — authoritative line of defense. The FE pre-
+        # filter catches most cases but a second tab, direct API call or
+        # parallel-batch race can bypass it. Inside the connection lock,
+        # SELECT-then-INSERT is atomic (SQLite serialises writers on this
+        # lock), so two concurrent callers with the same (session_id,
+        # filename) cannot both end up inserting. Idempotent return
+        # rather than 409 — honest retries succeed without ceremony.
+        # Status is irrelevant: delete_matter_document HARD-deletes the
+        # row, so a previously deleted file is genuinely absent here and
+        # a re-upload flows through to the INSERT path normally.
+        # The ``__dedup_existing`` marker lets the endpoint skip
+        # save_matter_upload + _enqueue_ingestion (which would otherwise
+        # rewrite the bytes and re-index, creating duplicate chunks).
+        existing = _conn().execute(
+            """
+            SELECT id, session_id, doc_index, filename, n_pages,
+                   upload_ext, created_at, status
+            FROM matter_documents
+            WHERE session_id = ? AND filename = ?
+            """,
+            (session_id, filename),
+        ).fetchone()
+        if existing is not None:
+            base = {
+                "id": int(existing["id"]),
+                "session_id": existing["session_id"],
+                "doc_index": int(existing["doc_index"]),
+                "filename": existing["filename"],
+                "n_pages": int(existing["n_pages"] or 0),
+                "upload_ext": existing["upload_ext"],
+                "created_at": existing["created_at"],
+                "status": existing["status"],
+            }
+            # Failed row → user is retrying after a transient upload
+            # corruption (e.g. the 0-byte multipart that triggered
+            # Docling's "Input document … is not valid"). Don't treat
+            # this as a permanent dedup hit; mark it for the endpoint to
+            # reset state, clear any stale matter_chunks, overwrite the
+            # on-disk blob with the new bytes, and re-enqueue ingestion.
+            # The doc_index STAYS so any in-flight UI / chat history
+            # that already saw "M-{n}" continues to point at the same
+            # row — no shifting handles.
+            if existing["status"] == "failed":
+                base["__dedup_failed_retry"] = True
+                return base
+            base["__dedup_existing"] = True
+            return base
         row = _conn().execute(
             "SELECT COALESCE(MAX(doc_index), 0) AS mx FROM matter_documents WHERE session_id = ?",
             (session_id,),
@@ -877,6 +963,93 @@ def finalize_matter_document(
             "n_chunks=?, pages_done=?, pages_total=?, error=NULL WHERE id = ?",
             (doc_text, n_pages, n_chunks, n_pages, n_pages, doc_id),
         )
+
+
+def reset_matter_document_for_retry(doc_id: int) -> None:
+    """Reset a previously-failed row to 'queued' so the ingestion pipeline
+    can re-process the new bytes the user just re-uploaded under the same
+    filename. The endpoint calls this when ``add_matter_document`` returned
+    the ``__dedup_failed_retry`` marker.
+
+    Caller is responsible for the surrounding orchestration:
+      1. Clear pgvector entries for this doc_index (defensive — failed
+         rows usually never indexed, but partial chunking is possible
+         if Docling died mid-batch on a previous attempt).
+      2. Overwrite the on-disk blob with the new bytes
+         (``save_matter_upload``).
+      3. Re-enqueue ingestion.
+
+    Keeping the orchestration in the API layer mirrors the
+    :func:`delete_matter_document` pattern and avoids importing the
+    retrieval client into this module.
+
+    ``doc_index`` stays stable across the retry so any chat history /
+    citation handle that already referenced ``[M-n]`` keeps pointing at
+    the same row instead of silently rotating to a fresh slot.
+    """
+    with _STATE["lock"]:
+        _conn().execute(
+            "UPDATE matter_documents SET status='queued', error=NULL, "
+            "doc_text='', n_pages=0, pages_done=0, pages_total=0, n_chunks=0 "
+            "WHERE id = ?",
+            (doc_id,),
+        )
+
+
+def delete_matter_document(
+    session_id: str, doc_index: int, *, user_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Hard-delete a matter document from a session: DB row + on-disk file.
+
+    Caller is responsible for also clearing the pgvector embeddings
+    (``retrieval_client.delete_matter_chunks(session_id, doc_index=...)``)
+    — keeping that orchestration in the API layer keeps this module free
+    of a retrieval-client import.
+
+    Returns the deleted row's ``{id, doc_index, filename, upload_ext}`` so
+    the caller can also remove the disk file by path, or ``None`` when:
+      • the session isn't owned by ``user_id`` (Path A Step 2 write gate —
+        a shared collaborator can READ but not delete), or
+      • no row matched.
+
+    The ``doc_index`` value stays consumed afterwards — we never reuse a
+    deleted index (``add_matter_document`` allocates ``MAX(doc_index)+1``,
+    not a free-slot scan) so existing ``[M-n]`` citations in old chat
+    history don't silently re-point at a different document.
+    """
+    if user_id is not None and not session_owned_by(session_id, user_id):
+        return None
+    with _STATE["lock"]:
+        row = _conn().execute(
+            "SELECT id, doc_index, filename, upload_ext FROM matter_documents "
+            "WHERE session_id = ? AND doc_index = ?",
+            (session_id, int(doc_index)),
+        ).fetchone()
+        if row is None:
+            return None
+        info = {
+            "id": int(row["id"]),
+            "doc_index": int(row["doc_index"]),
+            "filename": row["filename"],
+            "upload_ext": row["upload_ext"],
+        }
+        _conn().execute("DELETE FROM matter_documents WHERE id = ?", (info["id"],))
+    # Best-effort disk cleanup outside the lock (file I/O shouldn't block
+    # other writes). A missing file is fine — the DB row is the source of
+    # truth and the caller has already done what the user asked.
+    try:
+        path = matter_document_path(
+            session_id, info["id"], ext=info["upload_ext"],
+        )
+        if path is not None and path.exists():
+            path.unlink()
+    except Exception as exc:  # noqa: BLE001 — DB delete already succeeded
+        print(
+            f"[delete] matter file unlink failed for "
+            f"{session_id}/M-{doc_index}: {exc}",
+            flush=True,
+        )
+    return info
 
 
 def fail_matter_document(doc_id: int, error: str) -> None:
@@ -974,12 +1147,24 @@ def get_matter_document(
 
 def matter_document_path(session_id: str, doc_id: int, ext: Optional[str] = None) -> Optional[Path]:
     """Disk path of a matter document's original file. Files are stored as
-    ``<session_id>_m<doc_id><ext>`` to keep many docs per session distinct."""
+    ``<session_id>_m<doc_id><ext>`` to keep many docs per session distinct.
+
+    ``ext`` should be passed by callers that already know the extension
+    (it's stored on ``matter_documents.upload_ext`` and is derivable from
+    the filename); the no-arg form is a defensive fallback for callers
+    that don't, and tries the full known-extensions set including
+    images. Without images in the fallback set, image uploads landed on
+    disk but the ingestion job couldn't find them back."""
     base = Path(_STATE["uploads_dir"])
     if ext:
         p = base / f"{session_id}_m{doc_id}{ext}"
         return p if p.exists() else None
-    for candidate in (".pdf", ".docx", ".doc", ".txt", ".md", ".bin"):
+    for candidate in (
+        ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".txt", ".csv", ".md",
+        # Image OCR (vision-LLM path):
+        ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp",
+        ".bin",
+    ):
         p = base / f"{session_id}_m{doc_id}{candidate}"
         if p.exists():
             return p
@@ -988,10 +1173,50 @@ def matter_document_path(session_id: str, doc_id: int, ext: Optional[str] = None
 
 def save_matter_upload(session_id: str, doc_id: int, content: bytes, filename: str) -> str:
     """Write a matter document's bytes to ``<session_id>_m<doc_id><ext>``.
-    Returns the extension stored."""
+    Returns the extension stored.
+
+    Refuses empty payloads up-front so the ingestion worker can't pick up
+    a 0-byte file and surface Docling's cryptic "Input document … is not
+    valid." We hit this in the wild — a row landed with 0 bytes on disk
+    while the matter_documents row claimed an upload had happened; the
+    chip then sat at "Fehlgeschlagen: Input document is not valid".
+    Better to fail loudly here than to write the empty file and let the
+    error surface 30 seconds later via Docling.
+
+    Also fsyncs and verifies the on-disk size matches the buffer we tried
+    to write, so a partial write surfaces immediately instead of silently
+    truncating a doc the user thinks is fully ingested.
+    """
+    if not content:
+        raise ValueError(
+            f"save_matter_upload: refusing to write 0 bytes for {filename!r} "
+            f"(session={session_id}, doc_id={doc_id})"
+        )
     suffix = Path(filename).suffix.lower() or ".bin"
     target = Path(_STATE["uploads_dir"]) / f"{session_id}_m{doc_id}{suffix}"
-    target.write_bytes(content)
+    # write_bytes() ≈ open+write+close — but doesn't fsync. We add the
+    # fsync because the worker pool reads the file back in a different
+    # thread (and after enqueue → context switch → some millis later);
+    # without fsync, on a heavily-loaded box the reader can race the
+    # OS page cache flush.
+    with open(target, "wb") as f:
+        f.write(content)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    actual = target.stat().st_size
+    if actual != len(content):
+        # Surface partial writes loudly. The caller (`POST /upload` and
+        # the tus completion hook) now sees an IOError and the
+        # matter_documents row gets marked status='failed' with this
+        # exact message — instead of "Input document is not valid"
+        # popping out of Docling 30s later.
+        raise IOError(
+            f"save_matter_upload: wrote {actual} bytes to {target}, "
+            f"expected {len(content)} bytes — partial write detected"
+        )
     return suffix
 
 
