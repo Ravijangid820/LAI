@@ -47,6 +47,7 @@ from fastapi import (
 from pydantic import BaseModel, EmailStr, Field
 
 from lai.api.email import EmailConfig, send_reset_email
+from lai.common import audit
 from lai.common.auth import (
     AuthConfig,
     CurrentUser,
@@ -360,11 +361,26 @@ def build_auth_router(
                 else "$2b$12$invalidinvalidinvalidinvalidinvalidinvalidinvalidinval"
             )
             if not deps.hasher.verify(body.password, stored_hash) or user is None:
+                await audit.record(
+                    conn,
+                    action="login",
+                    outcome="failure",
+                    user_id=(user.id if user is not None else None),
+                    detail={"email": body.email, "reason": "invalid_credentials"},
+                )
                 raise InvalidCredentialsError(_INVALID_CREDENTIALS_DETAIL)
             if user.status != "active":
                 # Distinct exception so logs can attribute, but the
                 # network response is still a generic 401 — we do not
                 # want to confirm "this email exists but is disabled".
+                await audit.record(
+                    conn,
+                    action="login",
+                    outcome="denied",
+                    user_id=user.id,
+                    org_id=user.org_id,
+                    detail={"email": body.email, "reason": "account_disabled"},
+                )
                 raise UserDisabledError(_INVALID_CREDENTIALS_DETAIL)
 
             # Opportunistic rehash when the cost floor has been raised.
@@ -389,6 +405,14 @@ def build_auth_router(
                 expires_at=refresh.expires_at,
             )
             await deps.user_repo.touch_last_login(conn, user.id)
+            await audit.record(
+                conn,
+                action="login",
+                outcome="success",
+                user_id=user.id,
+                org_id=user.org_id,
+                detail={"email": user.email_canonical},
+            )
 
         _set_refresh_cookie(
             response,

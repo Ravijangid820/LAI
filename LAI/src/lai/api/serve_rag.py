@@ -68,6 +68,7 @@ from lai.api.share_router import build_share_router
 # import). A missing or weak ``LAI_AUTH_JWT_ACCESS_SECRET`` raises
 # here — a clear traceback at uvicorn start beats discovering at
 # first request that auth is disabled.
+from lai.common import audit
 from lai.common.auth import (
     AuthConfig,
     CurrentUser,
@@ -3861,6 +3862,8 @@ def query(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
         chunks_returned=len(chunks_out),
         citation_validation=citation_validation_out,
         jurisdiction_warnings=jurisdiction_warnings,
+        user_id=str(user.id),
+        org_id=_org_or_none(user),
     )
 
     return QueryResp(
@@ -3895,9 +3898,12 @@ def _emit_query_metrics(
     citation_validation: CitationValidationOut | None,
     jurisdiction_warnings: list[JurisdictionWarningOut],
     focus_doc_indexes: list[int] | None = None,
+    user_id: str | None = None,
+    org_id: str | None = None,
 ) -> None:
-    """Bump every domain-level counter / histogram for one completed turn, and
-    emit a structured slow-query record when the turn crosses _SLOW_QUERY_S.
+    """Bump every domain-level counter / histogram for one completed turn, emit
+    a structured slow-query record when the turn crosses _SLOW_QUERY_S, and
+    append a best-effort audit row.
 
     Centralised so the two query endpoints (/query and /query/stream)
     emit identical metrics — divergence would silently break the Grafana
@@ -3941,6 +3947,16 @@ def _emit_query_metrics(
             ),
             flush=True,
         )
+
+    # Append-only audit trail (Phase 2.3) — best-effort, never blocks the turn.
+    audit.record_sync(
+        action="query",
+        user_id=user_id,
+        org_id=org_id,
+        session_id=session_id,
+        latency_ms=round(timings.total_s * 1000),
+        detail={"mode": mode, "chunks": chunks_returned},
+    )
 
 
 def _run_jurisdiction_check(
@@ -4408,6 +4424,8 @@ def query_stream(req: QueryReq, user: CurrentUser = Depends(get_current_user)):
             chunks_returned=len(chunks_out),
             citation_validation=citation_validation_out,
             jurisdiction_warnings=jurisdiction_warnings,
+            user_id=uid,
+            org_id=org_id,
         )
 
         # Token counts: prompt is approximate from the assembled

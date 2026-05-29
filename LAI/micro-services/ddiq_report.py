@@ -25,6 +25,7 @@ import psycopg2.extras
 # shared ``auth_dep`` module so api.py and this router resolve to the
 # same TokenIssuer/secret instance.
 from auth_dep import get_current_user
+from lai.common import audit
 from lai.common.auth import CurrentUser
 
 # lai.common.llm / lai.common.exceptions imports moved to ``ddiq.llm``
@@ -2199,6 +2200,7 @@ def _run_report_generation_job(rid: str, req: "GenerateReportRequest", user_id, 
     can close the tab the moment they submit and still know when it's
     ready. See :func:`_notify_report_complete`.
     """
+    _t0 = time.time()
     try:
         _update_report_progress(rid, status="running", step="starting", percent=0.0)
         report, _T = _generate_report_core(
@@ -2207,15 +2209,30 @@ def _run_report_generation_job(rid: str, req: "GenerateReportRequest", user_id, 
         )
         _update_report_progress(rid, status="done", step="done", percent=1.0)
         _notify_report_complete(rid, user_id, success=True)
+        audit.record_sync(
+            action="report", outcome="success", user_id=user_id, org_id=org_id,
+            session_id=rid, latency_ms=round((time.time() - _t0) * 1000),
+            detail={"doc_count": len(req.document_ids)},
+        )
     except HTTPException as e:
         detail = f"HTTP {e.status_code}: {e.detail}"
         _update_report_progress(rid, status="failed", error=detail)
         _notify_report_complete(rid, user_id, success=False, error=detail)
+        audit.record_sync(
+            action="report", outcome="failed", user_id=user_id, org_id=org_id,
+            session_id=rid, latency_ms=round((time.time() - _t0) * 1000),
+            detail={"error": detail},
+        )
     except Exception as e:
         logger.exception(f"report {rid} failed")
         msg = str(e)[:500]
         _update_report_progress(rid, status="failed", error=msg)
         _notify_report_complete(rid, user_id, success=False, error=msg)
+        audit.record_sync(
+            action="report", outcome="failed", user_id=user_id, org_id=org_id,
+            session_id=rid, latency_ms=round((time.time() - _t0) * 1000),
+            detail={"error": msg},
+        )
 
 
 @router.post("/report/generate/async")
