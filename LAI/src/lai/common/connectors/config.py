@@ -24,6 +24,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 __all__ = [
     "ALKIS_WFS_ENDPOINTS",
     "AlkisConfig",
+    "GesetzeConfig",
     "NominatimConfig",
 ]
 
@@ -252,3 +253,87 @@ class AlkisConfig(BaseSettings):
         gt=0.0,
         description="Cap on exponential backoff between retries.",
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# gesetze-im-internet.de (German federal statute feed)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class GesetzeConfig(BaseSettings):
+    """Settings for
+    :class:`~lai.common.connectors.gesetze.GesetzeImInternetClient`.
+
+    Defaults target the official Bundesamt für Justiz portal. The feed
+    iterates the full table of contents (~6,500 laws) so politeness
+    matters: ``request_interval_seconds`` throttles between downloads to
+    stay a good citizen against a government server.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="LAI_GESETZE_",
+        case_sensitive=False,
+        extra="forbid",
+        frozen=True,
+    )
+
+    base_url: str = Field(
+        default="https://www.gesetze-im-internet.de",
+        description=(
+            "Base URL of the gesetze-im-internet.de portal. The "
+            "table-of-contents index lives at ``/gii-toc.xml``; each law "
+            "is a ``/<slug>/xml.zip`` archive."
+        ),
+    )
+    user_agent: str = Field(
+        default="LAI-statute-feed/1.0 (legal-ai-corpus)",
+        min_length=4,
+        description=(
+            "User-Agent header identifying the feed. Good citizenship "
+            "against a public government server and lets their operators "
+            "trace the traffic."
+        ),
+    )
+    timeout_seconds: float = Field(
+        default=30.0,
+        gt=0.0,
+        description=(
+            "Per-request HTTP timeout in seconds. Higher than the geocoder "
+            "because law archives can be a few MB and the server is slower "
+            "than a CDN."
+        ),
+    )
+    request_interval_seconds: float = Field(
+        default=0.5,
+        ge=0.0,
+        description=(
+            "Throttle delay AFTER each successful fetch. Iterating the full "
+            "TOC means thousands of downloads; 0.5 s keeps us polite. Set to "
+            "0 for a one-off single-law fetch where throughput matters."
+        ),
+    )
+
+    # ── Retry policy ────────────────────────────────────────────────
+    max_retries: int = Field(
+        default=3,
+        ge=0,
+        le=8,
+        description="Total retry attempts on transport / 5xx failure.",
+    )
+    retry_initial_wait_seconds: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="Initial backoff before the first retry.",
+    )
+    retry_max_wait_seconds: float = Field(
+        default=20.0,
+        gt=0.0,
+        description="Cap on exponential backoff between retries.",
+    )
+
+    @field_validator("base_url")
+    @classmethod
+    def _check_base_url_scheme(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("base_url must start with http:// or https://")
+        return value.rstrip("/")

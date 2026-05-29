@@ -21,6 +21,10 @@ __all__ = [
     "AlkisInvalidResponseError",
     "AlkisRetryExhaustedError",
     "ConnectorError",
+    "GesetzeCallError",
+    "GesetzeError",
+    "GesetzeInvalidResponseError",
+    "GesetzeRetryExhaustedError",
     "NominatimCallError",
     "NominatimError",
     "NominatimInvalidResponseError",
@@ -150,3 +154,63 @@ class AlkisRetryExhaustedError(AlkisError):
         super().__init__(message)
         self.attempts: int = attempts
         self.bundesland: str | None = bundesland
+
+
+# ── gesetze-im-internet.de (German federal statute feed) ─────────────
+
+
+class GesetzeError(ConnectorError):
+    """Base for any gesetze-im-internet.de failure."""
+
+
+class GesetzeCallError(GesetzeError):
+    """Transport-level failure when fetching from gesetze-im-internet.de.
+
+    HTTP 5xx, connection refusal, timeout. Retry-eligible (the retry
+    filter in the client matches this class). ``status_code`` is the
+    HTTP code when applicable; ``url`` is the resource we hit.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        url: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code: int | None = status_code
+        self.url: str | None = url
+
+
+class GesetzeInvalidResponseError(GesetzeError):
+    """A 2xx response whose body wasn't the expected shape.
+
+    Covers: a 4xx hard error (NOT retried — distinct class so the retry
+    filter skips it), the table-of-contents body not being parseable XML,
+    or a law download that isn't a valid zip / has no ``.xml`` entry.
+    ``url`` identifies the resource; ``raw_response`` carries up to ~500
+    chars of the body when textual.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        url: str | None = None,
+        raw_response: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.url: str | None = url
+        self.raw_response: str | None = raw_response[:500] if raw_response else None
+
+
+class GesetzeRetryExhaustedError(GesetzeError):
+    """Every retry attempt against gesetze-im-internet.de failed.
+
+    ``attempts`` is the number of attempts made (≥1).
+    """
+
+    def __init__(self, message: str, *, attempts: int) -> None:
+        super().__init__(message)
+        self.attempts: int = attempts

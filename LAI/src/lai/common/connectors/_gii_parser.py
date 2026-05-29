@@ -24,9 +24,11 @@ from dataclasses import dataclass
 from defusedxml.ElementTree import fromstring as _safe_fromstring
 
 __all__ = [
+    "LawRef",
     "ParsedLaw",
     "StatuteSection",
     "parse_law_xml",
+    "parse_toc",
 ]
 
 # Block-level GII tags after which a newline preserves the document's
@@ -34,6 +36,15 @@ __all__ = [
 _BLOCK_TAGS = frozenset({"P", "BR", "Title", "Ident", "row", "pre", "DT", "DD", "LA", "Citation"})
 
 _WS_RUN = re.compile(r"[ \t  ]+")
+
+
+@dataclass(frozen=True)
+class LawRef:
+    """A law's entry in the gesetze-im-internet.de table of contents."""
+
+    title: str  # human title, e.g. "Bundes-Immissionsschutzgesetz"
+    slug: str  # URL slug, e.g. "bimschg"
+    xml_url: str  # absolute https URL to the law's xml.zip
 
 
 @dataclass(frozen=True)
@@ -137,3 +148,26 @@ def parse_law_xml(xml: bytes | str) -> ParsedLaw:
         sections.append(StatuteSection(enbez=enbez, titel=titel, text=body))
 
     return ParsedLaw(jurabk=jurabk, long_title=long_title, sections=tuple(sections))
+
+
+def parse_toc(xml: bytes | str) -> tuple[LawRef, ...]:
+    """Parse the gesetze-im-internet.de table of contents (``gii-toc.xml``).
+
+    The TOC is ``<items><item><title>…</title><link>…/<slug>/xml.zip</link>
+    </item>…</items>``. Items without a ``<link>`` are skipped; the slug is
+    the path segment before ``xml.zip`` and the URL is normalised to https.
+
+    Raises :class:`xml.etree.ElementTree.ParseError` on malformed XML.
+    """
+    root: ET.Element = _safe_fromstring(xml if isinstance(xml, str) else xml.decode("utf-8", errors="replace"))
+
+    refs: list[LawRef] = []
+    for item in root.findall(".//item"):
+        link = _first_text(item, "link")
+        if not link:
+            continue
+        parts = link.rstrip("/").split("/")
+        slug = parts[-2] if len(parts) >= 2 else parts[-1]
+        xml_url = link.replace("http://", "https://", 1)
+        refs.append(LawRef(title=_first_text(item, "title") or "", slug=slug, xml_url=xml_url))
+    return tuple(refs)

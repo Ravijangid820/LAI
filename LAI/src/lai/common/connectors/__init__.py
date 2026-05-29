@@ -24,6 +24,7 @@ from lai.common.connectors.alkis import AlkisClient
 from lai.common.connectors.config import (
     ALKIS_WFS_ENDPOINTS,
     AlkisConfig,
+    GesetzeConfig,
     NominatimConfig,
 )
 from lai.common.connectors.exceptions import (
@@ -32,11 +33,16 @@ from lai.common.connectors.exceptions import (
     AlkisInvalidResponseError,
     AlkisRetryExhaustedError,
     ConnectorError,
+    GesetzeCallError,
+    GesetzeError,
+    GesetzeInvalidResponseError,
+    GesetzeRetryExhaustedError,
     NominatimCallError,
     NominatimError,
     NominatimInvalidResponseError,
     NominatimRetryExhaustedError,
 )
+from lai.common.connectors.gesetze import GesetzeImInternetClient
 from lai.common.connectors.metrics import (
     ConnectorMetrics,
     default_connector_metrics,
@@ -53,6 +59,12 @@ __all__ = [
     "AlkisRetryExhaustedError",
     "ConnectorError",
     "ConnectorMetrics",
+    "GesetzeCallError",
+    "GesetzeConfig",
+    "GesetzeError",
+    "GesetzeImInternetClient",
+    "GesetzeInvalidResponseError",
+    "GesetzeRetryExhaustedError",
     "NominatimCallError",
     "NominatimClient",
     "NominatimConfig",
