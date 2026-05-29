@@ -1,6 +1,6 @@
 # Plan — Statute feed Phase B (write path)
 
-**Date:** 2026-05-29 · **Owner:** rj · **Status:** PROPOSED — awaiting sign-off
+**Date:** 2026-05-29 · **Owner:** rj · **Status:** APPROVED 2026-05-29 — Phase B in progress
 **Why sign-off:** this phase writes to the **live `corpus_*` tables** that
 `serve_rag` retrieves from.
 **Context:** Phase A (read-only) is done — see `LAI/docs/statute_feed.md`.
@@ -35,8 +35,9 @@ Removed-from-TOC law → `DELETE` by `doc_id`.
 
 ## Key decisions / risks
 - **ID allocation** — `corpus_*` PKs are supplied BIGINTs (no DEFAULT). Feed rows
-  need a non-colliding range. Options: (a) dedicated high base ≥ 9e9 + a
-  sequence, or (b) deterministic hash-based ids. **Decide before writing.**
+  draw from a dedicated Postgres **sequence starting at 9,000,000,000**
+  (`corpus_feed_id_seq`, created in migration 007) — no collision with the
+  existing SQLite-origin ids.
 - **Live retrieval** — per-law transaction keeps retrieval consistent; run on
   ONE law first and verify via a `serve_rag` query before any backfill.
 - **Truncation parity** — reuse `migrate_corpus`'s exact fp16/first-4000 path.
@@ -52,10 +53,17 @@ Removed-from-TOC law → `DELETE` by `doc_id`.
 4. Idempotency: re-run → hash unchanged → no-op; amend → re-embed.
 5. Unit-test the pure bits (segment builder, id allocation, hash diff).
 
-## Open questions for sign-off
-1. ID range — high-base sequence vs deterministic hash?
-2. First backfill scope — the 29 mapped wind-relevant laws, or all 6,123?
-3. OK to write to live `corpus_*` on `lai_db`, or stage to a copy first?
+## Decisions (confirmed 2026-05-29)
+1. **ID allocation** — a dedicated high-base Postgres **sequence** starting at
+   9,000,000,000 (`corpus_feed_id_seq`). No collision with existing ids; no
+   per-row hashing.
+2. **Backfill scope** — **staged: 1 law → the 29 mapped → all 6,123.** Prove on
+   `bimschg`, then the wind-relevant set, then the full TOC. End state covers
+   every federal law; the daily feed keeps it current.
+3. **Write target** — **live `corpus_*` on `lai_db`, gated.** Additive (new
+   `doc_id`s; existing rows untouched) + per-law transactional → no staging
+   copy. Safeguard: first law in a quiet window, verify via a `serve_rag`
+   query, then proceed.
 
 ## Definition of done
 One law fully ingested + retrievable via `serve_rag`; re-run is idempotent;
