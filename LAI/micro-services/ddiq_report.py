@@ -3477,6 +3477,39 @@ def get_report(report_id: str, user: CurrentUser = Depends(get_current_user)):
             "project_name": row["project_name"], "report": row["report_data"]}
 
 
+@router.post("/report/{report_id}/export", status_code=204)
+def record_report_export(
+    report_id: str,
+    fmt: str = "docx",
+    user: CurrentUser = Depends(get_current_user),
+) -> None:
+    """Record that the caller exported a report. The DOCX/PDF/etc. is built
+    client-side (no server-side render), so the FE pings this purely for the
+    append-only audit trail. Verifies the report is visible to the caller
+    (owner or share) → 404 otherwise; the audit write itself is best-effort.
+    """
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        """SELECT 1 FROM ddiq_reports
+           WHERE id = %s
+             AND (user_id = %s
+                  OR EXISTS (SELECT 1 FROM ddiq_report_shares s
+                             WHERE s.report_id = ddiq_reports.id
+                               AND s.user_id = %s))""",
+        (report_id, str(user.id), str(user.id)),
+    )
+    visible = cur.fetchone(); cur.close(); conn.close()
+    if not visible:
+        raise HTTPException(404, "Not found")
+    audit.record_sync(
+        action="export",
+        user_id=str(user.id),
+        org_id=user.org_id,
+        session_id=report_id,
+        detail={"format": fmt},
+    )
+
+
 class RenameReportRequest(BaseModel):
     """Body for PATCH /ddiq/report/{id} — rename a report's project_name."""
     project_name: str

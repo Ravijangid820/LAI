@@ -4751,6 +4751,14 @@ async def upload(
     # staying race-safe under parallel uploads to one session.
     _enqueue_ingestion(sid, doc["id"], doc["doc_index"], fname, True)
 
+    audit.record_sync(
+        action="upload",
+        user_id=uid,
+        org_id=org_id,
+        session_id=sid,
+        detail={"filename": fname, "doc_index": doc["doc_index"], "bytes": len(contents)},
+    )
+
     return UploadResp(
         session_id=sid,
         filename=fname,
