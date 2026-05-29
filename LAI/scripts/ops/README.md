@@ -104,6 +104,36 @@ does **not** touch Docker, the Vite UI, or the running pipeline / migration jobs
 
 ## Quick smoke tests
 
+> The `/query`, `/sessions` and most endpoints below now require a Bearer token
+> (`Authorization: Bearer <jwt>`). The token-free `curl` snippets in this section
+> are illustrative — get a token from `POST /auth/login` first, or use the
+> system smoke test, which logs in for you.
+
+### System smoke test (reranker-on-CPU guard)
+
+The canonical check to run **after every `restart_serve_rag.sh`**. It logs in,
+sends one RAG query, and fails loudly if the round-trip is slow OR the reranker
+fell back to CPU (the boss-test root cause — see ROADMAP 1.2). Stdlib-only, so
+any `python3` runs it; exit code names the failure cause (0 pass, 5 slow, 6
+reranker-on-CPU).
+
+```bash
+# Credentials via env (or LAI_SMOKE_TOKEN to skip login):
+export LAI_SMOKE_EMAIL=ops@yourfirm.de LAI_SMOKE_PASSWORD=...
+python3 /data/projects/lai/LAI/scripts/ops/smoke_test.py
+```
+
+```bash
+# Daily cron at 08:00, appending outcomes to a log:
+0 8 * * *  cd /data/projects/lai/LAI && \
+  LAI_SMOKE_EMAIL=ops@yourfirm.de LAI_SMOKE_PASSWORD=... \
+  .venv/bin/python scripts/ops/smoke_test.py >> logs/host/smoke_test.log 2>&1
+```
+
+Tunables (all optional): `LAI_SMOKE_URL` (default `http://localhost:18000`),
+`LAI_SMOKE_MAX_S` (latency budget, default 20), `LAI_SMOKE_QUESTION`,
+`LAI_SMOKE_FORCE_MODE` (default `rag`), `LAI_SERVE_RAG_LOG`.
+
 ### Chat round-trip
 ```bash
 SID=$(python3 -c "import uuid; print(uuid.uuid4())")
@@ -179,6 +209,7 @@ docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'lai_|d
 
 ## Recent ops history (rolling, last 5)
 
+- 2026-05-29 — Added `scripts/ops/smoke_test.py` (vm-1 / ROADMAP 1.2): post-restart guard that fails loudly when a query is slow or the reranker is on CPU.
 - 2026-05-21 — Documented `scripts/ops/restart_serve_rag.sh` (Sahid's S-5 script) as the canonical safe restart; removed a duplicate `restart-serve_rag.sh` that had been added by mistake.
 - 2026-04-30 — `ops/resume_step6.sh` written (resume embeddings, 16.6% done at last check, ~41.6 M child chunks remaining).
 - 2026-04-30 — `LAI-UI/` directory rename (was `lai-ui/`); all references in scripts + docs flipped uppercase.
