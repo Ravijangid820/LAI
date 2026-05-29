@@ -1,6 +1,6 @@
 [project]
 name = "lai"
-version = "2.0.0"
+version = "2.1.0"
 description = "German Legal AI Platform for Wind Energy Due Diligence"
 # Floor relaxed to 3.11 (2026-05-16) so the DDiQ microservice container
 # (which runs on python:3.11-slim) can install ``lai.common`` and consume
