@@ -77,6 +77,11 @@ LAI/.runtime-cache/
 # Raw corpus (671 GB of legal source docs; lives in LAI/data/raw/)
 LAI/data/
 
+# Stress-test volume sets: a symlink farm into the (ignored) VDR corpus plus
+# manifests that enumerate confidential document names/paths. Regenerable
+# locally; the symlinks are absolute paths that break on clone. Never track.
+LAI/demo-seed/stress-volumes/
+
 # Eval / audit output artifacts under scripts/ — regenerable, kept local but not tracked.
 LAI/scripts/eval/rag_eval_results/
 LAI/scripts/**/*_results.json
