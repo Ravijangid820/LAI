@@ -80,16 +80,81 @@ The CI workflow does not need editing.
 
 ---
 
-## 4. Branching and commits
+## 4. Branching and releases
 
-- The active branch is **`v2-restructure`**. Direct commits land here until a
-  PR-based workflow is agreed.
+We run **Git Flow**: two permanent branches, releases marked by tags. A version
+is a **tag, never a branch** — do not create long-lived branches named `v3`,
+`v4`, etc. (that is how the old `v2-restructure` branch drifted 113 commits
+behind master).
+
+| Branch     | Role                                                              |
+|------------|-------------------------------------------------------------------|
+| `master`   | **Released** code only. Protected. Every commit here is shippable; release tags live here. |
+| `develop`  | **Integration** line — the next release in progress. Feature work merges here first. |
+
+### Everyday work
+
+```bash
+git checkout develop && git pull          # start from the integration line
+git checkout -b feat/<short-name>         # short-lived branch for ONE change
+# ...work, commit...
+git push -u origin feat/<short-name>
+# open a PR INTO develop → CI gate (make check) → review → merge → delete branch
+```
+
+Feature branches are short-lived: branch off `develop`, merge back into
+`develop`. Never branch a feature off `master`.
+
+### Cutting a release
+
+When `develop` is release-ready, promote it to `master` and tag it with
+[semver](https://semver.org/) (`vMAJOR.MINOR.PATCH`):
+
+```bash
+git checkout master && git merge --no-ff develop
+# bump  [project] version  in pyproject.toml to match the tag, then commit
+git tag -a v3.1.0 -m "LAI v3.1.0 — <one line>"
+git push origin master develop v3.1.0
+```
+
+- **PATCH** (`v3.0.1`) — bug fixes only, no behaviour change.
+- **MINOR** (`v3.1.0`) — backward-compatible features.
+- **MAJOR** (`v4.0.0`) — breaking change or a major milestone.
+
+Keep `[project] version` in `pyproject.toml` equal to the latest tag.
+
+### Hotfixes (and why we back-merge)
+
+A production bug in a released version must be fixed without shipping the
+unfinished work sitting on `develop`. So branch off **`master`**, fix, tag a
+patch — then **back-merge into `develop`** so the fix isn't lost:
+
+```bash
+git checkout -b hotfix/<name> master
+# ...fix, commit...
+git checkout master && git merge --no-ff hotfix/<name>
+git tag -a v3.0.1 -m "LAI v3.0.1 — <fix>" && git push origin master v3.0.1
+git checkout develop && git merge master   # ← BACK-MERGE: keeps the fix on both lines
+git push origin develop
+```
+
+Skip the back-merge and the next `develop → master` release can silently
+re-introduce the bug you just fixed (develop still holds the old, unfixed code).
+The hotfix is the *only* commit that ever lands on `master` without first going
+through `develop`.
+
+### Commit hygiene
+
 - Commit messages follow **Conventional Commits**
   (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, `ci:`, `build:`,
   `perf:`, `style:`, `revert:`). The `commit-msg` pre-commit hook enforces it.
 - One logical change per commit. Mixing refactor + feature in one commit
   invalidates `git bisect`.
 - Production PRs should be ≤ 400 LOC of non-test code. Larger means split.
+
+> **Recommended guardrail:** enable branch protection on `master` in GitHub
+> (Settings → Branches): require a PR + green CI before merge. That enforces
+> "master is always shippable" instead of relying on everyone remembering.
 
 ---
 
