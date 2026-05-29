@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -22,6 +23,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from lai.api.auth_router import AuthDeps
 from lai.api.email import send_invite_email
+from lai.common import audit
 from lai.common.auth import CurrentUser
 from lai.common.auth.repository import (
     InvitationRecord,
@@ -89,6 +91,18 @@ class InvitationOut(BaseModel):
     invited_by: UUID | None
     expires_at: datetime
     created_at: datetime
+
+
+class AuditEntryOut(BaseModel):
+    id: int
+    ts: datetime
+    user_id: UUID | None
+    org_id: UUID | None
+    action: str
+    outcome: str
+    session_id: str | None
+    latency_ms: int | None
+    detail: dict[str, Any] | None
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -534,5 +548,42 @@ def build_admin_router(
             invite_id,
             user.id,
         )
+
+    # ── GET /admin/audit ───────────────────────────────────────────────
+    # Read the append-only audit trail (migration 006). Super-admin sees every
+    # org (optional ``org`` filter); a firm admin is scoped to their own org
+    # (an org-less admin sees nothing). Newest first; offset paging.
+    @router.get("/audit", response_model=list[AuditEntryOut])
+    async def list_audit(
+        action: str | None = None,
+        user_id: UUID | None = None,
+        org: UUID | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        user: CurrentUser = Depends(get_current_user),
+    ) -> list[AuditEntryOut]:
+        if not user.is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="admin role required",
+            )
+        limit = max(1, min(200, limit))
+        offset = max(0, offset)
+        if user.is_super_admin:
+            scope_org = org  # optional filter; None = every org
+        else:
+            if user.org_id is None:
+                return []
+            scope_org = user.org_id  # firm admin: forced to own org
+        async with deps.pool.acquire() as conn:
+            rows = await audit.query(
+                conn,
+                org_id=scope_org,
+                action=action,
+                user_id=user_id,
+                limit=limit,
+                offset=offset,
+            )
+        return [AuditEntryOut(**row) for row in rows]
 
     return router

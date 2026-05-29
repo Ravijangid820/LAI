@@ -142,3 +142,34 @@ def test_get_pool_lazy_and_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     p2 = audit._get_pool()
     assert p1 is p2  # cached
     assert len(created) == 1  # built exactly once
+
+
+# ── query (read) ────────────────────────────────────────────────────────────
+
+
+class _FakeFetchConn:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.fetch_args: tuple[Any, ...] | None = None
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.fetch_args = (sql, *args)
+        return self.rows
+
+
+async def test_query_maps_rows_and_parses_detail() -> None:
+    conn = _FakeFetchConn([{"id": 1, "action": "login", "detail": '{"email": "a@b.c"}'}])
+    out = await audit.query(conn, org_id="o1", action="login", limit=10, offset=0)
+    assert out[0]["action"] == "login"
+    assert out[0]["detail"] == {"email": "a@b.c"}  # jsonb string parsed back to a dict
+    assert conn.fetch_args is not None
+    sql, *args = conn.fetch_args
+    assert "FROM audit_log" in sql
+    assert args == ["o1", "login", None, 10, 0]
+
+
+async def test_query_detail_none_or_unparseable() -> None:
+    conn = _FakeFetchConn([{"id": 2, "detail": None}, {"id": 3, "detail": "not json"}])
+    out = await audit.query(conn)
+    assert out[0]["detail"] is None
+    assert out[1]["detail"] is None  # unparseable detail collapses to None

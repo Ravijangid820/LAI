@@ -41,6 +41,16 @@ _INSERT_SYNC = (
     "(user_id, org_id, action, outcome, session_id, latency_ms, detail) "
     "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)"
 )
+# Read query. Optional filters are NULL-guarded (``$n IS NULL OR col = $n``) so
+# the SQL is fully static — no clause-building, no interpolation. Newest first.
+_SELECT = (
+    "SELECT id, ts, user_id, org_id, action, outcome, session_id, latency_ms, detail "
+    "FROM audit_log "
+    "WHERE ($1::uuid IS NULL OR org_id = $1) "
+    "AND ($2::text IS NULL OR action = $2) "
+    "AND ($3::uuid IS NULL OR user_id = $3) "
+    "ORDER BY ts DESC LIMIT $4 OFFSET $5"
+)
 
 _pool: Any = None
 _pool_lock = threading.Lock()
@@ -137,3 +147,32 @@ def record_sync(
         if conn is not None and pool is not None:
             with contextlib.suppress(Exception):
                 pool.putconn(conn)
+
+
+async def query(
+    conn: asyncpg.Connection,
+    *,
+    org_id: Any = None,
+    action: str | None = None,
+    user_id: Any = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """Read recent audit rows, newest first. Optional filters (``None`` skips
+    one). The ``detail`` jsonb is parsed back to a dict.
+
+    NOT best-effort (unlike the writers): a read failure surfaces to the admin
+    caller so a broken query is visible rather than silently empty.
+    """
+    rows = await conn.fetch(_SELECT, org_id, action, user_id, limit, offset)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        raw = item.get("detail")
+        if isinstance(raw, str):
+            try:
+                item["detail"] = json.loads(raw)
+            except (TypeError, ValueError):
+                item["detail"] = None
+        out.append(item)
+    return out
