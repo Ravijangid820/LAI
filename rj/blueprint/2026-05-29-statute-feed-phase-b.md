@@ -1,6 +1,6 @@
 # Plan — Statute feed Phase B (write path)
 
-**Date:** 2026-05-29 · **Owner:** rj · **Status:** APPROVED 2026-05-29 — Phase B in progress
+**Date:** 2026-05-29 · **Owner:** rj · **Status:** **DONE 2026-05-30** — verified live on `bimschg`
 **Why sign-off:** this phase writes to the **live `corpus_*` tables** that
 `serve_rag` retrieves from.
 **Context:** Phase A (read-only) is done — see `LAI/docs/statute_feed.md`.
@@ -68,3 +68,16 @@ Removed-from-TOC law → `DELETE` by `doc_id`.
 ## Definition of done
 One law fully ingested + retrievable via `serve_rag`; re-run is idempotent;
 nothing else in the corpus disturbed.
+
+## Result (2026-05-30)
+- Migration 007 applied to `lai_db`. `corpus_feed_id_seq` started at 9 000 000 000.
+- **`bimschg` ingested live:** 121 sections → 120 parents + 245 children in
+  23.9s. Feed rows live at id ≥ 9 000 000 001; existing migrated rows untouched.
+- `statute_feed_state`: `slug=bimschg, jurabk=BImSchG,
+  domain=immissionsschutzrecht, hash=aa2cf4f8904d…`.
+- **Idempotency confirmed:** re-running `--ingest bimschg` exits in 1.5 s with
+  `[skip] unchanged` — no re-embed, no DB churn.
+- Commits on `develop`: `bf516e5` (migration 007), `b709f76` (pure helpers),
+  `036bcbe` (live writer).
+- Phase C (full backfill — the 29 mapped → all 6 123, daily cron, ops wrapper)
+  is the next blueprint.
