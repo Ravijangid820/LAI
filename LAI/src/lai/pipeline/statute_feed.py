@@ -1,19 +1,28 @@
 """Phase 4.3 — German federal statute ingestion feed.
 
-Two modes:
+Modes:
 
-* **Dry-run** (default) — fetches the table of contents, categorises every law,
-  validates registry slugs, and optionally downloads a sample to prove the
-  parse. Writes nothing.
-* **Ingest** (``--ingest <slug>``) — fetches one law, parses it, chunks via
-  :mod:`lai.pipeline.chunk`, embeds via :mod:`lai.pipeline.embed` (truncated
-  4096 → 4000 to match the corpus's halfvec dim), and **transactionally
-  upserts** into the live ``corpus_*`` tables. Idempotent: re-running with no
-  upstream change is a no-op via the content hash in ``statute_feed_state``.
+* **Dry-run** (default) — fetch the TOC, categorise every law, validate the
+  registry, optionally download a sample. Writes nothing.
+* **Ingest one** (``--ingest <slug>``) — fetch + parse + chunk + embed +
+  transactionally upsert one law into the live ``corpus_*`` tables.
+* **Backfill** (``--backfill mapped|all [--limit N]``) — same per-law work
+  but iterated; one shared HTTP client (no per-law TOC re-fetch); per-law
+  try/except so a bad XML never aborts the batch. Idempotent via
+  ``content_hash`` — unchanged laws skip cheaply.
+* **Prune removed** (``--prune-removed [--missing-days N]``) — DELETE laws
+  whose ``statute_feed_state.last_seen`` is older than ``N`` days AND that
+  are absent from the current TOC. Conservative window guards against a
+  transient TOC fetch error wiping rows.
+* **Status** (``--status``) — print the feed-state summary (laws per domain,
+  corpus row counts, last-seen distribution).
 
-    python -m lai.pipeline.statute_feed                    # dry-run summary
-    python -m lai.pipeline.statute_feed --fetch-sections   # + validate parse
-    python -m lai.pipeline.statute_feed --ingest bimschg   # LIVE write to corpus_*
+    python -m lai.pipeline.statute_feed                       # dry-run summary
+    python -m lai.pipeline.statute_feed --ingest bimschg      # one law live
+    python -m lai.pipeline.statute_feed --backfill mapped     # the 29 mapped laws
+    python -m lai.pipeline.statute_feed --backfill all --limit 50  # smoke-test full
+    python -m lai.pipeline.statute_feed --prune-removed       # default 7-day window
+    python -m lai.pipeline.statute_feed --status              # current feed state
 """
 
 from __future__ import annotations
@@ -30,7 +39,7 @@ import numpy as np
 import psycopg2
 from pgvector.psycopg2 import register_vector
 
-from lai.common.connectors._gii_parser import parse_law_xml
+from lai.common.connectors._gii_parser import LawRef, parse_law_xml
 from lai.common.connectors.gesetze import GesetzeImInternetClient
 from lai.common.connectors.statute_categories import (
     DEFAULT_DOMAIN,
@@ -102,7 +111,7 @@ def _run_dry(*, fetch_sections: bool, limit: int) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ingest one law (LIVE write to corpus_* — Phase 4.3 Phase B)
+# DB connection (LIVE writes — Phase 4.3 Phase B/C)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -112,11 +121,11 @@ def _pg_conn() -> Iterator[psycopg2.extensions.connection]:
 
     Reads PG* env vars (PGHOST/PGPORT/PGUSER/PGDATABASE/PGPASSWORD); also
     honours the migrate_corpus DB_* names. ``PGPASSWORD`` has no default —
-    source ``LAI/.env.auth`` first.
+    source ``LAI/micro-services/.env`` first.
     """
     pw = os.environ.get("PGPASSWORD") or os.environ.get("DB_PASSWORD")
     if not pw:
-        raise RuntimeError("PGPASSWORD / DB_PASSWORD not set in env — source LAI/.env.auth before running --ingest.")
+        raise RuntimeError("PGPASSWORD / DB_PASSWORD not set in env — source LAI/micro-services/.env before running.")
     conn = psycopg2.connect(
         host=os.environ.get("PGHOST", os.environ.get("DB_HOST", "127.0.0.1")),
         port=int(os.environ.get("PGPORT", os.environ.get("DB_PORT", "5434"))),
@@ -133,23 +142,24 @@ def _pg_conn() -> Iterator[psycopg2.extensions.connection]:
         conn.close()
 
 
-def _run_ingest(slug: str) -> int:
-    """Fetch + parse + chunk + embed + transactionally upsert one law."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Ingest one law (the unit of work both --ingest and the backfills reuse)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _ingest_one(law: LawRef, client: GesetzeImInternetClient) -> int:
+    """Fetch + parse + chunk + embed + transactionally upsert one resolved law.
+
+    ``client`` MUST be an already-open ``GesetzeImInternetClient`` — the
+    backfill loops pass the same one across many laws to avoid re-fetching
+    the TOC per law. Returns 0 on success or [skip]; non-zero on a soft
+    error (no sections, no parents).
+    """
     t0 = time.monotonic()
-    slug = slug.lower()
+    slug = law.slug.lower()
+    print(f"[info] fetching {slug}: {law.title[:90]}")
+    xml = client.fetch_law_xml(law)
 
-    # 1. Fetch via the connector. Resolve the LawRef (so we also capture the
-    # human title + canonical URL for the metadata).
-    with GesetzeImInternetClient() as client:
-        laws = client.list_laws()
-        target = next((law for law in laws if law.slug == slug), None)
-        if target is None:
-            print(f"[error] slug '{slug}' not found in the live TOC")
-            return 2
-        print(f"[info] fetching {slug}: {target.title[:90]}")
-        xml = client.fetch_law_xml(target)
-
-    # 2. Parse
     parsed = parse_law_xml(xml)
     if not parsed.sections:
         print(f"[error] {slug}: parsed law has no sections")
@@ -158,9 +168,9 @@ def _run_ingest(slug: str) -> int:
     doc_id = stable_doc_id(slug)
     new_hash = content_hash(parsed)
     domain = categorize(slug)
-    source_url = target.xml_url
+    source_url = law.xml_url
 
-    # 3. Idempotency check — skip if upstream hash is unchanged.
+    # Idempotency check — skip if upstream hash is unchanged.
     with _pg_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT content_hash FROM statute_feed_state WHERE slug = %s", (slug,))
         row = cur.fetchone()
@@ -173,7 +183,7 @@ def _run_ingest(slug: str) -> int:
             print(f"[skip] {slug}: unchanged (hash {new_hash[:12]}…) — {time.monotonic() - t0:.1f}s")
             return 0
 
-    # 4. Build segments + chunk via the existing pipeline.
+    # Chunk via the existing pipeline.
     segments = segments_from_parsed_law(parsed)
     doc = {"doc_id": doc_id, "segments": segments}
     parents, children_per_parent = process_document(doc)
@@ -183,7 +193,7 @@ def _run_ingest(slug: str) -> int:
     total_children = sum(len(c) for c in children_per_parent)
     print(f"[info] {slug}: {len(segments)} segments → {len(parents)} parents → {total_children} children")
 
-    # 5. Embed every child text once; same order as the flattened children.
+    # Embed every child text once; same order as the flattened children.
     flat_children: list[str] = [child["text"] for child_list in children_per_parent for child in child_list]
     print(f"[info] embedding {len(flat_children)} children via {EMBED_URL}")
     raw_embeddings = embed_batch(
@@ -193,12 +203,10 @@ def _run_ingest(slug: str) -> int:
         batch_size=32,
         timeout=120.0,
     )
-    # 4096 fp32 → fp16 → first 4000 dims (matches migrate_corpus._blob_to_halfvec).
     embeddings_fp16 = [np.array(vec, dtype=np.float16)[:INDEX_DIM] for vec in raw_embeddings]
 
-    # 6. Transactional upsert into corpus_*. Per-law DELETE-then-INSERT keeps
-    # retrieval consistent: queries either see the old version or the new one,
-    # never a half-applied state.
+    # Transactional upsert. Per-law DELETE-then-INSERT: queries see either the
+    # old or the new version, never a half-applied state.
     metadata_json = json.dumps(
         {
             "jurabk": parsed.jurabk,
@@ -289,44 +297,171 @@ def _run_ingest(slug: str) -> int:
     return 0
 
 
-def _run_backfill_mapped() -> int:
-    """Sequentially ingest the registry-mapped wind-relevant laws.
+def _run_ingest(slug: str) -> int:
+    """Thin wrapper around :func:`_ingest_one` for the ``--ingest <slug>`` CLI."""
+    slug = slug.lower()
+    with GesetzeImInternetClient() as client:
+        laws = client.list_laws()
+        target = next((law for law in laws if law.slug == slug), None)
+        if target is None:
+            print(f"[error] slug '{slug}' not found in the live TOC")
+            return 2
+        return _ingest_one(target, client)
 
-    Per-law try/except: one bad XML or transient failure does NOT abort the
-    batch. Idempotent: laws with unchanged content_hash skip in ~1-2 s each,
-    so re-runs are cheap. Returns 0 if every law succeeded, 1 if any failed.
-    """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backfill helpers (shared loop)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _backfill_loop(laws: list[LawRef], client: GesetzeImInternetClient, label: str) -> int:
+    """Run :func:`_ingest_one` over every ``law`` in order, with per-law
+    try/except + a final summary. Shared by ``--backfill mapped|all``."""
     t0 = time.monotonic()
-    slugs = sorted(mapped_slugs())
-    print(f"[info] backfill: {len(slugs)} mapped laws (sequential)")
-
+    print(f"[info] backfill ({label}): {len(laws)} laws (sequential)")
     ok: list[str] = []
     failed: list[tuple[str, str]] = []
-    for i, slug in enumerate(slugs, 1):
-        print(f"\n[{i}/{len(slugs)}] --- {slug} ---")
+    for i, law in enumerate(laws, 1):
+        print(f"\n[{i}/{len(laws)}] --- {law.slug} ---")
         try:
-            rc = _run_ingest(slug)
+            rc = _ingest_one(law, client)
         except Exception as exc:  # one bad law must not abort the whole batch
-            print(f"[error] {slug}: {type(exc).__name__}: {exc}")
-            failed.append((slug, f"{type(exc).__name__}: {str(exc)[:200]}"))
+            print(f"[error] {law.slug}: {type(exc).__name__}: {exc}")
+            failed.append((law.slug, f"{type(exc).__name__}: {str(exc)[:200]}"))
             continue
         if rc == 0:
-            ok.append(slug)
+            ok.append(law.slug)
         else:
-            failed.append((slug, f"exit_code={rc}"))
+            failed.append((law.slug, f"exit_code={rc}"))
 
     elapsed = time.monotonic() - t0
-    print("\n=== backfill mapped summary ===")
-    print(f"  total:    {len(slugs)}")
+    print(f"\n=== backfill {label} summary ===")
+    print(f"  total:    {len(laws)}")
     print(f"  ok:       {len(ok)}")
     print(f"  failed:   {len(failed)}")
     print(f"  elapsed:  {elapsed:.0f}s ({elapsed / 60:.1f} min)")
     if failed:
         print(f"\nfailed laws ({len(failed)}):")
-        for slug, msg in failed:
-            print(f"  {slug:18s} {msg}")
+        for slug, msg in failed[:50]:
+            print(f"  {slug:24s} {msg}")
+        if len(failed) > 50:
+            print(f"  … and {len(failed) - 50} more")
         return 1
     return 0
+
+
+def _run_backfill_mapped() -> int:
+    """Sequentially ingest the registry-mapped wind-relevant laws."""
+    wanted = sorted(mapped_slugs())
+    with GesetzeImInternetClient() as client:
+        toc = list(client.list_laws())
+        slug_to_law = {law.slug: law for law in toc}
+        laws = [slug_to_law[s] for s in wanted if s in slug_to_law]
+        if len(laws) < len(wanted):
+            missing = sorted(set(wanted) - set(slug_to_law))
+            print(f"[warn] {len(missing)} registry slug(s) absent from TOC: {', '.join(missing)}")
+        return _backfill_loop(laws, client, "mapped")
+
+
+def _run_backfill_all(*, limit: int | None) -> int:
+    """Sequentially ingest every law in the TOC, optionally capped at ``limit``."""
+    with GesetzeImInternetClient() as client:
+        laws = list(client.list_laws())
+        if limit is not None and limit > 0:
+            laws = laws[:limit]
+            print(f"[info] --limit {limit} applied; processing first {len(laws)} of TOC")
+        return _backfill_loop(laws, client, f"all (n={len(laws)})")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prune removed laws
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _run_prune_removed(*, missing_days: int) -> int:
+    """Delete laws whose ``last_seen`` is older than ``missing_days`` AND that
+    are absent from the current TOC.
+
+    Conservative two-condition guard: a transient TOC fetch error cannot
+    delete corpus rows, because ``last_seen`` is bumped on every successful
+    sighting (even no-op skips). A row only falls into the prune set if it
+    has been missing for ``missing_days`` consecutive runs.
+    """
+    with GesetzeImInternetClient() as client:
+        current_slugs = {law.slug for law in client.list_laws()}
+
+    with _pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT slug, doc_id, last_seen FROM statute_feed_state WHERE last_seen < NOW() - INTERVAL '%s days'",
+            (missing_days,),
+        )
+        candidates = cur.fetchall()
+        to_prune = [(slug, doc_id, last_seen) for slug, doc_id, last_seen in candidates if slug not in current_slugs]
+        print(
+            f"[info] prune-removed: {len(candidates)} state rows older than "
+            f"{missing_days} days; {len(to_prune)} also absent from current TOC"
+        )
+        if not to_prune:
+            print("[ok] nothing to prune")
+            return 0
+
+        total_parents = 0
+        for slug, doc_id, last_seen in to_prune:
+            cur.execute(
+                "DELETE FROM corpus_parent_chunks WHERE doc_id = %s",
+                (doc_id,),
+            )
+            n_parents = cur.rowcount
+            total_parents += n_parents
+            cur.execute("DELETE FROM statute_feed_state WHERE slug = %s", (slug,))
+            print(f"  pruned {slug:24s} doc_id={doc_id} parents={n_parents} last_seen={last_seen}")
+        conn.commit()
+
+    print(f"[ok] pruned {len(to_prune)} laws ({total_parents} parents removed)")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Status
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _run_status() -> int:
+    """Print the current feed state — laws per domain, corpus row counts,
+    last-seen distribution."""
+    with _pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM statute_feed_state")
+        n_state = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM corpus_parent_chunks WHERE id >= 9000000000")
+        n_parents = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM corpus_child_chunks WHERE id >= 9000000000")
+        n_children = cur.fetchone()[0]
+        cur.execute("SELECT MIN(last_seen), MAX(last_seen) FROM statute_feed_state")
+        seen_min, seen_max = cur.fetchone()
+        cur.execute("SELECT MIN(last_changed), MAX(last_changed) FROM statute_feed_state")
+        chg_min, chg_max = cur.fetchone()
+        cur.execute(
+            "SELECT domain, COUNT(*), COALESCE(SUM(n_sections), 0) "
+            "FROM statute_feed_state GROUP BY domain ORDER BY COUNT(*) DESC, domain"
+        )
+        by_domain = cur.fetchall()
+
+    print("=== statute feed status ===")
+    print(f"  state rows           : {n_state}")
+    print(f"  corpus parents (≥9e9): {n_parents}")
+    print(f"  corpus children(≥9e9): {n_children}")
+    print(f"  last_seen   range    : {seen_min}  →  {seen_max}")
+    print(f"  last_changed range   : {chg_min}  →  {chg_max}")
+    print("\nby domain:")
+    print(f"  {'domain':24s} {'laws':>6} {'sections':>10}")
+    for domain, n_laws, n_secs in by_domain:
+        print(f"  {domain:24s} {n_laws:>6} {n_secs:>10}")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -342,13 +477,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--fetch-sections",
         action="store_true",
-        help="also download + parse a sample of mapped laws to validate the parse.",
+        help="(with dry-run) also download + parse a sample to validate the parse.",
     )
     parser.add_argument(
         "--limit",
         type=int,
-        default=5,
-        help="number of laws to fetch with --fetch-sections (default 5).",
+        default=None,
+        help="cap the law count. With --fetch-sections: sample size (default 5). "
+        "With --backfill all: cap the backfill (default: no cap).",
     )
     parser.add_argument(
         "--ingest",
@@ -357,16 +493,42 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--backfill",
-        choices=["mapped"],
-        help="bulk ingest. 'mapped': the 29 registry-mapped wind-relevant laws "
-        "(LIVE write; idempotent — unchanged laws skip cheaply).",
+        choices=["mapped", "all"],
+        help="bulk ingest. 'mapped': the 29 registry-mapped wind-relevant laws; "
+        "'all': every law in the TOC (combine with --limit N to cap). LIVE write.",
+    )
+    parser.add_argument(
+        "--prune-removed",
+        action="store_true",
+        help="DELETE corpus rows for laws missing from the TOC + with "
+        "last_seen older than --missing-days. LIVE delete.",
+    )
+    parser.add_argument(
+        "--missing-days",
+        type=int,
+        default=7,
+        help="how long a law must be missing from the TOC before --prune-removed deletes it (default 7).",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="print the current feed state — laws per domain, row counts.",
     )
     args = parser.parse_args(argv)
+
+    if args.status:
+        return _run_status()
+    if args.prune_removed:
+        return _run_prune_removed(missing_days=args.missing_days)
     if args.backfill == "mapped":
         return _run_backfill_mapped()
+    if args.backfill == "all":
+        return _run_backfill_all(limit=args.limit)
     if args.ingest:
         return _run_ingest(slug=args.ingest)
-    return _run_dry(fetch_sections=args.fetch_sections, limit=args.limit)
+    # Dry-run is the default; --fetch-sections default-limit is 5 when --limit not set.
+    fetch_limit = args.limit if args.limit is not None else 5
+    return _run_dry(fetch_sections=args.fetch_sections, limit=fetch_limit)
 
 
 if __name__ == "__main__":
