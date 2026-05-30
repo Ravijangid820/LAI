@@ -1,6 +1,6 @@
 # Plan — Bring LAI-UI under the same architecture as LAI
 
-**Date:** 2026-05-30 · **Owner:** rj · **Status:** PROPOSED — awaiting sign-off
+**Date:** 2026-05-30 · **Owner:** rj · **Status:** PARTIALLY DONE 2026-05-30 — branches + tags landed; CONTRIBUTING + CI + first FE blueprint remain
 **Why sign-off:** changes the LAI-UI branching model + introduces a CI gate,
 both of which affect everyone working in that repo. Also needs the active FE
 WIP to land first (cannot impose mid-WIP).
@@ -98,3 +98,41 @@ both repos:
   blocks merges on failure.
 - A successful audit-log view deploy executed per the new flow (proves the
   end-to-end loop: blueprint → develop → release tag → deploy).
+
+## Result (2026-05-30)
+
+**Branches + tags landed (executed via a throwaway `/tmp/lai-ui-rollout`
+worktree so the main worktree's 26 dirty WIP files weren't touched):**
+
+| Ref | Commit | What |
+|---|---|---|
+| `origin/master` | `17cf2fb` | v2 cut + `package.json` bump `0.0.0 → 2.0.0` |
+| `origin/develop` | `17cf2fb` | same — clean Git Flow init state |
+| `v1.0.0` tag    | `1c3b7dc` | pre-v2 baseline ("align UI ordering…") |
+| `v2.0.0` tag    | `17cf2fb` | cross-account isolation + onboarding + sharing + admin UI |
+| `origin/fix/cross-account-isolation` | DELETED | all content reachable from master |
+
+Diff `v1.0.0..v2.0.0` is **+14,445 / -2,454 across 70 files** — fully
+justifies the major bump (the dev's own commit msg said `feat(v2):` ).
+
+**Still local-only on the main worktree** (deliberately preserved):
+- **Harsh's 3 unpushed commits** (`f0f0441`, `9a2040e`, `c554842`) — audit-log
+  view, German DOCX labels, report progress labels. Will land as `v2.1.0` once
+  Harsh OKs pushing.
+- **26 dirty WIP files** — the in-progress resumable upload feature (4 new
+  `uploadResumable.ts` / `UploadResumeIndicator.tsx` / `uploadStore.ts` /
+  `dropFiles.ts` + 22 modifications wiring them in).
+
+## Remaining
+- **`LAI-UI/CONTRIBUTING.md`** — Git Flow §4 mirrored from LAI with TS commands.
+  Deliberately not added in this rollout (gives the FE team a chance to
+  review the rules before they're committed).
+- **`LAI-UI/rj/blueprint/`** — empty until the first real plan doc lands. First
+  candidate is still the **audit-log view deploy**, but it depends on Harsh's
+  3 unpushed commits going to develop first.
+- **`.github/workflows/ci.yml`** — optional: `npm ci && npm run build && npm
+  run lint` on push/PR to `develop` + `master`.
+- **Branch protection on `master`** in GitHub Settings — once the team
+  agrees, require PR + green CI before merge.
+- **Retire local `fix/cross-account-isolation`** — only after Harsh's 3
+  commits + 26 WIP files have landed on `develop`.
