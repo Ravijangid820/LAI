@@ -98,3 +98,18 @@ sufficient. The `last_seen` column already supports the pruning window.
 - Daily + weekly cron lines installed, last successful run recorded.
 - `statute_feed.sh` ops wrapper + ops README entry.
 - `harsh/PROGRESS_V2.md` 4.3 marked Phase C DONE.
+
+## Progress
+
+### Step 1 — `--backfill mapped` DONE 2026-05-30
+- 29/29 laws ingested, 0 failures, **12.1 min**.
+- Corpus delta (id ≥ 9 000 000 000): parents 120 → **5 762**, children 245 → **9 133**.
+- `statute_feed_state`: 29 rows across all 11 domains (energierecht 5, umweltrecht 4, steuerrecht 4, …).
+- Largest: `zpo` 682 p + 774 c in 62.4 s. Smallest: `windbg` 13 p + 30 c in 3.3 s.
+- Migrated rows untouched. Commit: `f1b9054`. Log: `LAI/logs/pipeline/statute_feed_backfill_mapped_*.log`.
+
+### Step 2 — full backfill + prune (`--backfill all`, `--prune-removed`, `--status`)
+Pending. Needs the heavy run scheduled in the agreed weekend window.
+
+### Step 3 — ops wrapper + cron
+Pending.
