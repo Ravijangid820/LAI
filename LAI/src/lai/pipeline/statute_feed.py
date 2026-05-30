@@ -289,6 +289,46 @@ def _run_ingest(slug: str) -> int:
     return 0
 
 
+def _run_backfill_mapped() -> int:
+    """Sequentially ingest the registry-mapped wind-relevant laws.
+
+    Per-law try/except: one bad XML or transient failure does NOT abort the
+    batch. Idempotent: laws with unchanged content_hash skip in ~1-2 s each,
+    so re-runs are cheap. Returns 0 if every law succeeded, 1 if any failed.
+    """
+    t0 = time.monotonic()
+    slugs = sorted(mapped_slugs())
+    print(f"[info] backfill: {len(slugs)} mapped laws (sequential)")
+
+    ok: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for i, slug in enumerate(slugs, 1):
+        print(f"\n[{i}/{len(slugs)}] --- {slug} ---")
+        try:
+            rc = _run_ingest(slug)
+        except Exception as exc:  # one bad law must not abort the whole batch
+            print(f"[error] {slug}: {type(exc).__name__}: {exc}")
+            failed.append((slug, f"{type(exc).__name__}: {str(exc)[:200]}"))
+            continue
+        if rc == 0:
+            ok.append(slug)
+        else:
+            failed.append((slug, f"exit_code={rc}"))
+
+    elapsed = time.monotonic() - t0
+    print("\n=== backfill mapped summary ===")
+    print(f"  total:    {len(slugs)}")
+    print(f"  ok:       {len(ok)}")
+    print(f"  failed:   {len(failed)}")
+    print(f"  elapsed:  {elapsed:.0f}s ({elapsed / 60:.1f} min)")
+    if failed:
+        print(f"\nfailed laws ({len(failed)}):")
+        for slug, msg in failed:
+            print(f"  {slug:18s} {msg}")
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="statute-feed",
@@ -315,7 +355,15 @@ def main(argv: list[str] | None = None) -> int:
         metavar="SLUG",
         help="ingest one law (LIVE write to corpus_*). Requires PGPASSWORD env.",
     )
+    parser.add_argument(
+        "--backfill",
+        choices=["mapped"],
+        help="bulk ingest. 'mapped': the 29 registry-mapped wind-relevant laws "
+        "(LIVE write; idempotent — unchanged laws skip cheaply).",
+    )
     args = parser.parse_args(argv)
+    if args.backfill == "mapped":
+        return _run_backfill_mapped()
     if args.ingest:
         return _run_ingest(slug=args.ingest)
     return _run_dry(fetch_sections=args.fetch_sections, limit=args.limit)
