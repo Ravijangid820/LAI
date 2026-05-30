@@ -60,6 +60,56 @@ bash /data/projects/lai/LAI/scripts/ops/resume_step5.sh --stop-all # stop + cont
 
 ---
 
+## Statute feed (Phase 4.3 — gesetze-im-internet.de → corpus_*)
+
+Keeps the German federal-statute portion of the corpus current. All modes go
+through `scripts/ops/statute_feed.sh`, which auto-sources
+`LAI/micro-services/.env` (DB password), writes logs under
+`LAI/logs/pipeline/`, and PID-tracks background jobs in
+`LAI/processed/statute_feed.pid`.
+
+```bash
+# Current state (counts per domain, last_seen range):
+bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --status
+
+# Daily — refresh the 29 wind-relevant laws (foreground; ~12 min):
+bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --mapped
+
+# Weekly — full TOC sweep (background ~43 h; survives SSH disconnect):
+bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --full
+# Smoke-test variant — only the first 50 laws:
+bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --full --limit 50
+
+# Tail the latest log / stop the background --full / prune dead laws:
+bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --tail
+bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --stop
+bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --prune    # default 7-day window
+```
+
+Idempotent: `statute_feed_state.content_hash` makes re-runs cheap — unchanged
+laws skip in ~1 s. The TOC is fetched once per backfill (one HTTP client
+shared across the loop).
+
+Recommended cron (install on the same box as `lai-backend`):
+```bash
+# Daily 03:00 — mapped backfill (~12 min)
+0 3 * * *  bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --mapped \
+  >> /data/projects/lai/LAI/logs/pipeline/statute_feed_cron_mapped.log 2>&1
+
+# Sunday 22:00 — full TOC sweep (background; finishes by Tuesday)
+0 22 * * 0  bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --full
+
+# Wednesday 02:00 — prune laws gone from the TOC for ≥ 7 days
+0 2 * * 3  bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --prune \
+  >> /data/projects/lai/LAI/logs/pipeline/statute_feed_cron_prune.log 2>&1
+```
+
+> **Coordinate before installing cron** — the embedding server on `:8003`
+> is shared with `serve_rag` /query. The schedule above puts the heavy
+> full sweep in the quiet weekend window.
+
+---
+
 ## LAI runtime (chat + DDiQ + UI)
 
 ```bash

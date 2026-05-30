@@ -69,13 +69,27 @@ every registry slug resolved; sample parse OK (BauGB 298 sections, AktG 394, …
 
 ## Status & remaining phases
 
-- **Phase A — read-only — DONE.** Connector + parsers + registry + dry-run, all
-  validated against live data. Unit tests under mypy `--strict` + ≥85% coverage.
-- **Phase B — write path.** Reuse `lai.pipeline.chunk.process_document` +
-  `lai.pipeline.embed.embed_batch` (Qwen3-Embedding-8B, truncate 4096→4000 to
-  match `corpus_child_chunks.embedding halfvec(4000)`), transactional per-law
-  upsert into `corpus_parent_chunks` / `corpus_child_chunks`. Needs a
-  non-colliding id range (the `corpus_*` PKs are supplied BIGINTs) + a
-  `statute_feed_state` table (content-hash diffing) — additive migration 007.
-- **Phase C — operationalize.** Daily cron (mirrors `scripts/ops/smoke_test.py`
-  + the resume_step6 idempotency pattern), ops wrapper, full statute set.
+- **Phase A — read-only — DONE 2026-05-29.** Connector + parsers + registry +
+  dry-run, all validated against live data. Unit tests under mypy `--strict`
+  + ≥85 % coverage.
+- **Phase B — write path — DONE 2026-05-30.** Migration 007 applied
+  (`statute_feed_state` + `corpus_feed_id_seq` ≥ 9 × 10⁹). `--ingest <slug>`
+  chunks via `lai.pipeline.chunk.process_document`, embeds via
+  `lai.pipeline.embed.embed_batch` (Qwen3-Embedding-8B, fp16 → first 4000
+  dims to match `corpus_child_chunks.embedding halfvec(4000)`), transactional
+  per-law upsert. Verified live: bimschg → 120 parents + 245 children in 23.9 s;
+  re-run skipped in 1.5 s.
+- **Phase C — operationalize — in progress.**
+  - **Step 1 — mapped backfill — DONE 2026-05-30.** 29/29 wind-relevant laws
+    ingested in 12.1 min → 5,762 parents + 9,133 children across all 11
+    `classify.py` domains.
+  - **Step 2 — extra CLI — DONE 2026-05-30.** Refactored `_ingest_one` so all
+    backfill modes share one HTTP client (no per-law TOC re-fetch). Added
+    `--backfill all [--limit N]`, `--prune-removed [--missing-days N]`,
+    `--status`.
+  - **Step 3 — ops wrapper + cron — DONE 2026-05-30.**
+    `scripts/ops/statute_feed.sh` (modes: `--status`, `--mapped`, `--full`,
+    `--prune`, `--tail`, `--stop`) + documented daily-mapped / weekly-full /
+    weekly-prune cron lines in `scripts/ops/README.md`.
+  - **Step 4 — weekend full sweep — pending.** Scheduled run (~43 h) to be
+    triggered in the agreed Sunday-22:00 window.

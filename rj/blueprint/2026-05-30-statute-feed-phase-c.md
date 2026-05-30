@@ -108,8 +108,26 @@ sufficient. The `last_seen` column already supports the pruning window.
 - Largest: `zpo` 682 p + 774 c in 62.4 s. Smallest: `windbg` 13 p + 30 c in 3.3 s.
 - Migrated rows untouched. Commit: `f1b9054`. Log: `LAI/logs/pipeline/statute_feed_backfill_mapped_*.log`.
 
-### Step 2 — full backfill + prune (`--backfill all`, `--prune-removed`, `--status`)
-Pending. Needs the heavy run scheduled in the agreed weekend window.
+### Step 2 — extra CLI DONE 2026-05-30
+- Refactored `_ingest_one(law, client)` so backfill loops share one open HTTP
+  client — no per-law TOC re-fetch (saves ~5 h on a full 6,123-law sweep).
+- Added `--backfill all [--limit N]`, `--prune-removed [--missing-days N]`,
+  `--status`. Smoke-tested live: `--status` shows 29 / 5762 / 9133;
+  `--ingest bimschg` skips in 0.6 s (idempotency intact across the refactor);
+  `--prune-removed --missing-days 365` finds nothing (fresh data).
+- Commit: `7a0de8f`.
 
-### Step 3 — ops wrapper + cron
-Pending.
+### Step 3 — ops wrapper + cron + docs DONE 2026-05-30
+- `scripts/ops/statute_feed.sh` (modes: `--status`, `--mapped`, `--full`
+  `[--limit N]`, `--prune`, `--tail`, `--stop`, `--help`). Sources
+  `LAI/micro-services/.env`, logs under `LAI/logs/pipeline/`, PIDs under
+  `processed/statute_feed.pid`. Background `--full` uses `setsid + nohup` so
+  it survives SSH disconnect.
+- Documented in `scripts/ops/README.md` with the three recommended cron
+  lines (daily 03:00 mapped · weekly Sunday 22:00 full · weekly Wed 02:00
+  prune). The cron is **not yet installed** — coordinate first; shared box.
+- `LAI/docs/statute_feed.md` updated.
+
+### Step 4 — weekend full sweep (pending)
+Trigger `bash scripts/ops/statute_feed.sh --full` in the agreed Sunday-22:00
+window. ~43 h, finishes by Tuesday. Verify with `--status` afterwards.
