@@ -186,6 +186,40 @@ watch -n 5 "curl -s http://localhost:18001/ddiq/report/$RID/status | python3 -m 
 
 ---
 
+## Audit-log export + retention
+
+`scripts/ops/audit_export.py` is the ops/compliance counterpart to the admin
+UI's audit-log viewer (`/dashboard/admin/audit`). It reuses
+`lai.common.audit.query` for reads and issues a bound-parameter `DELETE` for
+retention (migration 006's `audit_log_no_update` trigger blocks UPDATE but
+intentionally allows DELETE under a privileged job). Async, asyncpg-only.
+
+```bash
+# CSV export of the last 7 days to a file:
+.venv/bin/python scripts/ops/audit_export.py \
+  --since 2026-05-23 --format csv --out audit_2026-05.csv
+
+# JSON to stdout, filtered to one action / one org:
+.venv/bin/python scripts/ops/audit_export.py \
+  --action login --org-id <uuid> --format json
+
+# Dry-run a retention cull (always do this first):
+.venv/bin/python scripts/ops/audit_export.py --purge-older-than 365
+
+# Actually delete rows older than 365 days:
+.venv/bin/python scripts/ops/audit_export.py --purge-older-than 365 --yes
+```
+
+Reads `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` from the
+same env the audit writer uses, so a sourced `.env` is enough. Exit codes:
+0 ok, 1 config, 2 DB, 3 dry-run notice (`--purge-older-than` without `--yes`).
+
+> **EU AI Act:** Art. 12 sets a *minimum* retention period (6 months). Pick a
+> purge cutoff that's longer than your policy, not shorter, and run the
+> dry-run first to confirm the count.
+
+---
+
 ## Database state queries
 
 ### Pipeline progress (SQLite local DB, 331 GB)
@@ -232,6 +266,7 @@ docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'lai_|d
 
 ## Recent ops history (rolling, last 5)
 
+- 2026-05-30 — Added `scripts/ops/audit_export.py` (vm-4 / ROADMAP 2.3 follow-up): CSV/JSON bulk export of `audit_log` with date / action / org / user filters, plus a `--purge-older-than DAYS` retention path that requires `--yes` to actually DELETE (dry-run by default). Reads via `audit.query`; purge issues a bound-parameter `DELETE`.
 - 2026-05-30 — `scripts/ops/smoke_test.py` gained an optional `--report` leg (vm-3 / ROADMAP 1.2 follow-up): POSTs a DDiQ async report against `LAI_SMOKE_DDIQ_DOC_ID` and polls `/status` until `done` or budget, so the smoke test now catches DDiQ-pipeline regressions too (exit 7). `LAI_SMOKE_USER`/`LAI_SMOKE_PASS` accepted as aliases for the EMAIL/PASSWORD pair. Cron line documented but **not installed** — shared-box change, awaits rj's OK.
 - 2026-05-29 — Added `scripts/ops/smoke_test.py` (vm-1 / ROADMAP 1.2): post-restart guard that fails loudly when a query is slow or the reranker is on CPU.
 - 2026-05-21 — Documented `scripts/ops/restart_serve_rag.sh` (Sahid's S-5 script) as the canonical safe restart; removed a duplicate `restart-serve_rag.sh` that had been added by mistake.
