@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import sys
 import time
@@ -234,21 +235,80 @@ def write_reports(
     print(f"Wrote {outdir / 'report.md'}")
 
 
+def _probes_sha256(path: Path) -> str:
+    """SHA-256 of the probes file. Used to validate precomputed base answers
+    were generated against the same prompt set the callback will reuse."""
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def write_base_answers(
+    probes: list[Probe],
+    base_ans: list[str],
+    out_path: Path,
+    meta: dict,
+) -> None:
+    """Write a compact base-only artifact for the RetentionProbeCallback to read.
+
+    Schema (small and stable so the callback can rely on it):
+        {"meta": {...}, "answers": {probe_id: {"answer": str, "len": int, "ascii_ratio": float}}}
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "meta": meta,
+        "answers": {
+            p.id: {
+                "answer": ans,
+                "len": len(ans),
+                "ascii_ratio": round(ascii_ratio(ans), 3),
+            }
+            for p, ans in zip(probes, base_ans, strict=True)
+        },
+    }
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Wrote {out_path}")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Base-vs-FT retention probe — see ./README.md",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--base", required=True, help="Base model name or path (e.g. Qwen/Qwen3.6-27B)")
-    g = p.add_mutually_exclusive_group(required=True)
+    g = p.add_mutually_exclusive_group(required=False)
     g.add_argument("--ft-adapter", help="PEFT adapter dir (loaded on top of --base)")
     g.add_argument("--ft-model", help="Merged FT model dir (loaded directly)")
     p.add_argument("--probes", required=True, help="Path to retention_probes.jsonl")
-    p.add_argument("--out", required=True, help="Output dir (writes report.json + report.md)")
+    p.add_argument(
+        "--out",
+        help="Output dir (writes report.json + report.md). Required UNLESS --save-base-answers is set.",
+    )
+    p.add_argument(
+        "--save-base-answers",
+        metavar="PATH",
+        help=(
+            "Run BASE only and write a compact base-answers JSON to PATH. "
+            "Used by RetentionProbeCallback to avoid re-loading the base every save step. "
+            "When set, --ft-adapter/--ft-model are ignored and --out is not required."
+        ),
+    )
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     args = p.parse_args()
+
+    base_only = bool(args.save_base_answers)
+    if not base_only and not (args.ft_adapter or args.ft_model):
+        print(
+            "ERROR: pass --ft-adapter PATH or --ft-model PATH (or use --save-base-answers PATH "
+            "to write a base-only artifact).",
+            file=sys.stderr,
+        )
+        return 2
+    if not base_only and not args.out:
+        print("ERROR: --out is required unless --save-base-answers is set.", file=sys.stderr)
+        return 2
 
     probes_path = Path(args.probes)
     if not probes_path.exists():
@@ -277,6 +337,20 @@ def main() -> int:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    if base_only:
+        meta = {
+            "base": args.base,
+            "probes_path": str(probes_path),
+            "probes_sha256": _probes_sha256(probes_path),
+            "max_new_tokens": args.max_new_tokens,
+            "dtype": args.dtype,
+            "n_probes": len(probes),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        write_base_answers(probes, base_ans, Path(args.save_base_answers), meta)
+        print("\nBase-only run complete. Skipped FT side.")
+        return 0
 
     if args.ft_adapter:
         print(f"\n=== Loading FT (adapter on base): {args.ft_adapter} ===")

@@ -104,6 +104,25 @@ def parse_args():
                    help="If >0, subsample the val set to N rows. Full 10K val takes "
                         "several minutes per eval; 1-2K samples give a statistically "
                         "reliable eval_loss (std ~0.01) and cut total eval time ~10x.")
+
+    # --- retention probe callback (opt-in; see training/fine_tuning/eval/README.md) ---
+    p.add_argument("--retention-probe-base", default=None,
+                   help="Path to a base-answers JSON produced by "
+                        "`python -m training.fine_tuning.eval.retention_probe --save-base-answers ...`. "
+                        "When set, attaches RetentionProbeCallback to the trainer so each "
+                        "save step runs the probe and can early-stop on hard regressions "
+                        "(output degeneration / confident statute fabrication).")
+    p.add_argument("--retention-probes",
+                   default=str(LAI_DIR / "training" / "fine_tuning" / "eval" / "probes" / "retention_probes.jsonl"),
+                   help="Path to retention_probes.jsonl (used only if --retention-probe-base is set).")
+    p.add_argument("--retention-out", default=None,
+                   help="Output dir for per-step retention reports. "
+                        "Defaults to <output-dir>/retention/.")
+    p.add_argument("--retention-no-stop", action="store_true",
+                   help="If set, the retention callback LOGS regressions but does NOT "
+                        "early-stop training. Default is to stop — that's the whole point.")
+    p.add_argument("--retention-max-new-tokens", type=int, default=256,
+                   help="Max new tokens per probe generation (default 256).")
     return p.parse_args()
 
 
@@ -215,6 +234,21 @@ def main():
         dataloader_pin_memory=True,
     )
 
+    callbacks = []
+    if args.retention_probe_base:
+        # Local import: keeps the retention callback's transformers/torch graph cost
+        # out of training runs that don't use it.
+        from training.fine_tuning.eval.retention_callback import RetentionProbeCallback
+        callbacks.append(
+            RetentionProbeCallback(
+                probes_path=args.retention_probes,
+                base_answers_path=args.retention_probe_base,
+                out_dir=args.retention_out or (Path(args.output_dir) / "retention"),
+                max_new_tokens=args.retention_max_new_tokens,
+                early_stop=not args.retention_no_stop,
+            )
+        )
+
     trainer = SFTTrainer(
         model=model,
         args=sft,
@@ -222,6 +256,7 @@ def main():
         eval_dataset=ds["val"],
         peft_config=peft_config,
         processing_class=tok,
+        callbacks=callbacks or None,
     )
 
     print()

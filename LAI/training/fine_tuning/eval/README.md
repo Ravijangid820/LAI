@@ -16,9 +16,12 @@ fills:
 
 | | |
 |---|---|
-| `retention_probe.py` | Runner. Loads base + FT (PEFT adapter or merged checkpoint), runs the fixed prompt set through both with greedy decoding, writes `report.json` + `report.md` side-by-side with simple deltas. |
+| `retention_probe.py` | Standalone runner. Loads base + FT (PEFT adapter or merged checkpoint), runs the fixed prompt set through both with greedy decoding, writes `report.json` + `report.md` side-by-side with simple deltas. With `--save-base-answers PATH` runs **base only** and writes a compact JSON for the callback to reuse. |
 | `probes/retention_probes.jsonl` | The fixed probe set — **25 prompts**, see categories below. |
-| `reports/` | Output dir (created at first run). One sub-dir per probe run. |
+| `detectors.py` | Pure-Python detectors used by the callback: `looks_like_fabricated_frist` and `is_degenerate`. No torch dep, individually unit-testable. |
+| `retention_callback.py` | `RetentionProbeCallback(TrainerCallback)` — fires the probe at every `on_save` during training, writes a per-step report, and (default) **early-stops training** on hard regressions. Wired into `scripts/run_lora.py` via `--retention-probe-base`. |
+| `test_detectors.py` | 15 assert-based tests using real v1/v2 strings — locks in the detectors' false-positive-averse behaviour. Runs with bare Python 3, no venv needed: `python -m training.fine_tuning.eval.test_detectors`. |
+| `reports/` | Output dir (created at first run). One sub-dir per standalone probe run; `<run_lora_output>/retention/step-NNNNNN/` for callback runs. |
 
 ### Probe categories (25 prompts total)
 
@@ -72,17 +75,71 @@ Exit codes: `0` ok, `2` bad args / missing probes, `3` model load failure.
 - **`reasoning` answers that collapse** — the FT learned a templated answer shape
   and can no longer follow general logical structure.
 
-## How to use this in the training loop
+## Use as a training-loop stop signal (recommended for Phase 3)
 
-Run the probe **every 1–2K training steps** (alongside `eval_loss`) and treat
-regressions in `de_general` / `de_legal_other` / `refusal` as **stop conditions**,
-not just metrics to log. The prior attempt's `load_best_model_at_end=True` chose
-the lowest `val_loss` checkpoint — which on a 7B with 190K in-domain examples is
-often the *worst* on retention. Either:
+The standalone runner is for ad-hoc audits. For the actual training, use
+`RetentionProbeCallback` — it fires the probe at every `on_save`, writes a
+per-step report, and **early-stops training** on hard regressions.
 
-1. Pick `best_checkpoint` by a composite of `val_loss` + retention deltas, or
-2. Stop training before retention deltas grow large (early stop on the *probe*,
-   not just on val_loss).
+### One-off: precompute the base answers
+
+The base side is identical across every training run on a given `(base, probes)`
+combo, so compute it once and cache:
+
+```bash
+python -m training.fine_tuning.eval.retention_probe \
+    --base Qwen/Qwen3.6-27B \
+    --probes ./training/fine_tuning/eval/probes/retention_probes.jsonl \
+    --save-base-answers ./training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json
+```
+
+The output JSON records the probes file's SHA-256; the callback refuses to start
+if the probes have been edited since.
+
+### Training: opt the callback in via `run_lora.py`
+
+```bash
+python -m training.fine_tuning.scripts.run_lora \
+    --base-model Qwen/Qwen3.6-27B \
+    --output-dir ./training/fine_tuning/output/qwen36-27b-bimschg-lora \
+    --retention-probe-base ./training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json
+    # ... + your usual LoRA flags
+```
+
+That's it. With `--retention-probe-base` set, the trainer attaches the callback
+automatically. Per-step reports land at `<output-dir>/retention/step-NNNNNN/`.
+
+### Hard-stop conditions
+
+The callback is **false-positive-averse** by design — a wrongly-triggered stop
+kills a valid run. Only two conditions trigger `control.should_training_stop`:
+
+1. **Output degeneration on a `de_general` probe** — `unique_5gram_ratio < 0.20`
+   on an answer ≥ 30 chars. Catches the v1 *"grüne Wachtel, grüne Karte…"*
+   token-loop collapse. Skipped on short answers; ignored on in-domain probes.
+2. **Confident statute fabrication on a fictional probe** — the answer contains a
+   digit-form `Frist` (`\d+ (Jahre|Monate|Tage|Wochen)`) *without* any
+   calibration phrase (`fiktiv`, `existiert nicht`, `kenne nicht`, `fictional`,
+   …). Applies only to probe IDs in `fictional_probe_ids` (default
+   `{"refusal_003"}`). Catches the v1 == v2 ship-blocker pattern exactly.
+
+Other regressions (length collapse in `en_general`, cross-language leak,
+`de_legal_other` mis-citations) are **flagged in the report** but do NOT stop
+training — those are eval signals to read, not auto-stop signals.
+
+To disable the early-stop (LOG-only mode), pass `--retention-no-stop`.
+
+### Verifying the detectors didn't drift
+
+The detectors are pinned by 15 unit tests against real strings pulled from the
+v1 and v2 probe reports:
+
+```bash
+python -m training.fine_tuning.eval.test_detectors
+# -> Ran 15 detector tests; 15 passed.
+```
+
+Run this before any change to `detectors.py` lands.
 
 ## What this is *not*
 
