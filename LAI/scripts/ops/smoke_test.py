@@ -33,18 +33,26 @@ Exit codes (distinct so a cron can alert on the cause)
   4  query failed / server error
   5  query slower than the latency budget (possible CPU fallback)
   6  reranker is on CPU per the log (the regression), or the log is unreadable
+  7  DDiQ report leg failed (start, status, or never advanced)
 
 Environment
 -----------
-  LAI_SMOKE_URL        base URL                 (default http://localhost:18000)
-  LAI_SMOKE_TOKEN      pre-minted access token  (skips login when set)
-  LAI_SMOKE_EMAIL      login email              (used when no TOKEN)
-  LAI_SMOKE_PASSWORD   login password           (used when no TOKEN)
-  LAI_SMOKE_QUESTION   question to send         (default: a BImSchG corpus query)
-  LAI_SMOKE_FORCE_MODE "rag" | "chat" | ""      (default "rag")
-  LAI_SMOKE_MAX_S      pass/fail latency budget (default 20)
-  LAI_SMOKE_TIMEOUT    HTTP timeout seconds     (default 120)
-  LAI_SERVE_RAG_LOG    serve_rag log path       (default <repo>/logs/host/serve_rag.log)
+  LAI_SMOKE_URL          base URL                 (default http://localhost:18000)
+  LAI_SMOKE_TOKEN        pre-minted access token  (skips login when set)
+  LAI_SMOKE_EMAIL        login email              (used when no TOKEN)
+  LAI_SMOKE_PASSWORD     login password           (used when no TOKEN)
+  LAI_SMOKE_USER         alias for LAI_SMOKE_EMAIL (matches vm-3 spec naming)
+  LAI_SMOKE_PASS         alias for LAI_SMOKE_PASSWORD
+  LAI_SMOKE_QUESTION     question to send         (default: a BImSchG corpus query)
+  LAI_SMOKE_FORCE_MODE   "rag" | "chat" | ""      (default "rag")
+  LAI_SMOKE_MAX_S        pass/fail latency budget (default 20)
+  LAI_SMOKE_TIMEOUT      HTTP timeout seconds     (default 120)
+  LAI_SERVE_RAG_LOG      serve_rag log path       (default <repo>/logs/host/serve_rag.log)
+  LAI_SMOKE_DDIQ_URL     DDiQ base URL            (default http://localhost:18001)
+  LAI_SMOKE_DDIQ_DOC_ID  seeded ddiq_documents id (REQUIRED when --report is set)
+  LAI_SMOKE_DDIQ_PRESET  report preset            (default "comprehensive")
+  LAI_SMOKE_DDIQ_MAX_S   report budget seconds    (default 600 — DDiQ is slow)
+  LAI_SMOKE_DDIQ_POLL_S  status poll interval     (default 10)
 
 Usage
 -----
@@ -52,11 +60,16 @@ Usage
   export LAI_SMOKE_EMAIL=ops@yourfirm.de LAI_SMOKE_PASSWORD=...
   python3 LAI/scripts/ops/smoke_test.py
 
+  # also exercise the DDiQ report pipeline (needs a seeded document id):
+  export LAI_SMOKE_DDIQ_DOC_ID=<uuid-of-a-tiny-ddiq_documents-row>
+  python3 LAI/scripts/ops/smoke_test.py --report
+
 This script uses only the Python standard library, so any python3 runs it.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -75,6 +88,7 @@ EXIT_AUTH = 3
 EXIT_QUERY = 4
 EXIT_SLOW = 5
 EXIT_RERANKER_CPU = 6
+EXIT_REPORT = 7
 
 # serve_rag prints this once at startup (search/eval.py: "Loading reranker
 # {model} on {device}..."). We take the LAST match in the log, which reflects
@@ -165,15 +179,141 @@ def _reranker_device(log_path: Path) -> str | None:
     return last
 
 
-def main() -> int:
+# A DDiQ report progresses through these statuses; we accept any terminal hit on
+# "done" within budget, or — when the budget runs out — at least one observable
+# advance from the initial state ("queued"→"running" / progress > 0) so a slow
+# but healthy box still passes. "failed"/"error"/"cancelled" are immediate fails.
+_DDIQ_TERMINAL_PASS = {"done", "complete", "completed", "ready"}
+_DDIQ_TERMINAL_FAIL = {"failed", "error", "errored", "cancelled", "canceled"}
+
+
+def _ddiq_progress(parsed: dict | None) -> tuple[str, float]:
+    """Pull (status, progress_pct) from a /ddiq/report/{id}/status payload.
+
+    The DDiQ payload shape has bounced around between versions (``status`` vs
+    ``state``; ``progress`` 0-1 vs 0-100), so be forgiving — we only need it to
+    tell "advanced or didn't" from a smoke perspective.
+    """
+    if not parsed:
+        return ("", 0.0)
+    status = str(parsed.get("status") or parsed.get("state") or "").lower()
+    raw = parsed.get("progress")
+    if raw is None:
+        raw = parsed.get("progress_pct", 0)
+    try:
+        pct = float(raw)
+    except (TypeError, ValueError):
+        pct = 0.0
+    # Normalise 0-1 fractions to a percentage.
+    if 0.0 < pct <= 1.0:
+        pct *= 100.0
+    return (status, pct)
+
+
+def _run_report_leg(*, ddiq_base: str, doc_id: str, token: str | None) -> None:
+    """Start an async DDiQ report and poll until done / advanced / budget elapsed.
+
+    Exits via :func:`_fail` on configuration, transport, or status failures;
+    returns normally on pass. Sends the serve_rag bearer token along — DDiQ
+    ignores it if the route is unauthenticated, and uses it where it's needed
+    (e.g. the audited export route). Failure exit code 7.
+    """
+    preset = _env("LAI_SMOKE_DDIQ_PRESET", "comprehensive")
+    try:
+        budget = float(_env("LAI_SMOKE_DDIQ_MAX_S", "600"))
+        poll_s = float(_env("LAI_SMOKE_DDIQ_POLL_S", "10"))
+    except ValueError:
+        _fail(EXIT_CONFIG, "LAI_SMOKE_DDIQ_MAX_S / LAI_SMOKE_DDIQ_POLL_S must be numeric")
+
+    _info(f"ddiq report: doc_id={doc_id}, preset={preset}, budget={budget:.0f}s")
+    try:
+        status, parsed, raw = _http(
+            "POST",
+            f"{ddiq_base}/ddiq/report/generate/async",
+            token=token,
+            body={"document_ids": [doc_id], "preset": preset},
+            timeout=60.0,
+        )
+    except urllib.error.URLError as exc:
+        _fail(EXIT_UNREACHABLE, f"cannot reach {ddiq_base}: {exc.reason}")
+    except TimeoutError:
+        _fail(EXIT_UNREACHABLE, f"timed out POSTing to {ddiq_base}/ddiq/report/generate/async")
+    if status != 200 or not parsed or not parsed.get("report_id"):
+        _fail(EXIT_REPORT, f"ddiq generate/async failed ({status}): {_detail(parsed, raw)}")
+    report_id = parsed["report_id"]
+    _ok(f"ddiq report kicked off: {report_id}")
+
+    t0 = time.monotonic()
+    last_status, last_pct = ("", -1.0)
+    advanced = False
+    while True:
+        elapsed = time.monotonic() - t0
+        try:
+            code, body, raw = _http("GET", f"{ddiq_base}/ddiq/report/{report_id}/status", token=token, timeout=30.0)
+        except urllib.error.URLError as exc:
+            _fail(EXIT_REPORT, f"ddiq status fetch failed: {exc.reason}")
+        if code != 200 or not body:
+            _fail(EXIT_REPORT, f"ddiq status returned {code}: {_detail(body, raw)}")
+        rstatus, rpct = _ddiq_progress(body)
+        if rstatus != last_status or rpct > last_pct + 0.5:
+            _info(f"ddiq @ {elapsed:5.1f}s: status={rstatus or '?'} progress={rpct:5.1f}%")
+            if rstatus and rstatus != last_status:
+                advanced = True
+            if rpct > last_pct + 0.5 and last_pct >= 0:
+                advanced = True
+            last_status, last_pct = rstatus, rpct
+
+        if rstatus in _DDIQ_TERMINAL_FAIL:
+            _fail(EXIT_REPORT, f"ddiq report ended in {rstatus!r} after {elapsed:.0f}s")
+        if rstatus in _DDIQ_TERMINAL_PASS:
+            _ok(f"ddiq report done in {elapsed:.0f}s (status={rstatus})")
+            return
+        if elapsed >= budget:
+            if advanced:
+                _ok(
+                    f"ddiq report still {rstatus or '?'} at budget ({budget:.0f}s) "
+                    f"but progress advanced to {rpct:.1f}% — acceptable"
+                )
+                return
+            _fail(
+                EXIT_REPORT,
+                f"ddiq report did not advance in {budget:.0f}s (status={rstatus or '?'}, progress={rpct:.1f}%)",
+            )
+        time.sleep(poll_s)
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="smoke_test.py",
+        description=(
+            "LAI system smoke test — health/login/query + reranker-on-CPU guard. "
+            "With --report also runs a DDiQ async-report leg against :18001."
+        ),
+    )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help=(
+            "After the chat/RAG leg, kick off a DDiQ async report against "
+            "LAI_SMOKE_DDIQ_DOC_ID and poll until it reaches 'done' or the "
+            "LAI_SMOKE_DDIQ_MAX_S budget elapses. Requires the doc id env."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
     base = _env("LAI_SMOKE_URL", "http://localhost:18000").rstrip("/")
     token = _env("LAI_SMOKE_TOKEN")
-    email = _env("LAI_SMOKE_EMAIL")
-    password = os.environ.get("LAI_SMOKE_PASSWORD", "")
+    # Honour both the original vm-1 env names and the LAI_SMOKE_USER/PASS pair
+    # the vm-3 task spec wrote out; LAI_SMOKE_EMAIL/PASSWORD win when both are set
+    # since that's what the README + cron line already document.
+    email = _env("LAI_SMOKE_EMAIL") or _env("LAI_SMOKE_USER")
+    password = os.environ.get("LAI_SMOKE_PASSWORD") or os.environ.get("LAI_SMOKE_PASS", "")
     question = _env(
         "LAI_SMOKE_QUESTION",
-        "Welche Genehmigung ist nach dem BImSchG fuer eine "
-        "Windenergieanlage erforderlich?",
+        "Welche Genehmigung ist nach dem BImSchG fuer eine Windenergieanlage erforderlich?",
     )
     force_mode = _env("LAI_SMOKE_FORCE_MODE", "rag")
     log_path = Path(_env("LAI_SERVE_RAG_LOG", str(_REPO_ROOT / "logs/host/serve_rag.log")))
@@ -187,8 +327,7 @@ def main() -> int:
     if not token and not (email and password):
         _fail(
             EXIT_CONFIG,
-            "no credentials: set LAI_SMOKE_TOKEN, or LAI_SMOKE_EMAIL + "
-            "LAI_SMOKE_PASSWORD",
+            "no credentials: set LAI_SMOKE_TOKEN, or LAI_SMOKE_EMAIL + LAI_SMOKE_PASSWORD",
         )
 
     print(f"LAI smoke test -> {base}")
@@ -239,15 +378,12 @@ def main() -> int:
     _info(f"query (force_mode={force_mode or 'auto'}): {question!r}")
     t0 = time.monotonic()
     try:
-        status, parsed, raw = _http(
-            "POST", f"{base}/query", token=token, body=payload, timeout=timeout
-        )
+        status, parsed, raw = _http("POST", f"{base}/query", token=token, body=payload, timeout=timeout)
     except (urllib.error.URLError, TimeoutError):
         elapsed = time.monotonic() - t0
         _fail(
             EXIT_SLOW,
-            f"no response within {timeout:.0f}s (elapsed {elapsed:.1f}s) — a CPU "
-            "reranker stalls here",
+            f"no response within {timeout:.0f}s (elapsed {elapsed:.1f}s) — a CPU reranker stalls here",
         )
     elapsed = time.monotonic() - t0
     if status != 200 or not parsed:
@@ -259,10 +395,7 @@ def main() -> int:
         for k in ("embed_s", "retrieve_s", "rerank_s", "generate_s", "total_s")
         if isinstance(timings.get(k), (int, float))
     )
-    _ok(
-        f"query: {elapsed:.1f}s wall, mode={parsed.get('mode')}, "
-        f"answer={len(parsed.get('answer', ''))} chars"
-    )
+    _ok(f"query: {elapsed:.1f}s wall, mode={parsed.get('mode')}, answer={len(parsed.get('answer', ''))} chars")
     if server_t:
         _info(f"server timings: {server_t}")
 
@@ -292,7 +425,20 @@ def main() -> int:
         )
     _ok(f"reranker on {device}")
 
-    print("\nSMOKE PASS: serve_rag healthy, query fast, reranker on GPU.")
+    # 6. Optional DDiQ report leg --------------------------------------------
+    if args.report:
+        ddiq_base = _env("LAI_SMOKE_DDIQ_URL", "http://localhost:18001").rstrip("/")
+        ddiq_doc_id = _env("LAI_SMOKE_DDIQ_DOC_ID")
+        if not ddiq_doc_id:
+            _fail(
+                EXIT_CONFIG,
+                "--report needs LAI_SMOKE_DDIQ_DOC_ID (a seeded ddiq_documents id); "
+                "see scripts/ops/README.md for how to seed one once",
+            )
+        _run_report_leg(ddiq_base=ddiq_base, doc_id=ddiq_doc_id, token=token)
+        print("\nSMOKE PASS: serve_rag healthy, query fast, reranker on GPU, ddiq report ok.")
+    else:
+        print("\nSMOKE PASS: serve_rag healthy, query fast, reranker on GPU.")
     return EXIT_OK
 
 
