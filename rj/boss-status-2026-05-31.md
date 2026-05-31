@@ -14,10 +14,16 @@ Five lines, per the spec.
    audit event types (login / query / upload / report / export) wired in
    deployed code**; `audit_log` recorded 7 rows for the run (incl. a
    failed-login forensic trail).
-3. **One real finding from smoke** — pgvector retrieval is **16 s cold
-   and 4 s warm**; the ~+9 k feed rows from this week's mapped backfill
-   probably want a half-day of `hnsw.ef_search` re-tune. Not urgent —
-   warm-cache latency is fine — but worth a slot before pilot demo.
+3. **Diagnosed + fixed today (perf win)** — chased the 4 s `retrieve_s`
+   from the morning smoke; added per-substage timings, found it was not
+   HNSW (which is 3 ms warm) but **BM25**: the old OR-of-six-tokens
+   match expression pulled in millions of corpus rows whenever the query
+   contained a common German word like *welche*. Switched to **top-3
+   longest tokens, punctuation-stripped, implicit AND**.
+   **BM25: 4.1 s → 0.13 s (24× faster); total query 15.7 s → 11.8 s.**
+   Smoke answer length unchanged (862 chars — no recall regression
+   observed). Commit `e8875a6`. A numerical Recall@K eval against
+   `val.jsonl` is queued as confirmation.
 4. **Stuck on FE deploy** — Harsh's 3 finished LAI-UI commits
    (audit-log admin view at `/dashboard/admin/audit`, German DOCX
    letterhead, DDiQ report progress labels) + the half-built
