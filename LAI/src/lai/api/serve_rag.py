@@ -4856,11 +4856,23 @@ def _analyze_v2(req: AnalyzeReq, uid: str | None) -> AnalyzeResp:
 
     def _on_progress(event: dict) -> None:
         # Pipeline callback — write the latest event to the shared dict.
-        STATE["analyzer_progress"][sid] = {
+        # The analyzer's ``_emit`` carries ``step``/``current``/``total``/
+        # ``elapsed_s``/``percent`` but never a ``status`` key (see
+        # ``analyzer/pipeline.py:444``), so the hardcoded ``"running"`` above
+        # would otherwise mask the pipeline's final tick (``step="done"``,
+        # ``percent=1.0``) until the explicit done-write further below
+        # lands — long enough for an in-flight FE poll to render a perpetual
+        # "running" chip on a finished analysis. Re-pin status when the event
+        # indicates completion so the FE sees the transition the moment it
+        # arrives.
+        state = {
             "status": "running",
             **event,
             "started_at": t0,
         }
+        if event.get("step") == "done" or event.get("percent", 0.0) >= 1.0:
+            state["status"] = "done"
+        STATE["analyzer_progress"][sid] = state
 
     try:
         # Reuse fast-path clause segmentation — V2 reasons over the segmentation
