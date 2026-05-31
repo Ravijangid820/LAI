@@ -47,9 +47,10 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 
 @dataclass
@@ -105,42 +106,83 @@ def ascii_ratio(s: str) -> float:
     return sum(1 for ch in s if ord(ch) < 128) / len(s)
 
 
-def _load_base(path_or_name: str, device: str, dtype: torch.dtype):
+def _bnb_4bit_config(compute_dtype: torch.dtype) -> BitsAndBytesConfig:
+    """Match the QLoRA config used in ``scripts/run_lora.py`` so the precomputed
+    base baseline is loaded the same way the eventual FT training loads its base."""
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
+
+
+def _load_base(
+    path_or_name: str,
+    device: str,
+    dtype: torch.dtype,
+    *,
+    load_in_4bit: bool = False,
+):
     tok = AutoTokenizer.from_pretrained(path_or_name, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        path_or_name,
-        torch_dtype=dtype,
-        device_map=device,
-        trust_remote_code=True,
-    )
+    kwargs: dict[str, Any] = {"device_map": device, "trust_remote_code": True}
+    if load_in_4bit:
+        kwargs["quantization_config"] = _bnb_4bit_config(dtype)
+    else:
+        kwargs["torch_dtype"] = dtype
+    model = AutoModelForCausalLM.from_pretrained(path_or_name, **kwargs)
     model.eval()
     return tok, model
 
 
-def _load_ft_adapter(base: str, adapter_dir: str, device: str, dtype: torch.dtype):
+def _load_ft_adapter(
+    base: str,
+    adapter_dir: str,
+    device: str,
+    dtype: torch.dtype,
+    *,
+    load_in_4bit: bool = False,
+):
     # Lazy import: PEFT only needed in the adapter path.
     from peft import PeftModel
 
     tok = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base,
-        torch_dtype=dtype,
-        device_map=device,
-        trust_remote_code=True,
-    )
+    kwargs: dict[str, Any] = {"device_map": device, "trust_remote_code": True}
+    if load_in_4bit:
+        kwargs["quantization_config"] = _bnb_4bit_config(dtype)
+    else:
+        kwargs["torch_dtype"] = dtype
+    base_model = AutoModelForCausalLM.from_pretrained(base, **kwargs)
     model = PeftModel.from_pretrained(base_model, adapter_dir)
     model.eval()
     return tok, model
 
 
 @torch.no_grad()
-def generate_one(tok, model, prompt: str, max_new_tokens: int) -> str:
+def generate_one(
+    tok,
+    model,
+    prompt: str,
+    max_new_tokens: int,
+    *,
+    chat_template_kwargs: dict[str, Any] | None = None,
+) -> str:
+    """Generate one greedy answer.
+
+    ``chat_template_kwargs`` are forwarded to ``tok.apply_chat_template`` so the
+    caller can toggle e.g. Qwen3's ``enable_thinking`` flag. Unknown keys are
+    silently ignored by tokenizers whose template doesn't reference them
+    (Qwen2.5 ignores ``enable_thinking``), so the same kwarg dict is safe across
+    base / FT pairs."""
     messages = [{"role": "user", "content": prompt}]
-    text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    template_kwargs = chat_template_kwargs or {}
+    text = tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, **template_kwargs
+    )
     inp = tok(text, return_tensors="pt").to(model.device)
     out = model.generate(
         **inp,
@@ -151,13 +193,23 @@ def generate_one(tok, model, prompt: str, max_new_tokens: int) -> str:
     return tok.decode(out[0][inp.input_ids.shape[1] :], skip_special_tokens=True).strip()
 
 
-def run_side(tok, model, probes: list[Probe], max_new_tokens: int, label: str) -> list[str]:
+def run_side(
+    tok,
+    model,
+    probes: list[Probe],
+    max_new_tokens: int,
+    label: str,
+    *,
+    chat_template_kwargs: dict[str, Any] | None = None,
+) -> list[str]:
     out: list[str] = []
     t0 = time.time()
     for i, p in enumerate(probes):
         if i == 0 or (i + 1) % 5 == 0:
             print(f"  [{label}] {i + 1}/{len(probes)} ({time.time() - t0:.1f}s)", flush=True)
-        out.append(generate_one(tok, model, p.prompt, max_new_tokens))
+        out.append(
+            generate_one(tok, model, p.prompt, max_new_tokens, chat_template_kwargs=chat_template_kwargs)
+        )
     print(f"  [{label}] done in {time.time() - t0:.1f}s", flush=True)
     return out
 
@@ -296,7 +348,40 @@ def main() -> int:
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    p.add_argument(
+        "--load-in-4bit",
+        action="store_true",
+        help=(
+            "Load base + FT in 4-bit (nf4 + double-quant, bf16 compute) — matches the QLoRA "
+            "config in scripts/run_lora.py. Fits a 27B model in ~14 GB VRAM, so the precompute "
+            "can run alongside production on a single 96 GB Blackwell. Persisted in the "
+            "base-answers meta so the callback knows the baseline was 4-bit."
+        ),
+    )
+    p.add_argument(
+        "--enable-thinking",
+        choices=("default", "on", "off"),
+        default="default",
+        help=(
+            "Qwen3 chat-template thinking-mode toggle (passed via chat_template_kwargs to "
+            "apply_chat_template). 'default' = the tokenizer's built-in (on for Qwen3). For "
+            "the retention probe baseline, prefer 'off': cleaner outputs, fits in "
+            "--max-new-tokens, faster, and the detectors are calibrated against direct "
+            "answers (not <think> traces). Persisted in the base-answers meta so the callback "
+            "applies the same setting to the FT side at training time. No-op for tokenizers "
+            "whose template doesn't reference this variable (e.g., Qwen2.5)."
+        ),
+    )
     args = p.parse_args()
+
+    # Build the chat-template kwargs dict that will be (a) used here for generation
+    # and (b) persisted in the base-answers meta so the callback re-applies it.
+    chat_template_kwargs: dict[str, Any] = {}
+    if args.enable_thinking == "on":
+        chat_template_kwargs["enable_thinking"] = True
+    elif args.enable_thinking == "off":
+        chat_template_kwargs["enable_thinking"] = False
+    # "default" → empty dict → tokenizer default behaviour
 
     base_only = bool(args.save_base_answers)
     if not base_only and not (args.ft_adapter or args.ft_model):
@@ -326,13 +411,18 @@ def main() -> int:
         "float32": torch.float32,
     }[args.dtype]
 
-    print(f"\n=== Loading BASE: {args.base} ===")
+    quantization = "4bit_nf4" if args.load_in_4bit else "none"
+
+    print(f"\n=== Loading BASE: {args.base} ({quantization}) ===")
     try:
-        tok_b, model_b = _load_base(args.base, args.device, dtype)
+        tok_b, model_b = _load_base(args.base, args.device, dtype, load_in_4bit=args.load_in_4bit)
     except Exception as e:
         print(f"ERROR loading base: {e}", file=sys.stderr)
         return 3
-    base_ans = run_side(tok_b, model_b, probes, args.max_new_tokens, "base")
+    base_ans = run_side(
+        tok_b, model_b, probes, args.max_new_tokens, "base",
+        chat_template_kwargs=chat_template_kwargs,
+    )
     del model_b, tok_b
     gc.collect()
     if torch.cuda.is_available():
@@ -345,6 +435,9 @@ def main() -> int:
             "probes_sha256": _probes_sha256(probes_path),
             "max_new_tokens": args.max_new_tokens,
             "dtype": args.dtype,
+            "quantization": quantization,
+            "enable_thinking": args.enable_thinking,
+            "chat_template_kwargs": chat_template_kwargs,
             "n_probes": len(probes),
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -353,20 +446,27 @@ def main() -> int:
         return 0
 
     if args.ft_adapter:
-        print(f"\n=== Loading FT (adapter on base): {args.ft_adapter} ===")
+        print(f"\n=== Loading FT (adapter on base): {args.ft_adapter} ({quantization}) ===")
         try:
-            tok_f, model_f = _load_ft_adapter(args.base, args.ft_adapter, args.device, dtype)
+            tok_f, model_f = _load_ft_adapter(
+                args.base, args.ft_adapter, args.device, dtype, load_in_4bit=args.load_in_4bit
+            )
         except Exception as e:
             print(f"ERROR loading FT adapter: {e}", file=sys.stderr)
             return 3
     else:
-        print(f"\n=== Loading FT (merged): {args.ft_model} ===")
+        print(f"\n=== Loading FT (merged): {args.ft_model} ({quantization}) ===")
         try:
-            tok_f, model_f = _load_base(args.ft_model, args.device, dtype)
+            tok_f, model_f = _load_base(
+                args.ft_model, args.device, dtype, load_in_4bit=args.load_in_4bit
+            )
         except Exception as e:
             print(f"ERROR loading FT model: {e}", file=sys.stderr)
             return 3
-    ft_ans = run_side(tok_f, model_f, probes, args.max_new_tokens, "ft")
+    ft_ans = run_side(
+        tok_f, model_f, probes, args.max_new_tokens, "ft",
+        chat_template_kwargs=chat_template_kwargs,
+    )
     del model_f, tok_f
     gc.collect()
     if torch.cuda.is_available():
@@ -378,6 +478,9 @@ def main() -> int:
         "ft_model": args.ft_model,
         "max_new_tokens": args.max_new_tokens,
         "dtype": args.dtype,
+        "quantization": quantization,
+        "enable_thinking": args.enable_thinking,
+        "chat_template_kwargs": chat_template_kwargs,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     write_reports(probes, base_ans, ft_ans, Path(args.out), meta)

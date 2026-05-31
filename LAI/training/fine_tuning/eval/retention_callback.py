@@ -98,6 +98,9 @@ class RetentionProbeCallback(TrainerCallback):
         # the run burns GPU time.
         self.probes: list[Probe] = []
         self.base_answers: dict[str, dict[str, Any]] = {}
+        # Lifted from the base-answers meta — keeps base + FT generation paths in sync
+        # (e.g. Qwen3 enable_thinking). Empty dict = use the tokenizer's default chat template.
+        self.chat_template_kwargs: dict[str, Any] = {}
 
     # ---- lifecycle hooks ----
 
@@ -122,10 +125,11 @@ class RetentionProbeCallback(TrainerCallback):
 
         base = json.loads(self.base_answers_path.read_text(encoding="utf-8"))
         self.base_answers = base.get("answers", {})
+        base_meta = base.get("meta", {})
 
         # Validate the probes file hasn't changed since the base answers were computed.
         # Without this check, a silent probes-edit would invalidate every delta.
-        recorded_sha = base.get("meta", {}).get("probes_sha256")
+        recorded_sha = base_meta.get("probes_sha256")
         current_sha = _probes_sha256(self.probes_path)
         if recorded_sha and recorded_sha != current_sha:
             raise ValueError(
@@ -141,10 +145,24 @@ class RetentionProbeCallback(TrainerCallback):
                 f"Re-run --save-base-answers to refresh."
             )
 
+        # Lift the chat-template kwargs from the base-answers meta so FT generations
+        # use the exact same prompt-formatting (e.g. Qwen3 enable_thinking) the base
+        # was computed with. Silent drift here would make every delta uninterpretable.
+        meta_ctk = base_meta.get("chat_template_kwargs")
+        if isinstance(meta_ctk, dict):
+            self.chat_template_kwargs = meta_ctk
+
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        # Quantization / thinking-mode reported for traceability — written by the
+        # extended --save-base-answers in retention_probe.py.
+        q = base_meta.get("quantization", "unknown")
+        et = base_meta.get("enable_thinking", "unknown")
         print(
             f"[retention-probe] armed: {len(self.probes)} probes, "
-            f"early_stop={self.early_stop}, out={self.out_dir}",
+            f"early_stop={self.early_stop}, "
+            f"base_quantization={q}, enable_thinking={et}, "
+            f"chat_template_kwargs={self.chat_template_kwargs}, "
+            f"out={self.out_dir}",
             flush=True,
         )
 
@@ -200,7 +218,12 @@ class RetentionProbeCallback(TrainerCallback):
     @torch.no_grad()
     def _generate(self, model: Any, tokenizer: Any, prompt: str) -> str:
         messages = [{"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        # Use the same chat_template_kwargs the base side was computed with — lifted
+        # from the base-answers meta in on_train_begin. Empty dict for tokenizers /
+        # baselines that don't need any (Qwen2.5, or precomputes using 'default').
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, **self.chat_template_kwargs
+        )
         inp = tokenizer(text, return_tensors="pt").to(model.device)
         out = model.generate(
             **inp,

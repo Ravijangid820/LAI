@@ -83,18 +83,41 @@ per-step report, and **early-stops training** on hard regressions.
 
 ### One-off: precompute the base answers
 
-The base side is identical across every training run on a given `(base, probes)`
-combo, so compute it once and cache:
+The base side is identical across every training run on a given `(base, probes,
+load_in_4bit, enable_thinking)` combo, so compute it once and cache. For
+Qwen3.6-27B specifically:
 
 ```bash
-python -m training.fine_tuning.eval.retention_probe \
+# Pin to GPU 1 (the embedding/reranker card) so the precompute fits alongside
+# the live Qwen3.6-27B production analyzer on GPU 0.
+CUDA_VISIBLE_DEVICES=1 \
+  ./.venv/bin/python -m training.fine_tuning.eval.retention_probe \
     --base Qwen/Qwen3.6-27B \
     --probes ./training/fine_tuning/eval/probes/retention_probes.jsonl \
-    --save-base-answers ./training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json
+    --save-base-answers ./training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json \
+    --load-in-4bit \
+    --enable-thinking off
 ```
 
-The output JSON records the probes file's SHA-256; the callback refuses to start
-if the probes have been edited since.
+Two flags matter here:
+
+- `--load-in-4bit` — loads the base in **nf4 + double-quant, bf16 compute**
+  (same QLoRA config `scripts/run_lora.py` uses). A 27B model fits in ~14 GB
+  VRAM, so this runs on GPU 1's ~35 GB of headroom **without** taking
+  production down. Without this, bf16 27B needs ~54 GB and won't fit either
+  card's spare room.
+- `--enable-thinking off` — Qwen3's chat template **defaults to thinking-mode
+  on**, which emits a `<think>…</think>` block easily 1000+ tokens long. With
+  the default `--max-new-tokens 256` that truncates *inside* the think block
+  and the "answer" the detectors see is garbage. `off` gives clean direct
+  answers that fit the budget, run ~10× faster, and match what the detectors
+  are calibrated on. (No-op for Qwen2.5 — its template ignores the flag.)
+
+The output JSON records the probes file's SHA-256, the quantization mode, and
+the chat_template_kwargs that were used. The callback validates the SHA at
+training-time and lifts the chat_template_kwargs onto the FT side so base and
+FT generations are formatted identically — silent drift here would make every
+delta uninterpretable.
 
 ### Training: opt the callback in via `run_lora.py`
 
