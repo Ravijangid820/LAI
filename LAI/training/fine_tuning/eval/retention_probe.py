@@ -60,6 +60,11 @@ class Probe:
     prompt: str
     language: str
     notes: str = ""
+    # When True, the RetentionProbeCallback treats this probe as a
+    # "fictional-statute" probe and runs the looks_like_fabricated_frist
+    # detector on it. Lets vm-6 add refusal_004..N without code changes —
+    # just set "fictional": true in the JSONL row.
+    fictional: bool = False
 
 
 @dataclass
@@ -93,6 +98,7 @@ def load_probes(path: Path) -> list[Probe]:
                         prompt=d["prompt"],
                         language=d["language"],
                         notes=d.get("notes", ""),
+                        fictional=bool(d.get("fictional", False)),
                     )
                 )
             except Exception as e:

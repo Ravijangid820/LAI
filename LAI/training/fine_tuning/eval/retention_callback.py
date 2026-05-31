@@ -85,14 +85,20 @@ class RetentionProbeCallback(TrainerCallback):
         out_dir: str | Path,
         max_new_tokens: int = 256,
         early_stop: bool = True,
-        fictional_probe_ids: tuple[str, ...] = ("refusal_003",),
+        fictional_probe_ids: tuple[str, ...] | None = None,
     ) -> None:
         self.probes_path = Path(probes_path)
         self.base_answers_path = Path(base_answers_path)
         self.out_dir = Path(out_dir)
         self.max_new_tokens = max_new_tokens
         self.early_stop = early_stop
-        self.fictional_probe_ids = set(fictional_probe_ids)
+        # When None (the default), the fictional-§ check fires on every probe
+        # whose JSONL row has `"fictional": true` — see Probe.fictional. Pass
+        # an explicit tuple to override (mostly useful in tests).
+        self._fictional_override = (
+            set(fictional_probe_ids) if fictional_probe_ids is not None else None
+        )
+        self.fictional_probe_ids: set[str] = set()  # resolved in on_train_begin
 
         # Populated in on_train_begin so a misconfigured callback fails loudly *before*
         # the run burns GPU time.
@@ -152,6 +158,14 @@ class RetentionProbeCallback(TrainerCallback):
         if isinstance(meta_ctk, dict):
             self.chat_template_kwargs = meta_ctk
 
+        # Resolve which probes trigger the fictional-§ fabrication check. Explicit
+        # constructor override wins; otherwise pick up every probe with
+        # `fictional=True` from the JSONL. Hard-stop semantics unchanged.
+        if self._fictional_override is not None:
+            self.fictional_probe_ids = self._fictional_override
+        else:
+            self.fictional_probe_ids = {p.id for p in self.probes if p.fictional}
+
         self.out_dir.mkdir(parents=True, exist_ok=True)
         # Quantization / thinking-mode reported for traceability — written by the
         # extended --save-base-answers in retention_probe.py.
@@ -160,6 +174,7 @@ class RetentionProbeCallback(TrainerCallback):
         print(
             f"[retention-probe] armed: {len(self.probes)} probes, "
             f"early_stop={self.early_stop}, "
+            f"fictional_probes={sorted(self.fictional_probe_ids) or '(none — set fictional:true in JSONL)'}, "
             f"base_quantization={q}, enable_thinking={et}, "
             f"chat_template_kwargs={self.chat_template_kwargs}, "
             f"out={self.out_dir}",
@@ -184,11 +199,21 @@ class RetentionProbeCallback(TrainerCallback):
         step_dir.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
 
+        # Training sets model.config.use_cache=False to save activation memory
+        # (run_lora.py:184). For generation that means no KV cache — each new
+        # token re-attends over the full prefix, which is ~5-10x slower than
+        # cached generation. Toggle on for the probe, restore after.
         was_training = model.training
+        cfg = getattr(model, "config", None)
+        prev_use_cache = getattr(cfg, "use_cache", None) if cfg is not None else None
+        if cfg is not None and prev_use_cache is not None:
+            cfg.use_cache = True
         model.eval()
         try:
             ft_answers = [self._generate(model, tokenizer, p.prompt) for p in self.probes]
         finally:
+            if cfg is not None and prev_use_cache is not None:
+                cfg.use_cache = prev_use_cache
             if was_training:
                 model.train()
 
