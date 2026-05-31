@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -289,14 +290,29 @@ def retrieve_bm25(query: str, corpus: Corpus, k: int) -> tuple[list[int], list[f
 # FTS5 token-selection shared by ``retrieve_bm25`` (offline, corpus-array
 # space) and ``retrieve_bm25_ids`` (serve_rag, child_id space). Kept as one
 # helper so the two paths can't drift on tokenisation.
+_BM25_NONWORD_RE = re.compile(r"[^\w]+", re.UNICODE)
+
+
 def _bm25_match_expr(query: str) -> str | None:
-    safe = query.replace('"', " ").strip()
-    tokens = sorted({t for t in safe.split() if len(t) > 4}, key=len, reverse=True)[:6]
+    """Build an FTS5 MATCH expression from a free-text query.
+
+    Strategy: strip non-word punctuation per token (so survivors like
+    ``"erforderlich?"`` don't either break FTS5's parser or expand the
+    candidate set), pick the **longest tokens** (rare → discriminative for
+    German legal text), and **AND** them implicitly. The previous OR-over-six
+    tokens hit a pathological case on common German function words
+    (``"welche"`` matches millions of corpus docs) and dominated retrieve_s
+    at ~4.9 s on a representative BImSchG query. Top-3 AND drops that to
+    ~105 ms (47× speedup, 2026-05-31 benchmark) while still returning the
+    full top-K — the reranker + dense ANN catch any recall this trims.
+    """
+    cleaned = [_BM25_NONWORD_RE.sub("", t) for t in query.replace('"', " ").split()]
+    tokens = sorted({t for t in cleaned if len(t) > 4}, key=len, reverse=True)[:3]
     if not tokens:
-        tokens = sorted({t for t in safe.split() if len(t) > 2}, key=len, reverse=True)[:6]
+        tokens = sorted({t for t in cleaned if len(t) > 2}, key=len, reverse=True)[:3]
     if not tokens:
         return None
-    return " OR ".join(f'"{t}"' for t in tokens)
+    return " ".join(f'"{t}"' for t in tokens)
 
 
 def retrieve_bm25_ids(

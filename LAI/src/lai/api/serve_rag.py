@@ -3441,15 +3441,19 @@ def _do_rag(
     # carries parent_id + content already; BM25-only ids are hydrated
     # from pgvector in one batch below.
     t0 = time.time()
+    t_a = time.perf_counter()
     dense_hits = retrieval.dense_search(qvec, top_k=candidate_k)
     dense_by_child: dict[int, RetrievedChunk] = {h.child_id: h for h in dense_hits}
     dense_ranking = [h.child_id for h in dense_hits]
+    t_b = time.perf_counter()
 
     bm25_pairs = retrieve_bm25_ids(question, bm25_conn, candidate_k)
     bm25_ranking = [cid for cid, _ in bm25_pairs]
+    t_c = time.perf_counter()
 
     fused = rrf_fuse([dense_ranking, bm25_ranking])[:candidate_k]
     cand_ids = [cid for cid, _ in fused]
+    t_d = time.perf_counter()
 
     # Hydrate BM25-only candidates (those the dense query didn't surface)
     # so every candidate has a parent_id + content for rerank/dedupe.
@@ -3461,7 +3465,21 @@ def _do_rag(
     # whose pgvector row hasn't been migrated yet — possible while topup
     # is mid-stream).
     cand_ids = [cid for cid in cand_ids if cid in dense_by_child]
+    t_e = time.perf_counter()
     retrieve_s = time.time() - t0
+    # Diagnostic — find where retrieve_s actually goes. Direct DB benchmarks
+    # (2026-05-31) show dense ANN ~3 ms warm + BM25 ~30 ms; the smoke test
+    # reports retrieve_s ~4 s, so the slow stage is whichever one this line
+    # surfaces. Remove once the hot spot is fixed.
+    print(
+        f"[retrieve] dense={1000 * (t_b - t_a):.0f}ms "
+        f"bm25={1000 * (t_c - t_b):.0f}ms "
+        f"fuse={1000 * (t_d - t_c):.0f}ms "
+        f"hydrate={1000 * (t_e - t_d):.0f}ms "
+        f"missing={len(missing)} cand_k={candidate_k} "
+        f"total={retrieve_s * 1000:.0f}ms",
+        flush=True,
+    )
 
     # ── Parent texts (rerank + prompt context) ─────────────────────────
     # The reranker scores (query, parent_passage) pairs; the prompt
