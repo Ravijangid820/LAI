@@ -1,0 +1,50 @@
+{"id":"q01","category":"grundlagen","question":"Was regelt § 1 BImSchG zum Anwendungsbereich und welche Schutzgüter werden ausdrücklich genannt?","model_a_answer":"","model_b_answer":""}
+{"id":"q02","category":"grundlagen","question":"Welche Legaldefinitionen enthält § 3 BImSchG für „Immissionen\", „Emissionen\" und „schädliche Umwelteinwirkungen\"?","model_a_answer":"","model_b_answer":""}
+{"id":"q03","category":"grundlagen","question":"Welche Bedeutung hat der „Stand der Technik\" nach § 3 Abs. 6 BImSchG bei der Anlagenzulassung?","model_a_answer":"","model_b_answer":""}
+{"id":"q04","category":"grundlagen","question":"Welche Anlagen unterliegen der Genehmigungspflicht nach § 4 BImSchG und wo werden sie näher bezeichnet?","model_a_answer":"","model_b_answer":""}
+{"id":"q05","category":"grundlagen","question":"Welche Grundpflichten regelt § 5 Abs. 1 BImSchG für genehmigungsbedürftige Anlagen?","model_a_answer":"","model_b_answer":""}
+{"id":"q06","category":"grundlagen","question":"Welche Nachsorgepflicht trifft den Betreiber nach § 5 Abs. 3 BImSchG nach Stilllegung einer Anlage?","model_a_answer":"","model_b_answer":""}
+{"id":"q07","category":"genehmigung_verfahren","question":"In welchen Fällen ist nach § 6 Abs. 1 BImSchG eine Genehmigung zu erteilen und welche Versagungsgründe sind in Abs. 1 Nr. 2 angelegt?","model_a_answer":"","model_b_answer":""}
+{"id":"q08","category":"genehmigung_verfahren","question":"Unter welchen Voraussetzungen kann nach § 8 BImSchG eine Teilgenehmigung erteilt werden?","model_a_answer":"","model_b_answer":""}
+{"id":"q09","category":"genehmigung_verfahren","question":"Welche Voraussetzungen müssen für eine Zulassung des vorzeitigen Beginns nach § 8a BImSchG erfüllt sein?","model_a_answer":"","model_b_answer":""}
+{"id":"q10","category":"genehmigung_verfahren","question":"Welche Funktion hat der Vorbescheid nach § 9 BImSchG und welche Bindungswirkung kommt ihm zu?","model_a_answer":"","model_b_answer":""}
+{"id":"q11","category":"genehmigung_verfahren","question":"Wann ist eine immissionsschutzrechtliche Genehmigung nach § 10 BImSchG im förmlichen Verfahren mit Öffentlichkeitsbeteiligung erforderlich?","model_a_answer":"","model_b_answer":""}
+{"id":"q12","category":"genehmigung_verfahren","question":"Welche Bekanntmachungs- und Auslegungspflichten regelt § 10 Abs. 3 BImSchG?","model_a_answer":"","model_b_answer":""}
+{"id":"q13","category":"genehmigung_verfahren","question":"In welcher Frist sind Einwendungen gegen ein Vorhaben nach § 10 Abs. 3 BImSchG zu erheben und welche Präklusionswirkung hatte das früher?","model_a_answer":"","model_b_answer":""}
+{"id":"q14","category":"genehmigung_verfahren","question":"Welche behördlichen Entscheidungen werden nach § 13 BImSchG durch die immissionsschutzrechtliche Genehmigung mitgeschlossen?","model_a_answer":"","model_b_answer":""}
+{"id":"q15","category":"genehmigung_verfahren","question":"Welche Voraussetzungen muss eine Anzeige nach § 15 BImSchG für eine unwesentliche Änderung erfüllen?","model_a_answer":"","model_b_answer":""}
+{"id":"q16","category":"genehmigung_verfahren","question":"Wann ist nach § 16 BImSchG eine wesentliche Änderung einer genehmigungsbedürftigen Anlage selbst genehmigungspflichtig?","model_a_answer":"","model_b_answer":""}
+{"id":"q17","category":"genehmigung_verfahren","question":"Welche Rechtsfolgen knüpft § 17 BImSchG an nachträgliche Anordnungen?","model_a_answer":"","model_b_answer":""}
+{"id":"q18","category":"genehmigung_verfahren","question":"Unter welchen Voraussetzungen erlischt eine Genehmigung nach § 18 BImSchG?","model_a_answer":"","model_b_answer":""}
+{"id":"q19","category":"genehmigung_verfahren","question":"Welche Sondervorschriften enthält § 19 BImSchG für das vereinfachte Verfahren?","model_a_answer":"","model_b_answer":""}
+{"id":"q20","category":"genehmigung_verfahren","question":"Unter welchen Voraussetzungen kann die Behörde nach § 20 BImSchG den Betrieb einer Anlage untersagen?","model_a_answer":"","model_b_answer":""}
+{"id":"q21","category":"genehmigung_verfahren","question":"Unter welchen Voraussetzungen kann eine Genehmigung nach § 21 BImSchG widerrufen werden?","model_a_answer":"","model_b_answer":""}
+{"id":"q22","category":"ueberwachung_pflichten","question":"Welche Pflichten treffen den Betreiber einer nicht genehmigungsbedürftigen Anlage nach § 22 BImSchG?","model_a_answer":"","model_b_answer":""}
+{"id":"q23","category":"ueberwachung_pflichten","question":"Welche Befugnisse hat die Behörde nach § 24 BImSchG gegenüber nicht-genehmigungsbedürftigen Anlagen?","model_a_answer":"","model_b_answer":""}
+{"id":"q24","category":"ueberwachung_pflichten","question":"Wann darf eine Behörde nach § 25 BImSchG den Betrieb einer nicht-genehmigungsbedürftigen Anlage untersagen?","model_a_answer":"","model_b_answer":""}
+{"id":"q25","category":"ueberwachung_pflichten","question":"Welche Pflichten zu Messungen und Überwachung treffen den Betreiber nach § 26 BImSchG?","model_a_answer":"","model_b_answer":""}
+{"id":"q26","category":"ueberwachung_pflichten","question":"Welche Bedeutung hat die Bekanntgabe einer Messstelle nach § 29b BImSchG?","model_a_answer":"","model_b_answer":""}
+{"id":"q27","category":"ueberwachung_pflichten","question":"Welche Anforderungen stellt § 29a BImSchG an die Bekanntgabe von Sachverständigen?","model_a_answer":"","model_b_answer":""}
+{"id":"q28","category":"ueberwachung_pflichten","question":"Welche Pflichten zur Mitteilung von Messergebnissen regelt § 31 BImSchG?","model_a_answer":"","model_b_answer":""}
+{"id":"q29","category":"ueberwachung_pflichten","question":"Welche Befugnisse hat die Überwachungsbehörde nach § 52 BImSchG zum Betreten von Grundstücken und zur Einsicht in Unterlagen?","model_a_answer":"","model_b_answer":""}
+{"id":"q30","category":"ueberwachung_pflichten","question":"Welche Auskunftspflichten treffen den Anlagenbetreiber gegenüber der Überwachungsbehörde nach § 52 Abs. 2 BImSchG?","model_a_answer":"","model_b_answer":""}
+{"id":"q31","category":"ueberwachung_pflichten","question":"Welche Anzeigepflichten regelt § 31a BImSchG für Anlagen mit Störfallrisiko?","model_a_answer":"","model_b_answer":""}
+{"id":"q32","category":"ueberwachung_pflichten","question":"Was regelt § 32 BImSchG zu Beschaffenheit, Betrieb und Kennzeichnung von Anlagen, Stoffen und Erzeugnissen?","model_a_answer":"","model_b_answer":""}
+{"id":"q33","category":"ueberwachung_pflichten","question":"Welche Pflichten ergeben sich aus § 9 der 12. BImSchV (Störfall-Verordnung) zur Vorlage eines Sicherheitsberichts?","model_a_answer":"","model_b_answer":""}
+{"id":"q34","category":"laerm_luft_planung","question":"Was regelt § 41 BImSchG zu Verkehrsgeräuschen beim Bau und der wesentlichen Änderung öffentlicher Straßen?","model_a_answer":"","model_b_answer":""}
+{"id":"q35","category":"laerm_luft_planung","question":"Welche Grenzwerte für Lärmimmissionen werden über § 43 BImSchG i.V.m. der 16. BImSchV (Verkehrslärmschutzverordnung) festgelegt?","model_a_answer":"","model_b_answer":""}
+{"id":"q36","category":"laerm_luft_planung","question":"Unter welchen Voraussetzungen sind aktive Schallschutzmaßnahmen nach § 41 BImSchG vorrangig gegenüber passivem Schallschutz?","model_a_answer":"","model_b_answer":""}
+{"id":"q37","category":"laerm_luft_planung","question":"Was regelt § 47 BImSchG zur Aufstellung von Luftreinhalteplänen und welche Behörde ist zuständig?","model_a_answer":"","model_b_answer":""}
+{"id":"q38","category":"laerm_luft_planung","question":"Welche Mindestanforderungen stellt § 47a BImSchG an Lärmaktionspläne?","model_a_answer":"","model_b_answer":""}
+{"id":"q39","category":"laerm_luft_planung","question":"Welche Rolle spielt die Öffentlichkeit nach § 47d BImSchG im Verfahren der Lärmaktionsplanung?","model_a_answer":"","model_b_answer":""}
+{"id":"q40","category":"laerm_luft_planung","question":"Welche Verbindlichkeit haben die Festlegungen eines Luftreinhalteplans nach § 47 Abs. 6 BImSchG gegenüber anderen Behörden?","model_a_answer":"","model_b_answer":""}
+{"id":"q41","category":"laerm_luft_planung","question":"Welche Befugnis hat die Behörde nach § 47 Abs. 5 BImSchG zur Anordnung verkehrsbeschränkender Maßnahmen?","model_a_answer":"","model_b_answer":""}
+{"id":"q42","category":"laerm_luft_planung","question":"Welche Anforderungen stellt § 48 BImSchG an den Erlass allgemeiner Verwaltungsvorschriften (TA Luft, TA Lärm)?","model_a_answer":"","model_b_answer":""}
+{"id":"q43","category":"laerm_luft_planung","question":"Welche Funktion hat die Vorrangregelung des § 50 BImSchG bei raumbedeutsamen Planungen?","model_a_answer":"","model_b_answer":""}
+{"id":"q44","category":"laerm_luft_planung","question":"Welche Bedeutung hat die TA Lärm für die Beurteilung von Lärmimmissionen aus genehmigungsbedürftigen Anlagen?","model_a_answer":"","model_b_answer":""}
+{"id":"q45","category":"laerm_luft_planung","question":"Welche Bedeutung hat die TA Luft für die Beurteilung von Luftschadstoffen aus genehmigungsbedürftigen Anlagen?","model_a_answer":"","model_b_answer":""}
+{"id":"q46","category":"genehmigung_verfahren","question":"In welchen Fällen ist im Rahmen einer BImSchG-Genehmigung ein UVP-Verfahren nach dem UVPG durchzuführen?","model_a_answer":"","model_b_answer":""}
+{"id":"q47","category":"genehmigung_verfahren","question":"In welchem Verhältnis steht eine BImSchG-Genehmigung zu einer wasserrechtlichen Erlaubnis bei demselben Vorhaben?","model_a_answer":"","model_b_answer":""}
+{"id":"q48","category":"genehmigung_verfahren","question":"Welche Rolle spielt die Vorsorge gegen schädliche Umwelteinwirkungen nach § 5 Abs. 1 Nr. 2 BImSchG bei der Genehmigung?","model_a_answer":"","model_b_answer":""}
+{"id":"q49","category":"genehmigung_verfahren","question":"Welche Rechtsmittel sind gegen eine immissionsschutzrechtliche Genehmigung nach § 10 BImSchG statthaft und wer ist klagebefugt?","model_a_answer":"","model_b_answer":""}
+{"id":"q50","category":"genehmigung_verfahren","question":"Welche Klage- und Beteiligungsrechte haben anerkannte Umweltverbände nach § 1 UmwRG i.V.m. dem BImSchG?","model_a_answer":"","model_b_answer":""}
