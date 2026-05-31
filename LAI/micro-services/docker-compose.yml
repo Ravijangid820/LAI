@@ -32,6 +32,7 @@
 
 services:
   backend:
+    init: true  # 2026-05-31 21:30 CET: tini PID 1, reapt Zombie-Kinder
     build:
       # Context widened to the LAI/ repo root so the Dockerfile can install
       # the in-repo `lai` package (src/lai/) alongside the microservice code.
@@ -107,6 +108,7 @@ services:
   # Bump only if the embedding / LLM upstreams can absorb more parallel
   # report jobs (each one issues hundreds of embedding + chat calls).
   worker:
+    init: true  # 2026-05-31 21:30 CET: tini PID 1, reapt Zombie-Kinder
     build:
       context: ..
       dockerfile: micro-services/Dockerfile
