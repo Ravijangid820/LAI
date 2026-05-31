@@ -124,15 +124,23 @@ justifies the major bump (the dev's own commit msg said `feat(v2):` ).
   `dropFiles.ts` + 22 modifications wiring them in).
 
 ## Remaining
-- **`LAI-UI/CONTRIBUTING.md`** — Git Flow §4 mirrored from LAI with TS commands.
-  Deliberately not added in this rollout (gives the FE team a chance to
-  review the rules before they're committed).
-- **`LAI-UI/rj/blueprint/`** — empty until the first real plan doc lands. First
-  candidate is still the **audit-log view deploy**, but it depends on Harsh's
-  3 unpushed commits going to develop first.
-- **`.github/workflows/ci.yml`** — optional: `npm ci && npm run build && npm
-  run lint` on push/PR to `develop` + `master`.
+- ✅ **`LAI-UI/CONTRIBUTING.md`** — landed in `727b51c` on `develop`:
+  Git Flow §3 mirrored with TS-flavoured commands (`npm run build` is the
+  Vercel-truth gate); commit conventions; recommended branch protection.
+- ✅ **`LAI-UI/rj/blueprint/`** — convention established. First plan doc is
+  [`2026-05-31-audit-log-view-deploy.md`](https://github.com/Ravijangid820/LAI-UI/blob/develop/rj/blueprint/2026-05-31-audit-log-view-deploy.md)
+  — Harsh's 3 unpushed commits → `v2.1.0` release sequence + QA checklist.
+- ✅ **`.github/workflows/ci.yml`** — `npm ci && npm run build` on push/PR
+  to `develop` + `master`. Lint deliberately omitted: `develop` carries 7
+  pre-existing eslint errors on the v2.0.0 baseline; add the lint step
+  after a focused cleanup PR clears them (tracked as a follow-up).
+- **Lint cleanup PR** (NEW follow-up, ⬜) — fix the 7 eslint errors
+  (3 unused imports, 2 useless regex escapes, 2 unused expressions), then
+  add the `npm run lint` step to `ci.yml`.
 - **Branch protection on `master`** in GitHub Settings — once the team
-  agrees, require PR + green CI before merge.
+  agrees, require PR + green CI before merge. Vercel auto-deploys `master`
+  to production, so an enforced gate prevents broken builds from shipping.
+- **Coordinate with Harsh** on his 3 unpushed commits + cut **v2.1.0** per
+  the audit-log-view-deploy blueprint above.
 - **Retire local `fix/cross-account-isolation`** — only after Harsh's 3
   commits + 26 WIP files have landed on `develop`.
