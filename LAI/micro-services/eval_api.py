@@ -48,6 +48,8 @@ Endpoints
 * ``POST /eval/score/{idx}``          — body ``{choice: "left"|"right"|"equal"}`` → ``{ok}``
 * ``GET /eval/results``               — ``{model_a_wins, model_b_wins, ties, total, scored}``  (DEBLINDED — experimenter only)
 * ``GET /eval/export.csv``            — CSV with deblinded rows for the §3.4 write-up
+* ``POST /eval/archive``              — snapshot state.json + summary.json + export.csv to a timestamped sibling (non-destructive)
+* ``GET /eval/archives``              — list existing archive bundles
 
 Run
 ---
@@ -70,6 +72,7 @@ import io
 import json
 import os
 import random
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -97,6 +100,17 @@ _MISSING_ANSWER = (
     "[no answer recorded yet — populate model_a_answer / model_b_answer "
     "in bimschg_50.jsonl before the labelling session]"
 )
+
+# Restricts archive-label characters so a malicious or sloppy label can't
+# climb out of the archives directory. Anything outside the allowed set
+# collapses to ``-``; leading dots/dashes are stripped so the directory
+# isn't hidden or argparse-confusing; length is capped so the path stays
+# friendly to filesystem limits.
+_LABEL_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_label(label: str) -> str:
+    return _LABEL_RE.sub("-", label).strip("-.")[:60]
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +303,123 @@ class _EvalState:
             )
         return buf.getvalue()
 
+    def archive(self, label: str | None = None) -> dict[str, Any]:
+        """Snapshot the current state + deblinded summary + CSV to a timestamped
+        sibling directory under ``<state_path>/../archives/``.
+
+        Non-destructive — the active state file is not touched and scoring
+        can continue after the call. The bundle contains everything needed to
+        restore the session verbatim later:
+
+        * ``state.json``   — byte-for-byte copy of the active results.json
+                              (seed + L/R mapping + scores + started_at)
+        * ``summary.json`` — deblinded ``{model_a_wins, model_b_wins, ties,
+                              total, scored}`` + ``archive_meta``
+        * ``export.csv``   — full CSV export as of the snapshot
+
+        Recovery flow: stop the API, ``cp archives/<ts>__<label>/state.json
+        <EVAL_STATE_PATH>``, restart. The mapping + scores come back identical.
+        """
+        # Take a consistent snapshot of state, summary, and CSV under the
+        # process lock so a concurrent score-write can't tear across files.
+        with self.lock:
+            state_snapshot: dict[str, Any] = json.loads(json.dumps(self.state))
+            summary = self.results()
+            csv_text = self.export_csv()
+
+        ts = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
+        safe_label = _sanitize_label(label) if label else ""
+        dir_base = f"{ts}__{safe_label}" if safe_label else ts
+
+        archives_root = self.state_path.parent / "archives"
+        archives_root.mkdir(parents=True, exist_ok=True)
+
+        # Same-second collisions (rare — usually a double-fire by mistake)
+        # get a numeric suffix instead of clobbering an earlier snapshot.
+        target = archives_root / dir_base
+        suffix = 2
+        while target.exists():
+            target = archives_root / f"{dir_base}_{suffix}"
+            suffix += 1
+
+        archive_meta = {
+            "archived_at": ts,
+            "label": safe_label or None,
+            "seed": state_snapshot.get("seed"),
+            "started_at": state_snapshot.get("started_at"),
+            "scored": summary["scored"],
+            "total": summary["total"],
+        }
+
+        # Atomic-rename: write everything into a sibling .tmp__ dir then move
+        # into place. A crash mid-write never leaves a half-built archive
+        # under the canonical name (list_archives skips ``.tmp__`` prefixes).
+        tmp = archives_root / f".tmp__{target.name}"
+        tmp.mkdir(parents=True, exist_ok=False)
+        try:
+            (tmp / "state.json").write_text(
+                json.dumps(state_snapshot, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            (tmp / "summary.json").write_text(
+                json.dumps(
+                    {**summary, "archive_meta": archive_meta},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (tmp / "export.csv").write_text(csv_text, encoding="utf-8")
+            tmp.rename(target)
+        except Exception:
+            # Best-effort cleanup: remove the temp dir so a retry doesn't
+            # trip the ``exists_ok=False`` guard.
+            for p in tmp.glob("*"):
+                p.unlink(missing_ok=True)
+            tmp.rmdir()
+            raise
+
+        return {
+            "ok": True,
+            "archive_dir": str(target),
+            "archive_name": target.name,
+            **archive_meta,
+            "summary": summary,
+        }
+
+    def list_archives(self) -> list[dict[str, Any]]:
+        """List archive bundles under ``<state_path>/../archives/``.
+
+        Read-only and best-effort: directories without a valid ``summary.json``
+        are skipped (a half-written archive from a crashed POST, or a
+        directory dropped in by hand). ``.tmp__`` work-in-progress dirs are
+        always skipped.
+        """
+        archives_root = self.state_path.parent / "archives"
+        if not archives_root.exists():
+            return []
+        out: list[dict[str, Any]] = []
+        for d in sorted(archives_root.iterdir()):
+            if not d.is_dir() or d.name.startswith(".tmp__"):
+                continue
+            summary_path = d / "summary.json"
+            if not summary_path.is_file():
+                continue
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            out.append(
+                {
+                    "name": d.name,
+                    "path": str(d),
+                    "archive_meta": summary.get("archive_meta", {}),
+                    "scored": summary.get("scored"),
+                    "total": summary.get("total"),
+                }
+            )
+        return out
+
     def _check_idx(self, idx: int) -> None:
         if idx < 0 or idx >= len(self.questions):
             raise HTTPException(
@@ -374,6 +505,26 @@ def export_csv() -> Response:
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="bimschg_50_eval.csv"'},
     )
+
+
+@app.post("/eval/archive")
+def post_archive(label: str | None = None) -> dict[str, Any]:
+    """Snapshot the current session to a timestamped sibling directory.
+
+    Non-destructive. Use at the end of a labelling session to lock in the
+    results before any restart / state-file rotation, or mid-session as a
+    checkpoint. Optional ``?label=foo`` tags the snapshot (sanitised; only
+    ``[A-Za-z0-9._-]`` survive).
+    """
+    return _state().archive(label)
+
+
+@app.get("/eval/archives")
+def get_archives() -> dict[str, Any]:
+    """List existing archive bundles so the experimenter can see what's
+    preserved. Lightweight read-only — does not touch any state."""
+    items = _state().list_archives()
+    return {"count": len(items), "archives": items}
 
 
 if __name__ == "__main__":  # pragma: no cover — convenience launcher
