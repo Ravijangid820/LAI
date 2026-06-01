@@ -150,6 +150,36 @@ does **not** touch Docker, the Vite UI, or the running pipeline / migration jobs
 > `LAI_BIND_HOST=0.0.0.0 CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m lai.api.serve_rag --port 18000`
 > — but prefer the restart script above.
 
+### Auto-restart serve_rag via systemd (recommended; install once by ks_admin)
+
+Origin: a clean operator shutdown on 2026-05-31 21:13 left serve_rag down for
+~20 h until the BM25-revert restart picked it back up the next afternoon. The
+hourly smoke cron catches future outages within an hour, but a supervisor
+that auto-restarts on failure + at boot is the real fix.
+
+```bash
+# One-time install (must run as root — touches /etc/systemd/system):
+sudo bash /data/projects/lai/LAI/scripts/ops/systemd/install.sh
+
+# Day-to-day after install:
+sudo systemctl status   serve_rag
+sudo systemctl restart  serve_rag
+sudo systemctl stop     serve_rag
+journalctl -u serve_rag -n 100 -f
+```
+
+The unit (`scripts/ops/systemd/serve_rag.service`) runs as `rj:lai` with
+`LAI_BIND_HOST=0.0.0.0` + `CUDA_VISIBLE_DEVICES=1` baked in, sources
+`.env.auth` + `micro-services/.env`, `Restart=on-failure`, `RestartSec=10`,
+`WantedBy=multi-user.target` (auto-start at boot). `install.sh` gracefully
+stops any existing nohup-launched instance before handing off so the
+takeover is one ~20 s window.
+
+> **Cohabitation note:** once the unit is active, `restart_serve_rag.sh`
+> still works (its `SIGTERM` triggers `Restart=on-failure`), but the
+> standard play becomes `sudo systemctl restart serve_rag`. A
+> systemctl-aware mode in the wrapper is a follow-up.
+
 ---
 
 ## Quick smoke tests
@@ -191,13 +221,15 @@ python3 /data/projects/lai/LAI/scripts/ops/smoke_test.py --report
 ```
 
 ```bash
-# Daily cron at 08:00, appending outcomes to a log.
-# COORDINATE BEFORE INSTALLING — this is a shared box; check with rj first
-# (the line is here for reference, not a self-install instruction).
-0 8 * * *  cd /data/projects/lai/LAI && \
-  LAI_SMOKE_EMAIL=ops@yourfirm.de LAI_SMOKE_PASSWORD=... \
-  .venv/bin/python scripts/ops/smoke_test.py >> logs/host/smoke_test.log 2>&1
+# Hourly cron (installed for rj 2026-06-01 — tightened from daily after a
+# 20 h silent outage). Sources LAI/.env.smoke.local (gitignored, chmod 600
+# with LAI_SMOKE_USER/PASS/DDIQ_DOC_ID) so creds aren't in `crontab -l`.
+0 * * * * bash -c "cd /data/projects/lai/LAI && set -a && . ./.env.smoke.local && set +a && (echo \"=== \$(date -Iseconds) ===\"; LAI_SMOKE_MAX_S=60 .venv/bin/python scripts/ops/smoke_test.py) >> logs/host/smoke_test_cron.log 2>&1"
 ```
+
+Once the systemd unit (above) is in place, the cron can return to daily
+(it becomes a canary against the supervisor itself, not the primary
+recovery path). Until then, hourly catches outages within an hour.
 
 Tunables (all optional): `LAI_SMOKE_URL` (default `http://localhost:18000`),
 `LAI_SMOKE_MAX_S` (latency budget, default 20), `LAI_SMOKE_QUESTION`,

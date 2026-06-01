@@ -1,0 +1,72 @@
+# Systemd unit for the LAI serve_rag chat backend (host process, port 18000).
+#
+# Why this exists: serve_rag has been launched ad-hoc via
+# `scripts/ops/restart_serve_rag.sh` (setsid + nohup) since v1. That works
+# for interactive ops but leaves no supervisor — a clean shutdown by an
+# operator (or a panic-exit) leaves the process down until someone notices.
+# This unit puts systemd in charge: auto-restart on failure, auto-start on
+# boot, structured logs via journald.
+#
+# Install (one-time, by ks_admin):
+#   sudo bash /data/projects/lai/LAI/scripts/ops/systemd/install.sh
+#
+# Day-to-day after install:
+#   sudo systemctl status   serve_rag
+#   sudo systemctl restart  serve_rag
+#   sudo systemctl stop     serve_rag
+#   journalctl -u serve_rag -n 100 -f
+#
+# `restart_serve_rag.sh` still works (SIGTERM + relaunch) but if this unit
+# is active, killing the process triggers systemd's Restart=on-failure path
+# rather than a clean handoff. Prefer `systemctl restart serve_rag` going
+# forward; the wrapper script should add a systemctl-aware mode (TODO).
+
+[Unit]
+Description=LAI serve_rag chat backend (port 18000)
+Documentation=https://github.com/Ravijangid820/LAI
+# Wait for the local Postgres + embedding containers before we try to bind /
+# load the reranker. They live in separate compose projects, so we can only
+# express the dependency loosely (network online).
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=rj
+Group=lai
+WorkingDirectory=/data/projects/lai/LAI
+
+# Two env files: micro-services/.env carries DB_* (Postgres on :5434) and
+# .env.auth carries the JWT secrets the auth router needs to boot.
+# `EnvironmentFile=-` (leading dash) makes missing files non-fatal so a
+# first-boot before the secrets are placed doesn't refuse to start.
+EnvironmentFile=-/data/projects/lai/LAI/micro-services/.env
+EnvironmentFile=-/data/projects/lai/LAI/.env.auth
+
+# Pinned per the "serve_rag restart pattern" team memory: bind 0.0.0.0 so
+# LAN browsers can hit it; reranker on cuda:1 (the chat path; cuda:0 is for
+# the LLM + embed server).
+Environment=HOME=/data/home/rj
+Environment=LAI_BIND_HOST=0.0.0.0
+Environment=CUDA_VISIBLE_DEVICES=1
+
+# The .venv python so we get the project's locked deps (uv-managed venv).
+ExecStart=/data/projects/lai/LAI/.venv/bin/python -m lai.api.serve_rag --port 18000
+
+# Graceful shutdown — match the SIGTERM-then-wait pattern in
+# restart_serve_rag.sh. 30 s is the reranker-VRAM-release budget.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=10
+
+# File-descriptor headroom for many concurrent SSE / upload sockets.
+LimitNOFILE=65536
+
+# journald captures stdout/stderr; `journalctl -u serve_rag` is the log.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
