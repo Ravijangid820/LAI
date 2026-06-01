@@ -14,16 +14,22 @@ Five lines, per the spec.
    audit event types (login / query / upload / report / export) wired in
    deployed code**; `audit_log` recorded 7 rows for the run (incl. a
    failed-login forensic trail).
-3. **Diagnosed + fixed today (perf win)** — chased the 4 s `retrieve_s`
-   from the morning smoke; added per-substage timings, found it was not
-   HNSW (which is 3 ms warm) but **BM25**: the old OR-of-six-tokens
-   match expression pulled in millions of corpus rows whenever the query
-   contained a common German word like *welche*. Switched to **top-3
-   longest tokens, punctuation-stripped, implicit AND**.
-   **BM25: 4.1 s → 0.13 s (24× faster); total query 15.7 s → 11.8 s.**
-   Smoke answer length unchanged (862 chars — no recall regression
-   observed). Commit `e8875a6`. A numerical Recall@K eval against
-   `val.jsonl` is queued as confirmation.
+3. **Diagnosed but ultimately reverted (honest engineering)** — chased
+   the 4 s `retrieve_s` from the morning smoke. Sub-stage timings (now
+   live in serve_rag at every query, log line `[retrieve] dense=X
+   bm25=Y fuse=Z hydrate=W`) pinned the cost to **BM25**, not HNSW
+   (~3 ms warm). Shipped a tighter BM25 expression that took it from
+   4 s to ~13 ms (24× faster on the smoke). But a follow-up Recall@30
+   evaluation on 200 `val.jsonl` queries showed the change **dropped
+   standalone BM25 recall from 37 % → 15 %** — the smoke's identical
+   answer was dense + reranker absorbing it on that single query, not
+   evidence of no regression. A subsequent sweep across 7 other variants
+   (stopword filter, length filter, hybrid AND→OR fallback) found no
+   Pareto-better point. **Reverted to the original.** The substage
+   timings stay (operator visibility into retrieval is a real win
+   regardless). Commits: `e8875a6` (attempted fix) → `4cdf8ad` (revert).
+   Lesson: a smoke test with one query is not a recall test. Next time
+   a perf change touches retrieval, run the eval *before* claiming a win.
 4. **Stuck on FE deploy** — Harsh's 3 finished LAI-UI commits
    (audit-log admin view at `/dashboard/admin/audit`, German DOCX
    letterhead, DDiQ report progress labels) + the half-built
