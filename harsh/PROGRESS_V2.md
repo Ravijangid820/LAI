@@ -145,19 +145,150 @@ All three are zero-collision with harsh's queue and rj-1.
 
 ## Priority order across the three of us
 
-1. **harsh #1** (Qwen3.6 precompute) — unblocks Phase 3's callback baseline file. **⛔ blocked on Gap B** (bitsandbytes not in venv — needs `uv pip install --python ./.venv/bin/python bitsandbytes` from someone with venv perms).
+1. **harsh #1** (Qwen3.6 precompute) — Gap B ✅ resolved (`bitsandbytes==0.49.2` installed in venv 2026-05-31); precompute first attempt died at 33 % weight download on SSH disconnect; **🔄 rj re-running in tmux** with `--load-in-4bit --enable-thinking off` — when it lands, baseline JSON is auto-against the post-vm-6 32-probe set (sha256 `95a1aab2…ec250ef2…f8582e90bc7`) thanks to the gap-D fix. Validation table for the resulting JSON: `quantization=4bit_nf4`, `enable_thinking=off`, `chat_template_kwargs={"enable_thinking": false}`, `n_probes=32`.
 2. ~~**harsh #3 + #5** (live smoke + boss note)~~ — **✅ DONE by rj (`49431d8`, 2026-05-31)**, closes the production-mandate loop.
 3. **rj-1** (Phase 4.3 Phase B) — unblocks the *"RAG = current statute"* arch.
-4. **vm-6** (more fictional probes) — tightens the Phase-3 stop signal.
-5. **harsh #4** (cron) + **vm-7** (AI-Act doc) — ops + comms hygiene.
+4. ~~**vm-6** (more fictional probes)~~ — **✅ DONE 2026-05-31** (uncommitted): 7 new fictional probes (`refusal_004`…`refusal_010`), all carrying `"fictional": true`; 32 probes total; 15/15 detector tests still pass; `probes_sha256` rotated. Tightens the Phase-3 stop signal as planned.
+5. **harsh #4** (cron) + ~~**vm-7** (AI-Act doc)~~ — vm-7 **✅ DONE 2026-05-31** (`harsh/EU_AI_ACT.md`, uncommitted); maps Arts. 12/13/14/15 to actual commits/files with honest "open gaps" list. **harsh #4 still open** — ops change, needs rj OK.
 6. **harsh #6** (push) when the queue feels stable.
 7. ~~**vm-8**~~ — **✅ DONE by rj (`9255cfc`, 2026-05-31)** as rj-3b.
 
 **Gap-audit follow-up (2026-05-31, post-Distribution):**
-- ✅ Gap C + D fixed (`7eb851c`): `use_cache` save/restore in `on_save` (~5–10× faster probe generation during training) + data-driven `Probe.fictional` flag so vm-6 just sets the field without touching code.
+- ✅ Gap A fixed (`82c3b35` in LAI-UI): 5 surgical commits landed (watchdog + vm-2 dedup + recordExport function + 2 export-ping handlers + C2 isRehydrating + C3 partial-keep on timeout); team upload-WIP overlay preserved in WT untouched.
+- ✅ Gap B fixed (2026-05-31): `bitsandbytes==0.49.2` installed in the LAI venv by rj; harsh #1 precompute now firable (running).
+- ✅ Gap C + D fixed (`7eb851c`): `use_cache` save/restore in `on_save` (~5–10× faster probe generation during training) + data-driven `Probe.fictional` flag — vm-6 set the field on 7 new probes and the callback now auto-includes all 8 fictional IDs without any code change.
 - ✅ Gap E fixed: vm-9 spec added below (blind A/B lawyer eval UI, adopted from research docs).
-- ⛔ Gap B open: bitsandbytes install (see #1 above).
-- ⚠️ Gap A open: 5 LAI-UI files still uncommitted, now sitting on top of the team's `bba68b3` v2 rollout — per-file keep/drop review pending. See `RESEARCH_DOCS_REVIEW.md` cross-link for context.
+- 🆕 New blocker surfaced (2026-05-31): `transformers==4.57.6` in the venv does not recognise Qwen3.5/3.6's `model_type: qwen3_5` architecture, so the Qwen3.6-27B base load fails even with `bitsandbytes` present. Resolved-or-resolving in flight: rj upgrading via `uv pip install --python ./.venv/bin/python --upgrade transformers` (try 1) or `transformers @ git+https://github.com/huggingface/transformers.git` (try 2). Production serving on vLLM `:8005` is **unaffected** — vLLM has its own model loader.
+
+---
+
+## Next session — 2026-06-01 systematic plan
+
+Written 2026-06-01 ~12:30 CET. Every line below is verified at source — `git log`, `ps -ef`, `ss -ltn`, `nvidia-smi`, file read. **No assumptions, no hallucinations.** If anyone picks the project up cold tomorrow, this is the starting point.
+
+### State snapshot at session start (verified, not remembered)
+
+| Layer | State at 2026-06-01 12:30 CET | Source |
+|---|---|---|
+| **LAI `develop`** | `3bc4d5c` at HEAD; **6 commits ahead of `origin/develop`** (`3bc4d5c`, `5a00f7f`, `efec05e`, `be08bff`, `07a99fe`, `6261203`) | `git log --oneline origin/develop..develop` |
+| **LAI-UI** | `0081b66 feat(eval-ui): lawyer-blind A/B page at public /eval route` at HEAD; `82c3b35` surgical bundle landed below it | `git -C LAI-UI log --oneline -10` |
+| **Qwen3.6-27B analyzer** | ✅ up on `:8005` (vLLM, pid `526386` since 2026-05-27 — 5-day uptime) | `ps -ef`, `ss -ltn` |
+| **Qwen3-Embedding-8B** | ✅ up on GPU 1 (vLLM, pid `281407`) | `ps -ef` |
+| **DDiQ backend** | ✅ up on `:18001` | `ss -ltn` |
+| **DDiQ reranker (`lai-test-reranker`)** | ✅ up on `:8004` | `ss -ltn` |
+| **TEI cross-encoder** | ✅ up on `:80` | `ss -ltn` |
+| **serve_rag host process** | ❌ **DOWN** — no python process matching `lai.api.serve_rag`, no listener on `:18000`, in-process reranker absent from GPU 1 (~18 GB freed since last snapshot) | `ps -ef` + `ss -ltn` + `nvidia-smi` GPU-1 free 35 → 53 GB |
+| **GPU 0** | Qwen3.6-27B vLLM resident; 23.7 GB free | `nvidia-smi` |
+| **GPU 1** | Embedding 8B resident only (reranker gone with serve_rag); 53 GB free | `nvidia-smi` |
+| **Qwen3.6-27B retention baseline JSON** | Written 2026-05-31 15:35 (4-bit nf4, `enable_thinking=off`, 25 answers) — **stale**: `probes_sha256=901516dc…` but current probes file is 32 rows with sha `95a1aab2…`. Callback will refuse to mount it. | file meta read |
+| **harsh/ docs in git?** | `harsh/PROGRESS_V2.md` ✅ (committed `efec05e`, has uncommitted edits on top); `harsh/EU_AI_ACT.md` ✅ (committed `07a99fe`); `harsh/MODEL_COMPARISON.md` ❌ untracked (never committed); `harsh/RESEARCH_DOCS_REVIEW.md` ❌ untracked (never committed) | `git log` per file |
+| **F2 plan (phased pairwise §3.4)** | folded into `harsh/MODEL_COMPARISON.md` "Operational addendum to §3.4 — phased pairwise sessions (vm-9 / F2)" — uncommitted | file read |
+
+### P0 — `serve_rag` is down (do first, verify intent before anything else)
+
+The host chat-path process is not running. This *might* be intentional (rj could be mid-restart after the `5a00f7f init:true` infra commit at 23:30 CET — `restart_serve_rag.sh` brings both serve_rag and DDiQ down together and rj may have restored DDiQ only). Or it could be a real outage rj hasn't noticed. **First action: verify with rj.** If intentional, fine. If not:
+
+```bash
+cd /data/projects/lai/LAI && ./scripts/ops/restart_serve_rag.sh
+# Then re-verify:
+ss -ltn | grep :18000
+nvidia-smi --query-gpu=index,memory.used --format=csv   # GPU 1 used should jump ~18 GB on reranker reload
+curl -s http://localhost:18000/health
+```
+
+This blocks any RAG-path chat query end-to-end smoke. It does NOT block Phase 3 prep (which is `:8005`-only).
+
+### P1 — Push `develop` (one ask away from done)
+
+`develop` is 6 ahead of `origin/develop` with a clean chain. Push fails from my account because `~/.ssh/known_hosts` is empty (host-key verification). Two clean paths:
+
+| Path | Cost | Notes |
+|---|---|---|
+| **rj pushes from his account** *(recommended — matches existing handoff pattern)* | one `git push origin develop` from rj's shell | rj has the SSH host key trusted; this is how `49431d8`, `e8875a6`, `5eb7b96`, `9255cfc`, `5a00f7f`, etc. all landed |
+| harsh `ssh-keyscan github.com` + fingerprint-verify against [GitHub's published key](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints) → add to `~/.ssh/known_hosts` → push | ~1 min + one trusted change to hc's `.ssh/` | one-time setup so future pushes from hc work directly |
+
+Commits in flight (verified `git log --oneline origin/develop..develop`):
+
+```
+3bc4d5c feat(eval): pre-generate model_a/model_b answers for the §3.4 lawyer-blind session (vm-9 follow-on F1)
+5a00f7f fix(infra): init:true für backend + worker
+efec05e docs(progress): record vm-6 + vm-7 + vm-9 completion in PROGRESS_V2
+be08bff feat(eval-api): lawyer-blind A/B evaluation runner — backend + 50 BImSchG seed (vm-9 / §3.4 ship-gate)
+07a99fe docs(compliance): EU AI Act coverage map — Art. 12/13/14/15 → shipped commits (vm-7 / Phase 4.2)
+6261203 feat(eval): expand fictional-statute probes refusal_004..refusal_010 (vm-6 / Phase 3 prep)
+```
+
+### P2 — Re-run the Qwen3.6 retention precompute against the 32-probe set
+
+The 25-probe baseline at `LAI/training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json` is stale (vm-6 expanded probes from 25 → 32 *after* rj precomputed). The gap-D sha256 validation in `RetentionProbeCallback.on_train_begin` will refuse to mount it against the current probes file — by design. Same command as before, no new bits required:
+
+```bash
+tmux new -s probe
+cd /data/projects/lai/LAI && CUDA_VISIBLE_DEVICES=1 ./.venv/bin/python -m training.fine_tuning.eval.retention_probe --base Qwen/Qwen3.6-27B --probes training/fine_tuning/eval/probes/retention_probes.jsonl --save-base-answers training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json --load-in-4bit --enable-thinking off
+```
+
+The weights are already in the HF cache (the previous run completed) so this is generation-only — ~3 min, not 10. Verify after: `python3 -c 'import json; m=json.load(open("training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json"))["meta"]; print(m["n_probes"], m["probes_sha256"][:16])'` should print `32 95a1aab22a82152d`.
+
+### P3 — Small open ops items
+
+| Item | Owner | Detail |
+|---|---|---|
+| Smoke-test cron install | rj (shared box) | Line already in `LAI/scripts/ops/README.md`; needs rj OK to add. ~30 s. |
+| Live F1 smoke against base Qwen `:8005` | harsh | `./.venv/bin/python scripts/eval/generate_eval_answers.py --model-a-url http://localhost:8005 --model-a-name qwen3.6-27b --skip-b --input /tmp/one_question.jsonl` against a 1-row test JSONL — proves the pre-generate loop works end-to-end before any LoRA actually exists. ~1 min. Documents an answer in the script's expected shape. |
+
+### Process question — should `harsh/` scratch docs move into git?
+
+vm committed both `harsh/PROGRESS_V2.md` (`efec05e`) and `harsh/EU_AI_ACT.md` (`07a99fe`) — the original "harsh/ stays uncommitted" pattern is now broken in practice. Two docs are inconsistent with that:
+
+- `harsh/MODEL_COMPARISON.md` (~20 KB) — load-bearing: Phase-3 recipe + playbook + prior-attempt analysis + measured probe results + the F2 phased-pairwise plan. Referenced from `PROGRESS_V2.md` and `RESEARCH_DOCS_REVIEW.md` via relative links.
+- `harsh/RESEARCH_DOCS_REVIEW.md` (~18 KB) — load-bearing: the 12-rejection decision record with verified citations against the research-team docs. Referenced from `PROGRESS_V2.md`.
+
+If left uncommitted, future readers see broken-style relative links in `PROGRESS_V2.md` pointing at files that aren't in their checkout. **Recommendation: commit both** in a single `docs(harsh): commit load-bearing Phase-3 reference docs` commit, matching the vm precedent. Decision for harsh to make at start of next session.
+
+### Distribution — 2026-06-01
+
+**harsh — small queue, owner of cleanup + verification**
+1. Verify intent on serve_rag with rj; if accidental, restart. (P0 above)
+2. Push `develop` via rj's account (or set up `.ssh/known_hosts` and push directly). (P1)
+3. *(optional)* Commit `harsh/MODEL_COMPARISON.md` + `harsh/RESEARCH_DOCS_REVIEW.md` if the pattern is "harsh/ in git now."
+4. *(optional)* Run F1 live smoke against `:8005` to prove the pre-generate loop end-to-end.
+
+**rj — one big task + a small fast-path window**
+- **rj-1 (Phase 4.3 Phase B)** — statute corpus write path + migration 007. His Phase-A follow-on; only he can land this efficiently (he owns `lai.pipeline.statute_feed`). Unblocks the "RAG = current statute" architecture.
+- Fast wins inside an active ops window: (a) verify or restore serve_rag (P0), (b) push `develop` from his shell (P1), (c) re-fire the Qwen3.6 precompute against the 32-probe set in tmux (P2 — ~3 min, weights cached, atomic), (d) install the smoke cron with his own OK (P3).
+
+**vm — no new assignment; running ahead of plan**
+- vm-6, vm-7, vm-8 (via rj), and vm-9 (backend + FE) are all ✅ done. If vm has cycles, the *only* useful Phase-3-prep-adjacent task left is a small CSV-export-of-baseline tool or a result-archiving helper for the eval API. Neither is urgent. Worth letting vm pick up whatever surfaces organically rather than artificially assigning.
+- **2026-06-01 — CSV-export-of-baseline tool ✅ DONE.** Shipped `LAI/scripts/eval/baseline_to_csv.py` (stdlib only, ~270 LOC). Joins the baseline JSON's per-probe answers (`{answer, len, ascii_ratio}`) with the probes JSONL by id and emits a quote-all flat CSV — columns `probe_id, category, language, fictional, prompt, answer, answer_len, ascii_ratio, notes`, probe-file order so a reviewer reads them as the JSONL lists them. Optional `--meta-out` writes a 2-col key/value sidecar with the baseline meta block plus two synthetic rows (`current_probes_sha256`, `probes_sha256_match`) so the sidecar alone tells the reviewer if the baseline is stale. Loud staleness check (recomputes probes-file sha256, surfaces mismatch to stderr) but never aborts the export — the doc itself notes the current baseline is stale, and the reviewer may still want the CSV. Exit codes: 0=wrote (incl. with stale warn), 1=config error (missing file / bad JSON / bad probes row), 2=schema unexpected. Verified live against the current stale baseline at `LAI/training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json`: emitted 32 rows (matches the post-vm-6 probes file), 7 stale empty-answer rows = exactly the vm-6 additions (`refusal_004..010`), 0 orphaned answers, sha256-mismatch warning fired correctly with both hashes shown. `python3 -m py_compile` + `ruff check` + `ruff format --check` all green. **Side find for engineering review:** base Qwen3.6-27B's `refusal_003` answer ("Es gibt kein „fiktives Landesfantasiegesetz" in der deutschen Rechtsordnung…") is a *correctly calibrated refusal* — i.e. the base passes the canonical fabrication probe that both v1 and v2 LoRA fail. Reinforces the recipe-correction thesis: the fabrication is induced by the prior training recipe, not inherited from the base.
+
+### Priority order for the next session
+
+1. **P0 — serve_rag verification with rj** (5 min; if down-by-accident, restart).
+2. **P1 — push `develop`** (one command from rj's shell).
+3. **P2 — re-run Qwen3.6 precompute** against the 32-probe set (~3 min in tmux).
+4. **rj-1 — Phase 4.3 Phase B**.
+5. **harsh-process-question — commit `harsh/MODEL_COMPARISON.md` + `harsh/RESEARCH_DOCS_REVIEW.md`** if pattern allows.
+6. **harsh-#4 — install smoke cron** (rj OK).
+7. **harsh-F1-smoke** — live verify pre-generate script against `:8005`.
+
+### Deferred by design — NOT to be picked up this session
+
+- **Phase 3 actual LoRA training run** — waits for `2.4` (pilot firm). Every supporting artifact is already in place (`MODEL_COMPARISON.md` recipe + playbook + phased pairwise plan; retention probe scaffold + callback + 32 probes + baseline workflow; eval API + FE + 50-question seed + pre-generate script). The moment pilot lands, training is unblocked.
+- **`2.4` pilot firm** — relational, owned by boss + rj.
+- **`R3` report completion toast** (Phase 1.x Wave 2) — deferred since 05-29; still blocked on FE WIP region the team owns.
+
+### Verification commands (to re-run this state check next session)
+
+```bash
+cd /data/projects/lai && git log --oneline origin/develop..develop  # what's pending push
+ss -ltn | grep -E ":(18000|18001|18002|8004|8005|80) "             # which services are live
+ps -ef | grep -E "serve_rag|vllm" | grep -v grep                    # which python processes are alive
+nvidia-smi --query-gpu=index,memory.free --format=csv               # GPU state
+python3 -c 'import json; m=json.load(open("LAI/training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json"))["meta"]; print(m["n_probes"], m["probes_sha256"][:16])'  # baseline staleness check
+git status --short                                                   # uncommitted scope
+```
+
+Run these *first* next session before deciding anything — never trust this section's snapshot blind, re-verify it.
 
 ---
 
