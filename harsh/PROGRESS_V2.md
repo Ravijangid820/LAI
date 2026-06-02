@@ -195,6 +195,8 @@ This blocks any RAG-path chat query end-to-end smoke. It does NOT block Phase 3 
 
 ### P1 — Push `develop` (one ask away from done)
 
+**✅ DONE 2026-06-02 — pushed by rj.** `origin/develop` now at `c23c0c1`. Closes the 2026-06-01 P1 item. Working tree in sync; only `LAI/.coverage` artifact + `harsh/TESTING_GUIDE.md` (harsh's WIP) remain dirty by design.
+
 `develop` is 6 ahead of `origin/develop` with a clean chain. Push fails from my account because `~/.ssh/known_hosts` is empty (host-key verification). Two clean paths:
 
 | Path | Cost | Notes |
@@ -271,7 +273,7 @@ If left uncommitted, future readers see broken-style relative links in `PROGRESS
 ### Priority order for the next session
 
 1. **P0 — serve_rag verification with rj** (5 min; if down-by-accident, restart).
-2. **P1 — push `develop`** (one command from rj's shell).
+2. ✅ **P1 — push `develop`** — DONE 2026-06-02 by rj; `origin/develop` at `c23c0c1`.
 3. **P2 — re-run Qwen3.6 precompute** against the 32-probe set (~3 min in tmux).
 4. **rj-1 — Phase 4.3 Phase B**.
 5. **harsh-process-question — commit `harsh/MODEL_COMPARISON.md` + `harsh/RESEARCH_DOCS_REVIEW.md`** if pattern allows.
@@ -441,7 +443,9 @@ Pre-existing debt confirmed (not caused by our edits): the lint/type/security fa
 **Update 2026-06-01 — three deltas since 05-29 14:25.**
 - ✅ **serve_rag back up 2026-06-02 11:52** (rj-restart, PID 3176864, `.venv` interpreter, `:18000`) with `a43b440` (persistence RLock fix) live. Verified via 600-req synth burst across 5 sessions on 24 threads: `{200: 600}`, 1225 req/s, p50 17ms / p95 35ms / p99 48ms / max 70ms; zero new `InterfaceError` / `Traceback` / `5xx` in `logs/host/serve_rag.log` during the burst (baseline 6 pre-restart hits unchanged). Qwen3.6 analyzer `:8005` + DDiQ `:18001` + reranker `:8004` + embedding (vLLM GPU 1) all still up. Prior 05-31 → 06-02 outage: clean shutdown at 05-31 21:13 (FastAPI/uvicorn handled SIGTERM cleanly), preceded the `5a00f7f init:true` infra commit at 23:14 by ks_admin; smoke cron caught it daily 08:00 (`cannot reach :18000/health: Connection refused`).
 - ✅ **LAI-UI team WIP landed** as `bba68b3 feat(v2): cross-account isolation + onboarding + sharing + admin UI` — the "blocked on FE-WIP owner / 26 dirty files" line from 05-29 no longer holds. Our surgical bundle landed on top as `82c3b35` (LAI-UI: watchdog 60→120 + vm-2 dedup + recordExport + C2 + C3) + `0081b66` (vm-9 lawyer-blind eval UI). **All committed.** LAI-UI deploy itself — whether the team has rolled to the user-facing host — not separately verified this turn.
-- ✅ **Smoke cron installed** by rj (`rj-3` track), daily 08:00, logs to `LAI/logs/host/smoke_test_cron.log`. Verified by today's 08:00 log entry.
+- ✅ **Smoke cron installed** by rj (`rj-3` track), originally daily 08:00; **tightened to hourly 2026-06-02** (`e5bfd19`) after the 05-31 → 06-02 ~20 h outage proved a 24 h detection window was too wide. Logs to `LAI/logs/host/smoke_test_cron.log`, one iso-timestamped run per hour.
+- ✅ **`serve_rag` systemd unit drafted + committed** (`e5bfd19`, 2026-06-02): `LAI/scripts/ops/systemd/serve_rag.service` + `install.sh` + README section. Auto-restart on failure + auto-start at boot. **Install requires sudo** — pending ks_admin to run `sudo bash LAI/scripts/ops/systemd/install.sh`. Cohabits with `restart_serve_rag.sh`; not blocking anything if deferred — the hourly cron is the bridge until then.
+- ✅ **`develop` pushed to `origin`** (2026-06-02, `c23c0c1`) — closes the 2026-06-01 P1 item.
 
 **Update 2026-05-29 14:25 — audit deploy complete + `v2.1.0` released.** (historical, preserved for context)
 - **`v2.1.0` released:** repo consolidated to trunk-based **Git Flow** (single `master` + `develop`; `v2-restructure` retired). Tags: `v1.0.0`, `v2.0.0`, `v2.1.0`. The audit subsystem, CI fix (`fc931f9`), smoke test, and Git Flow docs all shipped in `v2.1.0`. master == develop == v2.1.0.
