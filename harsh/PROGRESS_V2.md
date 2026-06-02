@@ -419,9 +419,9 @@ One short follow-up note to as ("did you mean to query these docs? anything bloc
 - `components/chat/DocumentList.tsx` vm-2 (1.4): best-copy-per-filename dedup in the status poll → a stale duplicate row no longer keeps chat gated on "still processing" after a `done` copy exists (green chip already present). tsc + eslint clean; dedup logic unit-checked; not browser-tested. **Uncommitted** — edit sits in the poll region, clear of the upload-WIP hunks; commit together with that WIP.
 
 ## UX smoothness — Wave 2 status
-- **R2** (report step labels) ✅ committed `9a2040e`.
-- **C2** (rehydration skeleton) ✅ done, uncommitted in `DashboardChat.tsx` (WIP file).
-- **C3** (keep partial answer on timeout) ✅ done, uncommitted in `DashboardChat.tsx` (WIP file).
+- **R2** (report step labels) ✅ committed (`86ea301` post-rebase, was `9a2040e`).
+- **C2** (rehydration skeleton) ✅ shipped in surgical bundle (`cf9adfe` post-rebase, was `82c3b35`).
+- **C3** (keep partial answer on timeout) ✅ shipped in surgical bundle (`cf9adfe` post-rebase, was `82c3b35`).
 - **R3** (report completion toast) ✅ **DONE 2026-06-02** (`5c863ac` on LAI-UI develop) — confirmed harsh's WIP hunks on `ReportDownloadPanel.tsx` were in different branches of the same `.then().catch()` chain (his at the outer `.catch` for 404 handling, the toast goes into the inner `.then` for the done-success path). Surgically committed via stash-and-restore so harsh's 26-file resumable-upload WIP stays untouched. tsc clean; 3 pre-existing lint warnings unchanged. Ready-to-apply spec preserved below for historical context:
   > In `ReportDownloadPanel.tsx`, in the poll loop's `if (s.status === "done")` branch (~line 1425, right before `setStep("preview")`), add `toast.success("Your report is ready", { description: s.project_name })`. `toast` is already imported. One line; do it once the teammate's WIP in that region lands.
 
@@ -447,6 +447,8 @@ Pre-existing debt confirmed (not caused by our edits): the lint/type/security fa
 - ✅ **Smoke cron installed** by rj (`rj-3` track), originally daily 08:00; **tightened to hourly 2026-06-02** (`e5bfd19`) after the 05-31 → 06-02 ~20 h outage proved a 24 h detection window was too wide. Logs to `LAI/logs/host/smoke_test_cron.log`, one iso-timestamped run per hour.
 - ✅ **`serve_rag` systemd unit drafted + committed** (`e5bfd19`, 2026-06-02): `LAI/scripts/ops/systemd/serve_rag.service` + `install.sh` + README section. Auto-restart on failure + auto-start at boot. **Install requires sudo** — pending ks_admin to run `sudo bash LAI/scripts/ops/systemd/install.sh`. Cohabits with `restart_serve_rag.sh`; not blocking anything if deferred — the hourly cron is the bridge until then.
 - ✅ **`develop` pushed to `origin`** (2026-06-02, `c23c0c1`) — closes the 2026-06-01 P1 item.
+- ✅ **LAI-UI lint sweep 2026-06-02** (`5f8f311`) — 20 problems → 7. Cleared 13 false-positive react-refresh warnings via canonical-pattern eslint overrides for `components/ui/**` (shadcn variant exports), `contexts/**` (Provider+hook+context), `hooks/**` (Provider+hook). Fixed `Logo.tsx` exhaustive-deps + dropped unused `eslint-disable` in `DashboardLibrary.tsx`. **Remaining 7 (1 error + 6 warnings)** all sit inside harsh's uncommitted resumable-upload WIP — `--max-warnings 0` deferred until that bundle lands.
+- ✅ **R3 completion toast** shipped to `origin/develop` LAI-UI (`5c863ac`, 2026-06-02) — surgical commit while preserving harsh's 26-file WIP on the same file.
 
 **Update 2026-05-29 14:25 — audit deploy complete + `v2.1.0` released.** (historical, preserved for context)
 - **`v2.1.0` released:** repo consolidated to trunk-based **Git Flow** (single `master` + `develop`; `v2-restructure` retired). Tags: `v1.0.0`, `v2.0.0`, `v2.1.0`. The audit subsystem, CI fix (`fc931f9`), smoke test, and Git Flow docs all shipped in `v2.1.0`. master == develop == v2.1.0.
