@@ -105,23 +105,41 @@ Decision rule applied:
 |---|---|
 | Bump `RetrievalConfig.hnsw_ef_search` 100 → 200 | **NOT shipped** — hybrid measurement showed no carry-through |
 | Flip BM25 dispatcher default v1 → v5 | ✅ shipped |
-| Document residual recall floor (48.5 % both-miss) | ✅ documented in §1 |
+| Bump candidate_k 200 → 500 | **NOT shipped** — sweep proved no lift |
+| Document residual recall floor (48.5 % both-miss) | ✅ documented + spot-check-explained |
 
-Next experiments worth doing (in order of likely payoff):
+## 5. candidate_k sweep — also a negative result
 
-1. **Bigger candidate pool.** All 200-query missers had gold > rank
-   100 — try candidate_k=500. Hits the reranker harder but the latency
-   already lives in BM25 + dense, not in reranking 300 more chunks.
-2. **Query rewriting.** A short LLM call expands "Antrag" →
+| candidate_k | R@10 | R@30 | R@100 | R@500 | MRR | retrieve_ms |
+|---|---|---|---|---|---|---|
+| 100 | 0.425 | 0.490 | 0.555 | 0.615 | 0.251 | 2,414 |
+| 200 *(current default)* | 0.425 | 0.490 | 0.555 | 0.615 | 0.245 | 2,477 |
+| 500 | 0.425 | 0.490 | 0.555 | 0.605 | 0.247 | 2,428 |
+
+Pool size makes no difference at any K. The gold either sits in the
+first 100 candidate parents or not at all — extra pool depth surfaces
+nothing useful. Combined with the ef_search negative, **the 48.5 %
+both-miss floor is structural at this index**.
+
+The honest causal explanation, given the spot-check finding: ~half of
+those "misses" are val-label artifacts. The actual model ceiling at
+hybrid R@30 is 0.63–0.75 (see val-quality finding), not 0.49.
+
+## 6. Next experiments — reordered after val-quality finding
+
+1. **val.jsonl gold re-curation.** Now first, not third. Implemented
+   as `lai.search.val_language.classify_text` + the `filter_val_german`
+   script. 8429 German rows kept of 9998. Re-run baseline against
+   `val_de.jsonl` to get the real Recall@K ceiling.
+2. **Query rewriting.** Short LLM call expands "Antrag" →
    "Antrag OR Antragsverfahren OR Antragsstellung" before BM25. Could
-   recover some of v6's morphology lift without v6's noise cost.
-3. **val.jsonl gold re-curation.** The 48.5 % both-miss tail may
-   include questions whose gold parent_id is actually wrong (a side-
-   finding of any retrieval tuning at this scale). A spot-check of
-   20-30 misses tells us if the floor is "model can't find it" or
-   "we're scoring against the wrong target."
+   recover some morphology lift without the prefix-glob noise cost.
+   Worth trying after the val_de baseline lands.
+3. **Bigger candidate pool.** — **ABANDONED** (this sweep proved no
+   lift at any pool size tested).
+4. ~~HNSW ef_search bump.~~ — **ABANDONED** (sweep proved no hybrid lift).
 
-None are urgent before pilot — they're the next two iteration cycles.
+None are urgent before pilot — these are the next iteration cycles.
 
 Decision rule (locked before measurement, from
 [`2026-06-02-bm25-retune-empirical.md`](./2026-06-02-bm25-retune-empirical.md)):
