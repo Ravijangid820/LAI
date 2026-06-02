@@ -275,6 +275,8 @@ Closed today after a multi-phase unblock arc — what we thought was a "same com
 
 **Follow-on (for rj — see message below).** Install the same two packages in `LAI/.venv` so the production training path has the fast kernels ready when Phase 3 fires. Safe because the reranker (Qwen3-Reranker-8B = plain Qwen3 arch) doesn't have DeltaNet layers and won't touch fla's kernels — it'll keep using the standard attention paths it always has. No serve_rag restart needed; nothing imports fla at runtime today. `uv sync --extra training` after pin add is the only state change. Tracked separately so it lands deliberately, not coupled to a Phase 3 kickoff timeline.
 
+**✅ DONE 2026-06-02** (`d861b14`). Added `flash-linear-attention>=0.5.0` + `causal-conv1d>=1.6.2` to `pyproject.toml` `training` extra (pin floors mirror the hc-7 sandbox-resolved versions: fla 0.5.0, causal-conv1d 1.6.2.post1). `uv lock` resolved 5 new packages (incl. einops, fla-core, ninja). `UV_LINK_MODE=copy uv sync --extra training` installed cleanly in 12 s; hardlinks failed on the build cache filesystem, copy-mode worked. Verified live in `LAI/.venv`: `fla 0.5.0`, `causal_conv1d 1.6.2.post1`, `causal_conv1d_cuda` ext loaded, `torch 2.10.0+cu128 cuda_available=True`. Reranker safety claim verified by `AutoConfig.from_pretrained("Qwen/Qwen3-Reranker-8B")` → `model_type='qwen3'` + `architectures=['Qwen3ForCausalLM']` — plain Qwen3, no DeltaNet, fla kernels never touched at reranker load. Production stays inert until Phase 3 LoRA training actually fires.
+
 ### P3 — Small open ops items
 
 | Item | Owner | Detail |
