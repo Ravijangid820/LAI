@@ -475,10 +475,26 @@ def _bm25_match_expr(query: str) -> str | None:
     v6 prefix-glob was the biggest surprise loser at 25 s/query AND
     -5 pp R@30. Decision rule + full table in
     ``rj/blueprint/2026-06-02-retrieval-tuning-results.md``.
+
+    ``LAI_QUERY_REWRITE_VARIANT`` env (default ``none``) layers an
+    LLM-driven OR-expansion on top of the base expression — see
+    ``lai.search.query_rewriter`` + ``rj/blueprint/2026-06-02-query-rewriting-blueprint.md``.
+    Production is inert unless the env is set in the harness subprocess
+    (or the default is flipped here after a sweep confirms a winner).
+    The import is lazy so paths that don't rewrite don't pay for httpx.
     """
     variant = os.environ.get("LAI_BM25_VARIANT", "v5")
     fn = _BM25_VARIANTS.get(variant, _bm25_match_expr_v5)
-    return fn(query)
+    base = fn(query)
+    rewrite_variant = os.environ.get("LAI_QUERY_REWRITE_VARIANT", "none")
+    if rewrite_variant == "none" or not base:
+        return base
+    # Lazy import: avoids loading httpx + the rewriter module's cache
+    # plumbing for the common case where rewriting is off.
+    from lai.search.query_rewriter import get_safe_expansions, rewrite_bm25_expr
+
+    expansions = get_safe_expansions(query, rewrite_variant)
+    return rewrite_bm25_expr(base, expansions)
 
 
 def retrieve_bm25_ids(
