@@ -90,12 +90,7 @@ Most are <10 min. The precompute (#1) is the only one that needs a quiet GPU 1 w
    psql -h localhost -U lai_user -d lai_db -c \
      "SELECT action, COUNT(*) FROM audit_log WHERE ts > NOW() - INTERVAL '15 minutes' GROUP BY action ORDER BY action;"
    ```
-4. **Install the smoke-test cron** (was rj-3a; line is in `scripts/ops/README.md`):
-   ```bash
-   crontab -l > /tmp/cron.bak 2>/dev/null && \
-   crontab -l 2>/dev/null | { cat; grep -E "scripts/ops/smoke_test.py" scripts/ops/README.md | head -1; } | crontab -
-   crontab -l | grep smoke_test    # confirm
-   ```
+4. ✅ **DONE by rj as rj-3 (2026-05-31)** — Smoke-test cron installed daily 08:00, `LAI_SMOKE_MAX_S=60` to absorb cold-cache retrieval, sources `.env.smoke.local` inline so password isn't in `crontab -l`. Verified by today's `LAI/logs/host/smoke_test_cron.log` 08:00 entry (which is also what surfaced the serve_rag outage — the cron has been alerting that `:18000/health` is unreachable, working exactly as designed).
 5. **✅ DONE by rj (`49431d8`, 2026-05-31)** — Boss status note. Originally allocated to harsh; rj landed it in the same commit that covered #3, closing the production-mandate loop end-to-end (smoke verified, audit verified, boss-readable summary captured).
 6. **Push develop when satisfied** (currently ~5 commits ahead, more after rj's recent work):
    ```bash
@@ -149,7 +144,7 @@ All three are zero-collision with harsh's queue and rj-1.
 2. ~~**harsh #3 + #5** (live smoke + boss note)~~ — **✅ DONE by rj (`49431d8`, 2026-05-31)**, closes the production-mandate loop.
 3. **rj-1** (Phase 4.3 Phase B) — unblocks the *"RAG = current statute"* arch.
 4. ~~**vm-6** (more fictional probes)~~ — **✅ DONE 2026-05-31** (uncommitted): 7 new fictional probes (`refusal_004`…`refusal_010`), all carrying `"fictional": true`; 32 probes total; 15/15 detector tests still pass; `probes_sha256` rotated. Tightens the Phase-3 stop signal as planned.
-5. **harsh #4** (cron) + ~~**vm-7** (AI-Act doc)~~ — vm-7 **✅ DONE 2026-05-31** (`harsh/EU_AI_ACT.md`, uncommitted); maps Arts. 12/13/14/15 to actual commits/files with honest "open gaps" list. **harsh #4 still open** — ops change, needs rj OK.
+5. ~~**harsh #4** (cron)~~ + ~~**vm-7** (AI-Act doc)~~ — both **✅ DONE**. vm-7 shipped 2026-05-31 as `07a99fe docs(compliance): EU AI Act coverage map — Art. 12/13/14/15 → shipped commits (vm-7 / Phase 4.2)` (was originally `harsh/EU_AI_ACT.md` uncommitted; vm committed it). **harsh #4 was picked up by rj as `rj-3`** — smoke cron installed at daily 08:00, logs to `LAI/logs/host/smoke_test_cron.log`; verified by today's 08:00 entry. No outstanding ops change.
 6. **harsh #6** (push) when the queue feels stable.
 7. ~~**vm-8**~~ — **✅ DONE by rj (`9255cfc`, 2026-05-31)** as rj-3b.
 
@@ -218,16 +213,27 @@ be08bff feat(eval-api): lawyer-blind A/B evaluation runner — backend + 50 BImS
 6261203 feat(eval): expand fictional-statute probes refusal_004..refusal_010 (vm-6 / Phase 3 prep)
 ```
 
-### P2 — Re-run the Qwen3.6 retention precompute against the 32-probe set
+### P2 — Re-run the Qwen3.6 retention precompute against the 32-probe set — ✅ DONE 2026-06-02
 
-The 25-probe baseline at `LAI/training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json` is stale (vm-6 expanded probes from 25 → 32 *after* rj precomputed). The gap-D sha256 validation in `RetentionProbeCallback.on_train_begin` will refuse to mount it against the current probes file — by design. Same command as before, no new bits required:
+Closed today after a multi-phase unblock arc — what we thought was a "same command, ~3 min" turned out to need a transformers major-version bump first because the venv had silently downgraded.
 
-```bash
-tmux new -s probe
-cd /data/projects/lai/LAI && CUDA_VISIBLE_DEVICES=1 ./.venv/bin/python -m training.fine_tuning.eval.retention_probe --base Qwen/Qwen3.6-27B --probes training/fine_tuning/eval/probes/retention_probes.jsonl --save-base-answers training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json --load-in-4bit --enable-thinking off
-```
+**The bug.** Re-firing the precompute on 2026-06-02 errored with `model type 'qwen3_5' but Transformers does not recognize this architecture`. The `Qwen3.6-27B` checkpoint is part of Alibaba's Qwen3.5 multimodal family (hybrid Gated-DeltaNet + Gated-Attention SSM, `model_type: qwen3_5`); the `model_type` registration landed in transformers ≥ 5.x. Our `.venv` was rebuilt 2026-06-01 17:58 and resolved transformers down to **4.57.6** — below the cut. Pre-2026-06-02 success came from an earlier venv that had a newer transformers; the rebuild silently lost qwen3_5 support. pyproject.toml's `transformers>=4.46.0` floor was too loose for the Phase 3 target base.
 
-The weights are already in the HF cache (the previous run completed) so this is generation-only — ~3 min, not 10. Verify after: `python3 -c 'import json; m=json.load(open("training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json"))["meta"]; print(m["n_probes"], m["probes_sha256"][:16])'` should print `32 95a1aab22a82152d`.
+**Phase A — local validation (sandbox `.venv`, no production touch).** Built a parallel venv at `/data/projects/lai/training_sandbox/.venv` with `transformers>=5.9.0,<6.0` + `peft>=0.18` + `bitsandbytes>=0.49` + mirrored everything else from `LAI/.venv`. 6/6 checks green: `qwen3_5` + `qwen3_5_text` registered; `AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.6-27B")` auto-routes to text-only `Qwen3_5ForCausalLM` (skips the vision tower), 4bit nf4, 16.85 GB on GPU 1; chat template `enable_thinking=False` works via `**chat_template_kwargs` unpack (the script's existing invocation is correct); generation produces clean German output matching the 2026-05-31 baseline format. Architecture confirmed live as 3:1 hybrid: `Qwen3_5GatedDeltaNet` (linear attention, ~75% of layers) + `Qwen3_5Attention` (full attention, ~25%). LoRA-targetable leaf names enumerated — see "Phase 3 recipe gap" below. Runtime warning surfaced: `flash-linear-attention` + `causal-conv1d` not installed → torch fallback (~1.3× slower per-token); optional install for Phase 3 training throughput, not blocking the baseline.
+
+**Phase B — production blast-radius probe.** Mapped every transformers + huggingface_hub usage site in `src/`, `micro-services/`, and the DDiQ container. Only **one** live production hot path uses transformers: the in-process `Reranker` class (`src/lai/search/eval.py:359` Qwen3-Reranker-8B) loaded at `serve_rag` startup. Live-tested the production invocation in the sandbox: `Qwen3-Reranker-8B` loads cleanly at 15.6 GB, scores discriminate correctly (4.45 vs −12.32 on a relevant/irrelevant test pair), `dtype` preserved as fp16, model class `Qwen3ForCausalLM`. Single observable side-effect: a stderr print `torch_dtype is deprecated! Use dtype instead!` (5.x renamed the kwarg). DDiQ has zero transformers usage — its requirements.txt doesn't even mention it. vLLM at `:8005` is a separate stack with its own deps. No direct `huggingface_hub` imports anywhere in production code, so the 0.36 → 1.x major bump only matters transitively (and transformers 5.9 was built against ≥ 1.5). Verdict: single-venv upgrade is safe; no dual-venv split needed.
+
+**Phase C1 — pin + script updates + sync, 8 files +17/-10 (`<commit-pending>`).** `pyproject.toml`: floor lifted to `transformers>=5.9.0,<6.0` and `huggingface_hub>=1.5,<2.0` explicit (no longer transitive — prevents the silent-downgrade pattern from recurring). Mechanical rename `torch_dtype=` → `dtype=` across the 7 call sites in `src/lai/search/eval.py` (2), `src/lai/api/serve_rag.py` (1), and the four training scripts so the deprecation print goes away at next reranker load. py_compile clean on all touched files. `uv lock --upgrade-package transformers --upgrade-package huggingface_hub --upgrade-package peft` + `uv sync --extra training`; resolved versions: `5.9.0 / 1.17.0 / 0.19.1`. **No serve_rag restart** — see C2.
+
+**Phase C2 — serve_rag restart parked.** On-disk venv now has transformers 5.9; the running serve_rag process still holds 4.57.6 in memory (the in-process Reranker won't pick up the new version until the process restarts). Restart command (no sudo): `./scripts/ops/restart_serve_rag.sh` — Phase B verified the reranker survives the bump live, so the restart is expected clean (~6s reranker re-load + smoke verify). Parked because Phase D didn't require a prod-touch and the user wants to schedule the maintenance window deliberately. Risk if deferred indefinitely: the next unplanned restart (crash / deploy / reboot) becomes the moment 5.9 actually goes live in prod, coupled to whatever else that event carries.
+
+**Phase D — 32-probe baseline regenerated against the now-correct venv.** Ran the original command verbatim via tmux on GPU 1 (probe Python is a separate process, picks up the new on-disk venv without needing serve_rag restarted). Verified meta: `n_probes=32, probes_sha256[:16]=95a1aab22a82152d, quantization=4bit_nf4, enable_thinking=off`. The artifact at `LAI/training/fine_tuning/eval/baselines/qwen36-27b__retention_probes.json` is now what `RetentionProbeCallback.on_train_begin` will mount against the current probes file.
+
+**Phase 3 recipe gap surfaced for follow-up.** The live-enumerated architecture has two distinct attention block types with different leaf-module names:
+- Full-attention layers (~25%, `Qwen3_5Attention`): `q_proj, k_proj, v_proj, o_proj`
+- Linear-attention DeltaNet layers (~75%, `Qwen3_5GatedDeltaNet`): `in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj`
+
+`run_lora.py`'s current `target_modules = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]` covers the full-attention blocks and all MLPs, but **silently skips the DeltaNet projections** (75% of token mixing). MODEL_COMPARISON.md's "attention-only modules" phrasing didn't anticipate the hybrid. Recipe decision (whether to LoRA the DeltaNet `in_proj_*` / `out_proj` projections, how `r` should scale across the two attention types, whether to install `flash-linear-attention` for training-side throughput) is deliberately deferred until Phase 3 actually fires — no point speculating without a training-time signal. Logged here so it doesn't get lost.
 
 ### P3 — Small open ops items
 
@@ -269,8 +275,8 @@ If left uncommitted, future readers see broken-style relative links in `PROGRESS
 3. **P2 — re-run Qwen3.6 precompute** against the 32-probe set (~3 min in tmux).
 4. **rj-1 — Phase 4.3 Phase B**.
 5. **harsh-process-question — commit `harsh/MODEL_COMPARISON.md` + `harsh/RESEARCH_DOCS_REVIEW.md`** if pattern allows.
-6. **harsh-#4 — install smoke cron** (rj OK).
-7. **harsh-F1-smoke** — live verify pre-generate script against `:8005`.
+6. ~~**harsh-#4 — install smoke cron**~~ — **✅ DONE by rj as rj-3** (see #4 in the queue above).
+7. ✅ **DONE 2026-06-01 — harsh-F1-smoke ran live against `:8005`**: tiny one-row JSONL with the real `q01` BImSchG question from `bimschg_50.jsonl`, side-A-only against `qwen3.6-27b`. 9.7 s wall, 874-char structured German legal answer with proper §-citations, `enable_thinking=off` confirmed (no `<think>` block), exit 0. F1 pipeline verified end-to-end before any LoRA exists.
 
 ### Deferred by design — NOT to be picked up this session
 
@@ -290,6 +296,83 @@ git status --short                                                   # uncommitt
 ```
 
 Run these *first* next session before deciding anything — never trust this section's snapshot blind, re-verify it.
+
+---
+
+## Live production sample — ks + as chat audit (2026-06-01)
+
+**Why:** before assuming "production works fine since the boss-mandate close-out," pull actual user conversations and judge the model's behaviour. Read-only audit.
+
+**Method:** `sessions.db` stored at `LAI/processed/sessions.db` (SQLite, WAL-active; 98 sessions, 836 messages). User ↔ UUID mapping from `lai_db.users` table in `lai_postgres_main` container (`docker exec -e PGPASSWORD=… lai_postgres_main psql -U lai_user -d lai_db -c "SELECT id, email FROM users WHERE email ILIKE 'ks%' OR email ILIKE 'as%' OR email ILIKE 'sa%';"`). Conversations dumped via stdlib `sqlite3` (no CLI on box). Both users are admins in `org_id=e3bff292-…`.
+
+### Result by user
+
+| User | Sessions | Real chat turns | Verdict |
+|---|---|---|---|
+| **ks@blockland.ae** (`e477b066…`) | 2 | 8 (5 user + 5 assistant + an upload toast etc.) | Real exploratory use; **mixed model quality** |
+| **as@blockland.ae** (`7007d94a…`) | 6 | **0 user messages anywhere**; 5 sessions are bare document uploads with no chat at all, one has a single auto-generated upload-toast assistant message | **Cannot judge model behaviour for as** — they uploaded files and never asked anything. Either testing the upload flow, dropped files for someone else to query, or hit a UX block (possibly the *exact* "still processing" gate vm-2's dedup was meant to fix). Worth following up. |
+
+### ks — turn-by-turn verdict (2 sessions, 5 user questions)
+
+**Session 1 — chat mode, no documents (2026-05-25 16:29):**
+
+| User | Mode | Model verdict |
+|---|---|---|
+| "Bist duz online?" *(typo for "du")* | chat | ✅ appropriate brief acknowledgement |
+| "Überprüfe truenbrietzen" | chat | ✅ correctly didn't fabricate (asked for clarification), **but missed that "Treuenbrietzen" is a real Brandenburg town with active wind-energy projects** — geography-knowledge gap for a German-wind product |
+| "hast du zugrif auf meine projekte?" *(typo)* | rag | ✅ **excellent grounding** — explicitly explains [C-n] corpus vs [M-n] matter docs distinction, says no matter docs uploaded |
+| **"was kann ich hier tun?"** | rag | ❌ **real failure** — interprets a generic UI question as a *criminal-law / fraud / Konto-zur-Verfügung-stellen* topic from the retrieved chunks. Cites [C-1]/[C-2]/[C-3] Hude/Hatten DD docs + a 2009 fraud-forum post. Ended with "(unbelegt)" tag but the whole answer is off-topic. Classic "retrieve-then-answer reflex misfires on a non-content question." |
+| "was sind das quellen?" | rag | ✅ accurate listing of C-1 (EEG 2009 FAQ), C-2 (EEG 2009 statute), C-3 (EuGH rulings + 2009/28/EG directive) with proper citations |
+
+**Session 2 — `20261112-JM Motio.docx` + 6 matter files (2026-05-25 16:33):**
+
+| User | Mode | Model verdict |
+|---|---|---|
+| "was kannst du hier im datenraum erkennen?" | chat | ✅ substantive 2,750-char structured analysis of M-1…M-7 (draft motions, Gebotsbestätigungen, WhatsApp evidence, Motio Group entity, dates) — **but answered in English despite a German question.** Mild language drift. |
+| "auf deutswchg" *(typo)* | contract | ✅ switches to German cleanly, structured 4,083-char analysis of corporate structure (Rietz II, JV, Netzanschluss), citations preserved |
+| "gehst du semantisch vor? oder verstehst du die dokumente?" | contract | ⚠️ misinterpretation — user asks a *meta-question about the AI*, model treats it as a document-grounded question and says "no info found in the documents about how the AI works." Over-grounded retrieval. |
+
+### Honest summary of model behaviour from this sample
+
+**Works:**
+- Refusal-on-no-corpus is calibrated correctly (one of the things we'd want a §3.4 LoRA to preserve, not break).
+- Source-listing is accurate with proper `[C-n]` handles; the answer to *"was sind das quellen?"* is gold-standard for a legal AI.
+- Document analysis is substantive, well-structured, with `[M-n]` citations.
+
+**Broken / observed failure modes (3 of 5 ks turns):**
+- **Retrieve-then-answer reflex misfires on non-content questions** (worst — *"was kann ich hier tun?"*). UI / navigation / meta questions should not trigger RAG retrieval. The model retrieved corpus chunks, found something tangentially related to fraud, and answered as if the user asked about criminal law.
+- **Language drift** (English answer to German prompt in Session 2 turn 1). Inconsistent — the next turn handled language correctly. Worth a retention-probe-style sentinel.
+- **Over-grounded interpretation of meta-questions** ("gehst du semantisch vor?"). Asking about the AI itself ≠ asking about the documents.
+
+**Geography knowledge gap:** missed "Treuenbrietzen" (real Brandenburg wind town). Phase-3 BImSchG training data should include place-name grounding for the German wind-energy domain.
+
+### Surfaced new candidate work item — `mode-router-quality` (NOT YET ASSIGNED)
+
+The most important finding isn't an LLM problem; it's a **routing problem**. The model is doing what `force_mode=rag` told it to do. The fix is upstream:
+
+- **mode-router-quality** *(candidate Phase 1.x or 2.x — needs sizing before assigning)*: lightweight intent classifier (or set of regex heuristics in `serve_rag`) that detects (a) UI/navigation questions ("what can I do here?", "how does this work?"), (b) meta-questions about the assistant itself, (c) acknowledgement/greeting turns ("bist du online?") — and routes those to a `chat` (no-RAG) path. Avoids the *"was kann ich hier tun?"* failure mode entirely.
+
+  *Honest sizing concern:* an LLM-based router would double per-turn latency for the common case; a regex / heuristic router needs careful prompt-list curation in two languages. Worth scoping properly before someone picks it up. Probably 2–3 days work + an eval batch (which we can reuse vm-9's pre-generate runner for).
+
+### Implications for Phase 3 prep (already-shipped retention probes)
+
+The retention probe set (`retention_probes.jsonl`, 32 prompts) is **missing this category**: there are no probes for "UI / meta / navigation questions that should NOT trigger RAG." Worth a vm-6-style follow-on append: add 3–5 prompts of the *"was kann ich hier tun?"* / *"gehst du semantisch vor?"* / *"bist du online?"* shape and watch what the LoRA does with them. They're not currently in the §3.4 50-question seed either.
+
+### Follow-up for as
+
+as uploaded 6 documents on 2026-05-26 and asked **zero** questions. Possible causes (in order of plausibility):
+1. They were testing the upload flow only.
+2. They hit the *"still processing"* gate that vm-2's dedup fixed in `82c3b35` (not deployed live yet — see Phase 2.3 row).
+3. They dropped files for someone else (sa, ks) to query.
+4. Some FE / auth issue specific to that account.
+
+One short follow-up note to as ("did you mean to query these docs? anything blocking you?") closes this cheaply.
+
+### What this audit does NOT cover
+
+- We did not check the model's *Treuenbrietzen* answer against actual wind-park data — that geography gap is observed, not measured at scale.
+- We did not look at sessions from the most-active user `cd5a4a1b…` (8 sessions, last active 2026-06-01 17:58). That user isn't ks/as so out of scope for this audit; worth a separate look if you want a wider sample.
+- We did not check whether the "(unbelegt)" tagging on the off-topic turn-4 answer is consistent with how the citation-validator was supposed to flag it. Worth a separate audit of `citation_validation` outcomes vs. user-facing answer quality.
 
 ---
 
@@ -319,6 +402,12 @@ Run these *first* next session before deciding anything — never trust this sec
 - `5abe968` feat(ops): audit_log export + retention CLI (vm-4 / 2.3 follow-up; CSV/JSON export with date+action+org+user filters, dry-run-by-default `--purge-older-than DAYS`, EU AI Act Art. 12 callout in README)
 - `3c4033b` feat(ingest): one-law `gesetze-im-internet.de` fetcher (vm-5 / Phase 4 feed; thin wrapper around rj's Phase-A client+parser, writes per-§ JSON to `data/statutes/<slug>/`, atomic swap, sha256-keyed idempotency)
 
+**2026-06-02 — three commits today:**
+- `4f064ba` feat(LAI-UI): cross-reload ingest visibility — `ingestStore.ts` (localStorage registry per `{user, session, doc_index, filename, started_at}`) + `IngestionStatusToast.tsx` (bottom-right toast polling `matter_documents` per tracked session, hides "Seite 0/N" until pages_done>0, clears on done/failed/404). Inert until the FE-WIP owner lands their bundle (3 wiring edits in WT: `useComposerAttachments.ts`, `DashboardLayout.tsx`, `ragApi.ts` — depend on team's unstaged `useAuth` + `UploadResumeIndicator` + `deleteMatterDocument`). Ping sent.
+- `a43b440` fix(persistence): serialize SQLite reads under shared RLock. Root cause for the intermittent `sqlite3.InterfaceError: bad parameter or other API misuse` 500s at `persistence.py:523` on GET `/sessions/{id}/documents` — Python sqlite3 connection isn't thread-safe even with `check_same_thread=False`; writes had a lock, reads raced. `Lock` → `RLock` (read functions call other reads internally — `list_messages → session_exists` etc.), all 15 reads wrapped in `with _STATE["lock"]:`. `tests/unit/test_persistence_{user_scope,feedback,matter}.py` 29/29 green. Pre-existing TOCTOU in `add_session_share` / `revoke_session_share` (lockless `session_owner` check, then locked write) unchanged — out of scope.
+- `6c42f77` docs(harsh): commit load-bearing Phase-3 reference docs — `ROADMAP_2026Q3.md` + `MODEL_COMPARISON.md` + `RESEARCH_DOCS_REVIEW.md` (referenced via relative links from this file; anyone else's checkout saw broken-style links). Fixed stray "now" prefix on `MODEL_COMPARISON.md` line 1.
+- `<pending>` chore(deps) + style(transformers-5.x): qwen3_5 unblock arc. pyproject `transformers>=5.9.0,<6.0` + explicit `huggingface_hub>=1.5,<2.0` floors (was `>=4.46.0` — a 2026-06-01 venv rebuild had silently resolved transformers down to 4.57.6 and lost `qwen3_5` architecture support); mechanical `torch_dtype=` → `dtype=` rename across 7 production+training call sites (removes the deprecation print at reranker load). 8 files, +17/-10, py_compile clean. Live-verified under sandbox transformers 5.9: `Qwen3_5ForCausalLM` text-only loads at 16.85 GB on GPU 1; `Qwen3-Reranker-8B` production invocation survives the bump (scores discriminate cleanly 4.45 vs −12.32, dtype preserved as fp16). DDiQ untouched. `uv sync --extra training` landed (`5.9.0 / 1.17.0 / 0.19.1`). 32-probe Qwen3.6-27B baseline regenerated against the now-correct venv (`n_probes=32 sha256[:16]=95a1aab22a82152d quantization=4bit_nf4 enable_thinking=off`). serve_rag restart deferred to a planned window — in-process Reranker still holds 4.57.6 until then; full story in P2 above.
+
 **LAI-UI** (`fix/cross-account-isolation`):
 - `f0f0441` fix(ddiq): German labels + firm-letterhead placeholder in DOCX export (2.1)
 - `9a2040e` fix(report): readable progress labels for the DDiQ report pipeline (Wave 2 / R2 — clean file, committed)
@@ -347,12 +436,17 @@ All four CI gates pass, verified locally on the CI-locked tooling (ruff 0.15.5, 
 
 Pre-existing debt confirmed (not caused by our edits): the lint/type/security failures were branch-wide and latent — CI had been red on multiple gates, hidden because upstream failures skipped ci-gate.
 
-## Deploy state — live vs pending (updated 2026-05-29 14:25)
+## Deploy state — live vs pending (updated 2026-06-01)
 
-**Update 2026-05-29 14:25 — audit deploy complete + `v2.1.0` released.**
+**Update 2026-06-01 — three deltas since 05-29 14:25.**
+- ✅ **serve_rag back up 2026-06-02 11:52** (rj-restart, PID 3176864, `.venv` interpreter, `:18000`) with `a43b440` (persistence RLock fix) live. Verified via 600-req synth burst across 5 sessions on 24 threads: `{200: 600}`, 1225 req/s, p50 17ms / p95 35ms / p99 48ms / max 70ms; zero new `InterfaceError` / `Traceback` / `5xx` in `logs/host/serve_rag.log` during the burst (baseline 6 pre-restart hits unchanged). Qwen3.6 analyzer `:8005` + DDiQ `:18001` + reranker `:8004` + embedding (vLLM GPU 1) all still up. Prior 05-31 → 06-02 outage: clean shutdown at 05-31 21:13 (FastAPI/uvicorn handled SIGTERM cleanly), preceded the `5a00f7f init:true` infra commit at 23:14 by ks_admin; smoke cron caught it daily 08:00 (`cannot reach :18000/health: Connection refused`).
+- ✅ **LAI-UI team WIP landed** as `bba68b3 feat(v2): cross-account isolation + onboarding + sharing + admin UI` — the "blocked on FE-WIP owner / 26 dirty files" line from 05-29 no longer holds. Our surgical bundle landed on top as `82c3b35` (LAI-UI: watchdog 60→120 + vm-2 dedup + recordExport + C2 + C3) + `0081b66` (vm-9 lawyer-blind eval UI). **All committed.** LAI-UI deploy itself — whether the team has rolled to the user-facing host — not separately verified this turn.
+- ✅ **Smoke cron installed** by rj (`rj-3` track), daily 08:00, logs to `LAI/logs/host/smoke_test_cron.log`. Verified by today's 08:00 log entry.
+
+**Update 2026-05-29 14:25 — audit deploy complete + `v2.1.0` released.** (historical, preserved for context)
 - **`v2.1.0` released:** repo consolidated to trunk-based **Git Flow** (single `master` + `develop`; `v2-restructure` retired). Tags: `v1.0.0`, `v2.0.0`, `v2.1.0`. The audit subsystem, CI fix (`fc931f9`), smoke test, and Git Flow docs all shipped in `v2.1.0`. master == develop == v2.1.0.
 - **Audit log LIVE:** migration 006 applied to `lai_db` (audit_log table + append-only trigger verified); serve_rag restarted + DDiQ rebuilt with the audit code (reranker confirmed `on cuda:1`). login/query/upload (serve_rag) + report/export (DDiQ) instrumented end-to-end. Table records on next user action (0 rows at deploy).
-- **Still pending:** LAI-UI FE deploy (audit-log view + C2/C3/watchdog/vm-2) — blocked on the team upload WIP (26 dirty files).
+- ~~Still pending: LAI-UI FE deploy (audit-log view + C2/C3/watchdog/vm-2) — blocked on the team upload WIP (26 dirty files).~~ ← superseded by the 06-01 update above; team WIP landed in `bba68b3`, our surgical bundle in `82c3b35`/`0081b66`.
 
 ---
 
@@ -371,14 +465,14 @@ Pre-existing debt confirmed (not caused by our edits): the lint/type/security fa
 Ordered by value / unblocking:
 1. ✅ **DONE — `fc931f9` released in `v2.1.0`** (ci-gate green; merged to master + develop).
 2. ✅ **DONE — serve_rag restarted (05-29 14:25)**; `uid` history fix + audit code live; reranker on cuda:1. Smoke-test still pending a test login.
-3. **Commit the uncommitted FE** (`DashboardChat.tsx` C2/C3, `ragApi.ts` watchdog, `DocumentList.tsx` vm-2 dedup) alongside the team's upload WIP, then **deploy LAI-UI** to make R2 + German DOCX labels + C2/C3 + watchdog + vm-2 live. ⛔ **still open — blocked on the FE-WIP owner (26 dirty files in LAI-UI).**
+3. ✅ **DONE — committed the FE surgically in `82c3b35`** (LAI-UI): watchdog 60→120, vm-2 best-copy-per-filename dedup, recordExport + 2 export-ping handlers, C2 isRehydrating skeleton, C3 keep-partial-on-timeout. Per-file `git diff HEAD` confirms team WIP (now landed in `bba68b3`) is preserved alongside in WT. R2 step-labels + German DOCX labels were committed earlier (`9a2040e`, `f0f0441`); audit-log view was committed earlier (`c554842`); vm-9 lawyer-blind eval UI committed at `0081b66`. **LAI-UI deploy itself — whether the host has been re-rolled — not verified this turn; see Deploy state.**
 4. ✅ **DONE — DDiQ rebuilt (05-29 14:25)** via `restart_serve_rag.sh`; defusedxml + report-progress fixes live.
-5. **R3 completion toast** — apply the 1-line spec above once the teammate's `ReportDownloadPanel.tsx` WIP lands. ⛔ **still open — blocked (same FE WIP region).**
+5. ⬜ **R3 completion toast** — task #11 is marked **DEFER**; the FE WIP region that blocked it has since landed (`bba68b3` + `82c3b35`), so the 1-line spec is now apply-able rather than blocked. Will pick up if someone wants a 1-line PR. Not on any critical path.
 6. ✅ **DONE — Phase 2.3 audit log shipped (`v2.1.0`) AND deployed (05-29 14:25)**; migration 006 applied; login/query/upload/report/export instrumented across serve_rag + DDiQ.
 7. **Phase 2.4 pilot firm** — boss/rj, relational not engineering. The actual bottleneck (5 months, no pilot). ⬜ **← the remaining priority.**
 
 Deferred / later: Phase 3 foundation-model PoC (after a pilot); Phase 4 discipline items.
-Minor follow-up noted in code: an always-`"running"` ternary in the gated V2-analyzer progress path (collapsed for lint; logic smell — status never reports "done" there).
+~~Minor follow-up noted in code: an always-`"running"` ternary in the gated V2-analyzer progress path (collapsed for lint; logic smell — status never reports "done" there).~~ → **✅ DONE — fixed by rj in `9255cfc fix(serve_rag): V2-analyzer progress reports 'done' on final tick (rj-3b)`.** Root-cause correction: the bug was in `serve_rag.py:_on_progress`, not DDiQ (the analyzer's `_emit` carries `step`/`current`/`total`/`elapsed_s`/`percent` but no `status` key, so the hardcoded `status="running"` masked the final `step="done"`/`percent=1.0` tick).
 
 ## Vikrant Malik (vm) — parallel track
 
@@ -394,7 +488,7 @@ Picked because they're **isolated from our current work** (serve_rag retrieval/t
 - **Collision risk:** none — new standalone file; only reads the log and hits the HTTP API.
 
 ### vm-2 — "Still indexing" → green chip transition  (roadmap 1.4)  · FE, isolated from our work
-- **✅ DONE — implemented, UNCOMMITTED (bundle with the upload WIP).** Findings: (1) the **green-chip half was already done** in the working tree — `DocumentList.tsx` renders an emerald `CheckCircle2` + "· bereit" on `status === "done"`. (2) The real bug is the **stale "still processing" chat gate**: `DashboardChat.tsx` `docsIngesting` (disables Send + shows "Document is being processed…") comes from `DocumentList`'s `onIngestingChange`, computed as `active = docs.some(queued||processing)` over **raw, un-deduped** docs. A matter can hold duplicate rows per filename (re-drop / retry / an old `failed` beside a fresh `done`), so a stale copy kept `active` true after a `done` copy existed → the exact `GB-Auszug Tostedt` repro. **Fix:** added `bestDocPerFilename` (rank `done>ready>processing>queued>failed`) in the poll, applied to both the rendered rows and `active` — mirrors the composer's own poll-match in `useComposerAttachments.ts`. The edit lands in the poll region, **clear of the upload-WIP hunks**. tsc + eslint clean; dedup logic unit-checked; **not browser-tested** (needs a seeded duplicate matter row to reproduce live). Left uncommitted for the upload-WIP owner to review/bundle (the file is intermingled with their uncommitted changes; do NOT commit standalone).
+- **✅ DONE — committed in `82c3b35`** (LAI-UI surgical bundle, 2026-06-01) — extracted from the working tree via per-file surgical staging that left the team's `onCancel` X-button feature in WT untouched for the team to bundle. Original findings preserved: (1) the **green-chip half was already done** in the working tree — `DocumentList.tsx` renders an emerald `CheckCircle2` + "· bereit" on `status === "done"`. (2) The real bug was the **stale "still processing" chat gate** — `DashboardChat.tsx` `docsIngesting` came from `DocumentList`'s `onIngestingChange`, computed as `active = docs.some(queued||processing)` over **raw, un-deduped** docs. A matter can hold duplicate rows per filename (re-drop / retry / an old `failed` beside a fresh `done`), so a stale copy kept `active` true after a `done` copy existed → the exact `GB-Auszug Tostedt` repro. **Fix as committed:** new `DOC_STATUS_RANK` + `docStatusRank` + `bestDocPerFilename` helpers (rank `done>ready>processing>queued>failed`), applied to the poll callsite — mirrors the composer's own poll-match in `useComposerAttachments.ts`. tsc + eslint clean; dedup logic unit-checked. **Browser-test still pending** (needs a seeded duplicate matter row to reproduce live + the LAI-UI deploy to land it).
 - **Where:** the FE document-status chip (LAI-UI chat Documents list, likely `components/chat/DocumentList.tsx`) — **not** `ragApi.ts` / `ddiqDocx.ts` which we touched.
 - **Do:** when `matter_documents.status === 'done'`, flip the chip to green explicitly; stop the chat error saying "wait a moment / still processing" once ingestion is actually complete.
 - **Why:** repro — a user uploaded `GB-Auszug Tostedt`, was told "still processing" though it had finished seconds earlier.
