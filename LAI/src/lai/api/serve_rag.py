@@ -1051,6 +1051,29 @@ CONVERSATIONAL = re.compile(
     r"wer\s+bist\s+du|was\s+kannst\s+du|how\s+are\s+you)\b",
     re.IGNORECASE,
 )
+# UI / navigation / meta-AI questions that look like real questions but
+# carry no legal content. Surfaced by the 2026-06-01 ks/as production
+# audit ("was kann ich hier tun?" routed to RAG → answered with random
+# fraud-forum content). Each pattern is intentionally specific so it
+# can't eat a legal query — see tests/unit/api/test_router_ui_meta.py
+# for the gold-RAG safety check against bimschg_50.jsonl.
+UI_META = re.compile(
+    r"^\s*("
+    # German UI / navigation
+    r"was\s+kann\s+ich\s+(hier|tun|machen|alles\s+(hier\s+)?tun)|"
+    r"wie\s+funktioniert\s+(das|es|dieser|diese|der|die)\b|"
+    r"wie\s+(geht|nutze)\s+ich\s+das|"
+    # German meta about the AI
+    r"(gehst|verstehst|liest|erkennst|denkst)\s+du\s+(semantisch|wirklich|das|die\s+(dokumente|frage|aufgabe|texte))|"
+    r"bist\s+du\s+(online|wach|da)|"
+    r"wer\s+hat\s+dich\s+(gebaut|gemacht|trainiert)|"
+    # English mirrors
+    r"what\s+can\s+i\s+do\s+(here|with\s+this)|"
+    r"how\s+does\s+this\s+(work|function)|"
+    r"do\s+you\s+(understand|read|know|see)\s+(this|that|the\s+(documents?|files?|context|question))"
+    r")\b",
+    re.IGNORECASE,
+)
 LEGAL_KEYWORDS = re.compile(
     r"\b(BImSchG|BauGB|EEG|BGB|StGB|UStG|HGB|§|Art\.|Abs\.|"
     r"Genehmigung|Pacht|Vertrag|Kündigung|Klausel|Paragraf|"
@@ -2025,6 +2048,12 @@ def needs_rag(question: str) -> bool:
     if len(q) < 4:
         return False
     if CONVERSATIONAL.match(q):
+        return False
+    # UI / meta-AI questions look like real questions (have "?", > 20 chars)
+    # but carry no legal content. Check BEFORE LEGAL_KEYWORDS so a legal-word
+    # buried in a meta question ("wie funktioniert das mit BImSchG?") doesn't
+    # leak through — the meta pattern still wins. See 2026-06-01 ks/as audit.
+    if UI_META.match(q):
         return False
     if LEGAL_KEYWORDS.search(q):
         return True
