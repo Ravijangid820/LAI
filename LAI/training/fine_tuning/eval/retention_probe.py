@@ -137,7 +137,7 @@ def _load_base(
     if load_in_4bit:
         kwargs["quantization_config"] = _bnb_4bit_config(dtype)
     else:
-        kwargs["torch_dtype"] = dtype
+        kwargs["dtype"] = dtype
     model = AutoModelForCausalLM.from_pretrained(path_or_name, **kwargs)
     model.eval()
     return tok, model
@@ -161,7 +161,7 @@ def _load_ft_adapter(
     if load_in_4bit:
         kwargs["quantization_config"] = _bnb_4bit_config(dtype)
     else:
-        kwargs["torch_dtype"] = dtype
+        kwargs["dtype"] = dtype
     base_model = AutoModelForCausalLM.from_pretrained(base, **kwargs)
     model = PeftModel.from_pretrained(base_model, adapter_dir)
     model.eval()

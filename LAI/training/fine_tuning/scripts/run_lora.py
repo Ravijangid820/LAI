@@ -159,7 +159,7 @@ def main():
     if args.no_4bit:
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             trust_remote_code=True,
             # transformers picks the best available attention impl; use
             # flash_attention_2 only if the flash-attn package is installed.

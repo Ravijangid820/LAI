@@ -76,7 +76,7 @@ def load_lm(path: str, device: str = "cuda"):
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=torch.bfloat16, device_map=device, trust_remote_code=True,
+        path, dtype=torch.bfloat16, device_map=device, trust_remote_code=True,
     ).eval()
     return tok, model
 

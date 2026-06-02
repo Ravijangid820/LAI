@@ -389,7 +389,7 @@ class Reranker:
             )
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                torch_dtype=torch.float16,
+                dtype=torch.float16,
                 device_map={"": self.device},
                 trust_remote_code=True,
             ).eval()
@@ -413,7 +413,7 @@ class Reranker:
             self.tok = AutoTokenizer.from_pretrained(model_id)
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 model_id,
-                torch_dtype=torch.float16,
+                dtype=torch.float16,
                 device_map={"": self.device},
             ).eval()
 

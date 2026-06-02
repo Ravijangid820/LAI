@@ -61,7 +61,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map="auto",
         trust_remote_code=True,
     )

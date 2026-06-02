@@ -3135,7 +3135,7 @@ async def lifespan(app: FastAPI):
             tok.pad_token = tok.eos_token
         lm = AutoModelForCausalLM.from_pretrained(
             LLM_LOCAL_PATH,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map="cuda",
             trust_remote_code=True,
         ).eval()
