@@ -237,6 +237,20 @@ Closed today after a multi-phase unblock arc — what we thought was a "same com
 
 `run_lora.py`'s current `target_modules = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]` covers the full-attention blocks and all MLPs, but **silently skips the DeltaNet projections** (75% of token mixing). MODEL_COMPARISON.md's "attention-only modules" phrasing didn't anticipate the hybrid. Recipe decision (whether to LoRA the DeltaNet `in_proj_*` / `out_proj` projections, how `r` should scale across the two attention types, whether to install `flash-linear-attention` for training-side throughput) is deliberately deferred until Phase 3 actually fires — no point speculating without a training-time signal. Logged here so it doesn't get lost.
 
+### hc-7 — `flash-linear-attention` + `causal-conv1d` installability test (sandbox) — ✅ DONE 2026-06-02
+
+**Why this matters.** Phase A surfaced a runtime warning when loading `Qwen3_5ForCausalLM`: *"The fast path is not available because one of the required library is not installed. Falling back to torch implementation."* The torch fallback works fine for one-shot baseline generation (Phase D was clean on it), but it's ~1.3× slower per-token. For a 24k-step LoRA training run that's hours of wall-clock that we'd otherwise pay. Before Phase 3 actually fires post-pilot, we want to know: are the fla kernels even installable on our hardware (cuda 12.8 / sm_120 Blackwell / torch 2.10) — or are we stuck on the torch fallback?
+
+**What was tested.** Sandbox venv at `/data/projects/lai/training_sandbox/.venv` (parallel to `LAI/.venv`, zero production risk). `uv pip install flash-linear-attention causal-conv1d` resolved 5 packages cleanly in ~12 s (causal-conv1d built from source via ninja; fla 0.5.0 pulled wheel). Then re-ran `phase_a_loadtest.py` to compare the loaded-architecture's module classes against the no-fla baseline.
+
+**Result.** ✅ **Fast path is reachable on our hardware.** Two concrete signals:
+1. The *"fast path is not available"* warning is GONE from the re-run.
+2. The DeltaNet leaf-class set changed: pre-fla `['Conv1d', 'Linear4bit', 'Qwen3_5RMSNormGated', 'SiLUActivation']` → post-fla `['Conv1d', 'Linear4bit', 'FusedRMSNormGated', 'SiLUActivation']`. The `Qwen3_5RMSNormGated` → `FusedRMSNormGated` swap is transformers loading fla's fused RMSNorm kernel in place of the torch fallback.
+
+**Caveat surfaced honestly.** Single-probe generation took 36 s in the post-fla run vs 11.4 s in the no-fla run. Almost certainly **first-call CUDA-kernel JIT compile overhead** — fla's kernels are compiled lazily on first invocation and the cost amortises across subsequent calls. For a 24k-step LoRA train (or even a 32-probe baseline run) the per-step throughput win swamps the one-time JIT cost. **Not measured at steady-state in this test** — flagging as inferred from the kernel-loading mechanics, not benchmarked.
+
+**Follow-on (for rj — see message below).** Install the same two packages in `LAI/.venv` so the production training path has the fast kernels ready when Phase 3 fires. Safe because the reranker (Qwen3-Reranker-8B = plain Qwen3 arch) doesn't have DeltaNet layers and won't touch fla's kernels — it'll keep using the standard attention paths it always has. No serve_rag restart needed; nothing imports fla at runtime today. `uv sync --extra training` after pin add is the only state change. Tracked separately so it lands deliberately, not coupled to a Phase 3 kickoff timeline.
+
 ### P3 — Small open ops items
 
 | Item | Owner | Detail |
@@ -449,6 +463,7 @@ Pre-existing debt confirmed (not caused by our edits): the lint/type/security fa
 - ✅ **`develop` pushed to `origin`** (2026-06-02, `c23c0c1`) — closes the 2026-06-01 P1 item.
 - ✅ **LAI-UI lint sweep 2026-06-02** (`5f8f311`) — 20 problems → 7. Cleared 13 false-positive react-refresh warnings via canonical-pattern eslint overrides for `components/ui/**` (shadcn variant exports), `contexts/**` (Provider+hook+context), `hooks/**` (Provider+hook). Fixed `Logo.tsx` exhaustive-deps + dropped unused `eslint-disable` in `DashboardLibrary.tsx`. **Remaining 7 (1 error + 6 warnings)** all sit inside harsh's uncommitted resumable-upload WIP — `--max-warnings 0` deferred until that bundle lands.
 - ✅ **R3 completion toast** shipped to `origin/develop` LAI-UI (`5c863ac`, 2026-06-02) — surgical commit while preserving harsh's 26-file WIP on the same file.
+- ✅ **Scalable retrieval recall harness** shipped (`d4de720`, 2026-06-02) — new `LAI/scripts/eval/retrieval_recall.py` replaces the in-RAM `lai.search.eval.Corpus` (which OOMs on 35.7 M children × 4096 fp32 ≈ 572 GB). The new harness loops over `val.jsonl`, queries the SAME indexes serve_rag uses (pgvector HNSW dense + SQLite FTS5 BM25 + RRF), so reported Recall@K matches what users see. Modes `--mode {dense,bm25,hybrid}`, multi-K Recall@10/30/100 + MRR per run, query-embedding disk cache so re-runs skip the embedding service. Live-verified 10-row smoke: bm25 R@10=0.20 / dense R@10=0.30 / hybrid R@10=0.40 — RRF lifts both signals as designed. Per-query timings: dense ~250 ms (HNSW warm), BM25 ~2.7 s (FTS5 OR-of-6, the same slow leg the 05-31 perf experiment surfaced). The 05-31 BM25 retune that had to be reverted on a 1-query smoke-test recall regression can now be re-attempted with a real recall gate.
 
 **Update 2026-05-29 14:25 — audit deploy complete + `v2.1.0` released.** (historical, preserved for context)
 - **`v2.1.0` released:** repo consolidated to trunk-based **Git Flow** (single `master` + `develop`; `v2-restructure` retired). Tags: `v1.0.0`, `v2.0.0`, `v2.1.0`. The audit subsystem, CI fix (`fc931f9`), smoke test, and Git Flow docs all shipped in `v2.1.0`. master == develop == v2.1.0.
