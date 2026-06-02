@@ -2097,8 +2097,12 @@ def session_uses_contract(session_id: str | None, question: str) -> bool:
     if not has_docs:
         return False
     # Pure greeting / smalltalk needs no document context.
+    # UI / meta-AI questions are also excluded — they look substantive
+    # ("gehst du semantisch vor?") but adding 8k chars of contract text
+    # and routing them through contract analysis turns them into
+    # off-topic doc-grounded answers (2026-06-01 ks/as session-2 audit).
     q = question.strip()
-    return not (len(q) < 4 or CONVERSATIONAL.match(q))
+    return not (len(q) < 4 or CONVERSATIONAL.match(q) or UI_META.match(q))
 
 
 # ---------------------------------------------------------------------------

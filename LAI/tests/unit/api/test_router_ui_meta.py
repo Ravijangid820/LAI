@@ -126,3 +126,27 @@ def test_needs_rag_still_returns_true_on_real_legal_question() -> None:
     """A real legal query must still route to RAG — the UI_META filter
     cannot regress LEGAL_KEYWORDS coverage."""
     assert sr.needs_rag("Welche Schutzgüter regelt § 1 BImSchG?") is True
+
+
+# ── 4. session_uses_contract integration ────────────────────────────────
+
+
+def test_session_uses_contract_skips_ui_meta_question(monkeypatch) -> None:
+    """A meta question on a session WITH an uploaded document must NOT
+    pull the document into the prompt — otherwise the 8k-char contract
+    text feeds an off-topic doc-grounded answer to the meta question
+    (the 2026-06-01 ks/as session-2 failure)."""
+    monkeypatch.setattr(
+        sr.persistence, "list_matter_documents", lambda sid, user_id=None: [object()]
+    )
+    assert sr.session_uses_contract("sess-1", "gehst du semantisch vor?") is False
+
+
+def test_session_uses_contract_still_pulls_doc_on_real_question(monkeypatch) -> None:
+    """A real content question on the same session keeps the contract
+    injection — the UI_META exclusion cannot regress the core use
+    case ("upload a PDF, then ask about it")."""
+    monkeypatch.setattr(
+        sr.persistence, "list_matter_documents", lambda sid, user_id=None: [object()]
+    )
+    assert sr.session_uses_contract("sess-1", "Was steht in der Genehmigung?") is True
