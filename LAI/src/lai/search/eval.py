@@ -467,9 +467,17 @@ _BM25_VARIANTS = {
 
 
 def _bm25_match_expr(query: str) -> str | None:
-    """Dispatcher — env-gated, defaults to v1 (current production)."""
-    variant = os.environ.get("LAI_BM25_VARIANT", "v1")
-    fn = _BM25_VARIANTS.get(variant, _bm25_match_expr_v1)
+    """Dispatcher — env-gated, defaults to v5 (DE-stopword filter).
+
+    The 2026-06-02 variant sweep (hybrid mode, n=200 val queries) found
+    v5 = v1 on Recall@K (0.490 R@30 in both) and 14 % faster (2461 ms vs
+    2859 ms per query). v2, v3, v6, v7 all dropped recall by 3.5-10 pp;
+    v6 prefix-glob was the biggest surprise loser at 25 s/query AND
+    -5 pp R@30. Decision rule + full table in
+    ``rj/blueprint/2026-06-02-retrieval-tuning-results.md``.
+    """
+    variant = os.environ.get("LAI_BM25_VARIANT", "v5")
+    fn = _BM25_VARIANTS.get(variant, _bm25_match_expr_v5)
     return fn(query)
 
 

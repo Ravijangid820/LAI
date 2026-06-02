@@ -60,28 +60,68 @@ Per-row hit-overlap (@30):
 
 ## 3. BM25 variants (hybrid mode, n=200)
 
-Partial results — v6 and v7 still running as of write time. Will be
-re-edited when complete.
+Full sweep, all six variants:
 
 | Variant | Description | Recall@10 | Recall@30 | Recall@100 | MRR | retrieve_ms |
 |---|---|---|---|---|---|---|
 | **v1** *(control)* | top-6 OR len>4 | 0.435 | 0.490 | 0.550 | 0.251 | 2,859 |
 | v2 | top-4 OR len≥5 | 0.385 | 0.455 | 0.530 | 0.227 | 1,324 |
 | v3 | top-3 OR len≥5 | 0.370 | 0.435 | 0.510 | 0.207 | 836 |
-| **v5** | v1 + DE-stopword filter | 0.425 | **0.490** | 0.555 | 0.251 | **2,461** |
-| v6 | prefix-glob, 5-char + `*` | running | | | | |
-| v7 | length-routed AND-3 / OR-6 | pending | | | | |
+| **v5** *(winner)* | v1 + DE-stopword filter | 0.425 | **0.490** | 0.555 | 0.251 | **2,461** |
+| v6 | prefix-glob, 5-char + `*` | 0.360 | 0.440 | 0.495 | 0.209 | 24,876 |
+| v7 | length-routed AND-3 / OR-6 | 0.330 | 0.390 | 0.455 | 0.208 | 48 |
 
-Decision rule applied to results so far:
+Decision rule applied:
 
-* v2 — ΔR@30 = −3.5 pp → **DROP**
-* v3 — ΔR@30 = −5.5 pp → **DROP**
-* v5 — ΔR@30 = 0.0 pp, retrieve 14 % faster → **KEEP** (provisional
-  winner)
+| Variant | ΔR@30 | Δretrieve_ms | Verdict |
+|---|---|---|---|
+| v2 | −3.5 pp | −1,535 ms | **DROP** |
+| v3 | −5.5 pp | −2,024 ms | **DROP** |
+| **v5** | 0.0 pp | **−398 ms** | **KEEP — winner** |
+| v6 | −5.0 pp | **+22,016 ms** | **DROP** (8.7× slower AND worse recall) |
+| v7 | −10.0 pp | −2,811 ms | **DROP** (60× faster but tanks recall) |
 
-If v6 / v7 land cleanly under the recall gate AND faster than v5,
-they take the win. Otherwise v5 wins by default — same recall, modest
-latency saving (~400 ms / query).
+**Headline surprises:**
+
+1. v6 (prefix-glob) was *predicted* to lift recall via German
+   morphological matching ("genehmigung" / "genehmigungsverfahren" /
+   "genehmigt" all matching `genehm*`). In practice it **dropped**
+   recall by 5 pp and took **25 s per query**. The 10.8 M-row FTS5
+   scan drowned the relevant docs in noise — bm25() scored too many
+   marginally-matching prefix hits high. The intuition that broader
+   match = better recall is wrong here.
+2. v7 (length-routed) confirmed the 2026-05-31 finding empirically:
+   AND-of-3 on long queries is destructive on Recall@30 (−10 pp),
+   despite the 60× latency win. The 2026-05-31 commit's failure
+   mode was real; the only saved cost was not deploying it.
+3. v5 wins through micro-optimization (DE-stopword pre-filter trims
+   ~10-15 % of the FTS5 result set without changing the retrieval
+   semantics for the dominant query population). Modest cost saving
+   but **zero recall risk** by construction.
+
+## 4. Recommendation — SHIPPED
+
+| Change | Status |
+|---|---|
+| Bump `RetrievalConfig.hnsw_ef_search` 100 → 200 | **NOT shipped** — hybrid measurement showed no carry-through |
+| Flip BM25 dispatcher default v1 → v5 | ✅ shipped |
+| Document residual recall floor (48.5 % both-miss) | ✅ documented in §1 |
+
+Next experiments worth doing (in order of likely payoff):
+
+1. **Bigger candidate pool.** All 200-query missers had gold > rank
+   100 — try candidate_k=500. Hits the reranker harder but the latency
+   already lives in BM25 + dense, not in reranking 300 more chunks.
+2. **Query rewriting.** A short LLM call expands "Antrag" →
+   "Antrag OR Antragsverfahren OR Antragsstellung" before BM25. Could
+   recover some of v6's morphology lift without v6's noise cost.
+3. **val.jsonl gold re-curation.** The 48.5 % both-miss tail may
+   include questions whose gold parent_id is actually wrong (a side-
+   finding of any retrieval tuning at this scale). A spot-check of
+   20-30 misses tells us if the floor is "model can't find it" or
+   "we're scoring against the wrong target."
+
+None are urgent before pilot — they're the next two iteration cycles.
 
 Decision rule (locked before measurement, from
 [`2026-06-02-bm25-retune-empirical.md`](./2026-06-02-bm25-retune-empirical.md)):
