@@ -295,17 +295,182 @@ def retrieve_bm25(query: str, corpus: Corpus, k: int) -> tuple[list[int], list[f
 # focused Recall@30 eval (200 val.jsonl queries) showed it dropped standalone
 # BM25 recall from 37 % to 15 % — too large a quality hit to ship on the
 # strength of one smoke query whose answer happened to come from dense+rerank.
-# A stopword + length-filter sweep found no Pareto-better variant; both axes
-# (recall / latency) sit on a hard tradeoff. The slow path stays until we can
-# run a real end-to-end (post-reranker) recall test.
-def _bm25_match_expr(query: str) -> str | None:
+#
+# 2026-06-02 follow-up: ``LAI_BM25_VARIANT`` env switches between
+# experimental forms (v1 = baseline = current production behaviour). The
+# default keeps production unchanged. See blueprint
+# ``rj/blueprint/2026-06-02-bm25-retune-empirical.md`` for the variant
+# table + the decision rule the next retune is gated by.
+
+# German legal stopwords for v5 — frequent function words that survive the
+# len>4 filter on multi-word forms (e.g. ``dieser``, ``welches``). Kept
+# small (~30 entries) so it stays a high-precision noise filter, not a
+# semantic decision-maker.
+_DE_STOPWORDS_LEN5_PLUS: frozenset[str] = frozenset(
+    {
+        "dieser",
+        "diese",
+        "dieses",
+        "welche",
+        "welches",
+        "welcher",
+        "darauf",
+        "darin",
+        "danach",
+        "davon",
+        "darüber",
+        "deren",
+        "dessen",
+        "wegen",
+        "gegen",
+        "ohne",
+        "durch",
+        "nach",
+        "über",
+        "unter",
+        "während",
+        "zwischen",
+        "innerhalb",
+        "außerhalb",
+        "trotzdem",
+        "deshalb",
+        "daher",
+        "sodass",
+        "weil",
+        "wenn",
+        "dann",
+        "also",
+        "soll",
+        "wird",
+        "werden",
+        "wurden",
+        "haben",
+        "hatte",
+        "hatten",
+    }
+)
+
+
+def _select_tokens(query: str, *, min_len: int, top_n: int) -> list[str]:
+    """Shared longest-distinct-token picker used by every variant."""
     safe = query.replace('"', " ").strip()
-    tokens = sorted({t for t in safe.split() if len(t) > 4}, key=len, reverse=True)[:6]
-    if not tokens:
-        tokens = sorted({t for t in safe.split() if len(t) > 2}, key=len, reverse=True)[:6]
+    tokens = sorted({t for t in safe.split() if len(t) > min_len}, key=len, reverse=True)[
+        :top_n
+    ]
+    if not tokens:  # fall back to a more permissive min
+        tokens = sorted({t for t in safe.split() if len(t) > 2}, key=len, reverse=True)[:top_n]
+    return tokens
+
+
+def _bm25_match_expr_v1(query: str) -> str | None:
+    """Control — current production: top-6 OR, len>4 with len>2 fallback."""
+    tokens = _select_tokens(query, min_len=4, top_n=6)
     if not tokens:
         return None
     return " OR ".join(f'"{t}"' for t in tokens)
+
+
+def _bm25_match_expr_v2(query: str) -> str | None:
+    """Narrower pool — top-4 OR with stricter len>=6 character minimum."""
+    tokens = _select_tokens(query, min_len=5, top_n=4)
+    if not tokens:
+        return None
+    return " OR ".join(f'"{t}"' for t in tokens)
+
+
+def _bm25_match_expr_v3(query: str) -> str | None:
+    """Width gradient — top-3 OR len>=5. Narrower than v2 (top-4), broader than v7 (AND-3).
+
+    NEAR was prototyped here originally; abandoned because German legal
+    parent chunks span hundreds of tokens and gold paraphrases the
+    question, so even distance=200 matches <100 rows corpus-wide.
+    Width-narrowing via fewer disjuncts is a fairer apples-to-apples
+    BM25 perf test.
+    """
+    tokens = _select_tokens(query, min_len=5, top_n=3)
+    if not tokens:
+        return None
+    return " OR ".join(f'"{t}"' for t in tokens)
+
+
+def _bm25_match_expr_v4(query: str) -> str | None:
+    """Same as v1 but the SQL caller is expected to ``LIMIT`` earlier.
+
+    Mechanically identical to v1 at the expression level — the speed-up
+    here would come from the caller using a smaller candidate_k. Kept
+    as its own tag so the eval table can carry the "what if we drop
+    candidate_k from 200 to 100?" result side-by-side.
+    """
+    return _bm25_match_expr_v1(query)
+
+
+def _bm25_match_expr_v5(query: str) -> str | None:
+    """v1 with the German legal stopword pre-filter."""
+    safe = query.replace('"', " ").strip()
+    pool = [t for t in safe.split() if t.lower() not in _DE_STOPWORDS_LEN5_PLUS]
+    tokens = sorted({t for t in pool if len(t) > 4}, key=len, reverse=True)[:6]
+    if not tokens:
+        tokens = sorted({t for t in pool if len(t) > 2}, key=len, reverse=True)[:6]
+    if not tokens:
+        return None
+    return " OR ".join(f'"{t}"' for t in tokens)
+
+
+def _bm25_match_expr_v6(query: str) -> str | None:
+    """Prefix-glob — top-6 OR, but each token truncated to 5 chars + ``*``.
+
+    Catches morphological variants ubiquitous in German legal text:
+    ``Genehmigung``, ``Genehmigungsverfahren``, ``Genehmigungsbescheid``
+    all match the same ``genehm*`` glob. May *broaden* the pool (worse
+    latency) but should *lift* recall — the recall/latency direction
+    flips vs the other variants.
+    """
+    tokens = _select_tokens(query, min_len=4, top_n=6)
+    if not tokens:
+        return None
+    # Strip non-word chars from the prefix root so FTS5's MATCH parser
+    # doesn't choke on stray punctuation.
+    safe_prefixes = ["".join(c for c in t[:5].lower() if c.isalnum()) for t in tokens]
+    safe_prefixes = [p for p in safe_prefixes if len(p) >= 3]
+    if not safe_prefixes:
+        return None
+    return " OR ".join(f"{p}*" for p in safe_prefixes)
+
+
+def _bm25_match_expr_v7(query: str) -> str | None:
+    """Length-routed: AND-of-3 when query is long, OR-of-6 when short.
+
+    Long queries carry more lexical signal so a tighter AND has the
+    redundancy to land hits; short queries need broader OR to surface
+    anything at all. The 05-31 attempt failed because it used AND
+    *unconditionally* on a population dominated by short queries.
+    """
+    tokens = _select_tokens(query, min_len=4, top_n=6)
+    if not tokens:
+        return None
+    raw = query.replace('"', " ").strip().split()
+    if len(raw) >= 8:
+        tight = tokens[:3]
+        return " AND ".join(f'"{t}"' for t in tight) if tight else None
+    return " OR ".join(f'"{t}"' for t in tokens)
+
+
+_BM25_VARIANTS = {
+    "v1": _bm25_match_expr_v1,
+    "v2": _bm25_match_expr_v2,
+    "v3": _bm25_match_expr_v3,
+    "v4": _bm25_match_expr_v4,
+    "v5": _bm25_match_expr_v5,
+    "v6": _bm25_match_expr_v6,
+    "v7": _bm25_match_expr_v7,
+}
+
+
+def _bm25_match_expr(query: str) -> str | None:
+    """Dispatcher — env-gated, defaults to v1 (current production)."""
+    variant = os.environ.get("LAI_BM25_VARIANT", "v1")
+    fn = _BM25_VARIANTS.get(variant, _bm25_match_expr_v1)
+    return fn(query)
 
 
 def retrieve_bm25_ids(
