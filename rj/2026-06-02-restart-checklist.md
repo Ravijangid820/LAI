@@ -14,7 +14,7 @@ Vercel auto-roll (LAI-UI).
 | `0f4ce4d` | UI_META → chat router | "was kann ich hier tun?" no longer routes to RAG → no random fraud-forum content |
 | `11975c5` | UI_META → contract injection skip | Meta question on a doc-session no longer pulls 8k chars of contract |
 | `e84241f` | German language detector fix | "was kannst du …" now correctly detected as German → answered in German |
-| (BM25 winner, pending sweep) | Possibly `v5` (DE-stopword filter) as new default | ~15 % BM25 latency win, recall unchanged |
+| `3be15a3` | BM25 default flipped v1→v5 (DE-stopword filter) | ~14 % BM25 latency win (-398 ms / query), Recall@30 unchanged |
 
 **How to apply:**
 
@@ -63,7 +63,3 @@ it's the post-restart PID.
   100. No change.
 * Phase 2 of mode-router (embedding-based intent classifier) — only
   built if Phase 1 turns out brittle in pilot use.
-* The BM25 winner is pending the variant sweep finishing; if v5 wins,
-  the change is a 1-line dispatcher default flip + restart. If v6
-  wins, it's a re-test against actual latency budget. Either way it's
-  a SEPARATE restart, not bundled with this one.
