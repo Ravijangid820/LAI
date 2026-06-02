@@ -284,7 +284,7 @@ If left uncommitted, future readers see broken-style relative links in `PROGRESS
 
 - **Phase 3 actual LoRA training run** — waits for `2.4` (pilot firm). Every supporting artifact is already in place (`MODEL_COMPARISON.md` recipe + playbook + phased pairwise plan; retention probe scaffold + callback + 32 probes + baseline workflow; eval API + FE + 50-question seed + pre-generate script). The moment pilot lands, training is unblocked.
 - **`2.4` pilot firm** — relational, owned by boss + rj.
-- **`R3` report completion toast** (Phase 1.x Wave 2) — deferred since 05-29; still blocked on FE WIP region the team owns.
+- ~~**`R3` report completion toast** (Phase 1.x Wave 2)~~ — ✅ DONE 2026-06-02 (`5c863ac`).
 
 ### Verification commands (to re-run this state check next session)
 
@@ -422,7 +422,7 @@ One short follow-up note to as ("did you mean to query these docs? anything bloc
 - **R2** (report step labels) ✅ committed `9a2040e`.
 - **C2** (rehydration skeleton) ✅ done, uncommitted in `DashboardChat.tsx` (WIP file).
 - **C3** (keep partial answer on timeout) ✅ done, uncommitted in `DashboardChat.tsx` (WIP file).
-- **R3** (report completion toast) ⬜ **DEFERRED** — a teammate is actively editing the exact done-branch in `ReportDownloadPanel.tsx` (WIP hunk `@@ -1432 +1445,24`). Editing there risks duplicating/conflicting with live work. Ready-to-apply spec:
+- **R3** (report completion toast) ✅ **DONE 2026-06-02** (`5c863ac` on LAI-UI develop) — confirmed harsh's WIP hunks on `ReportDownloadPanel.tsx` were in different branches of the same `.then().catch()` chain (his at the outer `.catch` for 404 handling, the toast goes into the inner `.then` for the done-success path). Surgically committed via stash-and-restore so harsh's 26-file resumable-upload WIP stays untouched. tsc clean; 3 pre-existing lint warnings unchanged. Ready-to-apply spec preserved below for historical context:
   > In `ReportDownloadPanel.tsx`, in the poll loop's `if (s.status === "done")` branch (~line 1425, right before `setStep("preview")`), add `toast.success("Your report is ready", { description: s.project_name })`. `toast` is already imported. One line; do it once the teammate's WIP in that region lands.
 
 ---
@@ -472,7 +472,7 @@ Ordered by value / unblocking:
 2. ✅ **DONE — serve_rag restarted (05-29 14:25)**; `uid` history fix + audit code live; reranker on cuda:1. Smoke-test still pending a test login.
 3. ✅ **DONE — committed the FE surgically in `82c3b35`** (LAI-UI): watchdog 60→120, vm-2 best-copy-per-filename dedup, recordExport + 2 export-ping handlers, C2 isRehydrating skeleton, C3 keep-partial-on-timeout. Per-file `git diff HEAD` confirms team WIP (now landed in `bba68b3`) is preserved alongside in WT. R2 step-labels + German DOCX labels were committed earlier (`9a2040e`, `f0f0441`); audit-log view was committed earlier (`c554842`); vm-9 lawyer-blind eval UI committed at `0081b66`. **LAI-UI deploy itself — whether the host has been re-rolled — not verified this turn; see Deploy state.**
 4. ✅ **DONE — DDiQ rebuilt (05-29 14:25)** via `restart_serve_rag.sh`; defusedxml + report-progress fixes live.
-5. ⬜ **R3 completion toast** — task #11 is marked **DEFER**; the FE WIP region that blocked it has since landed (`bba68b3` + `82c3b35`), so the 1-line spec is now apply-able rather than blocked. Will pick up if someone wants a 1-line PR. Not on any critical path.
+5. ✅ **R3 completion toast** — DONE 2026-06-02 (`5c863ac`).
 6. ✅ **DONE — Phase 2.3 audit log shipped (`v2.1.0`) AND deployed (05-29 14:25)**; migration 006 applied; login/query/upload/report/export instrumented across serve_rag + DDiQ.
 7. **Phase 2.4 pilot firm** — boss/rj, relational not engineering. The actual bottleneck (5 months, no pilot). ⬜ **← the remaining priority.**
 
