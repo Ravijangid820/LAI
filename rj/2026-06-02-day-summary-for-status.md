@@ -44,20 +44,23 @@ reported Recall@K mirrors what users see at any corpus size.
 * **HNSW ef_search bump deferred.** Dense-only sweep showed ef=200
   buys +2.5 pp Recall@30 over the current ef=100, but the lift
   vanishes at the hybrid layer (RRF + a 200-candidate pool masks it).
-  Honest result: **no production change** there. Saved doing a
-  pointless config change that would have added latency for no user-
-  visible gain.
-* **BM25 variant sweep in progress.** Four of six variants done; v5
-  (DE-stopword filter, same recall as control, ~14 % faster) is the
-  provisional winner. v6 (prefix-glob, broader recall, slower) and
-  v7 (length-routed AND/OR) still running. If v5 holds, we ship a
-  1-line dispatcher default flip and the next user query is 400 ms
-  faster.
-* **The real ceiling.** 48.5 % of probe questions miss both signals
-  at @30 — that's the unrecoverable floor at the current candidate
-  pool. Future levers are bigger pool, query expansion, or honest
-  re-curation of `val.jsonl` gold. Not worth doing before pilot
-  feedback says "this category is missing."
+  Honest result: **no production change** there.
+* **BM25 v5 (DE-stopword filter) shipped** (`3be15a3`). Full sweep
+  ran six variants — v5 ties the v1 control on Recall@30 (0.490) and
+  is 14 % faster (−398 ms / query). Two surprises in the data: v6
+  prefix-glob was *predicted* to lift recall via German morphology
+  but instead dropped 5 pp AND took 25 s / query; v7 length-routed
+  empirically confirmed the 05-31 reverted AND-of-3 finding (60×
+  faster, −10 pp Recall@30).
+* **The bigger finding: 52 % of misses have bad gold.** Hand-audited
+  25 hybrid baseline misses with the new `inspect_misses.py` tool.
+  28 % `gold_unrelated` (Danish/English text for German legal
+  questions, metadata tables for "Rechtsgebiet" queries) + 24 %
+  `gold_questionable`. Adjusted Recall@30 estimate is **0.63–0.75,
+  not 0.49**. Built a language-filter (`filter_val_german.py`, 12
+  unit tests) that produced an 8429-row German-only val_de.jsonl;
+  re-running the baseline against it gives the "real" ceiling number
+  for any future experiment.
 
 ## LAI-UI 6-commit recovery
 
@@ -81,6 +84,10 @@ Now Vercel can actually roll these out.
 * "Treuenbrietzen" geography gap from session 1 — model didn't
   recognize a real Brandenburg wind town. Separate work; needs Phase
   3 grounding or a curated place-name layer. Not actionable solo.
+* Human review of the 1571 `non_de` + `unknown` val rows the language
+  filter dropped. Conservative classification by design, but a
+  reviewer might recover a few hundred legitimate German rows that
+  the heuristic was wrong about.
 
 ## Commits today (LAI + LAI-UI, all on develop)
 
