@@ -32,6 +32,47 @@ The real Recall@30 production users see is in the 0.63–0.75 band, not
 0.49. The 0.49 was an honest measurement of the harness, but the
 harness was honestly mismeasuring.
 
+## 2026-06-02 22:15 CORRECTION — extrapolation was wrong
+
+The conservative adjustment above assumed the bad-gold ratio
+extrapolated from the spot-check (52 %) translates 1:1 into a higher
+Recall@K. **That was wrong.** A direct same-questions analysis on the
+original n=200 baseline CSV — partitioned by gold language — finds:
+
+| Subset | n | R@10 | R@30 | R@100 | MRR |
+|---|---|---|---|---|---|
+| DE-gold rows | 106 | 0.443 | **0.491** | 0.566 | 0.298 |
+| non_DE-gold rows | 82 | 0.427 | **0.488** | 0.561 | 0.206 |
+| unknown gold | 12 | 0.417 | 0.500 | 0.500 | 0.154 |
+
+R@30 differs by 0.3 pp between DE and non_DE subsets — noise. The
+**real model Recall@30 ceiling is 0.49**, not 0.63-0.75.
+
+What's going on: the spot-check verdicts (52 % of misses have bad
+gold) stand AS DESCRIPTIVE FINDINGS — those misses really do have
+unrelated gold. But Recall@K is blind to WHY a row missed. A non_DE
+row missing because "model retrieved better German text instead of
+the Danish gold" counts the same as a DE row missing because "model
+genuinely couldn't find it." Both add to the (1 − 0.49) miss tail.
+
+What the val-quality finding IS still useful for:
+
+* **MRR diverges.** DE-gold rows get the gold to rank 1-3 about 50 %
+  more often than non_DE-gold rows (MRR 0.298 vs 0.206). So when DE
+  rows hit, they hit harder. Useful for the reranker conversation.
+* **Failure-mode classification.** A miss on a non_DE-gold row is
+  *not actionable* (model can't be expected to find Danish text from a
+  German question). A miss on a DE-gold row IS actionable. Future
+  retrieval experiments should report DE-only Recall@K as the primary
+  metric, not whole-set.
+* **Filtered val set as a future target.** `val_de.jsonl` is useful
+  as the eval target going forward — it removes the noise from
+  ambiguous-gold rows even if it doesn't change today's headline
+  number.
+
+The original conservative adjustment line is preserved above for
+honesty about the wrong claim. The right number is 0.49.
+
 ## Concrete examples
 
 **Danish-language gold for German questions** (7 of the first 25):
