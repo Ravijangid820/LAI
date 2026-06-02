@@ -136,12 +136,18 @@ class TestUpdateReportProgress:
         assert "finished_at = NOW()" in sql
         assert "boom" in params
 
-    def test_user_scoping_in_where(self, fake_db) -> None:
+    def test_user_id_accepted_but_not_in_where(self, fake_db) -> None:
+        """Phase B intentionally dropped user_id from the WHERE clause:
+        shared reports must let any teammate nudge progress, so the
+        UPDATE is gated by org_id at INSERT time + the report UUID
+        instead. user_id is accepted for caller-compat but ignored.
+        See ``_update_report_progress`` docstring + del user_id."""
         _, cur = fake_db()
         ddiq_report._update_report_progress("r-1", step="x", user_id="user-9")
         sql, params = cur.executed[0]
-        assert "AND user_id = %s" in sql
-        assert params[-1] == "user-9"
+        assert "AND user_id" not in sql
+        assert "user-9" not in params, "user_id must not be bound into the params"
+        assert params[-1] == "r-1", "report_id is the only WHERE binding"
 
     def test_db_error_swallowed(self, monkeypatch) -> None:
         """A best-effort progress write must never raise — the
