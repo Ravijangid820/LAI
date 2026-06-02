@@ -338,6 +338,36 @@ _DE_HINT_WORDS = frozenset(
         "ich",
         "bin",
         "über",
+        # Added 2026-06-02 after the ks/as session-2 audit found
+        # "was kannst du hier im datenraum erkennen?" detected as English
+        # — "was" is in _EN_HINT_WORDS (legitimate past-tense "to be") but
+        # the German-distinct "kannst" / "du" / "kann" / "hier" weren't on
+        # this side at all, so the count tilted 0:1 toward English. All
+        # additions verified absent from standard English vocabulary.
+        "du",
+        "kannst",
+        "kann",
+        "konnte",
+        "konnten",
+        "hier",
+        "soll",
+        "sollte",
+        "sollten",
+        "muss",
+        "musste",
+        "darf",
+        "willst",
+        "wirst",
+        "wollte",
+        "wollten",
+        "ihm",
+        "ihn",
+        "ihr",
+        "ihre",
+        "möchte",
+        "möchten",
+        "müssen",
+        "dürfen",
     )
 )
 
