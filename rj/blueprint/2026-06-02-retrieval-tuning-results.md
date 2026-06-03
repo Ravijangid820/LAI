@@ -131,15 +131,60 @@ hybrid R@30 is 0.63–0.75 (see val-quality finding), not 0.49.
    as `lai.search.val_language.classify_text` + the `filter_val_german`
    script. 8429 German rows kept of 9998. Re-run baseline against
    `val_de.jsonl` to get the real Recall@K ceiling.
-2. **Query rewriting.** Short LLM call expands "Antrag" →
-   "Antrag OR Antragsverfahren OR Antragsstellung" before BM25. Could
-   recover some morphology lift without the prefix-glob noise cost.
-   Worth trying after the val_de baseline lands.
-3. **Bigger candidate pool.** — **ABANDONED** (this sweep proved no
-   lift at any pool size tested).
-4. ~~HNSW ef_search bump.~~ — **ABANDONED** (sweep proved no hybrid lift).
+2. ~~Query rewriting.~~ — **ABANDONED 2026-06-02** (this sweep tested
+   3 variants at n=200; all dropped Recall@30 and added latency; the
+   same widening-hurts-precision pattern as v6 prefix-glob).
+3. ~~Bigger candidate pool.~~ — **ABANDONED** (no lift at any pool size).
+4. ~~HNSW ef_search bump.~~ — **ABANDONED** (no hybrid lift).
 
-None are urgent before pilot — these are the next iteration cycles.
+## 7. Query rewriting — also a negative result
+
+| variant | R@10 | R@30 | R@100 | MRR | retrieve_ms |
+|---|---|---|---|---|---|
+| **none** *(v5 control)* | 0.425 | **0.490** | 0.555 | 0.249 | 2,577 |
+| r1 morphology (3 LLM calls/query) | 0.360 | 0.460 | 0.535 | 0.225 | 5,903 |
+| r2 synonyms (1 LLM call/query) | 0.420 | 0.470 | 0.545 | 0.241 | 3,570 |
+| r3 combined | 0.345 | 0.440 | 0.525 | 0.216 | 6,979 |
+
+Decision rule (R@30 ≥ 0.500 AND retrieve_ms ≤ 3700) drops all three.
+
+**Headline mechanism:** the broader the BM25 disjunct set, the worse
+the recall. Same phenomenon as v6 prefix-glob (`genehm*`): a wider
+pool dilutes BM25's relevance ordering. The marginal disjunct matches
+documents that score well lexically without being topically right;
+those rank above the gold and the gold drops out of the top-K.
+
+This tells us something important about BM25's *role* in the hybrid
+system: it's not there to find broad semantic matches (the dense leg
+does that). It's there to **precision-anchor the dense leg via rare
+lexical hits** (§ refs, statute names, proper nouns, exact morphology
+the user actually typed). Making it broader undermines that job.
+
+That rules out the last plausible parameter-tuning lever. The
+remaining levers are architectural:
+
+* Learned-sparse retrieval (SPLADE, ColBERT) — different index shape.
+* Query expansion fed only to the **reranker**, not BM25 — BM25 stays
+  precise, the reranker sees a richer query against the dense
+  candidates.
+* Accept 0.49 as the real ceiling at this index and re-curate val to
+  surface meaningful next-question signal.
+
+## 8. Closing the day
+
+Five experiments, three negatives, one positive, one overclaim:
+
+| Experiment | Outcome | Action |
+|---|---|---|
+| BM25 v5 (DE-stopword) | +14 % faster, same R@30 | ✅ shipped (v1→v5) |
+| HNSW ef_search 100→200 | No hybrid lift via RRF | ❌ abandoned |
+| candidate_k 100/200/500 | Identical R@K | ❌ abandoned |
+| Query rewriting r1/r2/r3 | Broader BM25 hurts R@K | ❌ abandoned |
+| Val-quality "real ceiling 0.63-0.75" | Same-question partition shows no R@K bias | ↪️ correction shipped |
+
+Production R@30 = 0.49 IS the model ceiling at this index. Next move
+isn't more parameter tuning; it's architectural change OR pilot
+feedback driving a different question.
 
 Decision rule (locked before measurement, from
 [`2026-06-02-bm25-retune-empirical.md`](./2026-06-02-bm25-retune-empirical.md)):
