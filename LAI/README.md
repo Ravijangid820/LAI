@@ -2,17 +2,29 @@
 
 Legal AI platform for wind energy due diligence. Answers legal questions using RAG (Retrieval-Augmented Generation) over a 672GB German legal corpus with locally-hosted models. Includes a full data processing pipeline for both RAG retrieval and model fine-tuning.
 
+> **Where current state lives (2026-06-03):** this README is the
+> long-form "what is LAI" answer. For *current* state — what shipped
+> this week, what's pending, what unblocks what — see:
+> * Rolling tracker: [`harsh/PROGRESS_V2.md`](../harsh/PROGRESS_V2.md)
+> * Exec status: [`rj/boss-status-2026-06-03.md`](../rj/boss-status-2026-06-03.md)
+> * **Pilot conversation prep:** [`rj/pilot-prep/`](../rj/pilot-prep/)
+> * Engineering writeups: [`rj/blueprint/`](../rj/blueprint/)
+> * EU AI Act coverage: [`harsh/EU_AI_ACT.md`](../harsh/EU_AI_ACT.md)
+> * Onboarding overview: [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md)
+
 ## Architecture
 
-- **RAG Pipeline:** Query analysis → hybrid search (dense + BM25 + RRF) → cross-encoder reranking → CRAG grading → LLM generation → citation verification
+- **RAG Pipeline:** Embed query → hybrid search (pgvector HNSW dense + SQLite FTS5 BM25 v5 + RRF) → cross-encoder rerank (Qwen3-Reranker-8B, in-process) → LLM generation (remote Qwen3.6-27B at `:8005`) → citation validation
 - **Data Pipeline:** Raw documents → segments → parent-child chunks → domain classification → contextual enrichment → fine-tuning data → embeddings
 - **Models:**
-  - LLM: Qwen2.5-7B-Instruct (inference), Qwen2.5-72B-Instruct-AWQ (pipeline, tensor-parallel 2 GPUs)
-  - Embedding: Qwen3-Embedding-8B (**4096 dims**, #1 MTEB multilingual; `halfvec(4096)` on Postgres, exact cosine search — 4096 exceeds pgvector's HNSW limit)
-  - Reranker: **Qwen3-Reranker-8B** (multilingual, replaced English-only MiniLM — 2026-04)
+  - **Chat LLM (production, remote):** `Qwen/Qwen3.6-27B` via vLLM at `:8005` (`--reasoning-parser qwen3`, Apache-2.0). The chat path uses this model ONLY; any change requires explicit project-owner approval.
+  - **Pipeline LLM:** Qwen2.5-72B-Instruct-AWQ (Step 5 synthetic generation, tensor-parallel 2 GPUs)
+  - **Embedding:** Qwen3-Embedding-8B (4096 dims, truncated to 4000 for pgvector `halfvec(4000)` HNSW index — production has cosine ANN, ~3 ms warm per query)
+  - **Reranker:** Qwen3-Reranker-8B (multilingual, in-process at serve_rag startup, ~18.5 GB on cuda:1)
+  - **Phase 3 (planned):** LoRA fine-tune of Qwen3.6-27B on BImSchG-scoped data. Sequenced AFTER the first pilot — see `harsh/MODEL_COMPARISON.md` + `rj/pilot-prep/`.
 - **Infrastructure:** PostgreSQL + pgvector, Redis, MinIO, vLLM — all self-hosted
 - **Hardware:** 2x RTX Pro 6000 GPUs (96GB VRAM each)
-- **Multi-tenancy:** Per-user PostgreSQL schemas for uploaded documents
+- **Multi-tenancy:** Per-org PostgreSQL `corpus_*` + per-session matter view; audit log per [EU AI Act Art. 12](../harsh/EU_AI_ACT.md)
 
 ## Quick Start
 
@@ -21,14 +33,17 @@ Legal AI platform for wind energy due diligence. Answers legal questions using R
 docker network create lai_network
 cd /data/projects/lai/Docker/database/pgvector && docker compose up -d  # port 5434
 cd /data/projects/lai/Docker/database/redis && docker compose up -d
-cd /data/projects/lai/Docker/embedding && docker compose up -d
-cd /data/projects/lai/Docker/llm && docker compose up -d
+cd /data/projects/lai/Docker/embedding && docker compose up -d         # :8003
+cd /data/projects/lai/Docker/llm && docker compose up -d               # :8005 (Qwen3.6-27B)
 
-# 2. Run the application
+# 2. Run the chat backend (serve_rag — the live API)
 cd /data/projects/lai/LAI
 uv sync
-uv run python -m lai.api.main
-# API at http://localhost:8000, docs at http://localhost:8000/docs
+CUDA_VISIBLE_DEVICES=1 LAI_BIND_HOST=0.0.0.0 .venv/bin/python -m lai.api.serve_rag --port 18000
+# API at http://localhost:18000, /health for the readiness probe
+
+# Or use the managed restart wrapper (recommended for production-style start):
+./scripts/ops/restart_serve_rag.sh
 ```
 
 ## Runtime services (what's actually shipping)
@@ -130,12 +145,20 @@ Flags to know:
 - `--resume` — resume from the latest checkpoint in `--output-dir`
 - `--limit N` — process only the first N train rows (smoke test)
 
-> **Status (2026-04-23):** the first fine-tune completed (eval_loss 0.977 → 0.553,
-> token accuracy 76% → 86%), but an audit of the teacher-generated training
-> data found **15.8% of cited §§ / clauses are fabricated** by the 72B teacher.
-> Fine-tuning is shelved until we regenerate data with a verification loop.
-> See `scripts/archive/audit_training_data.py` and the *Known Issues* section of
-> [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
+> **Status (2026-06-03):** the section above documents the *historical*
+> Qwen2.5-7B LoRA work (v1, v2). It is shelved — both adapters confidently
+> fabricate `§ 999`-style fictional statutes per the 2026-05-30 retention
+> probe (`refusal_003` returns bit-identical fabrications in v1 and v2).
+> See `harsh/MODEL_COMPARISON.md` for the full failure analysis + the
+> corrected recipe.
+>
+> **Phase 3 (current plan):** LoRA fine-tune of **Qwen3.6-27B** (NOT the
+> 7B). Architecture is hybrid Gated-DeltaNet + full-attention (`model_type
+> = qwen3_5`); the retention-probe callback in `training/fine_tuning/eval/`
+> hard-stops on token-loop or fabrication regressions. Sequencing waits
+> on the first pilot firm — every supporting artifact is already in place
+> (recipe, probes, baseline workflow, eval API + UI). The moment pilot
+> lands, training is unblocked. See `rj/pilot-prep/` for the pilot side.
 
 ## Corpus Processing (Phase 2)
 
@@ -166,17 +189,40 @@ the search pool with `--exclude-source-corpus multilegalpile` or
 python -m lai.search.eval --mode hybrid_rerank --n 100
 ```
 
-Modes (compared on the **8.3M-embedding corpus** after dedup, n=100):
+Modes (compared on the 8.3M-embedding corpus after dedup, n=100):
 
 | Mode | R@1 | R@5 | R@10 | MRR |
 |---|---:|---:|---:|---:|
 | dense + Qwen3 query prefix | 31% | 55% | 63% | 0.413 |
 | hybrid (dense + bm25 + RRF) + prefix | 35% | 56% | 66% | 0.434 |
-| **hybrid + prefix + Qwen3-Reranker-8B** | **37%** | **66%** | **72%** | **0.492** |
+| hybrid + prefix + Qwen3-Reranker-8B | 37% | 66% | 72% | 0.492 |
 
-Reproducible numbers — these match what the evaluation actually returns
-on the recovered DB. The earlier README claim of R@5=75% was on a
-different val sample / smaller corpus and didn't replicate.
+Reproducible numbers — these match what the in-RAM eval harness
+returned on the recovered DB at that time.
+
+> **2026-06-03 update — scaled, production-fidelity harness shipped.**
+> The in-RAM harness above OOMs on the current 35.7M-child corpus
+> (572 GB of fp32 embeddings). The new
+> [`scripts/eval/retrieval_recall.py`](scripts/eval/retrieval_recall.py)
+> queries the SAME indexes serve_rag uses in production (pgvector HNSW
+> + SQLite FTS5 + RRF + reranker), so reported Recall@K matches what
+> users see. Live-measured baseline on **n=200 real BImSchG val
+> queries**:
+>
+> | Mode | R@10 | R@30 | R@100 | retrieve_ms |
+> |---|---:|---:|---:|---:|
+> | dense (Qwen3-Embedding-8B HNSW) | 0.315 | 0.380 | 0.435 | 119 |
+> | bm25 (FTS5 v5, DE-stopword filter) | 0.300 | 0.355 | 0.430 | 2,461 |
+> | **hybrid (dense + bm25 v5 + RRF)** | **0.435** | **0.490** | **0.560** | 3,015 |
+>
+> Six retrieval-tuning experiments across four layers (HNSW ef_search,
+> candidate pool size, 7 BM25 expression variants, 3 reranker-query
+> augmentations) were run during 2026-06-02 / 06-03. One positive
+> shipped (**BM25 v5 stopword filter, 14% faster, same recall** —
+> live since 2026-06-02 22:41); five documented negatives. Production
+> Recall@30 = 0.49 is the honest model ceiling at this index. Full
+> table + decision rules at
+> [`rj/blueprint/2026-06-02-retrieval-tuning-results.md`](../rj/blueprint/2026-06-02-retrieval-tuning-results.md).
 
 **Cleanup that mattered:** `scripts/archive/dedup_phase1_rechunks.py` removes
 the 134K parents (216K children, 216K embeddings) that Step 2 produced
@@ -215,8 +261,12 @@ Endpoints:
 - `POST /query {question, session_id?, top_k?}` — returns `{answer, chunks, timings, tokens, session_id}`
 - `POST /upload` — stub (returns OK without ingestion)
 
-Per-query latency: ~30s (retrieval ~18s + rerank ~7s + LLM gen ~6s) on
-the 8.3M-embedding corpus.
+Per-query latency (production smoke 2026-06-03, n_sessions=152):
+~14 s wall (retrieve 2.3 s + rerank 2.5 s + generate 8.8 s + auth/serialise
+overhead). The ~30 s figure in the original README was on the 8.3M-
+embedding corpus before the Track-B pgvector migration; current
+corpus is 35.7M children and faster per-query because we no longer
+load embeddings into RAM at startup.
 
 For end-to-end manual comparison of base vs fine-tuned model with RAG
 context:
@@ -251,8 +301,9 @@ Registered model keys (full inventory in
 
 | Key | Path | Size | Notes |
 |---|---|---|---|
-| `qwen25-ft` | `/data/projects/lai/models/qwen25-7b-legal-merged` | 15 GB | Our LoRA fine-tune merged in (default in `lai.api.serve_rag`) |
-| `qwen25-base` | `Qwen/Qwen2.5-7B-Instruct` | 15 GB | Base, same architecture as our FT |
+| `qwen36` *(production default)* | `Qwen/Qwen3.6-27B` (remote, vLLM `:8005`) | 54 GB | Chat path LLM since 2026-04. Apache-2.0. `--reasoning-parser qwen3`. |
+| `qwen25-ft` | `/data/projects/lai/models/qwen25-7b-legal-merged` | 15 GB | Historical: Qwen2.5-7B LoRA fine-tune (v2). Shelved — confidently fabricates fictional § 999. See `harsh/MODEL_COMPARISON.md`. |
+| `qwen25-base` | `Qwen/Qwen2.5-7B-Instruct` | 15 GB | Base for the historical 7B FT comparison |
 | `qwen35` | `Qwen/Qwen3.5-27B` | 52 GB | Larger, newer Qwen |
 | `qwen36` | `Qwen/Qwen3.6-27B` | 52 GB | Larger, newer Qwen |
 | `gemma4` | `google/gemma-4-E4B-it` | 15 GB | 4B effective, fast |
@@ -340,20 +391,22 @@ docs/                     Documentation (incl. adr/ + the v1 strategy/demo/techn
 demo-seed/                Curated demo matters (e.g. lamstedt/) — input to load_demo_matter.py
 ```
 
-## Runtime features (v2.0.0 — see [`docs/DEMO_STATUS.md`](docs/DEMO_STATUS.md) + [`docs/TECHNICAL_DOCUMENTATION.md`](docs/TECHNICAL_DOCUMENTATION.md))
+## Runtime features (v2.1.0+ — see [`docs/DEMO_STATUS.md`](docs/DEMO_STATUS.md) + [`docs/TECHNICAL_DOCUMENTATION.md`](docs/TECHNICAL_DOCUMENTATION.md))
 
 The chat backend (`lai.api.serve_rag`) wires the `lai.common` primitives into a
 production-grade Q&A flow:
 
 - **Streaming** answers via `POST /query/stream` (SSE) + non-streaming `POST /query`
-- **Citation rigor** — `[C-n]` / `[M-n]` handles in retrieved chunks; `lai.common.citation.validate_citations` strips fabricated handles post-LLM and rewrites the sentence to end `(unbelegt)`
+- **Mode router** — `needs_rag()` short-circuits UI/meta/navigation questions to chat instead of RAG; catches "was kann ich hier tun?", "can you access my documents?", "gehst du semantisch vor?" etc. Surfaced by the 2026-06-01 ks/as production audit + the 2026-06-03 wider session audit; closed at the regex layer with 51 unit tests + gold-RAG safety check against 50 BImSchG questions
+- **Citation rigor** — `[C-n]` / `[M-n]` handles in retrieved chunks; `lai.common.citation.validate_citations` strips fabricated handles post-LLM and rewrites the sentence to end `(unbelegt)`. Validator audit at [`rj/blueprint/2026-06-03-citation-validation-audit.md`](../rj/blueprint/2026-06-03-citation-validation-audit.md).
 - **Jurisdictional sanity** — `lai.common.jurisdiction.check_jurisdiction` returns a `JurisdictionWarning` when the matter's Bundesland disagrees with citations
 - **Auth, org tenancy & sharing** — JWT (`auth_router`), org/super-admin endpoints (`admin_router`, migrations 002–004), and per-session view-only sharing (`share_router`, migration 005)
-- **DOCX export** — `GET /ddiq/report/{id}/export.docx` for client-deliverable findings
+- **Audit log (EU AI Act Art. 12)** — append-only `audit_log` table (migration 006, no-UPDATE trigger), every login / query / upload / report / export event recorded. Admin read endpoint at `GET /admin/audit`; CSV/JSON export + 6-month retention CLI at `scripts/ops/audit_export.py`. Coverage map: [`harsh/EU_AI_ACT.md`](../harsh/EU_AI_ACT.md)
+- **DOCX export** — `GET /ddiq/report/{id}/export.docx` for client-deliverable findings (German labels + firm-letterhead placeholder)
 - **Resumable uploads** — tus 1.0 server (`upload_tus`) for VDR-scale documents
 - **Feedback** — `POST /feedback` lawyer thumbs-up/down, persisted, optimistic UI
-- **Observability** — `/metrics` Prometheus endpoint; 9-panel Grafana dashboard at [`infra/monitoring/`](infra/monitoring/)
-- **Bilingual EN ⇄ DE** — `target_language` on `/query`
+- **Observability** — `/metrics` Prometheus endpoint; 9-panel Grafana dashboard at [`infra/monitoring/`](infra/monitoring/); hourly smoke cron at `scripts/ops/smoke_test.py` catches outages within 1 h
+- **Bilingual EN ⇄ DE** — `target_language` on `/query`; German language detector at [`serve_rag.py:_detect_question_language`](src/lai/api/serve_rag.py)
 
 > **Retrieval backend:** the chat path now retrieves via `lai.common.retrieval` (pgvector + HNSW over `corpus_child_chunks`, loaded by the Track-B migration), not the legacy in-RAM numpy matrix — so cold-start no longer waits on a ~144 GB RAM load.
 
