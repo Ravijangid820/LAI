@@ -1097,10 +1097,17 @@ UI_META = re.compile(
     r"(gehst|verstehst|liest|erkennst|denkst)\s+du\s+(semantisch|wirklich|das|die\s+(dokumente|frage|aufgabe|texte))|"
     r"bist\s+du\s+(online|wach|da)|"
     r"wer\s+hat\s+dich\s+(gebaut|gemacht|trainiert)|"
+    # German file-access capability (2026-06-03 widening — surfaced by
+    # the cd5a4a1b session 02cac914 audit)
+    r"hast\s+du\s+(zugriff|zugang|den\s+zugriff|den\s+zugang)\s+(auf|zu|zur)|"
+    r"welche\s+(dokumente|dateien|pdfs?|akten?)\s+(hast|siehst|kennst|kannst)\s+du|"
     # English mirrors
     r"what\s+can\s+i\s+do\s+(here|with\s+this)|"
     r"how\s+does\s+this\s+(work|function)|"
-    r"do\s+you\s+(understand|read|know|see)\s+(this|that|the\s+(documents?|files?|context|question))"
+    r"do\s+you\s+(understand|read|know|see)\s+(this|that|the\s+(documents?|files?|context|question))|"
+    # English file-access capability (same audit)
+    r"(can|do|did)\s+you\s+access\s+(the|this|that|these|those|my|a)\s*(document|file|pdf|attachment)?|"
+    r"which\s+(documents?|files?|pdfs?|docs?)\s+(do|did|have|are)\s+you"
     r")\b",
     re.IGNORECASE,
 )

@@ -56,6 +56,12 @@ UI_META_HITS = [
     "bist du online?",
     "Bist du wach?",
     "wer hat dich gebaut?",
+    # German file-access capability (2026-06-03 widening from cd5a4a1b
+    # session 02cac914 audit)
+    "hast du zugriff auf meine projekte?",
+    "hast du Zugang zu der Datei?",
+    "Welche Dokumente hast du gesehen?",
+    "welche dateien kannst du lesen?",
     # English mirrors
     "what can I do here?",
     "What can I do with this?",
@@ -63,6 +69,12 @@ UI_META_HITS = [
     "How does this function?",
     "do you understand this?",
     "Do you read the documents?",
+    # English file-access capability (same audit)
+    "can you access the document that i uploaded in the documents and reports section",
+    "Can you access this file?",
+    "do you access the pdf?",
+    "which documents do you have access to?",
+    "Which files have you got?",
 ]
 
 
