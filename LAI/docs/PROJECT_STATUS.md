@@ -1,8 +1,34 @@
 # LAI Project Status
 
-> Last updated: 2026-04-23
+> Last full update: 2026-04-23
+> Status pointer: see "Where current state lives" below — this doc is the developer onboarding overview; the rolling state of the project lives elsewhere.
 
 This document explains the current state of the LAI project for developers joining the team.
+
+## Where current state lives (2026-06-03)
+
+This onboarding doc is the long-form "what is LAI" answer. For
+*current* state of work — what shipped this week, what's live in
+production, what the next priorities are — see:
+
+| Looking for… | Read |
+|---|---|
+| Rolling project tracker (all phases, every task) | [`harsh/PROGRESS_V2.md`](../../harsh/PROGRESS_V2.md) |
+| Latest exec status (last 7 days, 5 lines for the boss) | [`rj/boss-status-2026-06-03.md`](../../rj/boss-status-2026-06-03.md) |
+| Engineering blueprints + empirical writeups (retrieval tuning, mode-router, val-quality, audits) | [`rj/blueprint/`](../../rj/blueprint/) |
+| **Pilot conversation prep** (pitch, target firms, outreach template, offer terms, readiness self-check) | [`rj/pilot-prep/`](../../rj/pilot-prep/) |
+| EU AI Act coverage map | [`harsh/EU_AI_ACT.md`](../../harsh/EU_AI_ACT.md) |
+| Phase 3 (LoRA fine-tune) plan + base-model analysis | [`harsh/MODEL_COMPARISON.md`](../../harsh/MODEL_COMPARISON.md) |
+| Pilot test plan (2026-05-23 snapshot) | [`PILOT_FINAL_TEST_PLAN.md`](./PILOT_FINAL_TEST_PLAN.md) |
+| Demo readiness (2026-05-22 snapshot) | [`DEMO_STATUS.md`](./DEMO_STATUS.md) |
+
+**Phase status at 2026-06-03:** Phase 0 + 1 + 2 ✅ shipped. Phase 3
+(LoRA fine-tune) ⬜ waits for Phase 2.4 (one pilot firm) which is 🔄
+— engineering prep landed today at `rj/pilot-prep/`; the actual
+outreach is the relational bottleneck the doc has been tracking for
+5 months.
+
+---
 
 ---
 

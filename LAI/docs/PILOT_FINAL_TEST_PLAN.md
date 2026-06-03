@@ -1,9 +1,50 @@
 # LAI — Final Pilot Test Plan & Verdict
 
-**Date:** 2026-05-23
+**Date:** 2026-05-23 (original)
 **Audience:** Project lead pre-Kristian demo
 **Status:** Pilot-ready with two declared open-mouth edges (ALKIS external; LLM multi-park recall)
 **Build:** post-`b6421b6` (Phase-B org-tenancy complete) + this session's UI fixes
+
+---
+
+## Update 2026-06-03 — pilot is still pending, prep kit now available
+
+This doc was written 2026-05-23 to evidence pilot-readiness for an
+internal demo. Since then:
+
+* **Engineering side has continued maturing** — 5 production fixes
+  shipped + live since 2026-06-02 22:41 restart (UI/meta router, file-
+  access router, German language detector, BM25 v5 retune, persistence
+  RLock). 4 routing/lang fixes verified live via direct probes (4/4).
+* **Retrieval ceiling honestly measured** — Recall@30 = 0.49 over 200
+  real BImSchG val questions. Six retrieval-tuning experiments across
+  four layers; one positive shipped (BM25 v5, ~14 % faster) and five
+  documented negatives. Full table at
+  [`rj/blueprint/2026-06-02-retrieval-tuning-results.md`](../../rj/blueprint/2026-06-02-retrieval-tuning-results.md).
+* **Two production audits closed** — the ks/as session audit's
+  citation-validation question is answered (validator works for
+  fabricated handles; off-topic-with-real-cites is closed at the
+  routing layer, not citation), and a wider audit of session
+  `cd5a4a1b…` surfaced a NEW failure family that's now fixed +
+  tested. Details at
+  [`rj/blueprint/2026-06-03-citation-validation-audit.md`](../../rj/blueprint/2026-06-03-citation-validation-audit.md)
+  and
+  [`rj/blueprint/2026-06-03-wider-sessions-audit.md`](../../rj/blueprint/2026-06-03-wider-sessions-audit.md).
+* **Pilot prep kit drafted** — 5-doc bundle at
+  [`rj/pilot-prep/`](../../rj/pilot-prep/) — pitch one-pager, target-
+  firm shortlist with fit-scored tiers, German cold-email template,
+  4–8 week free-pilot offer terms with 3 variants, and a Day-1 /
+  Day-30 / Day-90 readiness self-check covering what boss IS safe to
+  claim versus what NOT to claim. Status remains 🔄 (in progress)
+  until a firm signs on for week 1.
+
+**The test plan content below is still accurate at the engineering
+layer.** The pilot itself remains 🔄 pending the relational outreach
+the prep kit was designed to enable. See
+[`harsh/PROGRESS_V2.md#L38`](../../harsh/PROGRESS_V2.md) for the
+canonical 2.4 status row.
+
+---
 
 ---
 

@@ -1,8 +1,20 @@
 # LAI v1 — Demo Status
 
-**Date:** 2026-05-18
-**Branch:** `v2-restructure`
+**Date:** 2026-05-18 (original snapshot)
+**Branch:** `v2-restructure` (since consolidated to Git Flow — `develop` trunk + `master` releases)
 **Demo deadline:** 10-day sprint (Day 8 of 10)
+
+> **2026-06-03 note:** This doc is a static 2026-05-18 snapshot of
+> v1 demo-readiness. The project has continued maturing: `v2.1.0`
+> tagged, Phase 2.3 audit log live, Phase 4.3 statute feed live (29
+> wind-relevant laws, 5,762 parents + 9,133 children, auto-refreshing
+> weekly), and 5 production routing/lang fixes shipped 2026-06-02.
+> For current state see:
+>
+> * [`harsh/PROGRESS_V2.md`](../../harsh/PROGRESS_V2.md) — rolling tracker
+> * [`rj/boss-status-2026-06-03.md`](../../rj/boss-status-2026-06-03.md) — latest exec status
+> * [`rj/pilot-prep/`](../../rj/pilot-prep/) — pilot conversation prep kit (NEW 2026-06-03)
+> * [`PROJECT_STATUS.md`](./PROJECT_STATUS.md) — onboarding overview with the full pointer block
 
 One-stop view of where v1 stands against the strategy doc. Every row says
 whether the work is **built**, whether it is **wired into the live
