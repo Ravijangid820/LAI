@@ -170,7 +170,7 @@ remaining levers are architectural:
 * Accept 0.49 as the real ceiling at this index and re-curate val to
   surface meaningful next-question signal.
 
-## 8. Closing the day
+## 8. Closing 2026-06-02
 
 Five experiments, three negatives, one positive, one overclaim:
 
@@ -185,6 +185,70 @@ Five experiments, three negatives, one positive, one overclaim:
 Production R@30 = 0.49 IS the model ceiling at this index. Next move
 isn't more parameter tuning; it's architectural change OR pilot
 feedback driving a different question.
+
+## 9. 2026-06-03 — query expansion fed to reranker (the remaining lever)
+
+Tested the residual hypothesis from §7: if BM25-side expansion hurts
+because it dilutes lexical ordering, maybe feeding the same
+expansions to the cross-encoder reranker (which scores by semantic
+match, not lexical) lifts ranking.
+
+Three augmentation variants composed onto the reranker prompt only:
+
+* `q1` — append synonyms via "Verwandte Begriffe: …"
+* `q2` — append morphology via "Verwandte Formen: …"
+* `q3` — both
+
+Full sweep at n=200, hybrid+rerank, top-30 reranker pool, BM25 stays
+on v5 (the eval ran the reranker at batch=1 max_length=1024 to
+coexist with production GPU pressure; latency numbers are
+pessimistic, recall numbers are valid):
+
+| variant | R@10 | R@30 | R@100 | MRR | retrieve_ms | rerank_ms |
+|---|---|---|---|---|---|---|
+| **none** *(control)* | **0.445** | 0.490 | 0.490 | **0.320** | 2,489 | 2,277 |
+| q1 synonyms | 0.445 | 0.490 | 0.490 | 0.314 | 2,541 | 2,364 |
+| q2 morphology | 0.435 | 0.490 | 0.490 | 0.311 | 2,358 | 2,424 |
+| q3 combined | 0.430 | 0.490 | 0.490 | 0.310 | 2,333 | 2,492 |
+
+**Result: NEUTRAL, with a small lean against augmentation.**
+
+* R@30 is flat at 0.490 across all four variants — augmentation
+  changes nothing at the headline metric.
+* R@10 drops slightly with augmentation (q3 worst: 0.445 → 0.430).
+* MRR drops slightly with augmentation (q3 worst: 0.320 → 0.310).
+* Latency grows monotonically with augmentation length (+9.5 % for
+  q3) — the cost is real even if modest.
+
+The blueprint's decision rule technically "KEEPs" all three (R@30
+didn't regress beyond −1 pp), but the control wins on every fine-
+grained metric. **Ship NOTHING.**
+
+**Mechanism:** the cross-encoder reranker is already doing the
+"Genehmigung ≈ Bewilligung" mapping via its trained embeddings.
+Explicit lexical hints in the prompt don't add value — and on
+already-relevant candidates, the extra tokens distract the scoring
+slightly (the small R@10 / MRR drop).
+
+This closes the parameter-tuning arc at every layer:
+
+| Layer | Variants tested | Result |
+|---|---|---|
+| Dense ANN | ef_search 40-800 | No hybrid lift |
+| Candidate pool | candidate_k 100-500 | Identical R@K |
+| BM25 expression | v1–v7 + r1/r2/r3 expansions | v5 (stopword filter) is +14 % free win; all widening variants hurt |
+| Reranker query | none + q1/q2/q3 | All neutral or slightly negative |
+
+**R@30 = 0.49 IS the production ceiling at this index across every
+retrieval-side parameter we can tune.** The only remaining levers are
+architectural (learned-sparse retrieval, different chunking, different
+embedding model) or candidate-quality (val re-curation, query
+classification). All are pilot-driven decisions — not free engineering
+sprints.
+
+Final note on yesterday's BM25 v5 ship: it remains the single positive
+result from the entire two-day tuning arc — same recall, ~400 ms /
+query faster, live since 22:41 yesterday.
 
 Decision rule (locked before measurement, from
 [`2026-06-02-bm25-retune-empirical.md`](./2026-06-02-bm25-retune-empirical.md)):
