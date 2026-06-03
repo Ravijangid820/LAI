@@ -250,6 +250,30 @@ def _hydrate_parents(client: RetrievalClient, child_ids: list[int]) -> list[int]
     return parents
 
 
+def _hydrate_parents_with_text(
+    client: RetrievalClient, child_ids: list[int]
+) -> list[tuple[int, str]]:
+    """Like :func:`_hydrate_parents` but also fetches each parent's text.
+
+    Two batched DB calls: ``fetch_children_by_id`` to get child→parent,
+    then ``fetch_parent_texts`` for the unique parent set. Children
+    whose parent text isn't in the live corpus are dropped.
+    """
+    if not child_ids:
+        return []
+    by_child = client.fetch_children_by_id(child_ids)
+    seen: set[int] = set()
+    ordered_parent_ids: list[int] = []
+    for cid in child_ids:
+        chunk = by_child.get(cid)
+        if chunk is None or chunk.parent_id in seen:
+            continue
+        seen.add(chunk.parent_id)
+        ordered_parent_ids.append(chunk.parent_id)
+    texts = client.fetch_parent_texts(ordered_parent_ids)
+    return [(pid, texts[pid]) for pid in ordered_parent_ids if pid in texts]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Metric aggregation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,8 +351,17 @@ def run_eval(
     ef_search: int | None,
     cache_dir: Path,
     db_path: Path,
+    rerank: bool = False,
+    rerank_top_n: int = 200,
 ) -> dict[str, Any]:
-    """Drive the harness — embed → retrieve → score → summarise."""
+    """Drive the harness — embed → retrieve → (rerank?) → score → summarise.
+
+    ``rerank=True`` adds a Qwen3-Reranker-8B pass after parent hydration:
+    score (augmented_query, parent_text) for each candidate parent, sort
+    by score desc, replace the parent ordering. The augmentation comes
+    from ``lai.search.rerank_query.augment`` which reads
+    ``LAI_RERANK_QUERY_VARIANT`` from env (default ``"none"`` = control).
+    """
     max_k = max(ks)
     if candidate_k < max_k:
         # Otherwise the gold can sit just outside the candidate pool and
@@ -340,6 +373,8 @@ def run_eval(
     print(f"  [setup] mode={mode} n={len(rows)} ks={ks} candidate_k={candidate_k}", flush=True)
     if ef_search is not None:
         print(f"  [setup] hnsw.ef_search={ef_search} (override)", flush=True)
+    if rerank:
+        print(f"  [setup] rerank=on  rerank_top_n={rerank_top_n}", flush=True)
 
     bm25_conn: sqlite3.Connection | None = None
     if mode in ("bm25", "hybrid"):
@@ -352,12 +387,59 @@ def run_eval(
     if not rows:
         return {"mode": mode, "summary": _summarise([], ks)}
 
+    # Lazy-load reranker only when needed. The Reranker auto-picks the
+    # freest CUDA device; honour LAI_RERANK_DEVICE if the caller wants
+    # to pin it (e.g. "cuda:1" to avoid contending with the vLLM
+    # analyzer on cuda:0). ~15 s load + ~16 GB resident.
+    #
+    # Production-coexistence patch: the in-tree Reranker uses batch=8
+    # max_length=8192, which OOMs alongside the running serve_rag
+    # Reranker (~18 GB on cuda:1) + vLLM analyzer (~72 GB on cuda:0).
+    # We monkeypatch to batch=1 max_length=1024 here so the harness can
+    # run during business hours without taking prod down. Slower per
+    # call but the 200-query sweep is bounded.
+    reranker = None
+    if rerank:
+        import types
+
+        import torch
+
+        from lai.search.eval import Reranker
+
+        reranker = Reranker()
+
+        def _score_tight(self: object, score_pairs: list[tuple[str, str]]) -> list[float]:
+            all_scores: list[float] = []
+            for j in range(0, len(score_pairs), 1):  # batch=1
+                b = score_pairs[j : j + 1]
+                texts = [
+                    f"{self.prefix}<Instruct>: {self.instruction}\n<Query>: {q}\n<Document>: {d}{self.suffix}"
+                    for q, d in b
+                ]
+                enc = self.tok(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=1024,
+                    return_tensors="pt",
+                ).to(self.device)
+                with torch.no_grad():
+                    logits = self.model(**enc).logits[:, -1, :]
+                yes = logits[:, self.token_yes]
+                no_ = logits[:, self.token_no]
+                all_scores.extend((yes - no_).float().cpu().numpy().tolist())
+            return all_scores
+
+        reranker._score_qwen3 = types.MethodType(_score_tight, reranker)
+
     rank_list: list[int | None] = []
     per_row_records: list[dict[str, Any]] = []
 
     t_embed_total = 0.0
     t_retrieve_total = 0.0
     t_hydrate_total = 0.0
+    t_rerank_total = 0.0
+    rerank_query_chars_total = 0
 
     try:
         for _i, row in _progress(rows, total=len(rows)):
@@ -390,10 +472,34 @@ def run_eval(
                 )
             t_retrieve_total += time.perf_counter() - t0
 
-            # ── Child → parent → rank gold ──────────────────────────────
+            # ── Child → parent → (optional rerank) → rank gold ──────────
             t0 = time.perf_counter()
-            parents = _hydrate_parents(client, child_ids)
+            if reranker is not None:
+                pairs = _hydrate_parents_with_text(client, child_ids)
+            else:
+                parents = _hydrate_parents(client, child_ids)
             t_hydrate_total += time.perf_counter() - t0
+
+            if reranker is not None:
+                # Trim to rerank_top_n BEFORE the cross-encoder pass so
+                # latency stays bounded. The harness shares the GPU with
+                # the production reranker + vLLM analyzer, so we trim
+                # parent texts to ~2000 chars (≈600 tokens) before
+                # scoring — keeps the activation tensor small enough to
+                # coexist. Production chunks are ~3000 chars; the head
+                # 2000 is plenty for cross-encoder relevance signal.
+                from lai.search.rerank_query import augment
+
+                pairs = pairs[:rerank_top_n]
+                aug_query = augment(row.question)
+                rerank_query_chars_total += len(aug_query)
+                trimmed = [(pid, (text or "")[:2000]) for pid, text in pairs]
+                t0 = time.perf_counter()
+                scores = reranker.score([(aug_query, text) for _, text in trimmed])
+                t_rerank_total += time.perf_counter() - t0
+                scored = list(zip(trimmed, scores, strict=False))
+                scored.sort(key=lambda x: x[1], reverse=True)
+                parents = [pid for (pid, _text), _ in scored]
 
             rank = _rank_of_gold(parents, row.gold_parent_id)
             rank_list.append(rank)
@@ -414,18 +520,25 @@ def run_eval(
 
     summary = _summarise(rank_list, ks)
     n = max(summary["n"], 1)
-    return {
+    timings: dict[str, float] = {
+        "embed": 1000 * t_embed_total / n,
+        "retrieve": 1000 * t_retrieve_total / n,
+        "hydrate": 1000 * t_hydrate_total / n,
+    }
+    if reranker is not None:
+        timings["rerank"] = 1000 * t_rerank_total / n
+    out: dict[str, Any] = {
         "mode": mode,
         "candidate_k": candidate_k,
         "ef_search": ef_search,
+        "rerank": reranker is not None,
         "summary": summary,
-        "timings_ms_per_query": {
-            "embed": 1000 * t_embed_total / n,
-            "retrieve": 1000 * t_retrieve_total / n,
-            "hydrate": 1000 * t_hydrate_total / n,
-        },
+        "timings_ms_per_query": timings,
         "per_row": per_row_records,
     }
+    if reranker is not None:
+        out["rerank_query_chars_avg"] = round(rerank_query_chars_total / n, 1)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -466,6 +579,21 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="optional CSV with one row per query (gold, rank, domain, …)",
     )
+    ap.add_argument(
+        "--rerank",
+        action="store_true",
+        help=(
+            "load Qwen3-Reranker-8B and report POST-reranker Recall@K. "
+            "LAI_RERANK_QUERY_VARIANT env (default 'none') picks the "
+            "augmentation strategy (q1=synonyms, q2=morphology, q3=both)."
+        ),
+    )
+    ap.add_argument(
+        "--rerank-top-n",
+        type=int,
+        default=200,
+        help="cap the candidate set passed to the reranker (default 200)",
+    )
     args = ap.parse_args(argv)
 
     ks = _parse_ks(args.k)
@@ -492,19 +620,27 @@ def main(argv: list[str] | None = None) -> int:
         ef_search=args.ef_search,
         cache_dir=args.cache_dir,
         db_path=args.db,
+        rerank=args.rerank,
+        rerank_top_n=args.rerank_top_n,
     )
 
     # ── Console summary ─────────────────────────────────────────────────
     s = result["summary"]
     print()
-    print(f"=== {args.mode} (n={s['n']}, candidate_k={result['candidate_k']}) ===")
+    suffix = " (post-rerank)" if result.get("rerank") else ""
+    print(f"=== {args.mode}{suffix} (n={s['n']}, candidate_k={result['candidate_k']}) ===")
     for k_str in sorted(s["recall_at_k"], key=int):
         print(f"  Recall@{k_str:<4} {s['recall_at_k'][k_str]:.3f}")
     print(f"  MRR        {s['mrr']:.3f}")
     t = result["timings_ms_per_query"]
-    print(
+    timing_line = (
         f"  per-query  embed={t['embed']:.0f}ms retrieve={t['retrieve']:.0f}ms hydrate={t['hydrate']:.0f}ms"
     )
+    if "rerank" in t:
+        timing_line += f" rerank={t['rerank']:.0f}ms"
+    print(timing_line)
+    if "rerank_query_chars_avg" in result:
+        print(f"  rerank_query_chars_avg = {result['rerank_query_chars_avg']:.0f}")
 
     # ── Optional JSON + per-row CSV ─────────────────────────────────────
     out = args.output
