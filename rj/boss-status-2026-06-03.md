@@ -61,7 +61,12 @@ Five lines, per the spec.
    children live in `corpus_*` and auto-refreshing weekly, retrieval
    ceiling honestly measured at R@30 = 0.49, and the lawyer-blind
    §3.4 A/B evaluation UI is shipped to LAI-UI's `/eval` route waiting
-   for a labelling session.
+   for a labelling session. **Engineering-side prep landed
+   2026-06-03** at `rj/pilot-prep/` (`cd36279`) — pitch one-pager,
+   target-firm shortlist, German cold-email template, 4–8 week
+   free-pilot offer terms, and an internal Day-1 readiness self-check
+   so we can walk into a first conversation tomorrow if you want.
+   See `rj/pilot-prep/00-README.md` for the order to read it in.
 
 ---
 
