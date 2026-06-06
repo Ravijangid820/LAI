@@ -3427,7 +3427,15 @@ def list_reports(limit: int = 50, user: CurrentUser = Depends(get_current_user))
                 """SELECT id, project_name, status, created_at, started_at, finished_at,
                           progress_percent, error, preset,
                           COALESCE(array_length(document_ids, 1), 0) AS doc_count,
-                          COALESCE(jsonb_array_length(report_data->'findings'), 0) AS finding_count
+                          -- Total risk findings = per-doc + cross-doc.
+                          -- The dashboard "Risk Findings" tile sums this; without
+                          -- the crossDocFindings half it under-counts and disagrees
+                          -- with the RiskOverview detail view (which concats both
+                          -- arrays). Symptom observed 2026-06-06: dashboard 113
+                          -- vs. detail 146 — gap = 33 cross-doc findings.
+                          COALESCE(jsonb_array_length(report_data->'findings'), 0)
+                          + COALESCE(jsonb_array_length(report_data->'crossDocFindings'), 0)
+                          AS finding_count
                    FROM ddiq_reports
                    WHERE user_id = %s
                       OR EXISTS (SELECT 1 FROM ddiq_report_shares s
