@@ -371,6 +371,21 @@ def main(argv: list[str] | None = None) -> int:
     session_id = parsed["session_id"]
     _ok(f"session: {session_id}")
 
+    # Register cleanup so the smoke session is DELETEd at exit (success OR
+    # failure). Without this, each hourly cron run leaves a session behind
+    # in sessions.db — observed 500+ accumulated rows for the cron user
+    # (cd5a4a1b…), which polluted the chat sidebar of anyone who logged
+    # into the smoke-test account. Best-effort: a failed DELETE is silently
+    # ignored so it can't mask the real smoke result. ``atexit`` runs even
+    # after _fail's sys.exit (SystemExit is caught by atexit handlers).
+    import atexit
+    def _cleanup_smoke_session() -> None:
+        try:
+            _http("DELETE", f"{base}/sessions/{session_id}", token=token, timeout=10)
+        except Exception:
+            pass
+    atexit.register(_cleanup_smoke_session)
+
     # 4. Timed query ----------------------------------------------------------
     payload: dict = {"question": question, "session_id": session_id}
     if force_mode:
