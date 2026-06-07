@@ -1070,16 +1070,43 @@ IMPORTANT: value MUST be a string, never a bare number ("10 contracts" not 10).
 Set ampel=red for material gaps/non-compliance, yellow for risks worth flagging,
 green for verified-compliant, null when not enough information.""")
         result = llm_json(EXTRACTION_SYSTEM, prompt)
-        val = clean_value(result.get("value"), "Information not found in documents")
+        raw_value = result.get("value")
+        val = clean_value(raw_value, "Information not found in documents")
         note_raw = result.get("note"); note = clean_value(note_raw, "") if note_raw else None
         if note == "": note = None
+        # Evidence resolution. The LLM is asked to cite chunks in
+        # ``evidence_chunks``, but in practice it often returns ``[]`` even
+        # when its answer DID come from the reranked context — most of
+        # ~13 evidence-less findings per report observed in the 2026-06-06
+        # audit traced back to this silent skip. Fallback: when the LLM
+        # cited nothing but the row's value is substantive (i.e. NOT the
+        # "Information not found" fallback that ``clean_value`` injects
+        # for null/empty model output), attach the top-2 reranked chunks
+        # as source linkage. The guardrail's defensive-AI scrub still runs
+        # downstream, so if the answer turns out to be a wordy "I cannot
+        # find this" the fallback evidence rides along with a clearly-
+        # missing finding — not ideal but better than orphaned. For truly
+        # null/empty model output we leave evidence empty (no source
+        # supported the "info missing" verdict).
+        cited = result.get("evidence_chunks") or []
+        evidence = evidence_from_chunks(reranked, cited)
+        if not evidence and reranked and raw_value not in (None, "", "null"):
+            # Take the top-2 reranked chunks — the same ones the LLM
+            # had in its prompt context. Keep it tight (not all 5) so
+            # downstream findings don't get padded with weakly-cited
+            # chunks.
+            fallback = reranked[: min(2, len(reranked))]
+            evidence = evidence_from_chunks(
+                reranked,
+                list(range(1, len(fallback) + 1)),
+            )
         # E10: evidence + anchor are real AusgabeblattRow fields now, so
         # they serialize through model_dump → JSONB + API response.
         return AusgabeblattRow(
             label=label, value=val,
             ampel=result.get("ampel") if result.get("ampel") in ("green", "yellow", "red") else None,
             note=note,
-            evidence=evidence_from_chunks(reranked, result.get("evidence_chunks", [])),
+            evidence=evidence,
             anchor=anchor,
         )
     except Exception as e:
