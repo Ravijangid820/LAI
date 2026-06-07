@@ -38,7 +38,28 @@ def check_cross_doc_consistency(
     parcels: list[CadastralParcel],
     total_capacity_mw: Optional[float] = None,
 ) -> list[Finding]:
-    """Detect contradictions BETWEEN the analysed documents."""
+    """Detect contradictions BETWEEN the analysed documents.
+
+    Cross-doc findings now carry **evidence** harvested from the
+    section rows that triggered each inconsistency. Previously every
+    cross-doc Finding had ``evidence=[]`` (the Pydantic default), which
+    landed all of them in the FE's "Document not specified" bucket
+    regardless of how grounded the observation was. The LLM is now
+    asked to cite ``evidence_rows: [{section, label}, ...]``; each
+    cited (section, label) pair is resolved back to the corresponding
+    Ausgabeblatt row's ``evidence`` list and merged into the Finding.
+    """
+    # Build a lookup from (section_title, row_label) → row.evidence so
+    # cited rows can be resolved in O(1). Label matching is exact —
+    # the LLM is given the canonical labels in the facts payload, so
+    # any cite should be a verbatim copy.
+    row_index: dict[tuple[str, str], list[Any]] = {}
+    for s in sections:
+        for r in s.rows:
+            ev = list(getattr(r, "evidence", None) or [])
+            if ev:
+                row_index[(s.title, r.label)] = ev
+
     facts: dict[str, Any] = {
         "sections": [
             {"section": s.title, "label": r.label, "value": r.value, "ampel": r.ampel}
@@ -76,7 +97,14 @@ Return JSON array. Each entry:
   "domain":"Land|Permits|Economics|Regulatory|General",
   "legal_basis":"if applicable",
   "recommended_action":"what to do about it",
-  "quantification":{{"mw_affected":..,"eur_impact_estimate":..,"days_until_deadline":..,"rationale":".."}}}}
+  "quantification":{{"mw_affected":..,"eur_impact_estimate":..,"days_until_deadline":..,"rationale":".."}},
+  "evidence_rows":[{{"section":"<exact section title from Facts>","label":"<exact row label from Facts>"}}, ...]}}
+
+Use ``evidence_rows`` to cite the Ausgabeblatt rows that ground this
+inconsistency. Cite at least one row whenever the observation derives
+from a row's value or ampel. Leave ``evidence_rows`` as ``[]`` only for
+purely structural counts (e.g. "wea_count vs parcel_count") that come
+from the count fields above rather than a specific row.
 
 Return [] if no inconsistencies found. Never fabricate — only flag what the
 facts clearly contradict."""
@@ -106,6 +134,47 @@ facts clearly contradict."""
                     days_until_deadline=q_raw.get("days_until_deadline"),
                     rationale=q_raw.get("rationale"),
                 )
+
+            # Resolve LLM-cited (section,label) pairs back to the
+            # actual rows' Evidence. Dedupe by (doc_id, excerpt) so
+            # the same chunk isn't attached twice if two cited rows
+            # both pulled it. A bad cite (unknown section/label) is
+            # silently skipped — defensive against LLM hallucinating
+            # row identifiers — but logged so the dropped-cite rate
+            # surfaces if the prompt starts drifting.
+            evidence_list: list[Any] = []
+            seen: set[tuple[Any, Any]] = set()
+            cited = r.get("evidence_rows") or []
+            dropped_cites: list[Any] = []
+            if isinstance(cited, list):
+                for c in cited:
+                    if not isinstance(c, dict):
+                        continue
+                    key = (
+                        str(c.get("section") or "").strip(),
+                        str(c.get("label") or "").strip(),
+                    )
+                    row_ev = row_index.get(key)
+                    if not row_ev:
+                        dropped_cites.append(c)
+                        continue
+                    for e in row_ev:
+                        dk = (
+                            getattr(e, "doc_id", None) or getattr(e, "doc_filename", None),
+                            (getattr(e, "excerpt", None) or "")[:50],
+                        )
+                        if dk in seen:
+                            continue
+                        seen.add(dk)
+                        evidence_list.append(e)
+            if dropped_cites:
+                _log.warning(
+                    "cross-doc: dropped %d/%d evidence_rows cites that "
+                    "didn't match any analysed row (LLM cited a section "
+                    "or label that doesn't exist): %r",
+                    len(dropped_cites), len(cited), dropped_cites,
+                )
+
             out.append(Finding(
                 domain=str(r.get("domain", "General")),
                 severity=(
@@ -118,6 +187,7 @@ facts clearly contradict."""
                 recommended_action=r.get("recommended_action"),
                 quantification=quant,
                 kind="cross_document",
+                evidence=evidence_list,
             ))
         return out
     except Exception as e:
