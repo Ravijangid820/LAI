@@ -388,18 +388,75 @@ def apply_to_findings(
     marker AND its ``severity`` is escalated to ``"yellow"`` if it was
     ``"green"`` — same demotion rule as for rows.
 
+    Defensive findings additionally get a SHORT topic hint appended to
+    the canonical message so a sidebar list view doesn't render N
+    findings as visually-identical "Nicht in den vorgelegten Dokumenten
+    enthalten." entries. The hint is taken from ``recommended_action``
+    (the next-step sentence which usually names WHAT the gap is — e.g.
+    "Rückbaubürgschaft anfordern…"). Falls back to the finding's
+    ``domain`` when no recommended action is present. The original
+    canonical sentence is preserved verbatim as the prefix so any
+    downstream consumer matching on it (audit, the FE's empty-state
+    bucket, etc.) still works.
+
     Returns:
         Counter dict ``{"defensive": n, "hedges": n}``.
     """
+    canonical = (
+        MISSING_VALUE_DE if target_language == "de" else MISSING_VALUE_EN
+    )
     counts = {"defensive": 0, "hedges": 0}
     for f in findings:
         raw = getattr(f, "text", None) or ""
         report = scrub_finding_text(raw, target_language=target_language)
-        if report.cleaned != raw:
-            f.text = report.cleaned
+        new_text = report.cleaned
         if report.was_defensive:
             counts["defensive"] += 1
             if getattr(f, "severity", "") == "green":
                 f.severity = "yellow"
+            hint = _topic_hint_from_finding(f)
+            if hint:
+                new_text = f"{canonical} — {hint}"
+        if new_text != raw:
+            f.text = new_text
         counts["hedges"] += report.hedges_stripped
     return counts
+
+
+# ── Topic-hint extraction ────────────────────────────────────────────────
+# Trim the recommended_action to a short label suitable for a sidebar
+# list entry. Keep it short enough that the row still fits on one line;
+# avoid mid-word truncation by breaking on the nearest whitespace
+# boundary <= the cap.
+_HINT_CHAR_CAP = 60
+
+
+def _topic_hint_from_finding(f: Any) -> str:
+    """Extract a short topic hint for a defensive (missing-info) finding.
+
+    Order of preference:
+      1. ``recommended_action`` — usually names the missing artifact
+         and what to obtain (e.g. "Rückbaubürgschaft anfordern und
+         Verzinsung prüfen").
+      2. ``domain`` — broad bucket (e.g. "Permits") when no action.
+
+    Returns an empty string only when neither field is usable, in which
+    case the caller keeps the bare canonical sentence.
+    """
+    action = (getattr(f, "recommended_action", None) or "").strip()
+    if action:
+        # Snip at a whitespace boundary near the cap so we don't break
+        # mid-word. ``rfind`` returns -1 if no space — fall back to the
+        # raw cap. Strip a trailing period/comma so the appended hint
+        # reads cleanly.
+        snippet = action[: _HINT_CHAR_CAP]
+        if len(action) > _HINT_CHAR_CAP:
+            cut = snippet.rfind(" ")
+            if cut >= 30:
+                snippet = snippet[:cut]
+            snippet = f"{snippet.rstrip(' ,;:')}…"
+        return snippet.strip()
+    domain = (getattr(f, "domain", None) or "").strip()
+    if domain and domain.lower() != "general":
+        return domain
+    return ""
