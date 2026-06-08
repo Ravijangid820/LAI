@@ -290,21 +290,178 @@ def _row_to_session(r: sqlite3.Row) -> dict:
     }
 
 
+def _format_date_suffix(epoch_ts: float, now_epoch: float | None = None) -> str:
+    """Render a short date label for the duplicate-title disambiguator.
+
+    Returns ``"yesterday"`` if the session is from the previous calendar
+    day, ``"Mon 02"`` style for anything in the trailing 7 days, and
+    ``"Jun 02"`` (locale-free abbreviated month) for anything older.
+    Always returns a non-empty string so the caller never builds
+    ``"… · "``.
+    """
+    from datetime import datetime
+    try:
+        ts = float(epoch_ts)
+    except (TypeError, ValueError):
+        return "older"
+    now = datetime.fromtimestamp(now_epoch if now_epoch is not None else time.time())
+    when = datetime.fromtimestamp(ts)
+    days = (now.date() - when.date()).days
+    if days <= 0:
+        # Same calendar day — almost never reached because the NEWEST
+        # duplicate keeps the bare title and the disambiguator only
+        # runs on the older ones, but covered for safety (clock skew /
+        # back-to-back sessions in the same minute).
+        return when.strftime("%H:%M")
+    if days == 1:
+        return "yesterday"
+    if days < 7:
+        return when.strftime("%a")  # "Mon" / "Tue"
+    return when.strftime("%b %d")  # "Jun 02"
+
+
+def _disambiguate_titles_in_place(sessions: list[dict]) -> None:
+    """Add a date suffix to duplicate sidebar titles within ``sessions``.
+
+    Given a list of session dicts already ordered newest-first, walk
+    them grouped by computed title. The first occurrence of each title
+    keeps its bare form; the 2nd .. Nth get ``" · <date>"`` appended
+    using :func:`_format_date_suffix` against ``updated_at``.
+
+    When N sessions of the same file land on the same calendar day
+    they would all render with the same date suffix (e.g. ``"· Jun
+    01"``). The second-pass collision check escalates those to include
+    ``HH:MM`` (``"· Jun 01 14:35"``) so the user can still tell them
+    apart by time-of-day. The newest of a same-day collision still
+    keeps the bare date suffix.
+
+    Skips:
+      * sessions where ``user_title`` is set — the user typed that title
+        themselves; we don't second-guess their choice even if it
+        collides with another row
+      * the literal ``"Untitled chat"`` fallback — disambiguating
+        "Untitled chat · yesterday" vs "Untitled chat · Mon" is more
+        noise than signal; either render keeps them all the same
+        bare-fallback label
+
+    Mutates in place. Idempotent: running twice does not double-stack
+    suffixes because the second pass sees the already-suffixed title
+    as a different key.
+    """
+    from datetime import datetime
+    seen: dict[str, int] = {}
+    used_suffixes: dict[str, list[tuple[int, float]]] = {}
+    for s in sessions:
+        title = s.get("title") or ""
+        if not title or title == "Untitled chat" or s.get("user_title"):
+            seen[title] = seen.get(title, 0) + 1
+            continue
+        n = seen.get(title, 0)
+        if n >= 1:
+            ts = s.get("updated_at") or s.get("uploaded_at") or 0.0
+            suffix = _format_date_suffix(ts)
+            full = f"{title} · {suffix}"
+            # Same-day collision: previous suffixed session under the
+            # same base title carried the same suffix. Escalate the
+            # CURRENT one to include time-of-day so the two are visibly
+            # distinct. We don't rewrite the prior — UI stability:
+            # whatever was rendered before still renders the same.
+            prior = used_suffixes.get(title, [])
+            collision = any(prev_suffix == suffix for _i, prev_suffix in prior)
+            if collision:
+                try:
+                    hhmm = datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+                    full = f"{title} · {suffix} {hhmm}"
+                except (TypeError, ValueError):
+                    pass  # fall back to bare suffix; better than crashing
+            s["title"] = full
+            prior.append((n, suffix))
+            used_suffixes[title] = prior
+        seen[title] = n + 1
+
+
 def _display_title_sql_expr() -> str:
-    """SQL fragment that picks the best available title for a session:
-    user-set title → uploaded filename → first user message (truncated)
-    → ``Untitled chat``. Used in list_sessions so the sidebar always
-    shows something useful even when nothing was set explicitly."""
-    return (
-        "COALESCE("
-        "NULLIF(TRIM(sessions.title), ''),"
-        "NULLIF(TRIM(sessions.filename), ''),"
-        "(SELECT SUBSTR(content, 1, 80) FROM messages "
-        " WHERE messages.session_id = sessions.id AND role = 'user' "
-        " ORDER BY created_at ASC, id ASC LIMIT 1),"
-        "'Untitled chat'"
-        ")"
+    """SQL fragment that picks the best available title for a session.
+
+    Order of preference:
+      1. user-set title (``sessions.title``)
+      2. first **substantive** user message — skipping:
+           * upload-toast bubbles that start with ``📎`` (those just
+             repeat the filename, so they collapse N sessions of the
+             same file to a single visible title)
+           * trivial chitchat openers ("hi"/"hello"/"hallo"/"hey"/
+             "check"/"test"/"ok"/"yo"/single emoji) that contain no
+             topical signal
+           * messages whose remaining trimmed content is shorter than
+             12 chars (sets a floor on signal density)
+      3. uploaded filename
+      4. first user message of any kind (so a chitchat-only chat still
+         gets a title other than "Untitled chat")
+      5. ``"Untitled chat"`` final fallback
+
+    Why the swap (filename vs first-message): when the same document
+    is uploaded into N chats and then no substantive prompt is sent,
+    every sidebar entry collapses to the same filename string — the
+    user sees N visually identical rows. Promoting a substantive
+    first-message above the filename gives each chat its own title.
+    The chitchat skip-list ensures we don't replace the filename with
+    "hi" / "hello" — those land on the filename like before.
+
+    Promoting the message above filename means the lawyer's actual
+    question — *"Welche Anschlussleistung ist vereinbart?"* — becomes
+    the title instead of *"05_EWE_Netzanschlussvertrag_2008.pdf"*,
+    which is the win.
+    """
+    # Pattern of trivial first messages. Tested at the SQLite layer with
+    # ``LOWER(TRIM(...)) GLOB``; SQLite's GLOB is case-sensitive (hence
+    # the LOWER) and supports ``[a-z]`` character classes + ``*`` /
+    # ``?``. Each pattern matches the WHOLE message after trimming, so
+    # "hi there" with topical content survives but a bare "hi" doesn't.
+    # Multi-char openers are listed verbatim (``hello``, ``hallo``, ...)
+    # because their cleanest expression is exact literal.
+    chitchat_patterns = (
+        "hi", "hii", "hiii", "hiiii",
+        "hello", "hallo", "hey", "heya", "yo", "sup",
+        "ok", "okay", "okk", "okkk",
+        "test", "testing", "check", "checking",
+        "thanks", "thank you", "danke",
+        "?", "??", "???",
     )
+    # GLOB OR-clauses build one big condition. ``NOT IN (...)`` would be
+    # simpler but case-folding has to happen before the comparison; the
+    # GLOB form lets us LOWER once and chain literal matches.
+    chitchat_clause = " OR ".join(
+        f"LOWER(TRIM(content)) = '{p}'" for p in chitchat_patterns
+    )
+
+    return f"""
+        COALESCE(
+          NULLIF(TRIM(sessions.title), ''),
+          (
+            -- 2. first substantive (non-chitchat, non-toast) user message
+            SELECT SUBSTR(content, 1, 80)
+            FROM messages
+            WHERE messages.session_id = sessions.id
+              AND role = 'user'
+              AND TRIM(content) <> ''
+              AND SUBSTR(TRIM(content), 1, 1) <> '📎'
+              AND LENGTH(TRIM(content)) >= 12
+              AND NOT ({chitchat_clause})
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+          ),
+          NULLIF(TRIM(sessions.filename), ''),
+          (
+            -- 4. last-ditch fallback: any user message at all
+            SELECT SUBSTR(content, 1, 80)
+            FROM messages
+            WHERE messages.session_id = sessions.id AND role = 'user'
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+          ),
+          'Untitled chat'
+        )
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +766,7 @@ def list_sessions(limit: int = 50, user_id: str | None = None) -> list[dict]:
                 )
                 .fetchall()
             )
-        return [
+        out = [
             {
                 "id": r["id"],
                 "title": r["title"],  # always non-null (COALESCE chain)
@@ -623,6 +780,17 @@ def list_sessions(limit: int = 50, user_id: str | None = None) -> list[dict]:
             }
             for r in rows
         ]
+        # Disambiguate identical computed titles across the same user's
+        # sessions by appending a date suffix to the older duplicates.
+        # The chitchat skip-list above can still leave the filename as
+        # the title for N upload-and-no-real-chat sessions of the same
+        # file; this pass renames the 2nd .. Nth ones (NEWEST one keeps
+        # the bare title — that's the one the user most likely meant to
+        # find). User-set titles (``user_title`` not null) are NEVER
+        # rewritten — if the user typed the same title twice, that's
+        # their call and we respect it.
+        _disambiguate_titles_in_place(out)
+        return out
 
 
 def count_sessions() -> int:
