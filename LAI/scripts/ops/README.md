@@ -346,8 +346,127 @@ docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'lai_|d
 
 ---
 
+## Disaster recovery — `lai_db` backup + restore
+
+Nightly logical dump of the irreplaceable user-content tables; the 901 GB
+legal corpus is **not** dumped (reproducible from MinIO via the v2
+pipeline). Rationale + per-table breakdown in
+[`rj/blueprint/2026-06-10-dr-runbook.md`](../../../rj/blueprint/2026-06-10-dr-runbook.md).
+
+### What gets backed up
+
+| Category | Tables | Mechanism | RPO | RTO |
+|---|---|---|---|---|
+| Irreplaceable user content | `audit_log` (EU AI Act Art. 12), `users`, `refresh_tokens`, `password_reset_tokens`, `organizations`, `org_invitations`, `projects`, `project_members`, `conversations`, `messages`, `matter_chunks`, `ddiq_*` (all 11 ddiq tables) | nightly `pg_dump -Fc` → `user_data_YYYY-MM-DD.dump` | **24 h** | **~10 min** |
+| Schema / DDL | full DB structure | nightly `pg_dump --schema-only --no-tablespaces` → `schema_YYYY-MM-DD.sql.gz` | 24 h | ~5 min |
+| Legal corpus (901 GB) | `corpus_parent_chunks`, `corpus_child_chunks`, `corpus_migration_state`, `statute_feed_state` | **NOT backed up — reproducible** from MinIO `lai-raw` via `lai.pipeline.cli step1..step6` + `statute_feed.sh --full` | **0 on raw** in MinIO | **~50 h** rebuild |
+
+### Where
+
+```
+/data/projects/lai/LAI/data/postgres-backups/
+  daily/    schema_YYYY-MM-DD.sql.gz   + user_data_YYYY-MM-DD.dump   (14-day rolling)
+  weekly/   same shape, copied every Sunday                          (35-day rolling)
+  monthly/  same shape, copied on the 1st                            (kept indefinitely)
+```
+
+Permissions: `0640 rj:ks_admin` — owner write, group read for restore,
+no world access (dumps contain audit-log identity events + user emails).
+
+### Run a backup manually (or kick the daily early)
+
+```bash
+bash /data/projects/lai/LAI/scripts/ops/backup_postgres.sh
+# Logs to stdout (or to logs/host/backup_postgres.log via the cron).
+# Wall-time: ~1.5 min, output ~520 MB (mostly matter_chunks embeddings).
+```
+
+### Restore — single copy-paste block
+
+Use this verbatim during an incident. Substitute the target date.
+**This assumes you've already created an empty `lai_db_test` (or fresh
+`lai_db`) on the target Postgres.** For a full host restore (production
+DB gone), bring up a fresh `lai_postgres_main` first via
+`docker compose -f Docker/database/pgvector/docker-compose.yml up -d`.
+
+```bash
+DATE=2026-06-10
+TARGET_CONT=lai_postgres_main   # or scratch container name
+TARGET_DB=lai_db                # or lai_db_test for rehearsal
+
+# 1. restore schema (DDL)
+zcat /data/projects/lai/LAI/data/postgres-backups/daily/schema_${DATE}.sql.gz \
+  | docker exec -i "${TARGET_CONT}" psql -U lai_user -d "${TARGET_DB}" -v ON_ERROR_STOP=1
+
+# 2. restore user data
+cat /data/projects/lai/LAI/data/postgres-backups/daily/user_data_${DATE}.dump \
+  | docker exec -i "${TARGET_CONT}" pg_restore -U lai_user -d "${TARGET_DB}" \
+      --data-only --no-owner --no-privileges
+
+# 3. verify row counts
+docker exec "${TARGET_CONT}" psql -U lai_user -d "${TARGET_DB}" -c "
+SELECT 'audit_log' AS t, count(*) FROM audit_log
+UNION ALL SELECT 'users', count(*) FROM users
+UNION ALL SELECT 'ddiq_reports', count(*) FROM ddiq_reports
+UNION ALL SELECT 'matter_chunks', count(*) FROM matter_chunks;"
+
+# 4. rebuild corpus (only if corpus tables are empty too)
+# bash /data/projects/lai/LAI/scripts/ops/statute_feed.sh --full
+# python -m lai.pipeline.cli step1   # → step6 for VDR/library corpus
+```
+
+### Rehearsal — verify a dump restores cleanly to a scratch DB
+
+```bash
+# Start ephemeral pg on tmpfs (no host port; auto-cleans on docker rm)
+docker run -d --name lai_pg_scratch_5499 --network lai_network \
+  -e POSTGRES_DB=lai_db_test -e POSTGRES_USER=lai_user -e POSTGRES_PASSWORD=test \
+  --tmpfs /var/lib/postgresql/data:rw,size=2g \
+  pgvector/pgvector:pg16
+
+# Wait for ready (~2s):
+until docker exec lai_pg_scratch_5499 pg_isready -U lai_user -d lai_db_test >/dev/null 2>&1; do sleep 1; done
+
+# Then run the restore block above with TARGET_CONT=lai_pg_scratch_5499 / TARGET_DB=lai_db_test
+# Tear down when done:
+docker stop lai_pg_scratch_5499 && docker rm lai_pg_scratch_5499
+```
+
+**Last verified rehearsal:** 2026-06-10 — all 9 sample tables matched
+source row counts exactly (audit_log 465, users 25, ddiq_reports 46,
+ddiq_documents 56, matter_chunks 37,731, conversations 0, messages 0,
+organizations 2, projects 0); 0 errors, 0 warnings. Schema restore:
+173 lines; user-data restore: 26 archive entries; total wall ~3 minutes.
+
+### Cron (already installed in rj's crontab 2026-06-10)
+
+```bash
+30 2 * * *  bash /data/projects/lai/LAI/scripts/ops/backup_postgres.sh \
+  >> /data/projects/lai/LAI/logs/host/backup_postgres.log 2>&1
+```
+
+Runs at 02:30 local (off-peak; statute_feed `--mapped` runs at 03:00).
+Off-host shipping is **not yet wired** — flagged as deferred work in the
+blueprint. For now, a filesystem-level loss of `/data/nvme1n1p1` would
+take both the live DB and its backups together.
+
+### Honest gaps (documented, not yet closed)
+
+1. **Same-filesystem risk.** Backups live next to the live DB. RAID
+   loss or `rm -rf /data` kills both. Mitigation: rsync to S3 or a
+   second host. Deferred to post-pilot.
+2. **No PITR.** Daily snapshots only; up to 24 h of user data can be
+   lost. WAL archiving + a replica is the right tool; out of scope.
+3. **No GPG encryption.** Dumps are `0640` on a project-private
+   filesystem. Encrypt before shipping off-host.
+4. **No automatic restore rehearsal.** Today's rehearsal was manual.
+   Add a weekly job if a pilot firm asks for it.
+
+---
+
 ## Recent ops history (rolling, last 5)
 
+- 2026-06-10 — Phase 4.5.3 DR runbook landed (rj-DR-1): `scripts/ops/backup_postgres.sh` nightly-dumps the irreplaceable user-content tables (~520 MB compressed; `audit_log`, `users`, `ddiq_*`, `matter_chunks`, plus schema-only DDL of the whole DB) into `LAI/data/postgres-backups/{daily,weekly,monthly}/` with 14d/35d/∞ retention. Corpus (901 GB) deliberately not dumped — reproducible from MinIO via Step 1-6 + statute_feed. Cron `30 2 * * *` installed; first scratch-container restore rehearsal matched all 9 sample row counts exactly with zero errors. Honest gaps documented (same-filesystem risk, no PITR, no GPG, no auto-rehearsal). Blueprint: [`rj/blueprint/2026-06-10-dr-runbook.md`](../../../rj/blueprint/2026-06-10-dr-runbook.md). Closes [`PROGRESS_V2.md` row 4.5.3](../../../harsh/PROGRESS_V2.md).
 - 2026-05-30 — Added `scripts/ops/audit_export.py` (vm-4 / ROADMAP 2.3 follow-up): CSV/JSON bulk export of `audit_log` with date / action / org / user filters, plus a `--purge-older-than DAYS` retention path that requires `--yes` to actually DELETE (dry-run by default). Reads via `audit.query`; purge issues a bound-parameter `DELETE`.
 - 2026-05-30 — `scripts/ops/smoke_test.py` gained an optional `--report` leg (vm-3 / ROADMAP 1.2 follow-up): POSTs a DDiQ async report against `LAI_SMOKE_DDIQ_DOC_ID` and polls `/status` until `done` or budget, so the smoke test now catches DDiQ-pipeline regressions too (exit 7). `LAI_SMOKE_USER`/`LAI_SMOKE_PASS` accepted as aliases for the EMAIL/PASSWORD pair. Cron line documented but **not installed** — shared-box change, awaits rj's OK.
 - 2026-05-29 — Added `scripts/ops/smoke_test.py` (vm-1 / ROADMAP 1.2): post-restart guard that fails loudly when a query is slow or the reranker is on CPU.
