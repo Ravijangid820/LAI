@@ -464,8 +464,103 @@ take both the live DB and its backups together.
 
 ---
 
+## Email deliverability — Brevo + DNS setup (Phase 4.5.4)
+
+The transactional-mail stack is wired via [`lai.api.email`](../../src/lai/api/email.py)
+(Brevo · 4 templates: password-reset, org-invite, report-ready,
+report-failed). For pilot-firm-grade deliverability the sender must
+be a domain we control, with SPF + DKIM + DMARC records that authorise
+Brevo. Today (2026-06-10) sender is a personal gmail address and base
+URL is a LAN IP — both are broken; see
+[`rj/blueprint/2026-06-10-email-deliverability.md`](../../../rj/blueprint/2026-06-10-email-deliverability.md).
+
+### Setup steps (in order; ~1 day end-to-end mostly waiting for DNS)
+
+1. **Decide subdomain** — recommended `lai.blockland.ae` (parent domain
+   already owned, MX = Outlook 365, SPF locked to Outlook). Subdomain
+   keeps Brevo IPs isolated from the parent's strict SPF.
+2. **Brevo console** (whoever has the Brevo login) → Senders, Domains
+   → Domains → "Add a domain" → enter the subdomain.
+3. **Brevo emits 2 DKIM CNAME targets** specific to your Brevo account.
+   Copy them.
+4. **DNS host for `blockland.ae`** (IT) → add four records under the
+   chosen subdomain:
+
+   | Type | Host | Value |
+   |---|---|---|
+   | TXT | `lai.blockland.ae` | `v=spf1 include:spf.brevo.com -all` |
+   | CNAME | `mail._domainkey.lai.blockland.ae` | (from Brevo console, step 3) |
+   | CNAME | `mail2._domainkey.lai.blockland.ae` | (from Brevo console, step 3) |
+   | TXT | `_dmarc.lai.blockland.ae` | `v=DMARC1; p=quarantine; rua=mailto:postmaster@blockland.ae; ruf=mailto:postmaster@blockland.ae; fo=1; adkim=r; aspf=r` |
+
+   **Do NOT** touch the existing `blockland.ae` SPF or add a parent
+   `_dmarc.blockland.ae` without coordinating with IT — parent SPF is
+   `-all`-locked for Outlook 365 and a careless DMARC could quarantine
+   real corporate mail.
+
+5. **Wait for propagation** — 1-2 h typical, up to 24 h. Brevo console
+   shows `Domain authenticated ✓` when ready.
+6. **Update [`.env.auth`](../../.env.auth)** on the host:
+   ```bash
+   LAI_EMAIL_SENDER_EMAIL=no-reply@lai.blockland.ae
+   LAI_EMAIL_PUBLIC_APP_BASE_URL=https://lai.blockland.ae   # or wherever the UI lives
+   ```
+   Then restart serve_rag:
+   ```bash
+   bash scripts/ops/restart_serve_rag.sh
+   ```
+7. **Send the test mails** — dry-run first to confirm rendering, then
+   `--yes` to fire:
+   ```bash
+   cd /data/projects/lai/LAI
+   set -a && . ./.env.auth && set +a   # load LAI_EMAIL_* from .env.auth
+
+   # Dry-run — shows what would be sent
+   .venv/bin/python scripts/ops/email_deliverability_test.py \
+       --to ravi@blockland.ae \
+       --to harsh@<google-workspace-strict-dmarc-host> \
+       --to <some-account>@gmx.de \
+       --to <some-account>@web.de \
+       --to <some-account>@<your-custom-domain>
+
+   # Actually fire (sends 4 templates × N recipients):
+   .venv/bin/python scripts/ops/email_deliverability_test.py \
+       --to <addr> --to <addr> ... --yes
+   ```
+   The script refuses to run if sender is a freemail address or
+   base URL is an RFC1918 IP — same guard the production code path
+   should have. Output includes Brevo's `messageId` per send + a
+   checklist for INBOX-vs-SPAM verification.
+
+8. **Bonus: mail-tester.com** — for an objective 10/10 score, send one
+   of the templates to a `*@mail-tester.com` address it generates
+   for you and grab the result URL.
+
+### Honest gaps not closed by this work
+
+- No bounce / complaint webhook syncing back to LAI DB — Brevo records
+  bounces in its dashboard but a permanently-bouncing user keeps getting
+  invite mails forever. Deferred (would need a new `email_events` table).
+- No DMARC `rua=` report parsing — reports go to
+  `postmaster@blockland.ae` but nobody is reading them. Use
+  dmarcian.com / Postmark free tier when traffic grows.
+- All 4 templates are English. Pilot firms will want German. Post-pilot.
+
+### Verify current sender / base URL config
+
+```bash
+grep -iE '^LAI_EMAIL_(SENDER|PUBLIC|ENABLED)' LAI/.env.auth
+```
+
+If sender ends in `@gmail.com` / `@web.de` / `@gmx.de` / etc., or if
+base URL contains `192.168.` / `10.` / `localhost`, the test harness
+will refuse to send.
+
+---
+
 ## Recent ops history (rolling, last 5)
 
+- 2026-06-10 — Phase 4.5.4 email-deliverability engineering side landed (rj-DR-2): caught that `LAI_EMAIL_SENDER_EMAIL` is a personal gmail address (pre-determined spam at every corporate receiver — Brevo can't DKIM-align with gmail.com) and `LAI_EMAIL_PUBLIC_APP_BASE_URL` is a LAN IP (call-to-action link unreachable for external recipients). Shipped: `scripts/ops/email_deliverability_test.py` (dry-run-by-default test harness, 4 templates × N recipients, guards against freemail-sender + RFC1918-base-URL, captures Brevo `messageId` + MX provider per send, prints inbox-vs-spam checklist); Brevo+DNS setup runbook in this README; full blueprint at [`rj/blueprint/2026-06-10-email-deliverability.md`](../../../rj/blueprint/2026-06-10-email-deliverability.md) with the exact TXT/CNAME records to plant on `blockland.ae` for the recommended `lai.blockland.ae` subdomain. **Blocked on** DNS-host access at blockland.ae (boss/IT) + Brevo console domain add. PROGRESS_V2 4.5.4 stays at 🔄 partial.
 - 2026-06-10 — Phase 4.5.3 DR runbook landed (rj-DR-1): `scripts/ops/backup_postgres.sh` nightly-dumps the irreplaceable user-content tables (~520 MB compressed; `audit_log`, `users`, `ddiq_*`, `matter_chunks`, plus schema-only DDL of the whole DB) into `LAI/data/postgres-backups/{daily,weekly,monthly}/` with 14d/35d/∞ retention. Corpus (901 GB) deliberately not dumped — reproducible from MinIO via Step 1-6 + statute_feed. Cron `30 2 * * *` installed; first scratch-container restore rehearsal matched all 9 sample row counts exactly with zero errors. Honest gaps documented (same-filesystem risk, no PITR, no GPG, no auto-rehearsal). Blueprint: [`rj/blueprint/2026-06-10-dr-runbook.md`](../../../rj/blueprint/2026-06-10-dr-runbook.md). Closes [`PROGRESS_V2.md` row 4.5.3](../../../harsh/PROGRESS_V2.md).
 - 2026-05-30 — Added `scripts/ops/audit_export.py` (vm-4 / ROADMAP 2.3 follow-up): CSV/JSON bulk export of `audit_log` with date / action / org / user filters, plus a `--purge-older-than DAYS` retention path that requires `--yes` to actually DELETE (dry-run by default). Reads via `audit.query`; purge issues a bound-parameter `DELETE`.
 - 2026-05-30 — `scripts/ops/smoke_test.py` gained an optional `--report` leg (vm-3 / ROADMAP 1.2 follow-up): POSTs a DDiQ async report against `LAI_SMOKE_DDIQ_DOC_ID` and polls `/status` until `done` or budget, so the smoke test now catches DDiQ-pipeline regressions too (exit 7). `LAI_SMOKE_USER`/`LAI_SMOKE_PASS` accepted as aliases for the EMAIL/PASSWORD pair. Cron line documented but **not installed** — shared-box change, awaits rj's OK.
