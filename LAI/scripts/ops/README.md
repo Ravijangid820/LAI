@@ -558,8 +558,37 @@ will refuse to send.
 
 ---
 
+## Push access — why "I can't push" happens (Phase 4.5.5)
+
+Both repos are at `Ravijangid820/LAI` and `Ravijangid820/LAI-UI` — rj's
+*personal* GitHub account. From this shared workstation, only rj's
+SSH key (`ED25519 rj@blockland.ae`) is registered with that account;
+every other team member's key resolves to the shared `TAI-Agent`
+identity, which has no push rights on rj-personal repos.
+
+**Symptom you'll hit:**
+```
+ERROR: Permission to Ravijangid820/LAI.git denied to <your-user>.
+fatal: Could not read from remote repository.
+```
+
+**Workaround (works today):** route the commit through rj — copy the
+diff, ask rj to commit + push from his machine.
+
+**Structural fix in flight:** Phase 4.5.5 — transfer both repos to a
+shared GitHub org so every team member with org access can push
+directly. Decision brief with the (a) per-collaborator-additions vs
+(b) org-transfer tradeoff is at
+[`rj/blueprint/2026-06-10-push-access-spof.md`](../../../rj/blueprint/2026-06-10-push-access-spof.md).
+Recommendation: (b). Blocked on boss conversation about org name +
+admin set (see the blueprint's "What needs the boss conversation"
+section).
+
+---
+
 ## Recent ops history (rolling, last 5)
 
+- 2026-06-10 — Phase 4.5.5 push-access SPOF decision brief landed (rj-DR-3): blueprint comparing (a) per-collaborator additions vs (b) shared-org transfer. Recommended (b) — only real cost is the boss decision on org name + admin set, and the existing TAI-Agent identity is almost certainly already a GitHub org (owns `DS_Platform` at the `owner/repo` URL pattern), which would collapse (b) to a 2-step transfer because team members already have org access. Verified state: both repos at `Ravijangid820`, LAI has 0 CI workflows, LAI-UI has 1 (`ci.yml`, no hardcoded owner — survives transfer unchanged), Vercel relinks via dashboard not config, 7 active files reference `Ravijangid820/` and would need a 1-line sed during the flip. GitHub auto-redirect covers the historical doc references. Engineering side cannot do the transfer unilaterally (one-way operation pending org decision); README pointer added so future "I can't push" hits get the link. Blueprint: [`rj/blueprint/2026-06-10-push-access-spof.md`](../../../rj/blueprint/2026-06-10-push-access-spof.md). PROGRESS_V2 4.5.5 stays at 🔄 partial.
 - 2026-06-10 — Phase 4.5.4 email-deliverability engineering side landed (rj-DR-2): caught that `LAI_EMAIL_SENDER_EMAIL` is a personal gmail address (pre-determined spam at every corporate receiver — Brevo can't DKIM-align with gmail.com) and `LAI_EMAIL_PUBLIC_APP_BASE_URL` is a LAN IP (call-to-action link unreachable for external recipients). Shipped: `scripts/ops/email_deliverability_test.py` (dry-run-by-default test harness, 4 templates × N recipients, guards against freemail-sender + RFC1918-base-URL, captures Brevo `messageId` + MX provider per send, prints inbox-vs-spam checklist); Brevo+DNS setup runbook in this README; full blueprint at [`rj/blueprint/2026-06-10-email-deliverability.md`](../../../rj/blueprint/2026-06-10-email-deliverability.md) with the exact TXT/CNAME records to plant on `blockland.ae` for the recommended `lai.blockland.ae` subdomain. **Blocked on** DNS-host access at blockland.ae (boss/IT) + Brevo console domain add. PROGRESS_V2 4.5.4 stays at 🔄 partial.
 - 2026-06-10 — Phase 4.5.3 DR runbook landed (rj-DR-1): `scripts/ops/backup_postgres.sh` nightly-dumps the irreplaceable user-content tables (~520 MB compressed; `audit_log`, `users`, `ddiq_*`, `matter_chunks`, plus schema-only DDL of the whole DB) into `LAI/data/postgres-backups/{daily,weekly,monthly}/` with 14d/35d/∞ retention. Corpus (901 GB) deliberately not dumped — reproducible from MinIO via Step 1-6 + statute_feed. Cron `30 2 * * *` installed; first scratch-container restore rehearsal matched all 9 sample row counts exactly with zero errors. Honest gaps documented (same-filesystem risk, no PITR, no GPG, no auto-rehearsal). Blueprint: [`rj/blueprint/2026-06-10-dr-runbook.md`](../../../rj/blueprint/2026-06-10-dr-runbook.md). Closes [`PROGRESS_V2.md` row 4.5.3](../../../harsh/PROGRESS_V2.md).
 - 2026-05-30 — Added `scripts/ops/audit_export.py` (vm-4 / ROADMAP 2.3 follow-up): CSV/JSON bulk export of `audit_log` with date / action / org / user filters, plus a `--purge-older-than DAYS` retention path that requires `--yes` to actually DELETE (dry-run by default). Reads via `audit.query`; purge issues a bound-parameter `DELETE`.
