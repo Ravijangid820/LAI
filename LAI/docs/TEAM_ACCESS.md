@@ -4,8 +4,13 @@
 
 Single operational doc for "I need (or someone else needs) to push to
 LAI / LAI-UI from the shared workstation." If you're hitting
-"Permission denied" you're in the right place. For the design
-context behind the current setup, see
+"Permission denied" you're in the right place.
+
+> **New team member?** Read [`PUSH_ACCESS_SETUP.md`](PUSH_ACCESS_SETUP.md)
+> instead — same procedure, written for you specifically (no rj-side
+> or design context). That's the doc to send to a new collaborator.
+
+For the design context behind the current setup, see
 [`rj/blueprint/2026-06-10-push-access-spof.md`](../../rj/blueprint/2026-06-10-push-access-spof.md).
 
 ## Why this is needed
