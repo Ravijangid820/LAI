@@ -173,7 +173,7 @@ GitHub username (the one tied to their own email — NOT the shared
 >    for `LAI-UI`) and you've accepted them, ssh into the shared
 >    workstation as yourself and run:
 >    ```
->    bash /data/projects/lai/LAI/scripts/ops/bootstrap_team_member_github_push.sh
+>    bash /data/projects/lai/LAI/scripts/ops/team_access_bootstrap.sh
 >    ```
 >    Follow the printed instructions (1 pubkey paste into github.com
 >    → Settings → SSH keys, then test push). ~5 min start to finish.
@@ -210,7 +210,7 @@ curate which actually need push):
 
 ### Phase 2 — each member runs the bootstrap script (~5 min per person)
 
-The script lives at `LAI/scripts/ops/bootstrap_team_member_github_push.sh`
+The script lives at `LAI/scripts/ops/team_access_bootstrap.sh`
 and is idempotent (safe to re-run). It:
 
 - Generates a new ED25519 keypair at `~/.ssh/id_ed25519_lai` (does

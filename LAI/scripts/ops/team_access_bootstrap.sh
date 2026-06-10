@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bootstrap_team_member_github_push.sh — Phase 4.5.5, option (a) path.
+# team_access_bootstrap.sh — Phase 4.5.5, option (a) path.
 #
 # Run this AS YOURSELF (not as rj) on the shared LAI workstation. It:
 #   1. Generates a separate ED25519 keypair at ~/.ssh/id_ed25519_lai
