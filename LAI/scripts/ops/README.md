@@ -558,7 +558,7 @@ will refuse to send.
 
 ---
 
-## Push access — why "I can't push" happens (Phase 4.5.5)
+## Push access — getting set up (Phase 4.5.5, option (a))
 
 Both repos are at `Ravijangid820/LAI` and `Ravijangid820/LAI-UI` — rj's
 *personal* GitHub account. From this shared workstation, only rj's
@@ -566,23 +566,62 @@ SSH key (`ED25519 rj@blockland.ae`) is registered with that account;
 every other team member's key resolves to the shared `TAI-Agent`
 identity, which has no push rights on rj-personal repos.
 
-**Symptom you'll hit:**
+**Symptom of an unconfigured team member:**
 ```
 ERROR: Permission to Ravijangid820/LAI.git denied to <your-user>.
 fatal: Could not read from remote repository.
 ```
 
-**Workaround (works today):** route the commit through rj — copy the
-diff, ask rj to commit + push from his machine.
+### How to fix (team member side, ~5 min)
 
-**Structural fix in flight:** Phase 4.5.5 — transfer both repos to a
-shared GitHub org so every team member with org access can push
-directly. Decision brief with the (a) per-collaborator-additions vs
-(b) org-transfer tradeoff is at
-[`rj/blueprint/2026-06-10-push-access-spof.md`](../../../rj/blueprint/2026-06-10-push-access-spof.md).
-Recommendation: (b). Blocked on boss conversation about org name +
-admin set (see the blueprint's "What needs the boss conversation"
-section).
+**Decided 2026-06-10:** option (a) — invite each team member's personal
+GitHub identity as a collaborator on both repos. The structural option
+(b) org transfer stays deferred for a future pass; the blueprint at
+[`rj/blueprint/2026-06-10-push-access-spof.md`](../../../rj/blueprint/2026-06-10-push-access-spof.md)
+covers both paths.
+
+Each team member, ssh into the shared workstation **as yourself** (not
+as rj), then:
+
+```bash
+bash /data/projects/lai/LAI/scripts/ops/bootstrap_team_member_github_push.sh
+```
+
+The script generates a separate ED25519 keypair at
+`~/.ssh/id_ed25519_lai` (does NOT touch your existing TAI-Agent key),
+updates `~/.ssh/config` so SSH prefers this key for github.com with
+your existing keys as fallback, and prints the new public key + 3
+copy-paste steps for:
+
+1. Adding the pubkey to **your personal** github.com → Settings → SSH keys.
+2. Telling rj your personal GitHub username so he can invite you as
+   a collaborator on `Ravijangid820/LAI` and `Ravijangid820/LAI-UI`.
+3. Accepting the two invite emails, then verifying via `ssh -T git@github.com`
+   and a test push.
+
+Idempotent — safe to re-run if your config gets reverted. Bails
+safely if you already have a `Host github.com` block in
+`~/.ssh/config` (prints what single line to add instead).
+
+### rj-side checklist (after collecting personal GH usernames)
+
+For each personal GH username:
+
+1. `https://github.com/Ravijangid820/LAI/settings/access` → "Add people"
+   → enter username → role **Write** (not Admin) → invite.
+2. Same for `https://github.com/Ravijangid820/LAI-UI/settings/access`.
+
+GitHub sends each user 2 invite emails. They expire in 7 days.
+
+### When option (b) happens later
+
+GitHub auto-migrates collaborators on repo transfer, so option (a)'s
+setup keeps working. Each user just runs:
+```bash
+git remote set-url origin git@github.com:<new-org>/LAI.git
+```
+on each clone, and `~/.ssh/config` needs no change (SSH endpoint
+stays `git@github.com`).
 
 ---
 

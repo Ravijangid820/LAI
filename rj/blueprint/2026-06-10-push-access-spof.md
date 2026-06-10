@@ -1,8 +1,20 @@
 # Push-access SPOF on rj — decision brief (Phase 4.5.5)
 
 **Date:** 2026-06-10 · **Owners:** rj (engineering audit) + boss
-(decision) · **Status:** DECISION BRIEF — engineering side ready;
-awaits boss conversation on org name + ownership
+(decision) · **Status:** **DECIDED 2026-06-10 — option (a) chosen for
+immediate unblock; option (b) deferred for a future structural pass.**
+
+> **DECISION (rj, 2026-06-10):** ship option (a) — invite each team
+> member's personal GitHub identity as a collaborator on both
+> Ravijangid820/* repos. The structural (b) shared-org transfer
+> stays the right answer eventually, but doing it tonight requires a
+> boss conversation we don't need to gate the team's push-unblock
+> on. Option (a) closes the immediate "I can't push" pain in 2-3
+> calendar days at the cost of ~9 min / member, leaves the
+> blockland.ae / TAI-Agent org-naming decision pending without
+> blocking anyone, and unwinds cleanly when (b) happens later
+> (collaborators auto-migrate when a repo transfers to an org). See
+> "Execution plan for option (a)" below for the per-step playbook.
 
 ## TL;DR
 
@@ -141,6 +153,122 @@ TAI-Agent" identity stays unused.
 
 **Recommendation: option (b). Strong recommendation.** The only
 real cost is the boss decision on org name + admin set.
+
+## Execution plan for option (a) — the chosen path
+
+### Phase 0 — collect the inputs (rj, ~10 min)
+
+For each team member who needs LAI push access, get their **personal**
+GitHub username (the one tied to their own email — NOT the shared
+`TAI-Agent` identity). Slack/email template:
+
+> Hi <name> — I'm setting up direct push access to the LAI repos so
+> you don't have to route commits through me anymore. Two things:
+>
+> 1. Send me your personal GitHub username (the one tied to your own
+>    email, not the shared TAI-Agent identity). If you don't have a
+>    personal GitHub account yet, create one at github.com — takes 2
+>    minutes; it stays your account.
+> 2. Once I've sent you two GitHub invite emails (one for `LAI`, one
+>    for `LAI-UI`) and you've accepted them, ssh into the shared
+>    workstation as yourself and run:
+>    ```
+>    bash /data/projects/lai/LAI/scripts/ops/bootstrap_team_member_github_push.sh
+>    ```
+>    Follow the printed instructions (1 pubkey paste into github.com
+>    → Settings → SSH keys, then test push). ~5 min start to finish.
+>
+> Thanks. Ping me if anything's unclear.
+
+### Phase 1 — invite each personal GH user (rj, ~16 web-UI clicks, ~15 min)
+
+For each personal GH username collected in Phase 0:
+
+1. Open `https://github.com/Ravijangid820/LAI/settings/access` →
+   "Add people" → enter username → "Select a role" = **Write** (NOT
+   Admin — only rj should have admin for now) → "Add NAME to this
+   repository".
+2. Same for `https://github.com/Ravijangid820/LAI-UI/settings/access`.
+
+GitHub sends each user 2 email invites. Each invite expires in 7
+days if not accepted.
+
+**Target list** (from the `lai` group, minus rj himself — let rj
+curate which actually need push):
+
+| Box user | Notes |
+|---|---|
+| `sa` | Sahid — wrote project-composer bundle `030f3bc`; definitely needs push |
+| `hc` | harsh — authors PROGRESS_V2; definitely needs push |
+| `vm` | multiple recent commits (vm-1 through vm-9); definitely needs push |
+| `ss` | wrote `start.sh`, `.env.auth`; definitely needs push |
+| `aj` | unclear — confirm with rj |
+| `dg` | unclear — confirm with rj |
+| `as` | unclear — confirm with rj |
+| `ks_admin` | likely a service / admin account — skip unless rj says otherwise |
+| `dn_admin` | likely a service / admin account — skip unless rj says otherwise |
+
+### Phase 2 — each member runs the bootstrap script (~5 min per person)
+
+The script lives at `LAI/scripts/ops/bootstrap_team_member_github_push.sh`
+and is idempotent (safe to re-run). It:
+
+- Generates a new ED25519 keypair at `~/.ssh/id_ed25519_lai` (does
+  NOT touch any existing key on the box).
+- Updates `~/.ssh/config` with a `Host github.com` block that prefers
+  the new key (with `IdentitiesOnly yes`) and chains any existing
+  default keys (`id_ed25519`, `id_rsa`, `id_ecdsa`) as fallbacks so
+  existing TAI-Agent access keeps working.
+- Prints the new public key + step-by-step instructions for adding
+  it to the user's personal GH account at github.com/settings/keys.
+- Prints test-push commands.
+
+The script bails safely if `~/.ssh/config` already contains a
+`Host github.com` block — instructs the user to add a single
+`IdentityFile ~/.ssh/id_ed25519_lai` line to it manually instead.
+
+### Phase 3 — verify (rj + each member, ~2 min per person)
+
+Each member runs:
+
+```bash
+ssh -T git@github.com
+# expected: "Hi <their-personal-github-username>! You've successfully authenticated"
+
+cd /data/projects/lai/LAI
+git checkout -b push-test/$USER
+git commit --allow-empty -m "push test from $USER"
+git push origin push-test/$USER
+# expected: push succeeds
+
+# cleanup:
+git push origin --delete push-test/$USER
+git checkout develop && git branch -D push-test/$USER
+```
+
+If `ssh -T` still says `Hi Ravijangid820` (rj's account) instead of
+their personal username, the user's SSH config is loading rj's key
+first — they need to use the bootstrap script's printed
+`Host github.com-lai` alias trick (documented in the script's
+warning path) or manually re-order their `~/.ssh/config`.
+
+### When option (b) happens later
+
+GitHub auto-migrates collaborators when a repo transfers between
+owners — so the team's push access keeps working through the
+transfer. The old `Host github.com` block in each user's
+`~/.ssh/config` keeps working because the SSH endpoint
+(`git@github.com`) is unchanged. The only follow-up: update the
+repo URL on each clone:
+
+```bash
+git remote set-url origin git@github.com:<new-org>/LAI.git
+```
+
+…which is the same one-line each user runs once. Option (a)'s
+investment doesn't go to waste when (b) lands.
+
+---
 
 ## The exact GitHub UI path for option (b)
 
