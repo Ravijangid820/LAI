@@ -565,7 +565,7 @@ Both repos are at `Ravijangid820/LAI` and `Ravijangid820/LAI-UI` — rj's
 workstation, their personal GitHub user must be a collaborator AND
 their SSH key on the box must be attached to that personal account.
 Full procedure (member-side, rj-side, verification, troubleshooting,
-offboarding) in **[`LAI/docs/TEAM_ACCESS.md`](../../docs/TEAM_ACCESS.md)**.
+offboarding) in **[`LAI/docs/team_access/README.md`](../../docs/team_access/README.md)**.
 
 **Symptom of an unconfigured team member:**
 ```
