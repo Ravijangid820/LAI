@@ -165,7 +165,7 @@ def _build_request_body(
     # accepted in the helper signature so callers don't have to
     # special-case it.
     _ = keep_thinking
-    if not config.thinking_mode_enabled:
+    if not config.thinking_mode_enabled and not config.api_key:
         # ``chat_template_kwargs`` MUST sit at the top level of the
         # request body. vLLM's OpenAI-compatible endpoint reads it there;
         # ``extra_body`` is an OpenAI *Python SDK* concept the SDK

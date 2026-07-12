@@ -70,6 +70,7 @@ _log = logging.getLogger("ddiq")
 
 LLM_URL: str       = os.getenv("LLM_URL", "http://localhost:8001/v1")
 LLM_MODEL: str     = os.getenv("LLM_MODEL", "legal-lora")
+LLM_API_KEY: str | None = os.getenv("LLM_API_KEY") or os.getenv("LAI_LLM_API_KEY")
 EMBEDDING_URL: str = os.getenv("EMBEDDING_URL", "http://localhost:8002")
 RERANKER_URL: str  = os.getenv("RERANKER_URL", "http://localhost:8004")
 
@@ -96,7 +97,10 @@ RERANKER_URL: str  = os.getenv("RERANKER_URL", "http://localhost:8004")
 # server-side, ~halving every call. The contract analyzer (serve_rag)
 # keeps thinking on via its own client; this flag is DDiQ-local.
 _LLM_CONFIG = LlmConfig(
-    base_url=LLM_URL, model=LLM_MODEL, thinking_mode_enabled=False,
+    base_url=LLM_URL,
+    model=LLM_MODEL,
+    api_key=LLM_API_KEY,
+    thinking_mode_enabled=False,
 )
 _LLM_CLIENT: SyncLlmClient = SyncLlmClient(_LLM_CONFIG)
 

@@ -21,6 +21,7 @@ class AnalyzerLLMConfig:
     model: str
     timeout_s: float = 600.0
     default_temperature: float = 0.2
+    api_key: str | None = None
 
 
 def from_env() -> AnalyzerLLMConfig | None:
@@ -30,6 +31,7 @@ def from_env() -> AnalyzerLLMConfig | None:
     return AnalyzerLLMConfig(
         api_url=url,
         model=os.environ.get("ANALYZER_LLM_MODEL", "qwen3.6-27b"),
+        api_key=os.environ.get("ANALYZER_LLM_API_KEY"),
     )
 
 
@@ -67,9 +69,10 @@ def call(
         "temperature": cfg.default_temperature if temperature is None else temperature,
     }
     # Qwen3 thinking-mode toggle via chat template kwargs
-    body["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
-    if enable_thinking:
-        body["max_completion_tokens"] = max_new_tokens + max_thinking_tokens
+    if not cfg.api_key:
+        body["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+        if enable_thinking:
+            body["max_completion_tokens"] = max_new_tokens + max_thinking_tokens
 
     if json_schema is not None:
         body["response_format"] = {
@@ -81,8 +84,12 @@ def call(
             },
         }
 
+    headers = {"Content-Type": "application/json"}
+    if cfg.api_key:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
+
     url = cfg.api_url.rstrip("/") + "/v1/chat/completions"
-    r = httpx.post(url, json=body, timeout=cfg.timeout_s)
+    r = httpx.post(url, json=body, headers=headers, timeout=cfg.timeout_s)
     r.raise_for_status()
     data = r.json()
     msg = data["choices"][0]["message"]

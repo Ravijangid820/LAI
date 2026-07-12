@@ -3174,7 +3174,8 @@ async def lifespan(app: FastAPI):
     print(f"[startup]   retrieval wiring: {time.time() - t0:.1f}s", flush=True)
 
     t0 = time.time()
-    reranker = Reranker("Qwen/Qwen3-Reranker-8B")
+    reranker_model = os.environ.get("LAI_RERANKER_MODEL", "Qwen/Qwen3-Reranker-8B")
+    reranker = Reranker(reranker_model)
     print(f"[startup]   reranker: {time.time() - t0:.1f}s", flush=True)
 
     # Default to the 27B analyzer container running locally — Qwen3.6-27B
@@ -3223,16 +3224,24 @@ async def lifespan(app: FastAPI):
     else:
         # Remote vLLM endpoint (default) — verify it's reachable; no in-process load.
         print(f"[startup]   LLM: remote endpoint {LLM_API_URL} (model={LLM_MODEL})", flush=True)
+        headers = {}
+        api_key = os.environ.get("LAI_LLM_API_KEY")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         try:
-            r = httpx.get(f"{LLM_API_URL.rstrip('/')}/v1/models", timeout=5)
-            if r.status_code != 200:
+            r = httpx.get(f"{LLM_API_URL.rstrip('/')}/v1/models", headers=headers, timeout=5)
+            if r.status_code not in (200, 401, 403):
                 raise RuntimeError(f"LLM endpoint returned {r.status_code}")
         except Exception as e:
-            raise RuntimeError(
-                f"LLM endpoint {LLM_API_URL} not reachable: {e}\n"
-                "  → Start the analyzer container: cd Docker/llm-analyzer && docker compose up -d\n"
-                "  → Or override LLM_API_URL to point at a reachable endpoint."
-            ) from e
+            is_local = "localhost" in LLM_API_URL or "127.0.0.1" in LLM_API_URL or "lai_analyzer_llm" in LLM_API_URL
+            if is_local:
+                raise RuntimeError(
+                    f"LLM endpoint {LLM_API_URL} not reachable: {e}\n"
+                    "  → Start the analyzer container: cd Docker/llm-analyzer && docker compose up -d\n"
+                    "  → Or override LLM_API_URL to point at a reachable endpoint."
+                ) from e
+            else:
+                print(f"[startup]   WARNING: Remote public LLM endpoint {LLM_API_URL} check failed ({e}). Proceeding anyway.", flush=True)
         # Build the shared SyncLlmClient. The OpenAI-compatible base
         # URL for vLLM is the endpoint root plus ``/v1``. Other
         # SyncLlmClient knobs (retry, timeout) come from
@@ -3270,8 +3279,11 @@ async def lifespan(app: FastAPI):
     analyzer_cfg = analyzer_llm.from_env()
     if analyzer_cfg is not None:
         try:
-            r = httpx.get(f"{analyzer_cfg.api_url.rstrip('/')}/v1/models", timeout=5)
-            if r.status_code != 200:
+            headers = {}
+            if getattr(analyzer_cfg, "api_key", None):
+                headers["Authorization"] = f"Bearer {analyzer_cfg.api_key}"
+            r = httpx.get(f"{analyzer_cfg.api_url.rstrip('/')}/v1/models", headers=headers, timeout=5)
+            if r.status_code not in (200, 401, 403):
                 raise RuntimeError(f"analyzer endpoint returned {r.status_code}")
             print(f"[startup]   analyzer LLM: {analyzer_cfg.api_url} (model={analyzer_cfg.model})", flush=True)
             STATE["analyzer_cfg"] = analyzer_cfg
