@@ -599,11 +599,12 @@ class Reranker:
         else:
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-            self.tok = AutoTokenizer.from_pretrained(model_id)
+            self.tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 model_id,
                 dtype=torch.float16,
                 device_map={"": self.device},
+                trust_remote_code=True,
             ).eval()
 
     @staticmethod
