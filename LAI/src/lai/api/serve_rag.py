@@ -23,6 +23,9 @@ restart). For persistence, add a SQLite session table later.
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import argparse
 import io
 import json
@@ -3158,7 +3161,10 @@ async def lifespan(app: FastAPI):
     t0 = time.time()
     conn = sqlite3.connect(str(DB), check_same_thread=False)
     conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
-    ensure_bm25_fts(conn)
+    try:
+        ensure_bm25_fts(conn)
+    except Exception as e:
+        print(f"[startup]   WARNING BM25 FTS5 init skipped ({e}) — no corpus data yet", flush=True)
     retrieval_client = RetrievalClient()
     if retrieval_client.ping():
         print("[startup]   pgvector reachable", flush=True)

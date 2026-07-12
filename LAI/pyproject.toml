@@ -68,6 +68,7 @@ dependencies = [
     # branch was retired with the dead-stack purge (commit 8431797).
     # Confirmed 2026-05-19 with
     # ``grep -rE '^(import|from) vllm' src/ micro-services/`` → no hits.
+    "python-dotenv>=1.2.2",
 ]
 
 [project.optional-dependencies]
