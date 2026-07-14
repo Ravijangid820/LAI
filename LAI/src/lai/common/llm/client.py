@@ -26,6 +26,7 @@ worker, the contract analyzer's sync entry points).
 from __future__ import annotations
 
 import json
+import os
 import time
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
@@ -185,6 +186,8 @@ def _headers(config: LlmConfig) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
     if config.api_key is not None:
         headers["Authorization"] = f"Bearer {config.api_key.get_secret_value()}"
+    elif os.getenv("GROQ_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.getenv('GROQ_API_KEY')}"
     return headers
 
 

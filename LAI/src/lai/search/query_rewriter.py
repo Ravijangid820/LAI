@@ -129,9 +129,13 @@ def _llm_call(system: str, user: str, *, timeout_s: float = DEFAULT_TIMEOUT_S) -
         },
     }
     try:
+        headers = {}
+        if os.getenv("GROQ_API_KEY"):
+            headers["Authorization"] = f"Bearer {os.getenv('GROQ_API_KEY')}"
         r = httpx.post(
             DEFAULT_LLM_URL.rstrip("/") + "/v1/chat/completions",
             json=body,
+            headers=headers,
             timeout=timeout_s,
         )
         r.raise_for_status()

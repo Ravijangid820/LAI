@@ -19,6 +19,7 @@ Target distribution per parent chunk:
 """
 
 import json
+import os
 import random
 from typing import Any
 
@@ -117,7 +118,10 @@ def _generate_sample(
     }
 
     try:
-        resp = httpx.post(llm_url, json=payload, timeout=timeout)
+        headers = {}
+        if os.getenv("GROQ_API_KEY"):
+            headers["Authorization"] = f"Bearer {os.getenv('GROQ_API_KEY')}"
+        resp = httpx.post(llm_url, json=payload, headers=headers, timeout=timeout)
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"].strip()
 

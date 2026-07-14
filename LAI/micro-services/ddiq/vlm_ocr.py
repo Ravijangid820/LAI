@@ -127,7 +127,10 @@ def _ocr_image(png_bytes: bytes) -> str:
         "temperature": 0.0,
         "chat_template_kwargs": {"enable_thinking": False},
     }
-    r = requests.post(url, json=body, timeout=_PAGE_TIMEOUT)
+    headers = {}
+    if os.getenv("GROQ_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.getenv('GROQ_API_KEY')}"
+    r = requests.post(url, json=body, headers=headers, timeout=_PAGE_TIMEOUT)
     r.raise_for_status()
     obj = r.json()
     return (obj["choices"][0]["message"]["content"] or "").strip()

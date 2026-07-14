@@ -32,45 +32,8 @@
 name: lai
 
 services:
-  # ── Analyzer LLM (Qwen3.6-27B with thinking + JSON-guided decoding) ──
-  analyzer-llm:
-    image: vllm/vllm-openai:latest
-    container_name: lai_analyzer_llm
-    restart: unless-stopped
-    ipc: host
-    command: >
-      --model ${ANALYZER_MODEL:-Qwen/Qwen3.6-27B}
-      --served-model-name ${ANALYZER_SERVED_NAME:-qwen3.6-27b}
-      --max-model-len ${ANALYZER_MAX_MODEL_LEN:-32768}
-      --max-num-seqs ${ANALYZER_MAX_NUM_SEQS:-8}
-      --dtype bfloat16
-      --trust-remote-code
-      --gpu-memory-utilization ${ANALYZER_GPU_MEM_UTIL:-0.75}
-      --reasoning-parser qwen3
-      --enable-prefix-caching
-    environment:
-      HF_TOKEN: ${HF_TOKEN:-}
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
-    volumes:
-      - ./.runtime-cache/hf:/root/.cache/huggingface
-    ports:
-      - "${ANALYZER_BIND_HOST:-127.0.0.1}:${ANALYZER_PORT:-8005}:8000"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 30
-      start_period: 600s
-    networks:
-      - lai_network
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['${ANALYZER_CUDA_DEVICE:-0}']
-              capabilities: [gpu]
+  # ── Analyzer LLM ──
+  # analyzer-llm moved to Groq API
 
   # ── Embedding service (Qwen3-Embedding-8B) ───────────────────────────
   # On GPU 1 by default — GPU 0 is dominated by the analyzer (Qwen3.6-27B)
@@ -84,7 +47,7 @@ services:
     restart: unless-stopped
     ipc: host
     command: >
-      ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-8B}
+      ${EMBEDDING_MODEL:-intfloat/multilingual-e5-small}
       --dtype auto
       --trust-remote-code
       --max-model-len 32768

@@ -23,6 +23,7 @@ Wind-energy due-diligence domains:
 """
 
 import json
+import os
 from typing import Any
 
 import httpx
@@ -91,7 +92,10 @@ def classify_chunk(
 
     raw_content = None
     try:
-        resp = httpx.post(llm_url, json=payload, timeout=timeout)
+        headers = {}
+        if os.getenv("GROQ_API_KEY"):
+            headers["Authorization"] = f"Bearer {os.getenv('GROQ_API_KEY')}"
+        resp = httpx.post(llm_url, json=payload, headers=headers, timeout=timeout)
         resp.raise_for_status()
         raw_content = resp.json()["choices"][0]["message"]["content"].strip()
         content = raw_content

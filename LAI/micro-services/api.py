@@ -464,6 +464,7 @@ def generate_answer(messages: list) -> dict:
             "temperature": 0.1,
             "frequency_penalty": 0.5,
         },
+        headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}"},
         timeout=300,
     )
     resp.raise_for_status()

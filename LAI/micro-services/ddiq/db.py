@@ -75,7 +75,7 @@ MAX_FILE_SIZE: int = 100 * 1024 * 1024
 
 
 SCHEMA_SQL = """
--- pgvector is required for ddiq_doc_chunks.embedding (4096-dim Qwen3 vectors).
+-- pgvector is required for ddiq_doc_chunks.embedding (384-dim e5-small vectors).
 -- Idempotent: no-op when the extension is already enabled. The whole
 -- SCHEMA_SQL runs in one transaction, so without this every CREATE TABLE
 -- below fails when the DB is fresh.
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS ddiq_documents (
     full_text TEXT, chunk_count INT DEFAULT 0, session_id TEXT);
 CREATE TABLE IF NOT EXISTS ddiq_doc_chunks (
     id SERIAL PRIMARY KEY, doc_id UUID REFERENCES ddiq_documents(id) ON DELETE CASCADE,
-    chunk_idx INT NOT NULL, text TEXT NOT NULL, embedding vector(4096), UNIQUE(doc_id, chunk_idx));
+    chunk_idx INT NOT NULL, text TEXT NOT NULL, embedding vector(384), UNIQUE(doc_id, chunk_idx));
     -- Qwen3-Embedding-8B returns 4096-dim vectors. If you swap to a different
     -- embedding model (1024-dim sentence-transformers / 1536-dim ada / etc.),
     -- update this column and drop ddiq_doc_chunks first.

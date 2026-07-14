@@ -11,6 +11,7 @@ content before embedding in Step 6.
 """
 
 from typing import Any
+import os
 
 import httpx
 
@@ -76,7 +77,10 @@ Abschnitt zum Anreichern:
     }
 
     try:
-        resp = httpx.post(llm_url, json=payload, timeout=timeout)
+        headers = {}
+        if os.getenv("GROQ_API_KEY"):
+            headers["Authorization"] = f"Bearer {os.getenv('GROQ_API_KEY')}"
+        resp = httpx.post(llm_url, json=payload, headers=headers, timeout=timeout)
         resp.raise_for_status()
         prefix = resp.json()["choices"][0]["message"]["content"].strip()
 
