@@ -35,32 +35,20 @@ services:
   # ── Analyzer LLM ──
   # analyzer-llm moved to Groq API
 
-  # ── Embedding service (Qwen3-Embedding-8B) ───────────────────────────
-  # On GPU 1 by default — GPU 0 is dominated by the analyzer (Qwen3.6-27B)
-  # at 0.75 mem-util, leaving only ~25 GB free which is too tight for an
-  # 8B embedding model. GPU 1 has plenty of headroom alongside serve_rag's
-  # in-process reranker (~16 GB). Override with EMBEDDING_CUDA_DEVICE=0 if
-  # the analyzer is stopped or running on a different GPU.
+  # ── Embedding service (TEI) ───────────────────────────
   embedding:
-    image: vllm/vllm-openai:latest
+    image: ghcr.io/huggingface/text-embeddings-inference:1.6
     container_name: lai_embedding
     restart: unless-stopped
     ipc: host
     command: >
-      ${EMBEDDING_MODEL:-intfloat/multilingual-e5-small}
-      --dtype auto
-      --trust-remote-code
-      --max-model-len 32768
-      --gpu-memory-utilization ${EMBEDDING_GPU_MEM:-0.45}
+      --model-id ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-4B}
+      --port 8000
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
-      # Use the local model snapshot — avoids the unauthenticated-HF-Hub
-      # warning + download rate limits. The model is already in
-      # .runtime-cache/hf via volume mount below.
       HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
     volumes:
-      - ./.runtime-cache/hf:/root/.cache/huggingface
+      - ./.runtime-cache/hf:/data
     ports:
       - "${EMBEDDING_BIND_HOST:-127.0.0.1}:${EMBEDDING_PORT:-8003}:8000"
     healthcheck:
@@ -77,6 +65,38 @@ services:
           devices:
             - driver: nvidia
               device_ids: ['${EMBEDDING_CUDA_DEVICE:-1}']
+              capabilities: [gpu]
+
+  # ── Reranker service (TEI) ───────────────────────────
+  reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:1.6
+    container_name: lai_reranker
+    restart: unless-stopped
+    ipc: host
+    command: >
+      --model-id ${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      --port 8000
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - ./.runtime-cache/hf:/data
+    ports:
+      - "${RERANKER_BIND_HOST:-127.0.0.1}:${RERANKER_PORT:-8004}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+    networks:
+      - lai_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${RERANKER_CUDA_DEVICE:-1}']
               capabilities: [gpu]
 
   # ── PostgreSQL + pgvector ────────────────────────────────────────────
