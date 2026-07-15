@@ -75,6 +75,7 @@ services:
     ipc: host
     command: >
       --model-id ${RERANKER_MODEL:-Qwen/Qwen3-Reranker-4B}
+      --pooling cls
       --port 8000
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
