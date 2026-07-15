@@ -64,7 +64,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['${EMBEDDING_CUDA_DEVICE:-1}']
+              device_ids: ['${EMBEDDING_CUDA_DEVICE:-0}']
               capabilities: [gpu]
 
   # ── Reranker service (TEI) ───────────────────────────
@@ -96,7 +96,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['${RERANKER_CUDA_DEVICE:-1}']
+              device_ids: ['${RERANKER_CUDA_DEVICE:-0}']
               capabilities: [gpu]
 
   # ── PostgreSQL + pgvector ────────────────────────────────────────────

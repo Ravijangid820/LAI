@@ -9,6 +9,7 @@ if ($Down) {
 }
 
 Write-Host "Starting LAI containers..." -ForegroundColor Cyan
+Set-Location $PSScriptRoot
 docker compose up -d
 
 Write-Host "Waiting for PostgreSQL to become ready..." -ForegroundColor Yellow
@@ -33,7 +34,12 @@ if (-not $ready) {
     exit 1
 }
 
-Write-Host "PostgreSQL is ready. Running migrations..." -ForegroundColor Green
-Get-Content -Path .\scripts\db\migrations\001_corpus_pgvector.sql | docker exec -i lai_postgres_main psql -U lai_user -d lai_db
+Write-Host "PostgreSQL is ready. Ensuring database exists and running migrations..." -ForegroundColor Green
+
+# Create database if it doesn't exist (ignore errors if it already exists)
+docker exec -i lai_postgres_main psql -U lai_user -d postgres -c "CREATE DATABASE lai_db;" 2>$null
+
+$sqlPath = Join-Path $PSScriptRoot "scripts\db\migrations\001_corpus_pgvector.sql"
+Get-Content -Path $sqlPath | docker exec -i lai_postgres_main psql -U lai_user -d lai_db
 
 Write-Host "Setup complete!" -ForegroundColor Green
